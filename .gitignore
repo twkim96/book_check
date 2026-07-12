@@ -1,0 +1,45 @@
+# Python 캐시
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+
+# 로컬 산출물 (scanner/folderling/dedup이 생성)
+file_list.json
+file_index.json
+success.log
+fail.log
+warning.log
+
+# 1.2.1 dedup decision DB / SQLite sidecars / local quarantine
+.dedup_state/
+*.sqlite3-wal
+*.sqlite3-shm
+dedup_quarantine/
+
+# 로컬 검토 입력·임시 파일
+temp/
+manual_duplicate_plan_*.json
+*.rtf
+
+# private 운영 이력 (공개 저장소에는 정리된 README/docs만 포함)
+update*.md
+dedup_detection_gap_*.md
+REAL_DEVICE_TEST_CHECKLIST.md
+DEDUP_REVIEW_GUIDE.md
+STRUCTURE.md
+tests/
+test_env/
+
+# 로컬 DB/백업/manifest
+*.sqlite3
+*.sqlite3-*
+
+# 로컬 Chrome 확장 소스와 생성 인덱스는 공개 저장소에서 제외
+extension/

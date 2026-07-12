@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=7,<9
+pyflakes>=2.4,<4
