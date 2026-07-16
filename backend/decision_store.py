@@ -2118,11 +2118,19 @@ def doctor_issues(conn: sqlite3.Connection, *, allowed_active_run_id=None):
         stat = path.stat()
         if stat.st_size != row["size"] or stat.st_mtime_ns != row["mtime_ns"]:
             issues.append({"kind": "stale_snapshot", "file_id": row["file_id"], "path": str(path)})
-        if row["dev"] is not None and (
-            row["dev"] != stat.st_dev
-            or row["ino"] != stat.st_ino
-            or row["ctime_ns"] != stat.st_ctime_ns
-        ):
+        identity_changed = row["dev"] is not None and (
+            row["dev"] != stat.st_dev or row["ino"] != stat.st_ino
+        )
+        managed_ctime_changed = (
+            row["assignment_state"] == "managed"
+            and row["dev"] is not None
+            and row["ctime_ns"] != stat.st_ctime_ns
+        )
+        # chmod/xattr 같은 macOS 메타데이터 변경은 inode·size·mtime를 그대로 둔 채
+        # ctime만 바꿀 수 있다. 아직 mutation 권한의 근거가 아닌 미배정 파일은 이
+        # 차이만으로 Folderling을 막지 않는다. 반면 실제 identity(dev/ino) 교체와
+        # managed 파일의 ctime 변화는 기존 fail-closed 검사를 유지한다.
+        if identity_changed or managed_ctime_changed:
             issues.append({"kind": "stale_identity", "file_id": row["file_id"], "path": str(path)})
         if row["current_fingerprint_id"] is None and row["assignment_state"] == "managed":
             issues.append({"kind": "missing_fingerprint", "file_id": row["file_id"]})
