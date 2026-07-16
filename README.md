@@ -68,8 +68,10 @@ python3 run_folderling_one_button.py --help
 ## 플랫폼 카탈로그 (1.2.5)
 
 Folderling과 별개로, 보유 작품의 플랫폼별 최신 인기·평점 지표를 상태 DB에 보관합니다.
-기본 실행은 아직 값이 없는 플랫폼만 최대 25개 제목씩, 제목 batch 사이 3초 간격으로
-조회합니다. 파일 이동·삭제와 file_index.json 갱신은 하지 않습니다.
+기본 실행은 아직 값이 없는 플랫폼만 최대 25개 제목씩 조회합니다. 한 제목의 Naver·Kakao·
+Novelpia는 최대 3개 worker로 병렬 조회하되, 같은 플랫폼에는 동시에 요청하지 않습니다.
+한 제목이 끝나면 1초 뒤 다음 제목을 시작합니다. 파일 이동·삭제와 file_index.json 갱신은
+하지 않습니다.
 
 ~~~bash
 # terminal control server의 새 버튼 대상
@@ -88,11 +90,16 @@ python3 run_platform_catalog.py top --order-by series-download --limit 20
 backup을 소유한 플랫폼/원버튼 진입점만 명시적으로 migration합니다.
 
 플랫폼 검색에는 파일명의 압축 key 대신 회차·완결·작가 표기만 제거한 읽기 쉬운 제목을
-사용합니다. 최종 결과는 사이트가 붙인 회차 상태 꼬리만 제외하고 제목이 정확히 같을 때만
+사용하며 `메인 제목: 부제목`은 전체를 보존합니다. 최종 결과는 사이트가 붙인 회차 상태
+꼬리만 제외하고 제목이 정확히 같을 때만
 채택합니다. Kakao는 최신 BFF search/overview JSON API를 사용하며 일시 오류는 재시도 가능한
 `error`로 남기며, Kakao 검색은 동명 웹툰을 피하도록 웹소설 분류로 제한합니다.
 `catalog_title_metrics` view에는 시리즈 다운로드·평점, 카카오 조회·평점,
 노벨피아 조회·추천의 여섯 컬럼이 있습니다.
+
+응답 구조가 예상과 다르면 `not_found`가 아니라 재시도 가능한 `error`로 기록합니다.
+정상적인 `not_found`도 30일 뒤 자동 재조회합니다. 마지막 성공 지표는 DB에 보존하지만
+`top` 명령은 현재 상태가 `ok`인 지표만 상위 목록에 표시합니다.
 
 ## 테스트
 

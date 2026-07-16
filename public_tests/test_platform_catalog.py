@@ -1,5 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -95,6 +96,52 @@ def test_catalog_query_keeps_readable_title_instead_of_compact_key(tmp_path):
         title = platform_catalog.discover_catalog_titles(conn)[0]
         assert title.title_key == "합성띄어쓰기작품"
         assert title.query_title == "합성 띄어쓰기 작품"
+    finally:
+        conn.close()
+
+
+def test_catalog_query_preserves_main_and_subtitle_while_bucket_key_stays_compatible(tmp_path):
+    state_db = _make_db(tmp_path, "합성 메인 제목: 충분히 긴 부제목 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        title = platform_catalog.discover_catalog_titles(conn)[0]
+        assert title.title_key == "충분히긴부제목"
+        assert title.query_title == "합성 메인 제목: 충분히 긴 부제목"
+        assert platform_catalog.titles_match(
+            title.query_title, "합성 메인 제목: 충분히 긴 부제목"
+        )
+    finally:
+        conn.close()
+
+
+def test_changed_catalog_query_retries_not_found_but_preserves_success(tmp_path):
+    state_db = _make_db(tmp_path, "합성 메인 제목: 충분히 긴 부제목 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat("series", "ok", rating=9.0),
+                platform_catalog.PlatformStat("kakao", "not_found"),
+                platform_catalog.PlatformStat("novelpia", "not_found"),
+            ],
+        )
+        conn.execute(
+            "UPDATE catalog_titles SET query_title = ? WHERE title_key = ?",
+            ("충분히 긴 부제목", key),
+        )
+        conn.commit()
+
+        platform_catalog.sync_catalog_titles(conn)
+        rows = conn.execute(
+            "SELECT platform, status FROM catalog_platform_stats ORDER BY platform"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [("series", "ok")]
+        target = platform_catalog.select_refresh_targets(conn)[0]
+        assert target.platforms == ("kakao", "novelpia")
     finally:
         conn.close()
 
@@ -222,6 +269,26 @@ def test_catalog_top_sorts_by_requested_platform_column(tmp_path):
     assert [row["series_download_count"] for row in active_only] == [10]
 
 
+def test_catalog_top_excludes_last_good_metric_when_current_lookup_failed(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn, key, [platform_catalog.PlatformStat("series", "ok", rating=9.8)]
+        )
+        platform_catalog.record_platform_stats(
+            conn, key, [platform_catalog.PlatformStat("series", "not_found")]
+        )
+    finally:
+        conn.close()
+
+    assert platform_catalog.top_catalog_metrics(
+        str(state_db), order_by="series-rating", limit=10
+    ) == []
+
+
 def test_catalog_status_is_read_only_and_uses_current_active_titles(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.connect_state_db(state_db)
@@ -326,3 +393,145 @@ def test_catalog_age_refresh_can_retry_old_not_found_rows(tmp_path):
         assert target[0].platforms == ("series", "kakao", "novelpia")
     finally:
         conn.close()
+
+
+def test_not_found_is_automatically_retried_after_thirty_days(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        recorded_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat(platform, "not_found") for platform in platform_catalog.PLATFORMS],
+            now=recorded_at,
+        )
+        assert platform_catalog.select_refresh_targets(
+            conn, now=recorded_at + timedelta(days=29)
+        ) == []
+        target = platform_catalog.select_refresh_targets(
+            conn, now=recorded_at + timedelta(days=30)
+        )[0]
+        assert target.platforms == platform_catalog.PLATFORMS
+    finally:
+        conn.close()
+
+
+def test_public_platform_response_fixtures_cover_all_three_parsers():
+    title = "합성 메인 제목: 충분히 긴 부제목"
+
+    def fetch_text(url, _timeout):
+        if "search/search.series" in url:
+            return (
+                '<li><a class="N=a:nov.title" '
+                'href="/novel/detail.series?productNo=11">'
+                f"{title} (총 20화/완결)</a></li>"
+            )
+        if "detail.series" in url:
+            return (
+                f'<meta property="og:title" content="{title}">'
+                '<button class="btn_download"><span>1.2만</span></button>'
+                '<div class="score_area"><em>9.8</em></div>'
+            )
+        raise AssertionError(url)
+
+    def fetch_json(url, _timeout):
+        if "/v2/search/series" in url:
+            assert "category_uid=11" in url
+            assert "is_complete=false" in url
+            return {"result": {"list": [{
+                "series_id": "22",
+                "title": title,
+                "on_issue": "N",
+                "service_property": {"view_count": 23000},
+            }]}}
+        if "/v1/content/overview" in url:
+            return {"result": {"content": {
+                "title": title,
+                "service_property": {
+                    "view_count": 23000,
+                    "rating_count": 20,
+                    "rating_sum": 190,
+                },
+            }}}
+        if "novelpia.com/proc/novel" in url:
+            return {"status": 200, "list": [{
+                "novel_no": "33",
+                "novel_name": title,
+                "count_view": 34000,
+                "count_good": 450,
+            }]}
+        raise AssertionError(url)
+
+    results = platform_catalog.lookup_platforms(
+        title, fetch_text=fetch_text, fetch_json=fetch_json, timeout=1
+    )
+    by_platform = {result.platform: result for result in results}
+    assert by_platform["series"].status == "ok"
+    assert by_platform["series"].download_count == 12000
+    assert by_platform["kakao"].status == "ok"
+    assert by_platform["kakao"].rating == 9.5
+    assert by_platform["novelpia"].status == "ok"
+    assert by_platform["novelpia"].recommend_count == 450
+
+
+def test_one_titles_three_platforms_are_looked_up_in_parallel(monkeypatch):
+    barrier = threading.Barrier(3, timeout=2)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def lookup(platform):
+        def run(*_args, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait()
+                return platform_catalog.PlatformStat(platform, "ok", view_count=1)
+            finally:
+                with lock:
+                    active -= 1
+
+        return run
+
+    monkeypatch.setattr(platform_catalog, "lookup_series", lookup("series"))
+    monkeypatch.setattr(platform_catalog, "lookup_kakao", lookup("kakao"))
+    monkeypatch.setattr(platform_catalog, "lookup_novelpia", lookup("novelpia"))
+
+    results = platform_catalog.lookup_platforms("합성작품", timeout=1)
+    assert [result.platform for result in results] == list(platform_catalog.PLATFORMS)
+    assert peak == 3
+
+
+@pytest.mark.parametrize("platform", ("series", "kakao"))
+def test_known_ten_point_platforms_reject_out_of_range_ratings(platform):
+    with pytest.raises(ValueError, match="rating"):
+        platform_catalog._validate_stat(
+            platform_catalog.PlatformStat(platform, "ok", rating=98)
+        )
+
+
+def test_changed_response_shapes_become_retryable_errors():
+    series = platform_catalog.lookup_platforms(
+        "합성작품",
+        platforms=("series",),
+        fetch_text=lambda _url, _timeout: "<html>unexpected</html>",
+        timeout=1,
+    )[0]
+    kakao = platform_catalog.lookup_platforms(
+        "합성작품",
+        platforms=("kakao",),
+        fetch_json=lambda _url, _timeout: {"unexpected": []},
+        timeout=1,
+    )[0]
+    novelpia = platform_catalog.lookup_platforms(
+        "합성작품",
+        platforms=("novelpia",),
+        fetch_json=lambda _url, _timeout: {"unexpected": []},
+        timeout=1,
+    )[0]
+    assert [series.status, kakao.status, novelpia.status] == ["error", "error", "error"]

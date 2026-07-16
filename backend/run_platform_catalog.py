@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--all", action="store_true", help="안전 기본 batch 제한 없이 모든 대상")
     refresh.add_argument(
         "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
-        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 3초)",
+        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 1초)",
     )
     refresh.add_argument("--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS)
     refresh.add_argument("--retry-not-found", action="store_true")

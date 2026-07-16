@@ -13,6 +13,7 @@ import math
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ import decision_store
 from normalizer import (
     NORMALIZER_VERSION,
     analyze_name,
+    extract_catalog_query_title,
     extract_readable_title,
 )
 
@@ -34,10 +36,15 @@ PLATFORM_LABELS = {
     "kakao": "카카오페이지",
     "novelpia": "노벨피아",
 }
-DEFAULT_DELAY_SECONDS = 3.0
+DEFAULT_DELAY_SECONDS = 1.0
 DEFAULT_LIMIT = 25
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_ERROR_RETRY_SECONDS = 6 * 60 * 60
+DEFAULT_NOT_FOUND_REFRESH_DAYS = 30
+RATING_SCALES = {
+    "series": 10.0,
+    "kakao": 10.0,
+}
 _USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " \
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 _KAKAO_BFF_ORIGIN = "https://bff-page.kakao.com"
@@ -142,9 +149,13 @@ def _count(value: object) -> Optional[int]:
     return int(parsed) if parsed is not None else None
 
 
-def _rating(value: object) -> Optional[float]:
+def _rating(value: object, *, maximum: Optional[float] = None) -> Optional[float]:
     parsed = _number(value)
-    return round(parsed, 4) if parsed is not None else None
+    if parsed is None:
+        return None
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"rating out of range: value={parsed}, maximum={maximum}")
+    return round(parsed, 4)
 
 
 def _first_value(record: object, keys: Sequence[str]) -> object:
@@ -224,10 +235,11 @@ def discover_catalog_titles(conn: sqlite3.Connection) -> List[CatalogTitle]:
         if not title_key:
             continue
         readable_title = extract_readable_title(filename).strip()
+        query_title = extract_catalog_query_title(filename).strip()
         candidate = CatalogTitle(
             title_key=title_key,
-            display_title=readable_title or title_key,
-            query_title=readable_title or title_key,
+            display_title=query_title or readable_title or title_key,
+            query_title=query_title or readable_title or title_key,
         )
         current = titles.get(title_key)
         if current is None or len(candidate.display_title) < len(current.display_title):
@@ -257,6 +269,12 @@ def sync_catalog_titles(conn: sqlite3.Connection) -> Dict[str, int]:
             NORMALIZER_VERSION,
         )
     ]
+    query_changed_keys = {
+        title.title_key
+        for title in changed
+        if title.title_key in existing
+        and existing[title.title_key][1] != title.query_title
+    }
     if changed:
         with decision_store.transaction(conn):
             for title in changed:
@@ -277,6 +295,12 @@ def sync_catalog_titles(conn: sqlite3.Connection) -> Dict[str, int]:
                         title.query_title,
                         NORMALIZER_VERSION,
                     ),
+                )
+            if query_changed_keys:
+                conn.executemany(
+                    "DELETE FROM catalog_platform_stats "
+                    "WHERE title_key = ? AND status = 'not_found'",
+                    ((title_key,) for title_key in sorted(query_changed_keys)),
                 )
     created = sum(1 for title in changed if title.title_key not in existing)
     return {"discovered": len(titles), "created": created, "known": len(titles) - created}
@@ -306,12 +330,16 @@ def _needed_platforms(
                 needed.append(platform)
             continue
         if status == "not_found":
+            last_attempt = _parse_time(row["last_attempt_at"])
+            automatic_refresh_before = now - timedelta(
+                days=DEFAULT_NOT_FOUND_REFRESH_DAYS
+            )
             if retry_not_found:
                 needed.append(platform)
-            elif refresh_before is not None:
-                last_attempt = _parse_time(row["last_attempt_at"])
-                if last_attempt is None or last_attempt <= refresh_before:
-                    needed.append(platform)
+            elif last_attempt is None or last_attempt <= automatic_refresh_before:
+                needed.append(platform)
+            elif refresh_before is not None and last_attempt <= refresh_before:
+                needed.append(platform)
             continue
         if refresh_before is not None:
             last_success = _parse_time(row["last_success_at"])
@@ -436,12 +464,18 @@ def _validate_stat(stat: PlatformStat) -> PlatformStat:
     ):
         if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
             raise ValueError(f"invalid {label}: {value!r}")
-    if stat.rating is not None and (
-        not isinstance(stat.rating, (int, float))
-        or not math.isfinite(stat.rating)
-        or stat.rating < 0
-    ):
-        raise ValueError(f"invalid rating: {stat.rating!r}")
+    if stat.rating is not None:
+        if (
+            not isinstance(stat.rating, (int, float))
+            or not math.isfinite(stat.rating)
+            or stat.rating < 0
+        ):
+            raise ValueError(f"invalid rating: {stat.rating!r}")
+        scale = RATING_SCALES.get(stat.platform)
+        if scale is not None and stat.rating > scale:
+            raise ValueError(
+                f"invalid {stat.platform} rating: {stat.rating!r} exceeds {scale}"
+            )
     if stat.status == "ok" and not _has_metrics(stat):
         raise ValueError("ok platform stat requires at least one metric")
     return stat
@@ -577,7 +611,7 @@ def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float]
     return (
         title,
         _count(_strip_tags(download.group(1))) if download else None,
-        _rating(rating.group(1)) if rating else None,
+        _rating(rating.group(1), maximum=RATING_SCALES["series"]) if rating else None,
     )
 
 
@@ -590,7 +624,12 @@ def lookup_series(
     search_url = "https://series.naver.com/search/search.series?" + urlencode(
         {"t": "all", "fs": "novel", "q": title}
     )
-    candidates = _parse_series_candidates(fetch_text(search_url, timeout))
+    search_page = fetch_text(search_url, timeout)
+    candidates = _parse_series_candidates(search_page)
+    if not candidates and "검색결과가 없습니다" not in search_page:
+        raise ValueError("Naver search response did not contain results or no-result marker")
+    if candidates and not any(item["title"] for item in candidates):
+        raise ValueError("Naver search result items have an unexpected title structure")
     candidate = next((item for item in candidates if titles_match(title, item["title"])), None)
     if candidate is None:
         return _not_found("series")
@@ -614,11 +653,13 @@ def lookup_series(
 
 def _kakao_api_candidates(data: object) -> List[Dict[str, object]]:
     if not isinstance(data, dict):
-        return []
+        raise ValueError("Kakao search response is not an object")
     result = data.get("result")
-    items = result.get("list") if isinstance(result, dict) else []
+    if not isinstance(result, dict):
+        raise ValueError("Kakao search response has no result object")
+    items = result.get("list")
     if not isinstance(items, list):
-        return []
+        raise ValueError("Kakao search response has no result.list array")
     candidates = []
     for item in items:
         if not isinstance(item, dict):
@@ -632,6 +673,8 @@ def _kakao_api_candidates(data: object) -> List[Dict[str, object]]:
                 "title": str(candidate_title),
                 "view_count": _count(_first_value(props, ("view_count", "viewCount"))),
             })
+    if items and not candidates:
+        raise ValueError("Kakao search result items have an unexpected structure")
     return candidates
 
 
@@ -641,7 +684,7 @@ def _parse_kakao_overview(
     result = data.get("result") if isinstance(data, dict) else None
     content = result.get("content") if isinstance(result, dict) else None
     if not isinstance(content, dict):
-        return "", None, None, None
+        raise ValueError("Kakao overview response has no result.content object")
     props = content.get("service_property") or content.get("serviceProperty") or {}
     rating_value = _first_value(props, ("ratingAverage", "ratingAvg", "rating"))
     rating_count = _count(_first_value(props, ("ratingCount", "rating_count")))
@@ -652,7 +695,7 @@ def _parse_kakao_overview(
     return (
         str(_first_value(content, ("title", "name", "seoTitle")) or ""),
         _count(_first_value(props, ("viewCount", "view_count", "readCount", "read_count"))),
-        _rating(rating_value),
+        _rating(rating_value, maximum=RATING_SCALES["kakao"]),
         rating_count,
     )
 
@@ -703,25 +746,6 @@ def lookup_kakao(
     return _not_found("kakao")
 
 
-def _object_arrays(root: object) -> List[List[dict]]:
-    arrays: List[List[dict]] = []
-    stack = [root]
-    seen = set()
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, (dict, list)) or id(node) in seen:
-            continue
-        seen.add(id(node))
-        if isinstance(node, list):
-            objects = [item for item in node if isinstance(item, dict)]
-            if objects:
-                arrays.append(objects)
-            stack.extend(node)
-        else:
-            stack.extend(value for value in node.values() if isinstance(value, (dict, list)))
-    return arrays
-
-
 def _novelpia_title(record: object) -> str:
     return str(_first_value(record, ("novel_name", "novelName", "title", "name", "subject")) or "")
 
@@ -753,10 +777,12 @@ def lookup_novelpia(
         "list_display": "list",
     }
     data = fetch_json("https://novelpia.com/proc/novel?" + urlencode(params), timeout)
-    candidates = [
-        item for values in _object_arrays(data) for item in values
-        if _novelpia_title(item)
-    ]
+    if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+        raise ValueError("Novelpia search response has no list array")
+    items = data["list"]
+    candidates = [item for item in items if isinstance(item, dict) and _novelpia_title(item)]
+    if items and not candidates:
+        raise ValueError("Novelpia search result items have an unexpected structure")
     candidate = next((item for item in candidates if titles_match(title, _novelpia_title(item))), None)
     if candidate is None:
         return _not_found("novelpia")
@@ -784,20 +810,33 @@ def lookup_platforms(
     fetch_json: Callable[[str, float], object] = _http_json,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> List[PlatformStat]:
+    if not platforms:
+        return []
+    if len(set(platforms)) != len(platforms):
+        raise ValueError("platform lookup list must not contain duplicates")
     lookups = {
         "series": lambda: lookup_series(title, fetch_text, timeout=timeout),
         "kakao": lambda: lookup_kakao(title, fetch_json, timeout=timeout),
         "novelpia": lambda: lookup_novelpia(title, fetch_json, timeout=timeout),
     }
-    results = []
     for platform in platforms:
         if platform not in lookups:
             raise ValueError(f"unknown platform: {platform}")
-        try:
-            results.append(lookups[platform]())
-        except Exception as exc:
-            results.append(_error(platform, exc))
-    return results
+
+    # 한 제목 안에서 서로 다른 플랫폼만 병렬 조회한다. 다음 제목은 이 세 작업이
+    # 모두 끝난 뒤 시작하므로 같은 플랫폼에 동시 요청이 쌓이지 않는다.
+    with ThreadPoolExecutor(
+        max_workers=min(len(platforms), len(PLATFORMS)),
+        thread_name_prefix="platform-catalog",
+    ) as executor:
+        futures = {platform: executor.submit(lookups[platform]) for platform in platforms}
+        results = []
+        for platform in platforms:
+            try:
+                results.append(futures[platform].result())
+            except Exception as exc:
+                results.append(_error(platform, exc))
+        return results
 
 
 def refresh_catalog(
@@ -919,6 +958,9 @@ _ORDER_COLUMNS = {
     "novelpia-view": "novelpia_view_count",
     "novelpia-recommend": "novelpia_recommend_count",
 }
+_ORDER_STATUS_COLUMNS = {
+    order: f"{order.split('-', 1)[0]}_status" for order in _ORDER_COLUMNS
+}
 
 
 def top_catalog_metrics(
@@ -932,6 +974,7 @@ def top_catalog_metrics(
     if limit <= 0:
         raise ValueError("limit must be positive")
     column = _ORDER_COLUMNS[order_by]
+    status_column = _ORDER_STATUS_COLUMNS[order_by]
     conn = decision_store.connect_state_db_readonly(state_db_path)
     try:
         views = {
@@ -948,7 +991,7 @@ def top_catalog_metrics(
         rows = conn.execute(
             f"""
             SELECT * FROM catalog_title_metrics
-            WHERE {column} IS NOT NULL
+            WHERE {column} IS NOT NULL AND {status_column} = 'ok'
             ORDER BY {column} DESC, display_title ASC
             """,
         ).fetchall()

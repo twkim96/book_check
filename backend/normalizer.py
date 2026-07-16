@@ -739,22 +739,18 @@ def is_side_story(filename):
     return True
 
 
-def extract_readable_title(filename):
-    """편수/완결/작가 표기를 제거하되 사람이 읽을 제목 형태는 보존한다.
-
-    Chrome 확장의 ``extractReadableTitle``과 같은 플랫폼 검색어를 만들기 위한
-    함수다.  중복 묶음 key가 필요하면 :func:`extract_core_title`을 사용한다.
-    """
+def _extract_readable_title(filename, *, prefer_colon_subtitle):
     # 분리 마커 〔Dn〕는 검색/매칭에서 제거해 base와 같은 코어로 인식되게 한다.
     base = _without_extension(strip_disambig_marker(filename))
 
     # 콜론 분리: "메인: 부제"에서 부제 쪽 검색어 길이가 충분하면 부제를 코어로 본다.
     # (JS extractReadableTitle과 동기화)
-    colon_parts = re.split(r"[:：]", base)
-    if len(colon_parts) > 1:
-        last_part = colon_parts[-1].strip()
-        if len(_compact_search(last_part)) >= 4:
-            base = last_part
+    if prefer_colon_subtitle:
+        colon_parts = re.split(r"[:：]", base)
+        if len(colon_parts) > 1:
+            last_part = colon_parts[-1].strip()
+            if len(_compact_search(last_part)) >= 4:
+                base = last_part
 
     base = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", base)
     # 게시글 접두 태그 제거 (예: "19禁완)", "19금)", "완결)" 등). JS와 동기화.
@@ -803,6 +799,20 @@ def extract_readable_title(filename):
 
     base = re.sub(r"^[^a-zA-Z0-9가-힣\u3400-\u9fff\uf900-\ufaff]+", " ", base)
     return re.sub(r"\s+", " ", base).strip()
+
+
+def extract_readable_title(filename):
+    """중복 묶음용으로 부제 우선 규칙을 적용한 사람이 읽을 수 있는 제목."""
+    return _extract_readable_title(filename, prefer_colon_subtitle=True)
+
+
+def extract_catalog_query_title(filename):
+    """플랫폼 검색용 제목을 만들되 ``메인: 부제`` 전체 제목은 보존한다.
+
+    기존 중복 버킷의 ``core_title`` 계약은 바꾸지 않고, 플랫폼에서 실제 작품명과
+    정확 비교할 때만 콜론 앞뒤 제목을 모두 사용한다.
+    """
+    return _extract_readable_title(filename, prefer_colon_subtitle=False)
 
 
 def extract_core_title(filename):
