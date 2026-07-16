@@ -739,8 +739,12 @@ def is_side_story(filename):
     return True
 
 
-def extract_core_title(filename):
-    """편수/완결 표식/작가 표기를 제거한 검색용 핵심 제목을 만든다."""
+def extract_readable_title(filename):
+    """편수/완결/작가 표기를 제거하되 사람이 읽을 제목 형태는 보존한다.
+
+    Chrome 확장의 ``extractReadableTitle``과 같은 플랫폼 검색어를 만들기 위한
+    함수다.  중복 묶음 key가 필요하면 :func:`extract_core_title`을 사용한다.
+    """
     # 분리 마커 〔Dn〕는 검색/매칭에서 제거해 base와 같은 코어로 인식되게 한다.
     base = _without_extension(strip_disambig_marker(filename))
 
@@ -761,6 +765,7 @@ def extract_core_title(filename):
         flags=re.IGNORECASE,
     )
     base = re.sub(r"@[^\s]+", " ", base)
+    base = re.sub(r"^[^a-zA-Z0-9가-힣\u3400-\u9fff\uf900-\ufaff]+", " ", base)
 
     # 제목 뒤에 붙는 메타데이터(편수/완결/외전/본편 등)의 첫 등장 위치에서 잘라낸다.
     # 메타데이터 뒤에 붙는 작가명, 판번호, 군더더기 토큰까지 함께 떨어뜨려
@@ -796,10 +801,13 @@ def extract_core_title(filename):
     for keyword in PREFIX_NOISE_WORDS:
         base = re.sub(rf"^\s*{re.escape(keyword)}\s*", " ", base)
 
-    # 한글/영숫자에 더해 CJK 한자(표의문자)도 보존한다. 한글 병기 없는 순한자 제목이
-    # 통째로 사라져 서로 못 묶이던 문제(測試堂 完 등)를 막는다.
-    base = re.sub(r"[^a-zA-Z0-9가-힣\u3400-\u9fff\uf900-\ufaff]", "", base)
-    return base.strip().lower()
+    base = re.sub(r"^[^a-zA-Z0-9가-힣\u3400-\u9fff\uf900-\ufaff]+", " ", base)
+    return re.sub(r"\s+", " ", base).strip()
+
+
+def extract_core_title(filename):
+    """원문형 제목을 소문자 영숫자/한글/CJK만 남긴 안정적인 묶음 key로 만든다."""
+    return _compact_search(extract_readable_title(filename))
 
 
 def analyze_name(name):

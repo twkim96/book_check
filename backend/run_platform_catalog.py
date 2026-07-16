@@ -84,7 +84,7 @@ def ensure_catalog_schema(state_db_path: str) -> Optional[Path]:
                 backup = decision_store.backup_state_db(conn, _backup_path(state_db))
             finally:
                 conn.close()
-        conn = decision_store.initialize_state_db(state_db)
+        conn = decision_store.initialize_state_db(state_db, migrate=True)
         conn.close()
         return backup
 

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS catalog_platform_stats (
     remote_id TEXT,
     remote_title TEXT,
     remote_url TEXT,
+    download_count INTEGER CHECK (download_count IS NULL OR download_count >= 0),
+    -- v8 compatibility column. New writes use download_count.
     interest_count INTEGER CHECK (interest_count IS NULL OR interest_count >= 0),
     view_count INTEGER CHECK (view_count IS NULL OR view_count >= 0),
     recommend_count INTEGER CHECK (recommend_count IS NULL OR recommend_count >= 0),
@@ -146,7 +148,8 @@ SELECT
     title.title_key,
     title.display_title,
     title.query_title,
-    MAX(CASE WHEN stat.platform = 'series' THEN stat.interest_count END) AS series_interest_count,
+    MAX(CASE WHEN stat.platform = 'series' THEN
+        COALESCE(stat.download_count, stat.interest_count) END) AS series_download_count,
     MAX(CASE WHEN stat.platform = 'series' THEN stat.rating END) AS series_rating,
     MAX(CASE WHEN stat.platform = 'kakao' THEN stat.view_count END) AS kakao_view_count,
     MAX(CASE WHEN stat.platform = 'kakao' THEN stat.rating END) AS kakao_rating,
@@ -453,9 +456,24 @@ def connect_state_db_readonly(path: os.PathLike | str) -> sqlite3.Connection:
     return conn
 
 
-def initialize_state_db(path: os.PathLike | str) -> sqlite3.Connection:
+def initialize_state_db(
+    path: os.PathLike | str, *, migrate: bool = False
+) -> sqlite3.Connection:
+    """Open/create the state DB; upgrade an existing DB only with explicit consent.
+
+    Callers that pass ``migrate=True`` must first create a verified SQLite backup.
+    This keeps Scanner/auditor/read workflows from silently invalidating an active
+    one-button authorization as a side effect of merely opening an older DB.
+    """
     conn = connect_state_db(path, create=True)
     version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version not in (0, SCHEMA_VERSION) and not migrate:
+        conn.close()
+        raise RuntimeError(
+            "state DB schema migration required: "
+            f"current={version}, expected={SCHEMA_VERSION}; "
+            "use a backup-owning migration entry point"
+        )
     if version == 0:
         conn.executescript(SCHEMA_SQL)
         conn.commit()
@@ -644,6 +662,36 @@ def initialize_state_db(path: os.PathLike | str) -> sqlite3.Connection:
         conn.execute("PRAGMA user_version = 8")
         conn.commit()
         version = 8
+    if version == 8:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(catalog_platform_stats)")
+        }
+        if "download_count" not in columns:
+            conn.execute(
+                "ALTER TABLE catalog_platform_stats ADD COLUMN download_count INTEGER "
+                "CHECK (download_count IS NULL OR download_count >= 0)"
+            )
+        conn.execute(
+            "UPDATE catalog_platform_stats SET download_count = interest_count "
+            "WHERE download_count IS NULL AND interest_count IS NOT NULL"
+        )
+        conn.executescript(CATALOG_SCHEMA_SQL)
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v9 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute("DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')")
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+        version = 9
     validate_schema(conn)
     return conn
 

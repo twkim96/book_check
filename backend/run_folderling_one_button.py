@@ -144,7 +144,7 @@ def run(src_dir, dst_dir, state_db_path):
             )
         approval_started = False
         try:
-            conn = decision_store.initialize_state_db(state_db)
+            conn = decision_store.initialize_state_db(state_db, migrate=True)
             try:
                 # A user moves managed queue files into these inboxes outside the
                 # program.  Back up first, then bind those renames to the stable
