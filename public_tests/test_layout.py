@@ -35,6 +35,19 @@ def test_control_server_entry_point_remains_at_root():
     assert "--state-db" in completed.stdout
 
 
+def test_platform_catalog_control_entry_point_is_available_at_root():
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "run_platform_catalog.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert "refresh" in completed.stdout
+    assert "status" in completed.stdout
+
+
 def test_public_source_has_no_literal_user_home_path():
     user_home_prefix = "/" + "Users/"
     paths = [*ROOT.glob("*.py"), *ROOT.glob("backend/*.py")]

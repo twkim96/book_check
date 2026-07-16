@@ -22,7 +22,7 @@ def build_parser():
     parser.add_argument("--temp", default=DEFAULT_TEMP_DIR)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init = subparsers.add_parser("init", help="빈 schema v7 DB를 생성합니다.")
+    init = subparsers.add_parser("init", help="빈 schema v8 DB를 생성합니다.")
     init.add_argument("--run", action="store_true")
 
     listing = subparsers.add_parser("list", help="검토 항목을 조회합니다.")

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -69,6 +69,11 @@ REQUIRED_TABLES = frozenset({
     "pair_cache",
     "actual_runs",
     "operations",
+    "catalog_titles",
+    "catalog_platform_stats",
+})
+REQUIRED_VIEWS = frozenset({
+    "catalog_title_metrics",
 })
 
 _ALLOWED_OPERATION_TRANSITIONS = {
@@ -99,6 +104,61 @@ _SYMBOL_COORDINATES = {
     "특별편": ("special", 300),
     "special": ("special", 300),
 }
+
+
+CATALOG_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS catalog_titles (
+    title_key TEXT PRIMARY KEY,
+    display_title TEXT NOT NULL,
+    query_title TEXT NOT NULL,
+    normalizer_version TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS catalog_platform_stats (
+    title_key TEXT NOT NULL REFERENCES catalog_titles(title_key) ON DELETE CASCADE,
+    platform TEXT NOT NULL CHECK (platform IN ('series', 'kakao', 'novelpia')),
+    status TEXT NOT NULL CHECK (status IN ('ok', 'not_found', 'error', 'skipped')),
+    remote_id TEXT,
+    remote_title TEXT,
+    remote_url TEXT,
+    interest_count INTEGER CHECK (interest_count IS NULL OR interest_count >= 0),
+    view_count INTEGER CHECK (view_count IS NULL OR view_count >= 0),
+    recommend_count INTEGER CHECK (recommend_count IS NULL OR recommend_count >= 0),
+    rating REAL CHECK (rating IS NULL OR rating >= 0),
+    rating_count INTEGER CHECK (rating_count IS NULL OR rating_count >= 0),
+    last_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_success_at TEXT,
+    retry_after TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (title_key, platform)
+);
+
+CREATE INDEX IF NOT EXISTS catalog_platform_stats_refresh
+ON catalog_platform_stats(platform, status, retry_after);
+
+DROP VIEW IF EXISTS catalog_title_metrics;
+CREATE VIEW catalog_title_metrics AS
+SELECT
+    title.title_key,
+    title.display_title,
+    title.query_title,
+    MAX(CASE WHEN stat.platform = 'series' THEN stat.interest_count END) AS series_interest_count,
+    MAX(CASE WHEN stat.platform = 'series' THEN stat.rating END) AS series_rating,
+    MAX(CASE WHEN stat.platform = 'kakao' THEN stat.view_count END) AS kakao_view_count,
+    MAX(CASE WHEN stat.platform = 'kakao' THEN stat.rating END) AS kakao_rating,
+    MAX(CASE WHEN stat.platform = 'novelpia' THEN stat.view_count END) AS novelpia_view_count,
+    MAX(CASE WHEN stat.platform = 'novelpia' THEN stat.recommend_count END) AS novelpia_recommend_count,
+    MAX(CASE WHEN stat.platform = 'series' THEN stat.status END) AS series_status,
+    MAX(CASE WHEN stat.platform = 'kakao' THEN stat.status END) AS kakao_status,
+    MAX(CASE WHEN stat.platform = 'novelpia' THEN stat.status END) AS novelpia_status
+FROM catalog_titles AS title
+LEFT JOIN catalog_platform_stats AS stat ON stat.title_key = title.title_key
+GROUP BY title.title_key, title.display_title, title.query_title;
+"""
 
 
 SCHEMA_SQL = f"""
@@ -349,6 +409,8 @@ CREATE TABLE operations (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+{CATALOG_SCHEMA_SQL}
+
 INSERT INTO settings(key, value) VALUES ('actual_mutation_enabled', '0');
 PRAGMA user_version = {SCHEMA_VERSION};
 """
@@ -563,6 +625,25 @@ def initialize_state_db(path: os.PathLike | str) -> sqlite3.Connection:
         )
         conn.execute("PRAGMA user_version = 7")
         conn.commit()
+        version = 7
+    if version == 7:
+        conn.executescript(CATALOG_SCHEMA_SQL)
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v8 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute("DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')")
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 8")
+        conn.commit()
+        version = 8
     validate_schema(conn)
     return conn
 
@@ -579,6 +660,14 @@ def validate_schema(conn: sqlite3.Connection) -> None:
     missing = REQUIRED_TABLES - tables
     if missing:
         raise RuntimeError(f"schema tables missing: {sorted(missing)}")
+    views = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'view'"
+        )
+    }
+    missing_views = REQUIRED_VIEWS - views
+    if missing_views:
+        raise RuntimeError(f"schema views missing: {sorted(missing_views)}")
 
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if integrity != "ok":

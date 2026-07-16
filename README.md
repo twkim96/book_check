@@ -65,6 +65,28 @@ python3 run_folderling_one_button.py --help
 `run_folderling_one_button.py`는 실제 파일 입고를 수행할 수 있으므로 라이브 환경에서는
 상태 DB의 doctor 결과와 backup을 확인한 뒤 사용해야 합니다.
 
+## 플랫폼 카탈로그 (1.2.4)
+
+Folderling과 별개로, 보유 작품의 플랫폼별 최신 인기·평점 지표를 상태 DB에 보관합니다.
+기본 실행은 아직 값이 없는 플랫폼만 최대 25개 제목씩, 제목 batch 사이 3초 간격으로
+조회합니다. 파일 이동·삭제와 file_index.json 갱신은 하지 않습니다.
+
+~~~bash
+# terminal control server의 새 버튼 대상
+python3 run_platform_catalog.py refresh
+
+# 네트워크/DB 변경 없이 다음 대상만 확인
+python3 run_platform_catalog.py refresh --dry-run
+
+# 수집 현황 및 지표별 상위 작품
+python3 run_platform_catalog.py status
+python3 run_platform_catalog.py top --order-by series-interest --limit 20
+~~~
+
+첫 실제 실행에서 schema v7 DB는 v8로 전환되며, 전환 전 SQLite backup을
+.dedup_state/backups/에 남깁니다. catalog_title_metrics view에는 시리즈 관심·평점,
+카카오 조회·평점, 노벨피아 조회·추천의 여섯 컬럼이 있습니다.
+
 ## 테스트
 
 ```bash
