@@ -20,7 +20,8 @@ from mutation_io import mutation_lock_for_roots
 from project_paths import FILE_INDEX, HOUSE_DIR, STATE_DB, TEMP_DIR
 
 
-FAILED_RETRY_SETTING_KEY = "platform_failed_retry_once_normalized_titles_v1"
+NOVELPIA_AUTH_RETRY_SETTING_KEY = "platform_novelpia_auth_retry_once_v1"
+FAILED_RETRY_SETTING_KEY = "platform_failed_retry_cycle_v2"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,10 +53,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--error-retry-seconds", type=int,
         default=platform_catalog.DEFAULT_ERROR_RETRY_SECONDS,
     )
+    refresh.add_argument(
+        "--require-novelpia-auth", action="store_true",
+        help="인증 환경변수가 없거나 로그인이 실패하면 일반 수집 전에 종료",
+    )
+
+    refresh_existing = subparsers.add_parser(
+        "refresh-existing",
+        help="기존 성공 플랫폼만 재조회해 증가한 인기값과 평점을 갱신합니다.",
+    )
+    refresh_existing.add_argument(
+        "--limit", type=int, default=platform_catalog.DEFAULT_LIMIT
+    )
+    refresh_existing.add_argument(
+        "--all", action="store_true", help="안전 기본 batch 제한 없이 모든 대상"
+    )
+    refresh_existing.add_argument(
+        "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
+        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 1초)",
+    )
+    refresh_existing.add_argument(
+        "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
+    )
+    refresh_existing.add_argument(
+        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 대상 수만 확인"
+    )
+    refresh_existing.add_argument(
+        "--require-novelpia-auth", action="store_true",
+        help="인증 환경변수가 없거나 로그인이 실패하면 갱신 전에 종료",
+    )
 
     retry_failed = subparsers.add_parser(
-        "retry-failed-once",
-        help="현재 not_found/error 플랫폼 행을 새 제목 비교 로직으로 정확히 한 번 재검사합니다.",
+        "retry-failed",
+        help="현재 not_found/error 플랫폼 행을 플랫폼 쌍 규칙으로 재검사합니다.",
     )
     retry_failed.add_argument(
         "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
@@ -70,6 +100,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry_failed.add_argument(
         "--dry-run", action="store_true", help="DB/네트워크 변경 없이 대상 수만 확인"
+    )
+    retry_failed.add_argument(
+        "--require-novelpia-auth", action="store_true",
+        help="인증 환경변수가 없거나 로그인이 실패하면 재검사 전에 종료",
+    )
+
+    retry_novelpia = subparsers.add_parser(
+        "retry-novelpia-auth",
+        help="세 플랫폼 모두 not_found인 기존 제목을 인증된 노벨피아 검색으로 한 번 재검사합니다.",
+    )
+    retry_novelpia.add_argument("--limit", type=int)
+    retry_novelpia.add_argument(
+        "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
+        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 1초)",
+    )
+    retry_novelpia.add_argument(
+        "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
+    )
+    retry_novelpia.add_argument(
+        "--error-retry-seconds", type=int,
+        default=platform_catalog.DEFAULT_ERROR_RETRY_SECONDS,
+    )
+    retry_novelpia.add_argument(
+        "--dry-run", action="store_true", help="로그인/DB 변경 없이 대상 수만 확인"
     )
 
     metadata = subparsers.add_parser(
@@ -170,7 +224,25 @@ def _progress_reporter():
                 flush=True,
             )
             return
-        if phase != "progress":
+        if phase == "auth_start":
+            started_at = time.monotonic()
+            print(
+                "🔐 인증 노벨피아 보완 수집 시작: "
+                f"이번 대상 {event['selected_titles']:,}개",
+                flush=True,
+            )
+            return
+        if phase == "existing_start":
+            started_at = time.monotonic()
+            print(
+                "📈 기존 플랫폼 인기값 갱신 시작: "
+                f"전체 제목 {event['discovered_titles']:,}개, "
+                f"이번 대상 {event['selected_titles']:,}개 / "
+                f"플랫폼 {event['selected_platforms']:,}건",
+                flush=True,
+            )
+            return
+        if phase not in {"progress", "auth_progress", "existing_progress"}:
             return
         completed = int(event["completed_titles"])
         total = int(event["selected_titles"])
@@ -179,10 +251,24 @@ def _progress_reporter():
         elapsed = max(0.001, time.monotonic() - (started_at or time.monotonic()))
         rate = completed / elapsed
         remaining = (total - completed) / rate if rate > 0 else 0
-        counts = event["status_counts"]
         percent = (completed / total * 100) if total else 100.0
+        if phase == "existing_progress":
+            counts = event["outcome_counts"]
+            print(
+                "📈 갱신 진행 "
+                + f"{completed:,}/{total:,} ({percent:.1f}%) | "
+                f"updated={counts.get('updated', 0):,} "
+                f"unchanged={counts.get('unchanged', 0):,} "
+                f"not_found={counts.get('not_found', 0):,} "
+                f"error={counts.get('error', 0):,} | "
+                f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
+                flush=True,
+            )
+            return
+        counts = event["status_counts"]
         print(
-            f"⏳ 진행 {completed:,}/{total:,} ({percent:.1f}%) | "
+            ("🔐 인증 진행 " if phase == "auth_progress" else "⏳ 진행 ")
+            + f"{completed:,}/{total:,} ({percent:.1f}%) | "
             f"ok={counts.get('ok', 0):,} "
             f"not_found={counts.get('not_found', 0):,} "
             f"error={counts.get('error', 0):,} | "
@@ -288,33 +374,34 @@ def _failed_retry_state(state_db_path: str, *, create: bool) -> dict:
             "SELECT value FROM settings WHERE key = ?",
             (FAILED_RETRY_SETTING_KEY,),
         ).fetchone()
+        previous = None
         if row is not None:
             try:
-                payload = json.loads(row["value"])
+                previous = json.loads(row["value"])
             except (TypeError, ValueError) as exc:
-                raise RuntimeError("one-time failed retry state is invalid") from exc
-            cutoff = platform_catalog._parse_time(payload.get("cutoff"))
-            if payload.get("state") not in {"active", "completed"} or cutoff is None:
-                raise RuntimeError("one-time failed retry state is invalid")
-            return payload
+                raise RuntimeError("failed retry cycle state is invalid") from exc
+            cutoff = platform_catalog._parse_time(previous.get("cutoff"))
+            if previous.get("state") not in {"active", "completed"} or cutoff is None:
+                raise RuntimeError("failed retry cycle state is invalid")
+            if previous["state"] == "active" or not create:
+                return previous
 
-        cutoff = conn.execute(
-            """
-            SELECT MAX(last_attempt_at)
-            FROM catalog_platform_stats
-            WHERE status IN ('not_found', 'error')
-            """
-        ).fetchone()[0]
-        cutoff = cutoff or platform_catalog._utc_text(platform_catalog.utc_now())
+        now_text = platform_catalog._utc_text(platform_catalog.utc_now())
         payload = {
             "state": "active" if create else "preview",
-            "cutoff": cutoff,
-            "started_at": platform_catalog._utc_text(platform_catalog.utc_now()),
+            "cycle": int((previous or {}).get("cycle", 0)) + 1,
+            "cutoff": now_text,
+            "started_at": now_text,
         }
         if create:
             with decision_store.transaction(conn):
                 conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    """
+                    INSERT INTO settings(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
                     (FAILED_RETRY_SETTING_KEY, json.dumps(payload, sort_keys=True)),
                 )
         return payload
@@ -322,7 +409,7 @@ def _failed_retry_state(state_db_path: str, *, create: bool) -> dict:
         conn.close()
 
 
-def _complete_failed_retry(state_db_path: str, cutoff: str, result: dict) -> None:
+def _complete_failed_retry(state_db_path: str, state: dict, result: dict) -> None:
     conn = decision_store.connect_state_db(state_db_path)
     try:
         row = conn.execute(
@@ -330,10 +417,14 @@ def _complete_failed_retry(state_db_path: str, cutoff: str, result: dict) -> Non
             (FAILED_RETRY_SETTING_KEY,),
         ).fetchone()
         if row is None:
-            raise RuntimeError("one-time failed retry state disappeared")
+            raise RuntimeError("failed retry cycle state disappeared")
         payload = json.loads(row["value"])
-        if payload.get("state") != "active" or payload.get("cutoff") != cutoff:
-            raise RuntimeError("one-time failed retry state changed unexpectedly")
+        if (
+            payload.get("state") != "active"
+            or payload.get("cycle") != state.get("cycle")
+            or payload.get("cutoff") != state.get("cutoff")
+        ):
+            raise RuntimeError("failed retry cycle state changed unexpectedly")
         payload.update({
             "state": "completed",
             "completed_at": platform_catalog._utc_text(platform_catalog.utc_now()),
@@ -342,15 +433,150 @@ def _complete_failed_retry(state_db_path: str, cutoff: str, result: dict) -> Non
         })
         with decision_store.transaction(conn):
             conn.execute(
-                "UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?",
+                "UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE key = ?",
                 (json.dumps(payload, sort_keys=True), FAILED_RETRY_SETTING_KEY),
             )
     finally:
         conn.close()
 
 
-def retry_failed_once(args: argparse.Namespace, *, progress=None) -> tuple:
-    state = _failed_retry_state(args.state_db, create=False)
+def _novelpia_auth_retry_state(state_db_path: str, *, create: bool) -> dict:
+    connector = (
+        decision_store.connect_state_db
+        if create else decision_store.connect_state_db_readonly
+    )
+    conn = connector(state_db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (NOVELPIA_AUTH_RETRY_SETTING_KEY,),
+        ).fetchone()
+        if row is not None:
+            try:
+                payload = json.loads(row["value"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "one-time authenticated NovelPia retry state is invalid"
+                ) from exc
+            cutoff = platform_catalog._parse_time(payload.get("cutoff"))
+            if payload.get("state") not in {"active", "completed"} or cutoff is None:
+                raise RuntimeError(
+                    "one-time authenticated NovelPia retry state is invalid"
+                )
+            return payload
+
+        now_text = platform_catalog._utc_text(platform_catalog.utc_now())
+        payload = {
+            "state": "active" if create else "preview",
+            "cutoff": now_text,
+            "started_at": now_text,
+        }
+        if create:
+            with decision_store.transaction(conn):
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (
+                        NOVELPIA_AUTH_RETRY_SETTING_KEY,
+                        json.dumps(payload, sort_keys=True),
+                    ),
+                )
+        return payload
+    finally:
+        conn.close()
+
+
+def _complete_novelpia_auth_retry(
+    state_db_path: str, cutoff: str, result: dict
+) -> None:
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (NOVELPIA_AUTH_RETRY_SETTING_KEY,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("authenticated NovelPia retry state disappeared")
+        payload = json.loads(row["value"])
+        if payload.get("state") != "active" or payload.get("cutoff") != cutoff:
+            raise RuntimeError("authenticated NovelPia retry state changed unexpectedly")
+        payload.update({
+            "state": "completed",
+            "completed_at": platform_catalog._utc_text(platform_catalog.utc_now()),
+            "selected_titles": result["selected_titles"],
+            "selected_platforms": result["selected_platforms"],
+        })
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE key = ?",
+                (
+                    json.dumps(payload, sort_keys=True),
+                    NOVELPIA_AUTH_RETRY_SETTING_KEY,
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def retry_failed(args: argparse.Namespace, *, progress=None) -> tuple:
+    auth_client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+        timeout=args.timeout,
+        required=args.require_novelpia_auth,
+    )
+    if args.dry_run:
+        result = platform_catalog.preview_catalog_refresh(
+            args.state_db,
+            limit=None,
+            failed_retry=True,
+        )
+        result.pop("titles", None)
+        return None, {
+            **result,
+            "authenticated_novelpia_configured": auth_client is not None,
+        }
+
+    if auth_client is not None:
+        # The all-three-failed branch can use the same adult-title fallback as
+        # the normal first collection. Fail before DB work if auth is required.
+        auth_client.login()
+    backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+    with _platform_refresh_lock(args.state_db, "platform-failed-retry"):
+        state = _failed_retry_state(args.state_db, create=True)
+        cutoff = platform_catalog._parse_time(state["cutoff"])
+        assert cutoff is not None
+        result = platform_catalog.refresh_catalog(
+            args.state_db,
+            limit=None,
+            delay_seconds=args.delay_seconds,
+            timeout=args.timeout,
+            failed_retry=True,
+            failure_retry_cutoff=cutoff,
+            error_retry_seconds=args.error_retry_seconds,
+            authenticated_novelpia_lookup=(
+                auth_client.lookup if auth_client is not None else None
+            ),
+            progress=progress,
+        )
+        remaining = platform_catalog.preview_catalog_refresh(
+            args.state_db,
+            limit=1,
+            failed_retry=True,
+            failure_retry_cutoff=cutoff,
+        )["selected_titles"]
+        result = {**result, "remaining_titles": remaining}
+        if remaining == 0:
+            _complete_failed_retry(args.state_db, state, result)
+    return backup, {
+        "file_metadata": metadata,
+        "retry_cycle": state["cycle"],
+        "retry_cutoff": state["cutoff"],
+        **result,
+    }
+
+
+def retry_novelpia_auth(args: argparse.Namespace, *, progress=None) -> tuple:
+    state = _novelpia_auth_retry_state(args.state_db, create=False)
     cutoff = platform_catalog._parse_time(state["cutoff"])
     assert cutoff is not None
     if state["state"] == "completed":
@@ -360,19 +586,22 @@ def retry_failed_once(args: argparse.Namespace, *, progress=None) -> tuple:
             "retry_state": state,
         }
     if args.dry_run:
-        result = platform_catalog.preview_catalog_refresh(
+        result = platform_catalog.preview_authenticated_novelpia_refresh(
             args.state_db,
-            limit=None,
-            failed_only=True,
-            failure_retry_cutoff=cutoff,
+            limit=args.limit,
+            attempted_before=cutoff,
         )
         result.pop("titles", None)
         return None, {**result, "retry_cutoff": state["cutoff"]}
 
+    client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+        timeout=args.timeout,
+        required=True,
+    )
+    assert client is not None
+    client.login()
     backup, metadata = sync_file_metadata(args.state_db, progress=progress)
-    state = _failed_retry_state(args.state_db, create=True)
-    cutoff = platform_catalog._parse_time(state["cutoff"])
-    assert cutoff is not None
+    state = _novelpia_auth_retry_state(args.state_db, create=True)
     if state["state"] == "completed":
         return backup, {
             "dry_run": False,
@@ -380,11 +609,8 @@ def retry_failed_once(args: argparse.Namespace, *, progress=None) -> tuple:
             "file_metadata": metadata,
             "retry_state": state,
         }
-    with _platform_refresh_lock(args.state_db, "platform-failed-retry-once"):
-        # A second button click may have waited for the first process here.
-        # Re-read the persistent marker after acquiring the lock so it cannot
-        # start another pass in the tiny gap around completion.
-        state = _failed_retry_state(args.state_db, create=True)
+    with _platform_refresh_lock(args.state_db, "platform-novelpia-auth-retry-once"):
+        state = _novelpia_auth_retry_state(args.state_db, create=True)
         if state["state"] == "completed":
             return backup, {
                 "dry_run": False,
@@ -394,17 +620,24 @@ def retry_failed_once(args: argparse.Namespace, *, progress=None) -> tuple:
             }
         cutoff = platform_catalog._parse_time(state["cutoff"])
         assert cutoff is not None
-        result = platform_catalog.refresh_catalog(
+        result = platform_catalog.refresh_authenticated_novelpia(
             args.state_db,
-            limit=None,
+            client,
+            limit=args.limit,
+            attempted_before=cutoff,
             delay_seconds=args.delay_seconds,
             timeout=args.timeout,
-            failed_only=True,
-            failure_retry_cutoff=cutoff,
             error_retry_seconds=args.error_retry_seconds,
             progress=progress,
         )
-        _complete_failed_retry(args.state_db, state["cutoff"], result)
+        remaining = platform_catalog.preview_authenticated_novelpia_refresh(
+            args.state_db,
+            limit=1,
+            attempted_before=cutoff,
+        )["selected_titles"]
+        result = {**result, "remaining_titles": remaining}
+        if remaining == 0:
+            _complete_novelpia_auth_retry(args.state_db, state["cutoff"], result)
     return backup, {
         "file_metadata": metadata,
         "retry_cutoff": state["cutoff"],
@@ -416,6 +649,10 @@ def run(args: argparse.Namespace, *, progress=None):
     if args.command == "refresh":
         limit = None if args.all else args.limit
         if args.dry_run:
+            auth_client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+                timeout=args.timeout,
+                required=args.require_novelpia_auth,
+            )
             backup = None
             metadata = file_metadata_status(args.state_db)
             if (
@@ -438,7 +675,18 @@ def run(args: argparse.Namespace, *, progress=None):
                     refresh_after_days=args.refresh_after_days,
                     force=args.force,
                 )
+            result = {
+                **result,
+                "authenticated_novelpia_configured": auth_client is not None,
+            }
         else:
+            auth_client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+                timeout=args.timeout,
+                required=args.require_novelpia_auth,
+            )
+            if auth_client is not None:
+                # Fail before public collection if credentials/CAPTCHA/adult auth are invalid.
+                auth_client.login()
             backup, metadata = sync_file_metadata(args.state_db, progress=progress)
             with _platform_refresh_lock(args.state_db, "platform-catalog-refresh"):
                 result = platform_catalog.refresh_catalog(
@@ -450,13 +698,67 @@ def run(args: argparse.Namespace, *, progress=None):
                     refresh_after_days=args.refresh_after_days,
                     force=args.force,
                     error_retry_seconds=args.error_retry_seconds,
+                    authenticated_novelpia_lookup=(
+                        auth_client.lookup if auth_client is not None else None
+                    ),
                     progress=progress,
                 )
             result = {"file_metadata": metadata, **result}
             if getattr(args, "sync_sheet", False):
                 result = {**result, "sheet_sync": sync_google_sheet(args.state_db)}
-    elif args.command == "retry-failed-once":
-        backup, result = retry_failed_once(args, progress=progress)
+    elif args.command == "refresh-existing":
+        limit = None if args.all else args.limit
+        auth_client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+            timeout=args.timeout,
+            required=args.require_novelpia_auth,
+        )
+        if args.dry_run:
+            backup = None
+            metadata = file_metadata_status(args.state_db)
+            if (
+                not metadata["schema_ready"]
+                or metadata["stale"]
+                or metadata["missing_files"]
+                or metadata["index_missing_db"]
+            ):
+                result = {
+                    "dry_run": True,
+                    "platform_preview_blocked": True,
+                    "reason": "file metadata sync required",
+                    "file_metadata": metadata,
+                }
+            else:
+                result = platform_catalog.preview_existing_metric_refresh(
+                    args.state_db,
+                    limit=limit,
+                )
+                result.pop("titles", None)
+            result = {
+                **result,
+                "authenticated_novelpia_configured": auth_client is not None,
+            }
+        else:
+            if auth_client is not None:
+                auth_client.login()
+            backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+            with _platform_refresh_lock(
+                args.state_db, "platform-existing-metrics-refresh"
+            ):
+                result = platform_catalog.refresh_existing_metrics(
+                    args.state_db,
+                    limit=limit,
+                    delay_seconds=args.delay_seconds,
+                    timeout=args.timeout,
+                    authenticated_novelpia_lookup=(
+                        auth_client.lookup if auth_client is not None else None
+                    ),
+                    progress=progress,
+                )
+            result = {"file_metadata": metadata, **result}
+    elif args.command == "retry-failed":
+        backup, result = retry_failed(args, progress=progress)
+    elif args.command == "retry-novelpia-auth":
+        backup, result = retry_novelpia_auth(args, progress=progress)
     elif args.command == "file-metadata-sync":
         if args.dry_run:
             backup = None

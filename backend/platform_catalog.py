@@ -10,16 +10,18 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 import decision_store
 from normalizer import (
@@ -29,6 +31,11 @@ from normalizer import (
 
 
 PLATFORMS = ("series", "kakao", "novelpia")
+GROWTH_METRICS = {
+    "series": ("download_count",),
+    "kakao": ("view_count",),
+    "novelpia": ("view_count", "recommend_count"),
+}
 PLATFORM_LABELS = {
     "series": "네이버 시리즈",
     "kakao": "카카오페이지",
@@ -38,7 +45,6 @@ DEFAULT_DELAY_SECONDS = 1.0
 DEFAULT_LIMIT = 25
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_ERROR_RETRY_SECONDS = 6 * 60 * 60
-DEFAULT_NOT_FOUND_REFRESH_DAYS = 30
 RATING_SCALES = {
     "series": 10.0,
     "kakao": 10.0,
@@ -46,6 +52,240 @@ RATING_SCALES = {
 _USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " \
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 _KAKAO_BFF_ORIGIN = "https://bff-page.kakao.com"
+_NOVELPIA_ORIGIN = "https://novelpia.com"
+NOVELPIA_EMAIL_ENV = "FILE_CHECK_NOVELPIA_EMAIL"
+NOVELPIA_PASSWORD_ENV = "FILE_CHECK_NOVELPIA_PASSWORD"
+NOVELPIA_AUTH_BATCH_SIZE = 20
+
+
+class NovelpiaAuthenticationError(RuntimeError):
+    """Raised when authenticated adult-title search cannot safely continue."""
+
+
+class NovelpiaSessionExpiredError(NovelpiaAuthenticationError):
+    """Raised only when the server explicitly reports an expired login."""
+
+
+class AuthenticatedNovelpiaClient:
+    """Cookie-scoped NovelPia client; credentials live only until login succeeds."""
+
+    def __init__(
+        self,
+        email: str,
+        password: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        opener=None,
+        credential_loader=None,
+    ):
+        if not str(email or "").strip() or not str(password or ""):
+            raise NovelpiaAuthenticationError(
+                "NovelPia email/password environment variables are incomplete"
+            )
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._email = str(email).strip()
+        self._password = str(password)
+        self.timeout = timeout
+        self._opener = opener or build_opener(HTTPCookieProcessor(CookieJar()))
+        self._credential_loader = credential_loader
+        self._logged_in = False
+        self._lookup_count = 0
+        self.relogin_count = 0
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        required: bool = False,
+        environ=None,
+    ):
+        source = os.environ if environ is None else environ
+        def load_credentials():
+            return (
+                str(source.get(NOVELPIA_EMAIL_ENV, "") or "").strip(),
+                str(source.get(NOVELPIA_PASSWORD_ENV, "") or ""),
+            )
+
+        email, password = load_credentials()
+        if not email and not password and not required:
+            return None
+        if not email or not password:
+            raise NovelpiaAuthenticationError(
+                f"{NOVELPIA_EMAIL_ENV} and {NOVELPIA_PASSWORD_ENV} must both be configured"
+            )
+        return cls(
+            email,
+            password,
+            timeout=timeout,
+            credential_loader=load_credentials,
+        )
+
+    @staticmethod
+    def environment_configured(environ=None) -> bool:
+        source = os.environ if environ is None else environ
+        return bool(
+            str(source.get(NOVELPIA_EMAIL_ENV, "") or "").strip()
+            and str(source.get(NOVELPIA_PASSWORD_ENV, "") or "")
+        )
+
+    def _request_text(self, url: str, *, data: Optional[bytes] = None) -> str:
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
+            "User-Agent": _USER_AGENT,
+            "Referer": _NOVELPIA_ORIGIN + "/",
+        }
+        if data is not None:
+            headers.update({
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": _NOVELPIA_ORIGIN,
+            })
+        request = Request(url, data=data, headers=headers)
+        with self._opener.open(request, timeout=self.timeout) as response:
+            payload = response.read()
+            response_headers = getattr(response, "headers", None)
+            encoding = response_headers.get_content_charset() if response_headers else None
+        return payload.decode(encoding or "utf-8", "replace")
+
+    def _request_json(self, url: str, *, data: Optional[bytes] = None) -> object:
+        return json.loads(self._request_text(url, data=data))
+
+    def verify_session(self) -> None:
+        try:
+            result = self._request_text(
+                _NOVELPIA_ORIGIN + "/proc/member_adt_mode",
+                data=urlencode({"option": "on"}).encode("utf-8"),
+            ).strip().strip('"')
+        except NovelpiaAuthenticationError:
+            raise
+        except Exception as exc:
+            raise NovelpiaAuthenticationError(
+                "NovelPia session verification request failed"
+            ) from exc
+        if result == "OK":
+            return
+        if result == "login":
+            self._logged_in = False
+            raise NovelpiaSessionExpiredError(
+                "NovelPia authenticated session expired"
+            )
+        if result == "auth":
+            raise NovelpiaAuthenticationError(
+                "NovelPia account requires adult identity verification"
+            )
+        raise NovelpiaAuthenticationError(
+            "NovelPia adult mode/session verification returned an unexpected response"
+        )
+
+    def _credentials_for_login(self) -> Tuple[str, str]:
+        email = self._email
+        password = self._password
+        if (not email or not password) and self._credential_loader is not None:
+            email, password = self._credential_loader()
+        if not str(email or "").strip() or not str(password or ""):
+            raise NovelpiaAuthenticationError(
+                f"{NOVELPIA_EMAIL_ENV} and {NOVELPIA_PASSWORD_ENV} must both be configured"
+            )
+        return str(email).strip(), str(password)
+
+    def login(self) -> None:
+        if self._logged_in:
+            return
+        try:
+            email, password = self._credentials_for_login()
+            self._request_text(_NOVELPIA_ORIGIN + "/login")
+            captcha = self._request_json(
+                _NOVELPIA_ORIGIN + "/proc/login_captcha?"
+                + urlencode({"mode": "get_captcha"})
+            )
+            if (
+                isinstance(captcha, dict)
+                and str(captcha.get("status")) == "200"
+                and captcha.get("result") is True
+            ):
+                raise NovelpiaAuthenticationError(
+                    "NovelPia requires CAPTCHA; complete a manual login before retrying"
+                )
+            payload = urlencode({
+                "redirectrurl": "",
+                "email": email,
+                "wd": password,
+            }).encode("utf-8")
+            self._request_text(_NOVELPIA_ORIGIN + "/proc/login", data=payload)
+            try:
+                self.verify_session()
+            except NovelpiaSessionExpiredError as exc:
+                raise NovelpiaAuthenticationError(
+                    "NovelPia login was rejected"
+                ) from exc
+            self._logged_in = True
+        finally:
+            # Do not retain reusable plaintext credentials after the login attempt.
+            self._email = ""
+            self._password = ""
+
+    def fetch_json(self, url: str, timeout: float) -> object:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self.timeout = timeout
+        return self._request_json(url)
+
+    def _lookup_once(
+        self, title: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+    ) -> PlatformStat:
+        try:
+            return lookup_novelpia(title, self.fetch_json, timeout=timeout)
+        except NovelpiaAuthenticationError:
+            raise
+        except Exception as exc:
+            return _error("novelpia", exc)
+
+    def lookup_batch(
+        self,
+        titles: Sequence[str],
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        delay_seconds: float = 0,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> List[PlatformStat]:
+        """Return only chunks whose authenticated session was verified afterward."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if delay_seconds < 0:
+            raise ValueError("delay_seconds must be non-negative")
+        self.login()
+        results: List[PlatformStat] = []
+        for start in range(0, len(titles), NOVELPIA_AUTH_BATCH_SIZE):
+            chunk = list(titles[start:start + NOVELPIA_AUTH_BATCH_SIZE])
+            attempted = []
+            for index, title in enumerate(chunk):
+                attempted.append(self._lookup_once(title, timeout=timeout))
+                if index + 1 < len(chunk) and delay_seconds:
+                    sleep(delay_seconds)
+            try:
+                self.verify_session()
+            except NovelpiaSessionExpiredError:
+                # Nothing from this chunk has escaped to a DB writer yet.
+                self._logged_in = False
+                self.relogin_count += 1
+                self.login()
+                attempted = []
+                for index, title in enumerate(chunk):
+                    attempted.append(self._lookup_once(title, timeout=timeout))
+                    if index + 1 < len(chunk) and delay_seconds:
+                        sleep(delay_seconds)
+                # A second expiry or verification error fails closed without
+                # returning any unverified result from this chunk.
+                self.verify_session()
+            results.extend(attempted)
+            self._lookup_count += len(chunk)
+        return results
+
+    def lookup(
+        self, title: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+    ) -> PlatformStat:
+        return self.lookup_batch([title], timeout=timeout)[0]
 
 
 @dataclass(frozen=True)
@@ -369,44 +609,59 @@ def _needed_platforms(
     retry_not_found: bool,
     refresh_before: Optional[datetime],
     force: bool,
-    failed_only: bool = False,
+    failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
 ) -> Tuple[str, ...]:
     if force:
         return PLATFORMS
+    rows = stats_by_title.get(title_key, {})
+    if failed_retry:
+        failed = {
+            platform
+            for platform, row in rows.items()
+            if row["status"] in {"not_found", "error"}
+            and (
+                failure_retry_cutoff is None
+                or _parse_time(row["last_attempt_at"]) is None
+                or _parse_time(row["last_attempt_at"]) <= failure_retry_cutoff
+            )
+        }
+        commercial_ok = any(
+            rows.get(platform) is not None and rows[platform]["status"] == "ok"
+            for platform in ("series", "kakao")
+        )
+        novelpia_ok = (
+            rows.get("novelpia") is not None
+            and rows["novelpia"]["status"] == "ok"
+        )
+        if commercial_ok:
+            # Series and Kakao may carry the same title. Retry only the failed
+            # side of that pair and do not probe NovelPia for a commercial work.
+            return tuple(
+                platform
+                for platform in ("series", "kakao")
+                if platform in failed
+            )
+        if novelpia_ok:
+            # NovelPia-only titles almost never need commercial-platform probes.
+            return ()
+        # No platform has a success. Retry each recorded failure once in this run;
+        # the normal refresh remains responsible for truly missing rows.
+        return tuple(platform for platform in PLATFORMS if platform in failed)
+
     needed = []
     for platform in PLATFORMS:
-        row = stats_by_title.get(title_key, {}).get(platform)
-        if failed_only:
-            if row is None or row["status"] not in {"not_found", "error"}:
-                continue
-            last_attempt = _parse_time(row["last_attempt_at"])
-            if (
-                failure_retry_cutoff is None
-                or last_attempt is None
-                or last_attempt <= failure_retry_cutoff
-            ):
-                needed.append(platform)
-            continue
+        row = rows.get(platform)
         if row is None:
             needed.append(platform)
             continue
         status = row["status"]
         if status == "error":
-            retry_after = _parse_time(row["retry_after"])
-            if retry_after is None or retry_after <= now:
-                needed.append(platform)
+            # Failure rows are deliberately sticky. They are retried only by the
+            # explicit failed-results action, never by the regular update button.
             continue
         if status == "not_found":
-            last_attempt = _parse_time(row["last_attempt_at"])
-            automatic_refresh_before = now - timedelta(
-                days=DEFAULT_NOT_FOUND_REFRESH_DAYS
-            )
             if retry_not_found:
-                needed.append(platform)
-            elif last_attempt is None or last_attempt <= automatic_refresh_before:
-                needed.append(platform)
-            elif refresh_before is not None and last_attempt <= refresh_before:
                 needed.append(platform)
             continue
         if refresh_before is not None:
@@ -432,7 +687,7 @@ def _refresh_targets(
     retry_not_found: bool = False,
     refresh_before: Optional[datetime] = None,
     force: bool = False,
-    failed_only: bool = False,
+    failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
 ) -> List[RefreshTarget]:
     if limit == 0:
@@ -446,7 +701,7 @@ def _refresh_targets(
             retry_not_found=retry_not_found,
             refresh_before=refresh_before,
             force=force,
-            failed_only=failed_only,
+            failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
         )
         if platforms:
@@ -463,7 +718,7 @@ def preview_catalog_refresh(
     retry_not_found: bool = False,
     refresh_after_days: Optional[float] = None,
     force: bool = False,
-    failed_only: bool = False,
+    failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
     now: Callable[[], datetime] = utc_now,
 ) -> Dict[str, object]:
@@ -493,7 +748,7 @@ def preview_catalog_refresh(
             retry_not_found=retry_not_found,
             refresh_before=refresh_before,
             force=force,
-            failed_only=failed_only,
+            failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
         )
         return {
@@ -515,7 +770,7 @@ def select_refresh_targets(
     retry_not_found: bool = False,
     refresh_before: Optional[datetime] = None,
     force: bool = False,
-    failed_only: bool = False,
+    failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
 ) -> List[RefreshTarget]:
     return _refresh_targets(
@@ -526,9 +781,61 @@ def select_refresh_targets(
         retry_not_found=retry_not_found,
         refresh_before=refresh_before,
         force=force,
-        failed_only=failed_only,
+        failed_retry=failed_retry,
         failure_retry_cutoff=failure_retry_cutoff,
     )
+
+
+def _row_has_growth_metric(platform: str, row: sqlite3.Row) -> bool:
+    return any(row[field] is not None for field in GROWTH_METRICS[platform])
+
+
+def select_existing_metric_targets(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+) -> List[RefreshTarget]:
+    """Select only active, successful platforms that already have a count."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return []
+    stats = _stats_by_title(conn)
+    targets = []
+    for title in sorted(discover_catalog_titles(conn), key=lambda item: item.title_key):
+        rows = stats.get(title.title_key, {})
+        platforms = tuple(
+            platform
+            for platform in PLATFORMS
+            if rows.get(platform) is not None
+            and rows[platform]["status"] == "ok"
+            and _row_has_growth_metric(platform, rows[platform])
+        )
+        if not platforms:
+            continue
+        targets.append(RefreshTarget(title=title, platforms=platforms))
+        if limit is not None and len(targets) >= limit:
+            break
+    return targets
+
+
+def preview_existing_metric_refresh(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = None,
+) -> Dict[str, object]:
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        targets = select_existing_metric_targets(conn, limit=limit)
+        return {
+            "dry_run": True,
+            "selected_titles": len(targets),
+            "selected_platforms": sum(len(target.platforms) for target in targets),
+            "titles": [target.title.display_title for target in targets],
+        }
+    finally:
+        conn.close()
 
 
 def _validate_stat(stat: PlatformStat) -> PlatformStat:
@@ -638,6 +945,75 @@ def record_platform_stats(
                     stat.message or None,
                 ),
             )
+
+
+def _monotonic_count(old: Optional[int], new: Optional[int]) -> Optional[int]:
+    if old is None:
+        return new
+    if new is None:
+        return old
+    return max(old, new)
+
+
+def _growth_metric_increased(row: sqlite3.Row, stat: PlatformStat) -> bool:
+    return any(
+        getattr(stat, field) is not None
+        and (row[field] is None or getattr(stat, field) > row[field])
+        for field in GROWTH_METRICS[stat.platform]
+    )
+
+
+def record_increased_platform_stats(
+    conn: sqlite3.Connection,
+    title_key: str,
+    stats: Sequence[PlatformStat],
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, str]:
+    """Apply successful results only when a platform's popularity count grew."""
+    outcomes: Dict[str, str] = {}
+    accepted = []
+    for raw_stat in stats:
+        stat = _validate_stat(raw_stat)
+        row = conn.execute(
+            "SELECT * FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = ?",
+            (title_key, stat.platform),
+        ).fetchone()
+        if stat.status != "ok":
+            outcomes[stat.platform] = stat.status
+            continue
+        if (
+            row is None
+            or row["status"] != "ok"
+            or not _row_has_growth_metric(stat.platform, row)
+        ):
+            outcomes[stat.platform] = "skipped"
+            continue
+        if not _growth_metric_increased(row, stat):
+            outcomes[stat.platform] = "unchanged"
+            continue
+        accepted.append(replace(
+            stat,
+            remote_id=stat.remote_id or row["remote_id"],
+            remote_title=stat.remote_title or row["remote_title"],
+            remote_url=stat.remote_url or row["remote_url"],
+            download_count=_monotonic_count(
+                row["download_count"], stat.download_count
+            ),
+            view_count=_monotonic_count(row["view_count"], stat.view_count),
+            recommend_count=_monotonic_count(
+                row["recommend_count"], stat.recommend_count
+            ),
+            rating=stat.rating if stat.rating is not None else row["rating"],
+            rating_count=_monotonic_count(
+                row["rating_count"], stat.rating_count
+            ),
+        ))
+        outcomes[stat.platform] = "updated"
+    if accepted:
+        record_platform_stats(conn, title_key, accepted, now=now)
+    return outcomes
 
 
 def _parse_series_candidates(page: str) -> List[Dict[str, str]]:
@@ -919,6 +1295,350 @@ def lookup_platforms(
         return results
 
 
+def _all_platforms_not_found(conn: sqlite3.Connection, title_key: str) -> bool:
+    rows = {
+        row["platform"]: row["status"]
+        for row in conn.execute(
+            "SELECT platform, status FROM catalog_platform_stats WHERE title_key = ?",
+            (title_key,),
+        )
+    }
+    return all(rows.get(platform) == "not_found" for platform in PLATFORMS)
+
+
+def _all_platforms_not_found_after(
+    conn: sqlite3.Connection,
+    title_key: str,
+    results: Sequence[PlatformStat],
+) -> bool:
+    statuses = {
+        row["platform"]: row["status"]
+        for row in conn.execute(
+            "SELECT platform, status FROM catalog_platform_stats WHERE title_key = ?",
+            (title_key,),
+        )
+    }
+    statuses.update({result.platform: result.status for result in results})
+    return all(statuses.get(platform) == "not_found" for platform in PLATFORMS)
+
+
+def _authenticated_lookup_batch(
+    lookup: Callable[..., PlatformStat],
+    titles: Sequence[str],
+    *,
+    timeout: float,
+    delay_seconds: float,
+    sleep: Callable[[float], None],
+) -> List[PlatformStat]:
+    owner = getattr(lookup, "__self__", None)
+    batch_lookup = getattr(owner, "lookup_batch", None)
+    if callable(batch_lookup):
+        return batch_lookup(
+            titles,
+            timeout=timeout,
+            delay_seconds=delay_seconds,
+            sleep=sleep,
+        )
+    results = []
+    for index, title in enumerate(titles):
+        try:
+            results.append(lookup(title, timeout=timeout))
+        except NovelpiaAuthenticationError:
+            raise
+        except Exception as exc:
+            results.append(_error("novelpia", exc))
+        if index + 1 < len(titles) and delay_seconds:
+            sleep(delay_seconds)
+    return results
+
+
+def select_authenticated_novelpia_targets(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+    attempted_before: Optional[datetime] = None,
+) -> List[CatalogTitle]:
+    """Select active titles whose three public platform searches all missed."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return []
+    stats = _stats_by_title(conn)
+    targets = []
+    for title in discover_catalog_titles(conn):
+        by_platform = stats.get(title.title_key, {})
+        if not all(
+            by_platform.get(platform) is not None
+            and by_platform[platform]["status"] == "not_found"
+            for platform in PLATFORMS
+        ):
+            continue
+        novelpia_attempt = _parse_time(by_platform["novelpia"]["last_attempt_at"])
+        if (
+            attempted_before is not None
+            and novelpia_attempt is not None
+            and novelpia_attempt > attempted_before
+        ):
+            continue
+        targets.append(title)
+        if limit is not None and len(targets) >= limit:
+            break
+    return targets
+
+
+def preview_authenticated_novelpia_refresh(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = None,
+    attempted_before: Optional[datetime] = None,
+) -> Dict[str, object]:
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        targets = select_authenticated_novelpia_targets(
+            conn,
+            limit=limit,
+            attempted_before=attempted_before,
+        )
+        return {
+            "dry_run": True,
+            "selected_titles": len(targets),
+            "selected_platforms": len(targets),
+            "titles": [title.query_title for title in targets],
+        }
+    finally:
+        conn.close()
+
+
+def refresh_authenticated_novelpia(
+    state_db_path: str,
+    client: AuthenticatedNovelpiaClient,
+    *,
+    limit: Optional[int] = None,
+    attempted_before: Optional[datetime] = None,
+    delay_seconds: float = DEFAULT_DELAY_SECONDS,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    error_retry_seconds: int = DEFAULT_ERROR_RETRY_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    progress: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> Dict[str, object]:
+    """Retry triple-not-found titles through one authenticated NovelPia session."""
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    client.login()
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        synced = sync_catalog_titles(conn)
+        targets = select_authenticated_novelpia_targets(
+            conn,
+            limit=limit,
+            attempted_before=attempted_before,
+        )
+        status_counts = {"ok": 0, "not_found": 0, "error": 0, "skipped": 0}
+        if progress is not None:
+            progress({
+                "phase": "auth_start",
+                "selected_titles": len(targets),
+                "selected_platforms": len(targets),
+            })
+        completed = 0
+        for start in range(0, len(targets), NOVELPIA_AUTH_BATCH_SIZE):
+            chunk = targets[start:start + NOVELPIA_AUTH_BATCH_SIZE]
+            stats = client.lookup_batch(
+                [title.query_title for title in chunk],
+                timeout=timeout,
+                delay_seconds=delay_seconds,
+                sleep=sleep,
+            )
+            if len(stats) != len(chunk) or any(
+                stat.platform != "novelpia" for stat in stats
+            ):
+                raise RuntimeError(
+                    "authenticated lookup batch returned invalid NovelPia results"
+                )
+            # lookup_batch verifies the session after the whole chunk. Only now
+            # may these results escape into persistent DB state.
+            for title, stat in zip(chunk, stats):
+                record_platform_stats(
+                    conn,
+                    title.title_key,
+                    [stat],
+                    now=now(),
+                    error_retry_seconds=error_retry_seconds,
+                )
+                completed += 1
+                status_counts[stat.status] = status_counts.get(stat.status, 0) + 1
+                if progress is not None:
+                    progress({
+                        "phase": "auth_progress",
+                        "completed_titles": completed,
+                        "selected_titles": len(targets),
+                        "completed_platforms": completed,
+                        "selected_platforms": len(targets),
+                        "status_counts": dict(status_counts),
+                    })
+            if start + len(chunk) < len(targets) and delay_seconds:
+                sleep(delay_seconds)
+        return {
+            "dry_run": False,
+            **synced,
+            "selected_titles": len(targets),
+            "selected_platforms": len(targets),
+            "status_counts": status_counts,
+            "authenticated_novelpia_relogins": client.relogin_count,
+        }
+    finally:
+        conn.close()
+
+
+def refresh_existing_metrics(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = None,
+    delay_seconds: float = DEFAULT_DELAY_SECONDS,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    dry_run: bool = False,
+    authenticated_novelpia_lookup: Optional[Callable[..., PlatformStat]] = None,
+    lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    progress: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> Dict[str, object]:
+    """Refresh existing successful metrics without allowing counters to fall."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if dry_run:
+        return preview_existing_metric_refresh(state_db_path, limit=limit)
+
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        if progress is not None:
+            progress({"phase": "sync_start"})
+        synced = sync_catalog_titles(conn)
+        targets = select_existing_metric_targets(conn, limit=limit)
+        selected_platforms = sum(len(target.platforms) for target in targets)
+        outcome_counts = {
+            "updated": 0,
+            "unchanged": 0,
+            "not_found": 0,
+            "error": 0,
+            "skipped": 0,
+        }
+        authenticated_novelpia_attempts = 0
+        if progress is not None:
+            progress({
+                "phase": "existing_start",
+                "discovered_titles": synced["discovered"],
+                "selected_titles": len(targets),
+                "selected_platforms": selected_platforms,
+            })
+        completed_titles = 0
+        pending_authenticated = []
+
+        def report_completed(target, results, authenticated=None):
+            nonlocal completed_titles, authenticated_novelpia_attempts
+            final_results = list(results)
+            if authenticated is not None:
+                final_results = [
+                    result for result in final_results
+                    if result.platform != "novelpia"
+                ] + [authenticated]
+                authenticated_novelpia_attempts += 1
+            outcomes = record_increased_platform_stats(
+                conn,
+                target.title.title_key,
+                final_results,
+                now=now(),
+            )
+            for outcome in outcomes.values():
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            completed_titles += 1
+            if progress is not None:
+                progress({
+                    "phase": "existing_progress",
+                    "completed_titles": completed_titles,
+                    "selected_titles": len(targets),
+                    "completed_platforms": sum(outcome_counts.values()),
+                    "selected_platforms": selected_platforms,
+                    "outcome_counts": dict(outcome_counts),
+                    "authenticated_novelpia_attempts": (
+                        authenticated_novelpia_attempts
+                    ),
+                })
+
+        def flush_authenticated():
+            if not pending_authenticated:
+                return
+            authenticated_results = _authenticated_lookup_batch(
+                authenticated_novelpia_lookup,
+                [target.title.query_title for target, _results in pending_authenticated],
+                timeout=timeout,
+                delay_seconds=delay_seconds,
+                sleep=sleep,
+            )
+            if len(authenticated_results) != len(pending_authenticated) or any(
+                result.platform != "novelpia" for result in authenticated_results
+            ):
+                raise RuntimeError(
+                    "authenticated lookup batch returned invalid NovelPia results"
+                )
+            for (target, results), authenticated in zip(
+                pending_authenticated, authenticated_results
+            ):
+                report_completed(target, results, authenticated)
+            pending_authenticated.clear()
+
+        for index, target in enumerate(targets):
+            results = lookup(target.title.query_title, target.platforms, timeout=timeout)
+            if {result.platform for result in results} != set(target.platforms):
+                raise RuntimeError(
+                    "platform lookup did not return exactly the requested platforms"
+                )
+            if (
+                authenticated_novelpia_lookup is not None
+                and "novelpia" in target.platforms
+            ):
+                novelpia_index = next(
+                    i for i, result in enumerate(results)
+                    if result.platform == "novelpia"
+                )
+                if results[novelpia_index].status == "not_found":
+                    pending_authenticated.append((target, results))
+                    if len(pending_authenticated) >= NOVELPIA_AUTH_BATCH_SIZE:
+                        flush_authenticated()
+                else:
+                    report_completed(target, results)
+            else:
+                report_completed(target, results)
+            if index + 1 < len(targets) and delay_seconds:
+                sleep(delay_seconds)
+        flush_authenticated()
+        return {
+            "dry_run": False,
+            **synced,
+            "selected_titles": len(targets),
+            "selected_platforms": selected_platforms,
+            "outcome_counts": outcome_counts,
+            "authenticated_novelpia_attempts": authenticated_novelpia_attempts,
+            "authenticated_novelpia_relogins": int(getattr(
+                getattr(authenticated_novelpia_lookup, "__self__", None),
+                "relogin_count",
+                0,
+            )),
+        }
+    finally:
+        conn.close()
+
+
 def refresh_catalog(
     state_db_path: str,
     *,
@@ -928,10 +1648,11 @@ def refresh_catalog(
     retry_not_found: bool = False,
     refresh_after_days: Optional[float] = None,
     force: bool = False,
-    failed_only: bool = False,
+    failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
     dry_run: bool = False,
     error_retry_seconds: int = DEFAULT_ERROR_RETRY_SECONDS,
+    authenticated_novelpia_lookup: Optional[Callable[..., PlatformStat]] = None,
     lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
@@ -953,7 +1674,7 @@ def refresh_catalog(
             retry_not_found=retry_not_found,
             refresh_after_days=refresh_after_days,
             force=force,
-            failed_only=failed_only,
+            failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
             now=now,
         )
@@ -976,10 +1697,14 @@ def refresh_catalog(
             retry_not_found=retry_not_found,
             refresh_before=refresh_before,
             force=force,
-            failed_only=failed_only,
+            failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
         )
         status_counts: Dict[str, int] = {"ok": 0, "not_found": 0, "error": 0, "skipped": 0}
+        authenticated_counts: Dict[str, int] = {
+            "ok": 0, "not_found": 0, "error": 0, "skipped": 0
+        }
+        authenticated_attempts = 0
         selected_platforms = sum(len(target.platforms) for target in targets)
         if progress is not None:
             progress({
@@ -988,36 +1713,97 @@ def refresh_catalog(
                 "selected_titles": len(targets),
                 "selected_platforms": selected_platforms,
             })
-        for index, target in enumerate(targets):
-            results = lookup(target.title.query_title, target.platforms, timeout=timeout)
-            if {result.platform for result in results} != set(target.platforms):
-                raise RuntimeError("platform lookup did not return exactly the requested platforms")
+        completed_titles = 0
+        pending_authenticated = []
+
+        def report_completed(target, results, authenticated=None):
+            nonlocal completed_titles, authenticated_attempts
+            final_results = list(results)
+            if authenticated is not None:
+                final_results = [
+                    result for result in final_results
+                    if result.platform != "novelpia"
+                ] + [authenticated]
             record_platform_stats(
                 conn,
                 target.title.title_key,
-                results,
+                final_results,
                 now=now(),
                 error_retry_seconds=error_retry_seconds,
             )
             for result in results:
                 status_counts[result.status] = status_counts.get(result.status, 0) + 1
+            if authenticated is not None:
+                authenticated_attempts += 1
+                authenticated_counts[authenticated.status] = (
+                    authenticated_counts.get(authenticated.status, 0) + 1
+                )
+            completed_titles += 1
             if progress is not None:
                 progress({
                     "phase": "progress",
-                    "completed_titles": index + 1,
+                    "completed_titles": completed_titles,
                     "selected_titles": len(targets),
                     "completed_platforms": sum(status_counts.values()),
                     "selected_platforms": selected_platforms,
                     "status_counts": dict(status_counts),
+                    "authenticated_novelpia_attempts": authenticated_attempts,
+                    "authenticated_novelpia_status_counts": dict(authenticated_counts),
                 })
+
+        def flush_authenticated():
+            if not pending_authenticated:
+                return
+            authenticated_results = _authenticated_lookup_batch(
+                authenticated_novelpia_lookup,
+                [target.title.query_title for target, _results in pending_authenticated],
+                timeout=timeout,
+                delay_seconds=delay_seconds,
+                sleep=sleep,
+            )
+            if len(authenticated_results) != len(pending_authenticated) or any(
+                result.platform != "novelpia" for result in authenticated_results
+            ):
+                raise RuntimeError(
+                    "authenticated lookup batch returned invalid NovelPia results"
+                )
+            for (target, results), authenticated in zip(
+                pending_authenticated, authenticated_results
+            ):
+                report_completed(target, results, authenticated)
+            pending_authenticated.clear()
+
+        for index, target in enumerate(targets):
+            results = lookup(target.title.query_title, target.platforms, timeout=timeout)
+            if {result.platform for result in results} != set(target.platforms):
+                raise RuntimeError("platform lookup did not return exactly the requested platforms")
+            if (
+                authenticated_novelpia_lookup is not None
+                and _all_platforms_not_found_after(
+                    conn, target.title.title_key, results
+                )
+            ):
+                pending_authenticated.append((target, results))
+                if len(pending_authenticated) >= NOVELPIA_AUTH_BATCH_SIZE:
+                    flush_authenticated()
+            else:
+                report_completed(target, results)
             if index + 1 < len(targets) and delay_seconds:
                 sleep(delay_seconds)
+        flush_authenticated()
         return {
             "dry_run": False,
             **synced,
             "selected_titles": len(targets),
             "selected_platforms": selected_platforms,
             "status_counts": status_counts,
+            "authenticated_novelpia_attempts": authenticated_attempts,
+            "authenticated_novelpia_status_counts": authenticated_counts,
+            "authenticated_novelpia_relogins": int(getattr(
+                getattr(authenticated_novelpia_lookup, "__self__", None),
+                "relogin_count",
+                0,
+            )),
         }
     finally:
         conn.close()

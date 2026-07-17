@@ -53,17 +53,23 @@ def _sheet_db(tmp_path):
                     (variant_id, file_id),
                 )
         platform_catalog.sync_catalog_titles(conn)
-        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        key = conn.execute(
+            "SELECT core_title FROM file_analysis ORDER BY core_title LIMIT 1"
+        ).fetchone()[0]
         platform_catalog.record_platform_stats(
             conn,
             key,
             [
                 platform_catalog.PlatformStat(
-                    "series", "ok", download_count=1234, rating=9.2
+                    "series", "ok", remote_title="합성 작품",
+                    remote_url="https://series.example/1",
+                    download_count=1234, rating=9.2
                 ),
                 platform_catalog.PlatformStat("kakao", "not_found"),
                 platform_catalog.PlatformStat(
-                    "novelpia", "ok", view_count=4567, recommend_count=88
+                    "novelpia", "ok", remote_title="합성 작품",
+                    remote_url="https://novelpia.example/1",
+                    view_count=4567, recommend_count=88
                 ),
             ],
             now=datetime(2026, 7, 17, tzinfo=timezone.utc),
@@ -73,7 +79,7 @@ def _sheet_db(tmp_path):
     return state_db
 
 
-def test_sheet_projection_is_read_only_and_repeats_metrics_for_split_buckets(tmp_path):
+def test_sheet_projection_is_read_only_groups_titles_and_blanks_not_found(tmp_path):
     state_db = _sheet_db(tmp_path)
     before = _digest(state_db)
     snapshot = platform_sheet_export.build_sheet_snapshot(
@@ -82,15 +88,51 @@ def test_sheet_projection_is_read_only_and_repeats_metrics_for_split_buckets(tmp
     after = _digest(state_db)
 
     assert before == after
-    assert len(snapshot.works.rows) == 2
-    work = [dict(zip(snapshot.works.headers, row)) for row in snapshot.works.rows]
-    assert {row["work_bucket_id"] for row in work} == {1, 2}
-    assert {row["series_download_count"] for row in work} == {1234}
-    assert {row["novelpia_recommend_count"] for row in work} == {88}
+    assert snapshot.works.title == "도서 목록"
+    assert snapshot.works.headers == (
+        "원본 도서명", "보유 범위", "작가", "보유 파일 수",
+        "시리즈 작품명", "시리즈 다운로드 수", "시리즈 평점", "시리즈 링크",
+        "카카오 작품명", "카카오 조회 수", "카카오 평점", "카카오 링크",
+        "노벨피아 작품명", "노벨피아 조회 수", "노벨피아 좋아요 수", "노벨피아 링크",
+    )
+    assert len(snapshot.works.rows) == 1
+    work = dict(zip(snapshot.works.headers, snapshot.works.rows[0]))
+    assert work["원본 도서명"] == "합성 작품"
+    assert work["보유 범위"] == "30화"
+    assert work["보유 파일 수"] == 2
+    assert work["시리즈 작품명"] == "합성 작품"
+    assert work["시리즈 링크"] == "https://series.example/1"
+    assert work["시리즈 다운로드 수"] == 1234
+    assert work["카카오 작품명"] == ""
+    assert work["카카오 링크"] == ""
+    assert work["카카오 조회 수"] == ""
+    assert work["카카오 평점"] == ""
+    assert work["노벨피아 좋아요 수"] == 88
+    assert snapshot.errors.rows == ()
+
+
+def test_sheet_error_tab_contains_only_real_errors(tmp_path):
+    state_db = _sheet_db(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        key = conn.execute(
+            "SELECT core_title FROM file_analysis ORDER BY core_title LIMIT 1"
+        ).fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat("kakao", "error", message="temporary")],
+            now=datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    snapshot = platform_sheet_export.build_sheet_snapshot(state_db)
     assert len(snapshot.errors.rows) == 1
     error = dict(zip(snapshot.errors.headers, snapshot.errors.rows[0]))
     assert error["platform"] == "kakao"
-    assert error["status"] == "not_found"
+    assert error["status"] == "error"
+    assert error["error_message"] == "temporary"
 
 
 def test_sheet_sync_dry_run_never_loads_google_credentials(tmp_path, monkeypatch):
@@ -99,8 +141,10 @@ def test_sheet_sync_dry_run_never_loads_google_credentials(tmp_path, monkeypatch
     monkeypatch.delenv("FILE_CHECK_GOOGLE_SPREADSHEET_ID", raising=False)
     result = run_platform_catalog.sync_google_sheet(str(state_db), dry_run=True)
     assert result["dry_run"] is True
-    assert result["works_rows"] == 2
-    assert result["error_rows"] == 1
+    assert result["works_rows"] == 1
+    assert result["error_rows"] == 0
+    assert result["works_columns"] == 16
+    assert result["error_columns"] == 8
 
 
 def test_scanner_prunes_only_analysis_projection_for_excluded_house_paths(tmp_path):
@@ -136,6 +180,7 @@ class _FakeSheetsClient:
         self.fail_values = fail_values
         self.batch_calls = []
         self.value_calls = []
+        self.value_input_options = []
         self._next_id = 100
 
     def get_sheets(self):
@@ -143,6 +188,7 @@ class _FakeSheetsClient:
             {"sheetId": 1, "title": platform_sheet_export.WORKS_TAB, "index": 0},
             {"sheetId": 2, "title": platform_sheet_export.ERRORS_TAB, "index": 1},
             {"sheetId": 3, "title": "사용자 메모", "index": 2},
+            {"sheetId": 4, "title": "작품 현황", "index": 3},
         ]
 
     def batch_update(self, requests):
@@ -158,17 +204,18 @@ class _FakeSheetsClient:
             replies.append({"addSheet": {"properties": properties}})
         return {"replies": replies}
 
-    def values_batch_update(self, data):
+    def values_batch_update(self, data, *, value_input_option="RAW"):
         if self.fail_values:
             raise RuntimeError("synthetic values failure")
         self.value_calls.append(list(data))
+        self.value_input_options.append(value_input_option)
         return {"totalUpdatedCells": 1}
 
 
 def test_sheet_writer_uses_temporary_tabs_then_atomically_swaps_targets():
     rows = tuple((index,) for index in range(1600))
     snapshot = platform_sheet_export.SheetSnapshot(
-        works=platform_sheet_export.SheetTable("작품 현황", ("n",), rows),
+        works=platform_sheet_export.SheetTable(platform_sheet_export.WORKS_TAB, ("n",), rows),
         errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
         synced_at="2026-07-17T00:00:00+00:00",
     )
@@ -187,19 +234,77 @@ def test_sheet_writer_uses_temporary_tabs_then_atomically_swaps_targets():
     )
     ranges = [item for call in client.value_calls for item in call]
     assert len(ranges) == 3  # works header+1600 rows in two chunks, errors header once
+    frozen = [
+        request["updateSheetProperties"]
+        for request in final_call
+        if "updateSheetProperties" in request
+        and "gridProperties" in request["updateSheetProperties"].get("fields", "")
+    ]
+    assert frozen
+    frozen_by_sheet = {
+        request["properties"]["sheetId"]:
+        request["properties"]["gridProperties"]
+        for request in frozen
+    }
+    assert frozen_by_sheet[100] == {
+        "frozenRowCount": 1, "frozenColumnCount": 2
+    }
+    assert frozen_by_sheet[101] == {
+        "frozenRowCount": 1, "frozenColumnCount": 1
+    }
     assert any(request.get("deleteSheet", {}).get("sheetId") == 1 for request in final_call)
+    assert any(request.get("deleteSheet", {}).get("sheetId") == 4 for request in final_call)
     renamed = {
         request["updateSheetProperties"]["properties"]["title"]
         for request in final_call
         if "updateSheetProperties" in request
         and request["updateSheetProperties"].get("fields") == "title"
     }
-    assert renamed == {"작품 현황", "수집 오류"}
+    assert renamed == {"도서 목록", "수집 오류"}
+
+
+def test_sheet_writer_replaces_link_urls_with_hyperlink_formulas():
+    row = tuple(
+        {
+            "시리즈 링크": "https://series.example/1",
+            "카카오 링크": "",
+            "노벨피아 링크": "https://novelpia.example/1",
+        }.get(header, "")
+        for header in platform_sheet_export.WORK_HEADERS
+    )
+    snapshot = platform_sheet_export.SheetSnapshot(
+        works=platform_sheet_export.SheetTable(
+            platform_sheet_export.WORKS_TAB,
+            platform_sheet_export.WORK_HEADERS,
+            (row,),
+        ),
+        errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
+        synced_at="2026-07-17T00:00:00+00:00",
+    )
+    client = _FakeSheetsClient()
+    platform_sheet_export.sync_snapshot_to_google(snapshot, client)
+
+    formula_ranges = [
+        item
+        for option, call in zip(client.value_input_options, client.value_calls)
+        if option == "USER_ENTERED"
+        for item in call
+    ]
+    assert [item["range"].rsplit("!", 1)[1] for item in formula_ranges] == [
+        "H2", "L2", "P2"
+    ]
+    assert formula_ranges[0]["values"] == [
+        ['=HYPERLINK("https://series.example/1","열기")']
+    ]
+    assert formula_ranges[1]["values"] == [[""]]
+    assert formula_ranges[2]["values"] == [
+        ['=HYPERLINK("https://novelpia.example/1","열기")']
+    ]
 
 
 def test_sheet_writer_failure_does_not_delete_existing_target_tabs():
     snapshot = platform_sheet_export.SheetSnapshot(
-        works=platform_sheet_export.SheetTable("작품 현황", ("n",), ((1,),)),
+        works=platform_sheet_export.SheetTable(platform_sheet_export.WORKS_TAB, ("n",), ((1,),)),
         errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
         synced_at="2026-07-17T00:00:00+00:00",
     )

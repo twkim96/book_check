@@ -7,43 +7,36 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import decision_store
 
 
-WORKS_TAB = "작품 현황"
+WORKS_TAB = "도서 목록"
 ERRORS_TAB = "수집 오류"
+LEGACY_SYNC_TABS = ("작품 현황",)
 TEMP_PREFIX = "__file_check_tmp_"
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 DEFAULT_BATCH_ROWS = 1000
 
 WORK_HEADERS = (
-    "work_bucket_id",
-    "variant_ids",
-    "variant_kinds",
-    "assignment_states",
-    "title_key",
-    "display_title",
-    "query_title",
-    "file_count",
-    "series_status",
-    "series_download_count",
-    "series_rating",
-    "series_last_success_at",
-    "series_last_attempt_at",
-    "kakao_status",
-    "kakao_view_count",
-    "kakao_rating",
-    "kakao_last_success_at",
-    "kakao_last_attempt_at",
-    "novelpia_status",
-    "novelpia_view_count",
-    "novelpia_recommend_count",
-    "novelpia_last_success_at",
-    "novelpia_last_attempt_at",
-    "sheet_synced_at",
+    "원본 도서명",
+    "보유 범위",
+    "작가",
+    "보유 파일 수",
+    "시리즈 작품명",
+    "시리즈 다운로드 수",
+    "시리즈 평점",
+    "시리즈 링크",
+    "카카오 작품명",
+    "카카오 조회 수",
+    "카카오 평점",
+    "카카오 링크",
+    "노벨피아 작품명",
+    "노벨피아 조회 수",
+    "노벨피아 좋아요 수",
+    "노벨피아 링크",
 )
 
 ERROR_HEADERS = (
@@ -82,30 +75,25 @@ def _empty(value):
     return "" if value is None else value
 
 
-def _joined(values: Iterable[object]) -> str:
-    return ", ".join(sorted({str(value) for value in values if value is not None}))
-
-
 def build_sheet_snapshot(
     state_db_path: os.PathLike | str,
     *,
     synced_at: Optional[datetime] = None,
 ) -> SheetSnapshot:
-    """Build both Sheet tabs through a query-only SQLite connection."""
+    """Build the public catalog and technical-error tabs read-only."""
     conn = decision_store.connect_state_db_readonly(state_db_path)
     try:
         decision_store.validate_schema(conn)
         file_rows = conn.execute(
             """
             SELECT
-                f.file_id, f.variant_id, f.assignment_state,
-                v.work_bucket_id, v.variant_kind,
-                a.core_title, a.readable_title, a.catalog_query_title
+                f.file_id, a.core_title, a.readable_title,
+                a.catalog_query_title, a.author, a.effective_max,
+                a.unit, a.complete
             FROM files AS f
             JOIN file_analysis AS a ON a.file_id = f.file_id
-            LEFT JOIN variants AS v ON v.variant_id = f.variant_id
             WHERE f.active = 1 AND f.source = 'house'
-            ORDER BY a.core_title, v.work_bucket_id, f.canonical_path
+            ORDER BY a.core_title, f.canonical_path
             """
         ).fetchall()
         expected = conn.execute(
@@ -134,77 +122,89 @@ def build_sheet_snapshot(
         ):
             stats.setdefault(row["title_key"], {})[row["platform"]] = row
 
-        grouped: Dict[Tuple[str, Optional[int]], dict] = {}
+        grouped: Dict[str, dict] = {}
         for row in file_rows:
-            title_key = row["core_title"]
+            title_key = str(row["core_title"] or "").strip()
             if not title_key:
                 continue
-            group_key = (title_key, row["work_bucket_id"])
             group = grouped.setdefault(
-                group_key,
+                title_key,
                 {
-                    "variant_ids": set(),
-                    "variant_kinds": set(),
-                    "assignment_states": set(),
-                    "file_count": 0,
                     "candidates": [],
+                    "authors": set(),
+                    "ranges": [],
+                    "file_count": 0,
                 },
             )
-            group["variant_ids"].add(row["variant_id"])
-            group["variant_kinds"].add(row["variant_kind"])
-            group["assignment_states"].add(row["assignment_state"])
-            group["file_count"] += 1
             candidate = (
                 row["catalog_query_title"] or row["readable_title"] or title_key
             )
             group["candidates"].append(str(candidate))
+            author = str(row["author"] or "").strip()
+            if author:
+                group["authors"].add(author)
+            group["ranges"].append((
+                int(row["effective_max"]),
+                str(row["unit"] or "미상"),
+                bool(row["complete"]),
+            ))
+            group["file_count"] += 1
 
         sync_text = _utc_text(synced_at)
         works_rows: List[Tuple[object, ...]] = []
-        for (title_key, bucket_id), group in sorted(
-            grouped.items(),
-            key=lambda item: (item[0][0], item[0][1] is None, item[0][1] or 0),
-        ):
+        for title_key, group in sorted(grouped.items()):
             catalog = catalog_titles.get(title_key)
-            fallback_title = min(group["candidates"], key=lambda value: (len(value), value))
+            fallback_title = min(
+                group["candidates"], key=lambda value: (len(value), value)
+            )
             display_title = catalog["display_title"] if catalog else fallback_title
-            query_title = catalog["query_title"] if catalog else fallback_title
             by_platform = stats.get(title_key, {})
             series = by_platform.get("series")
             kakao = by_platform.get("kakao")
             novelpia = by_platform.get("novelpia")
 
-            def field(row, name):
-                return _empty(row[name]) if row is not None else ""
+            def platform_field(row, name):
+                if row is None or row["status"] != "ok":
+                    return ""
+                return _empty(row[name])
+
+            known_ranges = [
+                item for item in group["ranges"] if item[0] > 0
+            ]
+            if known_ranges:
+                effective_max, unit, _ = max(
+                    known_ranges, key=lambda item: (item[0], item[1])
+                )
+                range_text = str(effective_max)
+                if unit != "미상":
+                    range_text += unit
+                if any(item[2] for item in known_ranges):
+                    range_text += " 완"
+            elif any(item[2] for item in group["ranges"]):
+                range_text = "완결"
+            else:
+                range_text = ""
 
             works_rows.append((
-                bucket_id if bucket_id is not None else "미배정",
-                _joined(group["variant_ids"]),
-                _joined(group["variant_kinds"]),
-                _joined(group["assignment_states"]),
-                title_key,
                 display_title,
-                query_title,
+                range_text,
+                ", ".join(sorted(group["authors"])),
                 group["file_count"],
-                field(series, "status"),
-                field(series, "download_count"),
-                field(series, "rating"),
-                field(series, "last_success_at"),
-                field(series, "last_attempt_at"),
-                field(kakao, "status"),
-                field(kakao, "view_count"),
-                field(kakao, "rating"),
-                field(kakao, "last_success_at"),
-                field(kakao, "last_attempt_at"),
-                field(novelpia, "status"),
-                field(novelpia, "view_count"),
-                field(novelpia, "recommend_count"),
-                field(novelpia, "last_success_at"),
-                field(novelpia, "last_attempt_at"),
-                sync_text,
+                platform_field(series, "remote_title"),
+                platform_field(series, "download_count"),
+                platform_field(series, "rating"),
+                platform_field(series, "remote_url"),
+                platform_field(kakao, "remote_title"),
+                platform_field(kakao, "view_count"),
+                platform_field(kakao, "rating"),
+                platform_field(kakao, "remote_url"),
+                platform_field(novelpia, "remote_title"),
+                platform_field(novelpia, "view_count"),
+                platform_field(novelpia, "recommend_count"),
+                platform_field(novelpia, "remote_url"),
             ))
 
-        active_keys = {key[0] for key in grouped}
+        active_keys = set(grouped)
         error_rows = []
         for row in conn.execute(
             """
@@ -213,8 +213,8 @@ def build_sheet_snapshot(
                 s.last_attempt_at, s.last_success_at, s.retry_after, s.error_message
             FROM catalog_platform_stats AS s
             JOIN catalog_titles AS t ON t.title_key = s.title_key
-            WHERE s.status IN ('not_found', 'error')
-            ORDER BY s.status, s.platform, t.display_title, s.title_key
+            WHERE s.status = 'error'
+            ORDER BY s.platform, t.display_title, s.title_key
             """
         ):
             if row["title_key"] not in active_keys:
@@ -291,11 +291,18 @@ class GoogleSheetsRestClient:
             "POST", self._base + ":batchUpdate", body={"requests": list(requests)}
         )
 
-    def values_batch_update(self, data: Sequence[dict]) -> dict:
+    def values_batch_update(
+        self,
+        data: Sequence[dict],
+        *,
+        value_input_option: str = "RAW",
+    ) -> dict:
+        if value_input_option not in {"RAW", "USER_ENTERED"}:
+            raise ValueError("invalid Google Sheets value input option")
         return self._request(
             "POST",
             self._base + "/values:batchUpdate",
-            body={"valueInputOption": "RAW", "data": list(data)},
+            body={"valueInputOption": value_input_option, "data": list(data)},
         )
 
 
@@ -316,15 +323,64 @@ def _value_ranges(table: SheetTable, temp_title: str, batch_rows: int) -> List[d
     return ranges
 
 
+def _column_name(index: int) -> str:
+    if index < 0:
+        raise ValueError("column index must be non-negative")
+    value = index + 1
+    letters = ""
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
+
+
+def _hyperlink_formula(value: object) -> str:
+    url = str(value or "").strip()
+    if not url.startswith(("https://", "http://")):
+        return ""
+    return '=HYPERLINK("' + url.replace('"', '""') + '","열기")'
+
+
+def _hyperlink_ranges(
+    table: SheetTable,
+    temp_title: str,
+    batch_rows: int,
+) -> List[dict]:
+    ranges = []
+    link_columns = [
+        index for index, header in enumerate(table.headers)
+        if str(header).endswith("링크")
+    ]
+    for column_index in link_columns:
+        column = _column_name(column_index)
+        for offset in range(0, len(table.rows), batch_rows):
+            rows = table.rows[offset:offset + batch_rows]
+            ranges.append({
+                "range": f"{_a1_title(temp_title)}!{column}{offset + 2}",
+                "majorDimension": "ROWS",
+                "values": [
+                    [_hyperlink_formula(row[column_index])]
+                    for row in rows
+                ],
+            })
+    return ranges
+
+
 def _format_requests(sheet_id: int, row_count: int, column_count: int, *, errors: bool):
     requests = [
         {
             "updateSheetProperties": {
                 "properties": {
                     "sheetId": sheet_id,
-                    "gridProperties": {"frozenRowCount": 1},
+                    "gridProperties": {
+                        "frozenRowCount": 1,
+                        "frozenColumnCount": 1 if errors else 2,
+                    },
                 },
-                "fields": "gridProperties.frozenRowCount",
+                "fields": (
+                    "gridProperties.frozenRowCount,"
+                    "gridProperties.frozenColumnCount"
+                ),
             }
         },
         {
@@ -369,6 +425,19 @@ def _format_requests(sheet_id: int, row_count: int, column_count: int, *, errors
             }
         },
     ]
+    if not errors:
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 360},
+                "fields": "pixelSize",
+            }
+        })
     if errors and row_count > 1:
         status_range = {
             "sheetId": sheet_id,
@@ -447,6 +516,17 @@ def sync_snapshot_to_google(
     for offset in range(0, len(value_ranges), 20):
         client.values_batch_update(value_ranges[offset:offset + 20])
 
+    hyperlink_ranges = _hyperlink_ranges(
+        snapshot.works,
+        temp_titles[snapshot.works.title],
+        batch_rows,
+    )
+    for offset in range(0, len(hyperlink_ranges), 20):
+        client.values_batch_update(
+            hyperlink_ranges[offset:offset + 20],
+            value_input_option="USER_ENTERED",
+        )
+
     final_requests = []
     for table in (snapshot.works, snapshot.errors):
         sheet_id = temp_ids[temp_titles[table.title]]
@@ -456,7 +536,7 @@ def sync_snapshot_to_google(
             len(table.headers),
             errors=table.title == ERRORS_TAB,
         ))
-    for title in (WORKS_TAB, ERRORS_TAB):
+    for title in (WORKS_TAB, ERRORS_TAB, *LEGACY_SYNC_TABS):
         old = existing_by_title.get(title)
         if old is not None:
             final_requests.append({"deleteSheet": {"sheetId": old["sheetId"]}})

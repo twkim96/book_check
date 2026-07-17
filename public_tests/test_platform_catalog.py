@@ -98,6 +98,457 @@ def test_catalog_refresh_only_requests_missing_platforms_and_waits_between_title
     assert len(calls) == 2
 
 
+def test_existing_metric_refresh_selects_only_successful_platforms_with_counts(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", rating=9.0
+                ),
+                platform_catalog.PlatformStat(
+                    "kakao", "ok", view_count=456, rating=8.2
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "not_found"
+                ),
+            ],
+        )
+        targets = platform_catalog.select_existing_metric_targets(conn)
+        assert len(targets) == 1
+        assert targets[0].platforms == ("kakao",)
+    finally:
+        conn.close()
+
+
+def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", download_count=100,
+                    rating=9.0, rating_count=20,
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", view_count=1000, recommend_count=100,
+                ),
+            ],
+        )
+        outcomes = platform_catalog.record_increased_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", download_count=120,
+                    rating=8.7, rating_count=18,
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", view_count=1100, recommend_count=95,
+                ),
+            ],
+        )
+        assert outcomes == {"series": "updated", "novelpia": "updated"}
+        rows = {
+            row["platform"]: row
+            for row in conn.execute("SELECT * FROM catalog_platform_stats")
+        }
+        assert rows["series"]["download_count"] == 120
+        assert rows["series"]["rating"] == 8.7
+        assert rows["series"]["rating_count"] == 20
+        assert rows["novelpia"]["view_count"] == 1100
+        assert rows["novelpia"]["recommend_count"] == 100
+
+        outcomes = platform_catalog.record_increased_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", download_count=119, rating=9.9
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "error", message="temporary"
+                ),
+            ],
+        )
+        assert outcomes == {"series": "unchanged", "novelpia": "error"}
+        rows = {
+            row["platform"]: row
+            for row in conn.execute("SELECT * FROM catalog_platform_stats")
+        }
+        assert rows["series"]["download_count"] == 120
+        assert rows["series"]["rating"] == 8.7
+        assert rows["novelpia"]["status"] == "ok"
+    finally:
+        conn.close()
+
+
+def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallback(tmp_path):
+    state_db = _make_db(tmp_path, "성인 합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "kakao", "ok", view_count=100, rating=8.0
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", view_count=200, recommend_count=20
+                ),
+            ],
+        )
+    finally:
+        conn.close()
+
+    calls = []
+    auth_calls = []
+
+    def lookup(_title, platforms, *, timeout):
+        calls.append(tuple(platforms))
+        return [
+            platform_catalog.PlatformStat(
+                "kakao", "ok", view_count=150, rating=8.3
+            ),
+            platform_catalog.PlatformStat("novelpia", "not_found"),
+        ]
+
+    def authenticated(title, *, timeout):
+        auth_calls.append(title)
+        return platform_catalog.PlatformStat(
+            "novelpia", "ok", view_count=250, recommend_count=25
+        )
+
+    result = platform_catalog.refresh_existing_metrics(
+        str(state_db),
+        delay_seconds=0,
+        lookup=lookup,
+        authenticated_novelpia_lookup=authenticated,
+    )
+    assert calls == [("kakao", "novelpia")]
+    assert auth_calls == ["성인 합성작품"]
+    assert result["outcome_counts"]["updated"] == 2
+
+
+def test_refresh_uses_authenticated_novelpia_only_after_three_public_misses(tmp_path):
+    state_db = _make_db(tmp_path, "성인 합성작품 1-20화.txt")
+    authenticated_calls = []
+
+    def public_lookup(_title, platforms, *, timeout):
+        return [
+            platform_catalog.PlatformStat(platform, "not_found")
+            for platform in platforms
+        ]
+
+    def authenticated_lookup(title, *, timeout):
+        authenticated_calls.append((title, timeout))
+        return platform_catalog.PlatformStat(
+            "novelpia", "ok", remote_id="64741",
+            remote_title=title, view_count=1869045, recommend_count=95029,
+        )
+
+    result = platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        lookup=public_lookup,
+        authenticated_novelpia_lookup=authenticated_lookup,
+        now=lambda: datetime(2026, 7, 17, tzinfo=timezone.utc),
+    )
+    assert authenticated_calls == [("성인 합성작품", 10.0)]
+    assert result["authenticated_novelpia_attempts"] == 1
+    assert result["authenticated_novelpia_status_counts"]["ok"] == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        statuses = {
+            row["platform"]: row["status"]
+            for row in conn.execute("SELECT platform, status FROM catalog_platform_stats")
+        }
+        assert statuses == {
+            "series": "not_found",
+            "kakao": "not_found",
+            "novelpia": "ok",
+        }
+    finally:
+        conn.close()
+
+
+def test_refresh_skips_authenticated_novelpia_when_public_pair_has_a_match(tmp_path):
+    state_db = _make_db(tmp_path, "일반 합성작품 1-20화.txt")
+    authenticated_calls = []
+
+    def public_lookup(_title, platforms, *, timeout):
+        return [
+            _stat(platform) if platform == "series"
+            else platform_catalog.PlatformStat(platform, "not_found")
+            for platform in platforms
+        ]
+
+    platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        lookup=public_lookup,
+        authenticated_novelpia_lookup=lambda *args, **kwargs: authenticated_calls.append(args),
+    )
+    assert authenticated_calls == []
+
+
+def test_authenticated_novelpia_target_cutoff_makes_retry_resumable(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    first = datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc)
+    second = first + timedelta(minutes=1)
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(platform, "not_found")
+                for platform in platform_catalog.PLATFORMS
+            ],
+            now=first,
+        )
+        assert len(platform_catalog.select_authenticated_novelpia_targets(
+            conn, attempted_before=first
+        )) == 1
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat("novelpia", "not_found")],
+            now=second,
+        )
+        assert platform_catalog.select_authenticated_novelpia_targets(
+            conn, attempted_before=first
+        ) == []
+    finally:
+        conn.close()
+
+
+def test_authenticated_novelpia_environment_is_all_or_nothing():
+    assert platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+        environ={}, required=False
+    ) is None
+    with pytest.raises(platform_catalog.NovelpiaAuthenticationError, match="must both"):
+        platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+            environ={platform_catalog.NOVELPIA_EMAIL_ENV: "reader@example.com"}
+        )
+
+
+def test_authenticated_novelpia_login_enables_adult_mode_and_drops_password(monkeypatch):
+    client = platform_catalog.AuthenticatedNovelpiaClient(
+        "reader@example.com", "secret-password"
+    )
+    requests = []
+
+    def request_text(url, *, data=None):
+        requests.append((url, data))
+        if url == "https://novelpia.com/":
+            return 'mem_no : "12345"'
+        if url.endswith("/proc/member_adt_mode"):
+            return "OK"
+        return ""
+
+    monkeypatch.setattr(client, "_request_text", request_text)
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda _url, **_kwargs: {"status": 200, "result": False},
+    )
+    client.login()
+    assert client._logged_in is True
+    assert client._email == ""
+    assert client._password == ""
+    login_request = next(item for item in requests if item[0].endswith("/proc/login"))
+    assert b"reader%40example.com" in login_request[1]
+    assert b"secret-password" in login_request[1]
+    assert any(item[0].endswith("/proc/member_adt_mode") for item in requests)
+
+
+def test_authenticated_novelpia_captcha_fails_closed_and_drops_password(monkeypatch):
+    client = platform_catalog.AuthenticatedNovelpiaClient(
+        "reader@example.com", "secret-password"
+    )
+    monkeypatch.setattr(client, "_request_text", lambda _url, **_kwargs: "")
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda _url, **_kwargs: {"status": 200, "result": True},
+    )
+    with pytest.raises(platform_catalog.NovelpiaAuthenticationError, match="CAPTCHA"):
+        client.login()
+    assert client._email == ""
+    assert client._password == ""
+
+
+def test_authenticated_novelpia_not_found_verifies_once_per_twenty(monkeypatch):
+    client = platform_catalog.AuthenticatedNovelpiaClient(
+        "reader@example.com", "secret-password"
+    )
+    client._logged_in = True
+    checks = []
+    monkeypatch.setattr(
+        client,
+        "_lookup_once",
+        lambda _title, **_kwargs: platform_catalog.PlatformStat(
+            "novelpia", "not_found"
+        ),
+    )
+    monkeypatch.setattr(client, "verify_session", lambda: checks.append("check"))
+
+    results = client.lookup_batch([f"작품 {index}" for index in range(45)])
+    assert len(results) == 45
+    assert all(result.status == "not_found" for result in results)
+    assert checks == ["check", "check", "check"]
+
+
+def test_authenticated_novelpia_expired_chunk_relogs_and_retries(monkeypatch):
+    environ = {
+        platform_catalog.NOVELPIA_EMAIL_ENV: "reader@example.com",
+        platform_catalog.NOVELPIA_PASSWORD_ENV: "secret-password",
+    }
+    client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+        environ=environ,
+        required=True,
+    )
+    login_payloads = []
+    session_results = iter(["OK", "login", "OK", "OK"])
+
+    def request_text(url, *, data=None):
+        if url.endswith("/proc/login"):
+            login_payloads.append(data)
+            return ""
+        if url.endswith("/proc/member_adt_mode"):
+            return next(session_results)
+        return ""
+
+    attempts = []
+    monkeypatch.setattr(client, "_request_text", request_text)
+    monkeypatch.setattr(
+        client,
+        "_request_json",
+        lambda _url, **_kwargs: {"status": 200, "result": False},
+    )
+    monkeypatch.setattr(
+        client,
+        "_lookup_once",
+        lambda title, **_kwargs: (
+            attempts.append(title)
+            or platform_catalog.PlatformStat("novelpia", "not_found")
+        ),
+    )
+
+    results = client.lookup_batch(["작품 하나", "작품 둘"])
+    assert [result.status for result in results] == ["not_found", "not_found"]
+    assert attempts == ["작품 하나", "작품 둘", "작품 하나", "작품 둘"]
+    assert len(login_payloads) == 2
+    assert all(b"secret-password" in payload for payload in login_payloads)
+    assert client.relogin_count == 1
+
+
+def test_authenticated_chunk_failure_writes_no_unverified_result(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    attempted_at = datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc)
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(platform, "not_found")
+                for platform in platform_catalog.PLATFORMS
+            ],
+            now=attempted_at,
+        )
+    finally:
+        conn.close()
+
+    class ExpiredClient:
+        def login(self):
+            return None
+
+        def lookup_batch(self, *_args, **_kwargs):
+            raise platform_catalog.NovelpiaAuthenticationError(
+                "session verification failed"
+            )
+
+    with pytest.raises(platform_catalog.NovelpiaAuthenticationError):
+        platform_catalog.refresh_authenticated_novelpia(
+            str(state_db),
+            ExpiredClient(),
+            attempted_before=attempted_at,
+            delay_seconds=0,
+        )
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        row = conn.execute(
+            "SELECT last_attempt_at FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'novelpia'",
+            (key,),
+        ).fetchone()
+        assert platform_catalog._parse_time(row["last_attempt_at"]) == attempted_at
+    finally:
+        conn.close()
+
+
+def test_regular_refresh_buffers_public_misses_until_auth_batch_is_verified(tmp_path):
+    state_db = _make_db(
+        tmp_path,
+        "합성작품가 1-20화.txt",
+        "합성작품나 1-20화.txt",
+    )
+
+    def public_lookup(_title, platforms, *, timeout):
+        return [
+            platform_catalog.PlatformStat(platform, "not_found")
+            for platform in platforms
+        ]
+
+    class UnverifiedBatch:
+        def lookup(self, *_args, **_kwargs):
+            raise AssertionError("per-title authenticated lookup must not be used")
+
+        def lookup_batch(self, titles, **_kwargs):
+            assert len(titles) == 2
+            raise platform_catalog.NovelpiaAuthenticationError(
+                "session verification failed"
+            )
+
+    client = UnverifiedBatch()
+    with pytest.raises(platform_catalog.NovelpiaAuthenticationError):
+        platform_catalog.refresh_catalog(
+            str(state_db),
+            limit=None,
+            delay_seconds=0,
+            lookup=public_lookup,
+            authenticated_novelpia_lookup=client.lookup,
+        )
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM catalog_platform_stats"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_control_entry_progress_reporter_prints_start_and_periodic_updates(capsys):
     report = run_platform_catalog._progress_reporter()
     report({"phase": "sync_start"})
@@ -202,14 +653,51 @@ def test_changed_catalog_query_retries_not_found_but_preserves_success(tmp_path)
         conn.close()
 
 
-def test_failed_only_cutoff_retries_each_failed_platform_once_and_skips_missing(tmp_path):
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        (("ok", "not_found", "error"), ("kakao",)),
+        (("not_found", "ok", "error"), ("series",)),
+        (("not_found", "error", "ok"), ()),
+        (("not_found", "error", "not_found"), platform_catalog.PLATFORMS),
+    ],
+)
+def test_failed_retry_obeys_commercial_pair_and_novelpia_only_rule(
+    tmp_path, stats, expected
+):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                _stat(platform)
+                if status == "ok"
+                else platform_catalog.PlatformStat(platform, status, message="failed")
+                for platform, status in zip(platform_catalog.PLATFORMS, stats)
+            ],
+        )
+        targets = platform_catalog.select_refresh_targets(
+            conn,
+            limit=None,
+            failed_retry=True,
+        )
+        assert [target.platforms for target in targets] == ([expected] if expected else [])
+    finally:
+        conn.close()
+
+
+def test_regular_refresh_never_retries_recorded_failures_but_failed_action_can(tmp_path):
     state_db = _make_db(
         tmp_path,
         "합성작품가 1-20화.txt",
         "합성작품나 1-20화.txt",
     )
-    recorded_at = datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc)
-    retried_at = recorded_at + timedelta(minutes=1)
+    recorded_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    much_later = recorded_at + timedelta(days=365)
     conn = decision_store.initialize_state_db(state_db)
     try:
         platform_catalog.sync_catalog_titles(conn)
@@ -223,39 +711,29 @@ def test_failed_only_cutoff_retries_each_failed_platform_once_and_skips_missing(
                 platform_catalog.PlatformStat("novelpia", "error", message="temporary"),
             ],
             now=recorded_at,
+            error_retry_seconds=1,
         )
+        regular_targets = platform_catalog.select_refresh_targets(
+            conn,
+            now=much_later,
+        )
+        assert len(regular_targets) == 1
+        assert regular_targets[0].title.title_key == keys[1]
+        assert regular_targets[0].platforms == platform_catalog.PLATFORMS
         targets = platform_catalog.select_refresh_targets(
             conn,
             limit=None,
-            now=retried_at,
-            failed_only=True,
-            failure_retry_cutoff=recorded_at,
+            now=much_later,
+            failed_retry=True,
         )
         assert len(targets) == 1
         assert targets[0].title.title_key == keys[0]
-        assert targets[0].platforms == ("kakao", "novelpia")
-
-        platform_catalog.record_platform_stats(
-            conn,
-            keys[0],
-            [
-                platform_catalog.PlatformStat("kakao", "not_found"),
-                platform_catalog.PlatformStat("novelpia", "error", message="still temporary"),
-            ],
-            now=retried_at,
-        )
-        assert platform_catalog.select_refresh_targets(
-            conn,
-            limit=None,
-            now=retried_at,
-            failed_only=True,
-            failure_retry_cutoff=recorded_at,
-        ) == []
+        assert targets[0].platforms == ("kakao",)
     finally:
         conn.close()
 
 
-def test_failed_retry_state_is_resumable_then_permanently_completed(tmp_path):
+def test_failed_retry_is_reusable_when_a_platform_still_fails(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)
     try:
@@ -267,22 +745,99 @@ def test_failed_retry_state_is_resumable_then_permanently_completed(tmp_path):
             [platform_catalog.PlatformStat("series", "not_found")],
             now=datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc),
         )
+        cutoff = datetime(2026, 7, 17, 1, 0, tzinfo=timezone.utc)
+        first = platform_catalog.select_refresh_targets(
+            conn,
+            limit=None,
+            failed_retry=True,
+            failure_retry_cutoff=cutoff,
+        )
+        assert first[0].platforms == ("series",)
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat("series", "not_found")],
+            now=cutoff + timedelta(minutes=1),
+        )
+        assert platform_catalog.select_refresh_targets(
+            conn,
+            limit=None,
+            failed_retry=True,
+            failure_retry_cutoff=cutoff,
+        ) == []
+        second = platform_catalog.select_refresh_targets(
+            conn, limit=None, failed_retry=True
+        )
+        assert second[0].platforms == ("series",)
     finally:
         conn.close()
 
-    active = run_platform_catalog._failed_retry_state(str(state_db), create=True)
-    assert active["state"] == "active"
+
+def test_failed_retry_cycle_resumes_active_then_starts_a_new_cycle(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    first = run_platform_catalog._failed_retry_state(str(state_db), create=True)
+    assert first["state"] == "active"
     assert run_platform_catalog._failed_retry_state(
-        str(state_db), create=False
-    )["cutoff"] == active["cutoff"]
+        str(state_db), create=True
+    ) == first
+
     run_platform_catalog._complete_failed_retry(
         str(state_db),
-        active["cutoff"],
-        {"selected_titles": 1, "selected_platforms": 1},
+        first,
+        {"selected_titles": 1, "selected_platforms": 2},
     )
-    completed = run_platform_catalog._failed_retry_state(str(state_db), create=False)
+    completed = run_platform_catalog._failed_retry_state(
+        str(state_db), create=False
+    )
     assert completed["state"] == "completed"
-    assert completed["selected_platforms"] == 1
+    second = run_platform_catalog._failed_retry_state(str(state_db), create=True)
+    assert second["state"] == "active"
+    assert second["cycle"] == first["cycle"] + 1
+
+
+def test_authenticated_novelpia_retry_state_is_resumable_then_completed(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    active = run_platform_catalog._novelpia_auth_retry_state(
+        str(state_db), create=True
+    )
+    assert active["state"] == "active"
+    assert run_platform_catalog._novelpia_auth_retry_state(
+        str(state_db), create=False
+    )["cutoff"] == active["cutoff"]
+    run_platform_catalog._complete_novelpia_auth_retry(
+        str(state_db),
+        active["cutoff"],
+        {"selected_titles": 3, "selected_platforms": 3},
+    )
+    completed = run_platform_catalog._novelpia_auth_retry_state(
+        str(state_db), create=False
+    )
+    assert completed["state"] == "completed"
+    assert completed["selected_titles"] == 3
+
+
+def test_authenticated_novelpia_retry_dry_run_needs_no_credentials(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(platform, "not_found")
+                for platform in platform_catalog.PLATFORMS
+            ],
+        )
+    finally:
+        conn.close()
+    args = run_platform_catalog.build_parser().parse_args([
+        "--state-db", str(state_db), "retry-novelpia-auth", "--dry-run"
+    ])
+    _backup, result = run_platform_catalog.retry_novelpia_auth(args)
+    assert result["dry_run"] is True
+    assert result["selected_titles"] == 1
 
 
 def test_plain_initializer_refuses_to_migrate_an_existing_old_schema(tmp_path):
@@ -567,7 +1122,7 @@ def test_catalog_updates_display_title_when_a_cleaner_active_name_appears(tmp_pa
         conn.close()
 
 
-def test_catalog_age_refresh_can_retry_old_not_found_rows(tmp_path):
+def test_catalog_age_refresh_does_not_retry_old_not_found_rows(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)
     try:
@@ -589,13 +1144,12 @@ def test_catalog_age_refresh_can_retry_old_not_found_rows(tmp_path):
             now=datetime(2026, 2, 1, tzinfo=timezone.utc),
             refresh_before=datetime(2026, 1, 2, tzinfo=timezone.utc),
         )
-        assert len(target) == 1
-        assert target[0].platforms == ("series", "kakao", "novelpia")
+        assert target == []
     finally:
         conn.close()
 
 
-def test_not_found_is_automatically_retried_after_thirty_days(tmp_path):
+def test_not_found_is_not_automatically_retried_after_thirty_days(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)
     try:
@@ -611,10 +1165,9 @@ def test_not_found_is_automatically_retried_after_thirty_days(tmp_path):
         assert platform_catalog.select_refresh_targets(
             conn, now=recorded_at + timedelta(days=29)
         ) == []
-        target = platform_catalog.select_refresh_targets(
-            conn, now=recorded_at + timedelta(days=30)
-        )[0]
-        assert target.platforms == platform_catalog.PLATFORMS
+        assert platform_catalog.select_refresh_targets(
+            conn, now=recorded_at + timedelta(days=300)
+        ) == []
     finally:
         conn.close()
 
