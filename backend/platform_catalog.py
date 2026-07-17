@@ -24,9 +24,7 @@ from urllib.request import Request, urlopen
 import decision_store
 from normalizer import (
     NORMALIZER_VERSION,
-    analyze_name,
-    extract_catalog_query_title,
-    extract_readable_title,
+    extract_core_title,
 )
 
 
@@ -102,23 +100,46 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
 
 
 def titles_match(requested_title: str, candidate_title: str) -> bool:
-    """Match exact titles after removing only platform-added presentation suffixes."""
-    def exact_key(value: str) -> str:
+    """Match normalized full titles and their dedup cores.
+
+    Platform responses commonly append presentation-only tags such as
+    ``[단행본]``/``[독점]`` and total episode text.  Remove only that narrow
+    whitelist before the full-title comparison; the file normalizer is more
+    aggressive and would incorrectly collapse a real ``외전`` title.
+    """
+    def normalized(value: str) -> Tuple[str, str]:
         text = html.unescape(str(value or "")).strip()
         text = re.sub(r"\s*:\s*네이버시리즈\s*$", "", text, flags=re.IGNORECASE)
-        text = re.sub(
-            r"\s*[\(（]\s*총\s*[\d,]+\s*화(?:\s*/\s*[^\)）]+)?[\)）]\s*$",
-            "",
-            text,
-            flags=re.IGNORECASE,
+        previous = None
+        while text != previous:
+            previous = text
+            text = re.sub(
+                r"\s*[\(（]\s*총\s*[\d,]+\s*(?:화|권|편)"
+                r"(?:\s*/\s*[^\)）]+)?[\)）]\s*$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+            text = re.sub(
+                r"\s*[\[［]\s*(?:단행본|독점|미니노블)\s*[\]］]\s*$",
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
+        full_title = text
+        exact = re.sub(
+            r"[^a-z0-9가-힣\u3400-\u9fff\uf900-\ufaff]", "", full_title.lower()
         )
-        return re.sub(
-            r"[^a-z0-9가-힣\u3400-\u9fff\uf900-\ufaff]", "", text.lower()
-        )
+        core = extract_core_title(full_title)
+        return exact, core
 
-    requested = exact_key(requested_title)
-    candidate = exact_key(candidate_title)
-    return bool(requested) and requested == candidate
+    requested_exact, requested_core = normalized(requested_title)
+    candidate_exact, candidate_core = normalized(candidate_title)
+    return bool(requested_exact) and (
+        requested_exact == candidate_exact
+        and bool(requested_core)
+        and requested_core == candidate_core
+    )
 
 
 def _safe_message(error: BaseException) -> str:
@@ -223,19 +244,48 @@ def _http_json(url: str, timeout: float) -> object:
 
 
 def discover_catalog_titles(conn: sqlite3.Connection) -> List[CatalogTitle]:
-    """Derive stable catalog keys from active library files without changing them."""
+    """Read stable catalog keys from the versioned file-analysis projection."""
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "file_analysis" not in tables:
+        raise RuntimeError("file metadata sync required: schema v10 file_analysis is missing")
     rows = conn.execute(
-        "SELECT canonical_path FROM files WHERE active = 1 AND source = 'house'"
+        """
+        SELECT
+            f.canonical_path, f.size, f.mtime_ns, f.ctime_ns,
+            a.file_id AS analysis_file_id, a.normalizer_version, a.analyzed_name,
+            a.analyzed_size, a.analyzed_mtime_ns, a.analyzed_ctime_ns,
+            a.core_title, a.readable_title, a.catalog_query_title
+        FROM files AS f
+        JOIN file_analysis AS a ON a.file_id = f.file_id
+        WHERE f.active = 1 AND f.source = 'house'
+        ORDER BY f.canonical_path
+        """
     ).fetchall()
+    active_count = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE active = 1 AND source = 'house'"
+    ).fetchone()[0]
+    if active_count and not rows:
+        raise RuntimeError("file metadata sync required before platform collection")
     titles: Dict[str, CatalogTitle] = {}
+    stale = 0
     for row in rows:
-        filename = Path(row["canonical_path"]).name
-        info = analyze_name(filename)
-        title_key = str(info.get("core_title") or "").strip()
+        current_name = Path(row["canonical_path"]).name
+        title_analysis_current = (
+            row["normalizer_version"] == NORMALIZER_VERSION
+            and row["analyzed_name"] == current_name
+        )
+        if not title_analysis_current:
+            stale += 1
+            continue
+        title_key = str(row["core_title"] or "").strip()
         if not title_key:
             continue
-        readable_title = extract_readable_title(filename).strip()
-        query_title = extract_catalog_query_title(filename).strip()
+        readable_title = str(row["readable_title"] or "").strip()
+        query_title = str(row["catalog_query_title"] or "").strip()
         candidate = CatalogTitle(
             title_key=title_key,
             display_title=query_title or readable_title or title_key,
@@ -244,6 +294,11 @@ def discover_catalog_titles(conn: sqlite3.Connection) -> List[CatalogTitle]:
         current = titles.get(title_key)
         if current is None or len(candidate.display_title) < len(current.display_title):
             titles[title_key] = candidate
+    if stale:
+        raise RuntimeError(
+            "file metadata sync required before platform collection: "
+            f"stale={stale}"
+        )
     return [titles[key] for key in sorted(titles)]
 
 
@@ -314,12 +369,25 @@ def _needed_platforms(
     retry_not_found: bool,
     refresh_before: Optional[datetime],
     force: bool,
+    failed_only: bool = False,
+    failure_retry_cutoff: Optional[datetime] = None,
 ) -> Tuple[str, ...]:
     if force:
         return PLATFORMS
     needed = []
     for platform in PLATFORMS:
         row = stats_by_title.get(title_key, {}).get(platform)
+        if failed_only:
+            if row is None or row["status"] not in {"not_found", "error"}:
+                continue
+            last_attempt = _parse_time(row["last_attempt_at"])
+            if (
+                failure_retry_cutoff is None
+                or last_attempt is None
+                or last_attempt <= failure_retry_cutoff
+            ):
+                needed.append(platform)
+            continue
         if row is None:
             needed.append(platform)
             continue
@@ -364,6 +432,8 @@ def _refresh_targets(
     retry_not_found: bool = False,
     refresh_before: Optional[datetime] = None,
     force: bool = False,
+    failed_only: bool = False,
+    failure_retry_cutoff: Optional[datetime] = None,
 ) -> List[RefreshTarget]:
     if limit == 0:
         return []
@@ -376,6 +446,8 @@ def _refresh_targets(
             retry_not_found=retry_not_found,
             refresh_before=refresh_before,
             force=force,
+            failed_only=failed_only,
+            failure_retry_cutoff=failure_retry_cutoff,
         )
         if platforms:
             targets.append(RefreshTarget(title=title, platforms=platforms))
@@ -391,6 +463,8 @@ def preview_catalog_refresh(
     retry_not_found: bool = False,
     refresh_after_days: Optional[float] = None,
     force: bool = False,
+    failed_only: bool = False,
+    failure_retry_cutoff: Optional[datetime] = None,
     now: Callable[[], datetime] = utc_now,
 ) -> Dict[str, object]:
     """Read-only preview that also works before the v8 catalog migration."""
@@ -419,6 +493,8 @@ def preview_catalog_refresh(
             retry_not_found=retry_not_found,
             refresh_before=refresh_before,
             force=force,
+            failed_only=failed_only,
+            failure_retry_cutoff=failure_retry_cutoff,
         )
         return {
             "dry_run": True,
@@ -439,6 +515,8 @@ def select_refresh_targets(
     retry_not_found: bool = False,
     refresh_before: Optional[datetime] = None,
     force: bool = False,
+    failed_only: bool = False,
+    failure_retry_cutoff: Optional[datetime] = None,
 ) -> List[RefreshTarget]:
     return _refresh_targets(
         discover_catalog_titles(conn),
@@ -448,6 +526,8 @@ def select_refresh_targets(
         retry_not_found=retry_not_found,
         refresh_before=refresh_before,
         force=force,
+        failed_only=failed_only,
+        failure_retry_cutoff=failure_retry_cutoff,
     )
 
 
@@ -848,11 +928,14 @@ def refresh_catalog(
     retry_not_found: bool = False,
     refresh_after_days: Optional[float] = None,
     force: bool = False,
+    failed_only: bool = False,
+    failure_retry_cutoff: Optional[datetime] = None,
     dry_run: bool = False,
     error_retry_seconds: int = DEFAULT_ERROR_RETRY_SECONDS,
     lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
+    progress: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Dict[str, object]:
     """Fill only missing/due platform records in bounded, delayed batches."""
     if limit is not None and limit < 0:
@@ -870,12 +953,16 @@ def refresh_catalog(
             retry_not_found=retry_not_found,
             refresh_after_days=refresh_after_days,
             force=force,
+            failed_only=failed_only,
+            failure_retry_cutoff=failure_retry_cutoff,
             now=now,
         )
 
     conn = decision_store.connect_state_db(state_db_path)
     try:
         decision_store.validate_schema(conn)
+        if progress is not None:
+            progress({"phase": "sync_start"})
         current = now()
         refresh_before = (
             current - timedelta(days=refresh_after_days)
@@ -889,8 +976,18 @@ def refresh_catalog(
             retry_not_found=retry_not_found,
             refresh_before=refresh_before,
             force=force,
+            failed_only=failed_only,
+            failure_retry_cutoff=failure_retry_cutoff,
         )
         status_counts: Dict[str, int] = {"ok": 0, "not_found": 0, "error": 0, "skipped": 0}
+        selected_platforms = sum(len(target.platforms) for target in targets)
+        if progress is not None:
+            progress({
+                "phase": "start",
+                "discovered_titles": synced["discovered"],
+                "selected_titles": len(targets),
+                "selected_platforms": selected_platforms,
+            })
         for index, target in enumerate(targets):
             results = lookup(target.title.query_title, target.platforms, timeout=timeout)
             if {result.platform for result in results} != set(target.platforms):
@@ -904,13 +1001,22 @@ def refresh_catalog(
             )
             for result in results:
                 status_counts[result.status] = status_counts.get(result.status, 0) + 1
+            if progress is not None:
+                progress({
+                    "phase": "progress",
+                    "completed_titles": index + 1,
+                    "selected_titles": len(targets),
+                    "completed_platforms": sum(status_counts.values()),
+                    "selected_platforms": selected_platforms,
+                    "status_counts": dict(status_counts),
+                })
             if index + 1 < len(targets) and delay_seconds:
                 sleep(delay_seconds)
         return {
             "dry_run": False,
             **synced,
             "selected_titles": len(targets),
-            "selected_platforms": sum(len(target.platforms) for target in targets),
+            "selected_platforms": selected_platforms,
             "status_counts": status_counts,
         }
     finally:

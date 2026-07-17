@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -69,6 +69,7 @@ REQUIRED_TABLES = frozenset({
     "pair_cache",
     "actual_runs",
     "operations",
+    "file_analysis",
     "catalog_titles",
     "catalog_platform_stats",
 })
@@ -104,6 +105,31 @@ _SYMBOL_COORDINATES = {
     "특별편": ("special", 300),
     "special": ("special", 300),
 }
+
+
+FILE_ANALYSIS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS file_analysis (
+    file_id TEXT PRIMARY KEY REFERENCES files(file_id) ON DELETE CASCADE,
+    normalizer_version TEXT NOT NULL,
+    analyzed_name TEXT NOT NULL,
+    core_title TEXT NOT NULL,
+    readable_title TEXT NOT NULL,
+    catalog_query_title TEXT NOT NULL,
+    author TEXT,
+    max_number INTEGER NOT NULL CHECK (max_number >= 0),
+    effective_max INTEGER NOT NULL CHECK (effective_max >= 0),
+    unit TEXT NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    disambig INTEGER NOT NULL CHECK (disambig > 0),
+    analyzed_size INTEGER NOT NULL CHECK (analyzed_size >= 0),
+    analyzed_mtime_ns INTEGER NOT NULL CHECK (analyzed_mtime_ns >= 0),
+    analyzed_ctime_ns INTEGER,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS file_analysis_core_title
+ON file_analysis(core_title);
+"""
 
 
 CATALOG_SCHEMA_SQL = """
@@ -412,6 +438,8 @@ CREATE TABLE operations (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+{FILE_ANALYSIS_SCHEMA_SQL}
+
 {CATALOG_SCHEMA_SQL}
 
 INSERT INTO settings(key, value) VALUES ('actual_mutation_enabled', '0');
@@ -692,6 +720,24 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 9")
         conn.commit()
         version = 9
+    if version == 9:
+        conn.executescript(FILE_ANALYSIS_SCHEMA_SQL)
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v10 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute("DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')")
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 10")
+        conn.commit()
+        version = 10
     validate_schema(conn)
     return conn
 
@@ -2493,12 +2539,282 @@ def _symlink_component(path: os.PathLike | str):
     return None
 
 
+def build_file_analysis(name: str) -> dict:
+    """Return the versioned filename-derived metadata stored in SQLite."""
+    from normalizer import (
+        NORMALIZER_VERSION,
+        analyze_name,
+        extract_catalog_query_title,
+        extract_readable_title,
+        normalize_nfc,
+    )
+
+    analyzed_name = normalize_nfc(name)
+    info = analyze_name(analyzed_name)
+    return {
+        "normalizer_version": NORMALIZER_VERSION,
+        "analyzed_name": analyzed_name,
+        "core_title": str(info.get("core_title") or "").strip(),
+        "readable_title": extract_readable_title(analyzed_name).strip(),
+        "catalog_query_title": extract_catalog_query_title(analyzed_name).strip(),
+        "author": info.get("author"),
+        "max_number": int(info.get("max_number") or 0),
+        "effective_max": int(info.get("effective_max") or 0),
+        "unit": str(info.get("unit") or "미상"),
+        "complete": 1 if info.get("complete") else 0,
+        "disambig": int(info.get("disambig") or 1),
+        "ext": info.get("ext") or "",
+        "start_number": info.get("start_number"),
+        "end_number": info.get("end_number"),
+        "span_ambiguous": bool(info.get("span_ambiguous")),
+    }
+
+
+def _file_analysis_current(row, analysis: dict, stat_result) -> bool:
+    return bool(
+        row
+        and row["normalizer_version"] == analysis["normalizer_version"]
+        and row["analyzed_name"] == analysis["analyzed_name"]
+        and row["analyzed_size"] == stat_result.st_size
+        and row["analyzed_mtime_ns"] == stat_result.st_mtime_ns
+        and (
+            row["analyzed_ctime_ns"] is None
+            or row["analyzed_ctime_ns"] == stat_result.st_ctime_ns
+        )
+    )
+
+
+def upsert_file_analysis(
+    conn: sqlite3.Connection,
+    file_id: str,
+    path: os.PathLike | str,
+    *,
+    analysis: Optional[dict] = None,
+    stat_result=None,
+) -> bool:
+    """Store one file's derived title metadata; return whether the row changed."""
+    canonical_path = canonicalize_path(path)
+    stat_result = stat_result or os.stat(canonical_path, follow_symlinks=False)
+    analysis = analysis or build_file_analysis(Path(canonical_path).name)
+    current = conn.execute(
+        "SELECT * FROM file_analysis WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    if _file_analysis_current(current, analysis, stat_result):
+        return False
+    conn.execute(
+        """
+        INSERT INTO file_analysis(
+            file_id, normalizer_version, analyzed_name,
+            core_title, readable_title, catalog_query_title, author,
+            max_number, effective_max, unit, complete, disambig,
+            analyzed_size, analyzed_mtime_ns, analyzed_ctime_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file_id) DO UPDATE SET
+            normalizer_version = excluded.normalizer_version,
+            analyzed_name = excluded.analyzed_name,
+            core_title = excluded.core_title,
+            readable_title = excluded.readable_title,
+            catalog_query_title = excluded.catalog_query_title,
+            author = excluded.author,
+            max_number = excluded.max_number,
+            effective_max = excluded.effective_max,
+            unit = excluded.unit,
+            complete = excluded.complete,
+            disambig = excluded.disambig,
+            analyzed_size = excluded.analyzed_size,
+            analyzed_mtime_ns = excluded.analyzed_mtime_ns,
+            analyzed_ctime_ns = excluded.analyzed_ctime_ns,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            file_id,
+            analysis["normalizer_version"],
+            analysis["analyzed_name"],
+            analysis["core_title"],
+            analysis["readable_title"],
+            analysis["catalog_query_title"],
+            analysis.get("author"),
+            analysis["max_number"],
+            analysis["effective_max"],
+            analysis["unit"],
+            analysis["complete"],
+            analysis["disambig"],
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        ),
+    )
+    return True
+
+
+def file_analysis_sync_status(
+    conn: sqlite3.Connection,
+    *,
+    eligible_paths: Optional[set[str]] = None,
+) -> dict:
+    """Inspect active house rows without changing the DB or library files."""
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    has_analysis = "file_analysis" in tables
+    query = """
+        SELECT f.file_id, f.canonical_path
+        {analysis_columns}
+        FROM files AS f
+        {analysis_join}
+        WHERE f.active = 1 AND f.source = 'house'
+        ORDER BY f.canonical_path
+    """.format(
+        analysis_columns=(
+            ", a.normalizer_version, a.analyzed_name, a.analyzed_size, "
+            "a.analyzed_mtime_ns, a.analyzed_ctime_ns"
+            if has_analysis else ""
+        ),
+        analysis_join=(
+            "LEFT JOIN file_analysis AS a ON a.file_id = f.file_id"
+            if has_analysis else ""
+        ),
+    )
+    current = stale = missing = unindexed_active = 0
+    seen_eligible_paths = set()
+    from normalizer import NORMALIZER_VERSION, normalize_nfc
+
+    for row in conn.execute(query):
+        path = row["canonical_path"]
+        canonical_path = canonicalize_path(path)
+        if eligible_paths is not None and canonical_path not in eligible_paths:
+            unindexed_active += 1
+            continue
+        seen_eligible_paths.add(canonical_path)
+        try:
+            stat_result = os.stat(path, follow_symlinks=False)
+        except OSError:
+            missing += 1
+            continue
+        if not has_analysis or row["normalizer_version"] is None:
+            stale += 1
+            continue
+        is_current = (
+            row["normalizer_version"] == NORMALIZER_VERSION
+            and row["analyzed_name"] == normalize_nfc(Path(path).name)
+            and row["analyzed_size"] == stat_result.st_size
+            and row["analyzed_mtime_ns"] == stat_result.st_mtime_ns
+            and (
+                row["analyzed_ctime_ns"] is None
+                or row["analyzed_ctime_ns"] == stat_result.st_ctime_ns
+            )
+        )
+        if is_current:
+            current += 1
+        else:
+            stale += 1
+    index_missing_db = (
+        len(eligible_paths - seen_eligible_paths) if eligible_paths is not None else 0
+    )
+    return {
+        "total": current + stale + missing + index_missing_db,
+        "current": current,
+        "stale": stale,
+        "missing_files": missing,
+        "index_missing_db": index_missing_db,
+        "schema_ready": has_analysis,
+        "unindexed_active": unindexed_active,
+    }
+
+
+def sync_active_file_analysis(
+    conn: sqlite3.Connection,
+    *,
+    eligible_paths: Optional[set[str]] = None,
+    progress=None,
+) -> dict:
+    """Backfill indexed active house files inside the caller's transaction."""
+    rows = conn.execute(
+        """
+        SELECT file_id, canonical_path
+        FROM files
+        WHERE active = 1 AND source = 'house'
+        ORDER BY canonical_path
+        """
+    ).fetchall()
+    if eligible_paths is not None:
+        by_path = {canonicalize_path(row["canonical_path"]): row for row in rows}
+        missing_db = sorted(eligible_paths - set(by_path))
+        if missing_db:
+            raise RuntimeError(
+                "file index contains paths missing from active house DB; run Scanner first: "
+                f"count={len(missing_db)}"
+            )
+        rows = [by_path[path] for path in sorted(eligible_paths)]
+    changed = 0
+    for index, row in enumerate(rows, start=1):
+        path = row["canonical_path"]
+        try:
+            stat_result = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError(f"active house file is missing or unreadable: {path}: {exc}") from exc
+        analysis = build_file_analysis(Path(path).name)
+        if upsert_file_analysis(
+            conn, row["file_id"], path, analysis=analysis, stat_result=stat_result
+        ):
+            changed += 1
+        if progress is not None and (index == 1 or index == len(rows) or index % 1000 == 0):
+            progress({
+                "phase": "file_analysis",
+                "completed": index,
+                "total": len(rows),
+                "changed": changed,
+            })
+    return {"total": len(rows), "changed": changed, "unchanged": len(rows) - changed}
+
+
+def prune_file_analysis_projection(
+    conn: sqlite3.Connection,
+    *,
+    seen_file_ids: set[str],
+    scanned_roots: Iterable[os.PathLike | str],
+) -> int:
+    """Remove derived metadata for house rows excluded from a complete root scan."""
+    roots = [
+        canonicalize_path(root) for root in scanned_roots if os.path.isdir(root)
+    ]
+    if not roots:
+        return 0
+
+    def under_scanned_root(path: str) -> bool:
+        canonical = canonicalize_path(path)
+        for root in roots:
+            try:
+                if os.path.commonpath((canonical, root)) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    stale_ids = [
+        row["file_id"]
+        for row in conn.execute(
+            "SELECT file_id, canonical_path FROM files WHERE active = 1 AND source = 'house'"
+        )
+        if row["file_id"] not in seen_file_ids and under_scanned_root(row["canonical_path"])
+    ]
+    if stale_ids:
+        conn.executemany(
+            "DELETE FROM file_analysis WHERE file_id = ?",
+            ((file_id,) for file_id in stale_ids),
+        )
+    return len(stale_ids)
+
+
 def reconcile_file_metadata(
     conn: sqlite3.Connection,
     path: os.PathLike | str,
     *,
     source: str,
     legacy_marker: bool = False,
+    analysis: Optional[dict] = None,
 ):
     """Create/update one stable file identity without inferring any decision.
 
@@ -2602,6 +2918,11 @@ def reconcile_file_metadata(
                 coordinates["span_ambiguous"],
                 file_id,
             ),
+        )
+
+    if source == "house":
+        upsert_file_analysis(
+            conn, file_id, canonical_path, analysis=analysis, stat_result=stat
         )
 
     return conn.execute(

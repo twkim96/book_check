@@ -29,10 +29,10 @@ def _default_index_path(output_path):
     return os.path.join(os.path.dirname(output_path), "file_index.json")
 
 
-def _build_entry(path, base_dir, entry_type, decision_projection=None):
+def _build_entry(path, base_dir, entry_type, decision_projection=None, analysis=None):
     name = normalize_nfc(os.path.basename(path))
     rel_path = normalize_nfc(os.path.relpath(path, base_dir))
-    info = analyze_name(name)
+    info = analysis or analyze_name(name)
     entry = {
         "type": entry_type,
         "name": name,
@@ -97,8 +97,10 @@ def get_file_entries(
     progress_seconds=5.0,
     state_db_path=None,
 ):
+    directory_list = list(directory_list)
     entries = []
     decision_conn = None
+    seen_file_ids = set()
     if state_db_path:
         from decision_store import initialize_state_db
 
@@ -134,17 +136,21 @@ def get_file_entries(
                         continue
                     path = os.path.join(root, file)
                     projection = None
+                    analysis = None
                     if decision_conn is not None:
-                        from decision_store import reconcile_file_metadata
+                        from decision_store import build_file_analysis, reconcile_file_metadata
 
                         name = normalize_nfc(file)
+                        analysis = build_file_analysis(name)
                         legacy_marker = has_pass_marker(name) or read_disambig_marker(name) > 1
                         projection = dict(reconcile_file_metadata(
                             decision_conn,
                             path,
                             source="house",
                             legacy_marker=legacy_marker,
+                            analysis=analysis,
                         ))
+                        seen_file_ids.add(projection["file_id"])
                     if projection:
                         from decision_store import canonicalize_path
 
@@ -152,7 +158,7 @@ def get_file_entries(
                     else:
                         projection_map = None
                     entries.append(_build_entry(
-                        path, base_dir, "file", projection_map
+                        path, base_dir, "file", projection_map, analysis=analysis
                     ))
 
                 # 카테고리 루트 폴더 자체는 제외하고, 그 아래 묶음 폴더만 인덱싱한다.
@@ -167,6 +173,13 @@ def get_file_entries(
         raise
     else:
         if decision_conn is not None:
+            from decision_store import prune_file_analysis_projection
+
+            prune_file_analysis_projection(
+                decision_conn,
+                seen_file_ids=seen_file_ids,
+                scanned_roots=directory_list,
+            )
             decision_conn.commit()
     finally:
         if decision_conn is not None:

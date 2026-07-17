@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +17,10 @@ from typing import Optional
 import decision_store
 import platform_catalog
 from mutation_io import mutation_lock_for_roots
-from project_paths import HOUSE_DIR, STATE_DB, TEMP_DIR
+from project_paths import FILE_INDEX, HOUSE_DIR, STATE_DB, TEMP_DIR
+
+
+FAILED_RETRY_SETTING_KEY = "platform_failed_retry_once_normalized_titles_v1"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,8 +45,47 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--force", action="store_true")
     refresh.add_argument("--dry-run", action="store_true", help="DB/네트워크 변경 없이 대상만 미리 봄")
     refresh.add_argument(
+        "--sync-sheet", action="store_true",
+        help="플랫폼 수집이 정상 종료된 뒤 Google Sheet도 갱신",
+    )
+    refresh.add_argument(
         "--error-retry-seconds", type=int,
         default=platform_catalog.DEFAULT_ERROR_RETRY_SECONDS,
+    )
+
+    retry_failed = subparsers.add_parser(
+        "retry-failed-once",
+        help="현재 not_found/error 플랫폼 행을 새 제목 비교 로직으로 정확히 한 번 재검사합니다.",
+    )
+    retry_failed.add_argument(
+        "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
+        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 1초)",
+    )
+    retry_failed.add_argument(
+        "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
+    )
+    retry_failed.add_argument(
+        "--error-retry-seconds", type=int,
+        default=platform_catalog.DEFAULT_ERROR_RETRY_SECONDS,
+    )
+    retry_failed.add_argument(
+        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 대상 수만 확인"
+    )
+
+    metadata = subparsers.add_parser(
+        "file-metadata-sync",
+        help="파일명 분석 메타데이터를 schema v10 DB에 안전하게 동기화합니다.",
+    )
+    metadata.add_argument(
+        "--dry-run", action="store_true", help="DB 변경 없이 대상 수만 확인"
+    )
+
+    sheet = subparsers.add_parser(
+        "sheet-sync", help="SQLite 현재 상태를 조회용 Google Sheet에 단방향 복제합니다."
+    )
+    sheet.add_argument(
+        "--dry-run", action="store_true",
+        help="Google 네트워크/SQLite 변경 없이 행 수만 확인",
     )
 
     subparsers.add_parser("status", help="카탈로그 수집 현황을 표시합니다.")
@@ -89,30 +133,340 @@ def ensure_catalog_schema(state_db_path: str) -> Optional[Path]:
         return backup
 
 
-def run(args: argparse.Namespace):
+def _duration_text(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}시간 {minutes}분"
+    if minutes:
+        return f"{minutes}분 {secs}초"
+    return f"{secs}초"
+
+
+def _progress_reporter():
+    started_at = None
+
+    def report(event):
+        nonlocal started_at
+        phase = event.get("phase")
+        if phase == "file_analysis":
+            print(
+                f"🧭 파일 분석 DB 동기화 {event['completed']:,}/{event['total']:,} "
+                f"(변경 {event['changed']:,})",
+                flush=True,
+            )
+            return
+        if phase == "sync_start":
+            print("🔄 플랫폼 카탈로그 제목 동기화 시작", flush=True)
+            return
+        if phase == "start":
+            started_at = time.monotonic()
+            print(
+                "🚀 플랫폼 카탈로그 수집 시작: "
+                f"전체 제목 {event['discovered_titles']:,}개, "
+                f"이번 대상 {event['selected_titles']:,}개 / "
+                f"플랫폼 {event['selected_platforms']:,}건",
+                flush=True,
+            )
+            return
+        if phase != "progress":
+            return
+        completed = int(event["completed_titles"])
+        total = int(event["selected_titles"])
+        if completed != 1 and completed != total and completed % 10:
+            return
+        elapsed = max(0.001, time.monotonic() - (started_at or time.monotonic()))
+        rate = completed / elapsed
+        remaining = (total - completed) / rate if rate > 0 else 0
+        counts = event["status_counts"]
+        percent = (completed / total * 100) if total else 100.0
+        print(
+            f"⏳ 진행 {completed:,}/{total:,} ({percent:.1f}%) | "
+            f"ok={counts.get('ok', 0):,} "
+            f"not_found={counts.get('not_found', 0):,} "
+            f"error={counts.get('error', 0):,} | "
+            f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
+            flush=True,
+        )
+
+    return report
+
+
+def _indexed_file_paths(state_db_path: str):
+    if Path(state_db_path).resolve() != STATE_DB.resolve():
+        return None
+    if not FILE_INDEX.is_file():
+        raise RuntimeError("file_index.json is missing; run Scanner first")
+    payload = json.loads(FILE_INDEX.read_text(encoding="utf-8"))
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("file_index.json entries are invalid; run Scanner again")
+    house_root = decision_store.canonicalize_path(HOUSE_DIR)
+    paths = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "file":
+            continue
+        rel_path = entry.get("rel_path")
+        if not isinstance(rel_path, str) or not rel_path:
+            raise RuntimeError("file_index.json contains an invalid file path")
+        path = decision_store.canonicalize_path(HOUSE_DIR / rel_path)
+        if os.path.commonpath((house_root, path)) != house_root:
+            raise RuntimeError("file_index.json contains a path outside the house root")
+        paths.add(path)
+    return paths
+
+
+def file_metadata_status(state_db_path: str) -> dict:
+    eligible_paths = _indexed_file_paths(state_db_path)
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        return decision_store.file_analysis_sync_status(
+            conn, eligible_paths=eligible_paths
+        )
+    finally:
+        conn.close()
+
+
+def sync_file_metadata(state_db_path: str, *, progress=None):
+    """Own the schema backup and backfill before any platform network request."""
+    eligible_paths = _indexed_file_paths(state_db_path)
+    backup = ensure_catalog_schema(state_db_path)
+    with mutation_lock_for_roots(HOUSE_DIR, TEMP_DIR, "file-metadata-sync"):
+        conn = decision_store.connect_state_db(state_db_path)
+        try:
+            decision_store.validate_schema(conn)
+            with decision_store.transaction(conn):
+                result = decision_store.sync_active_file_analysis(
+                    conn, eligible_paths=eligible_paths, progress=progress
+                )
+        finally:
+            conn.close()
+    return backup, result
+
+
+def sync_google_sheet(state_db_path: str, *, dry_run: bool = False) -> dict:
+    import platform_sheet_export
+
+    snapshot = platform_sheet_export.build_sheet_snapshot(state_db_path)
+    preview = {
+        "works_rows": len(snapshot.works.rows),
+        "error_rows": len(snapshot.errors.rows),
+        "works_columns": len(snapshot.works.headers),
+        "error_columns": len(snapshot.errors.headers),
+        "synced_at": snapshot.synced_at,
+    }
+    if dry_run:
+        return {"dry_run": True, **preview}
+    with mutation_lock_for_roots(
+        Path(state_db_path).resolve(),
+        Path(state_db_path).resolve().parent / "google-sheet-sync",
+        "google-sheet-sync",
+    ):
+        client = platform_sheet_export.GoogleSheetsRestClient.from_environment()
+        result = platform_sheet_export.sync_snapshot_to_google(snapshot, client)
+    return {"dry_run": False, **result}
+
+
+def _platform_refresh_lock(state_db_path: str, owner: str):
+    state_db = Path(state_db_path).resolve()
+    return mutation_lock_for_roots(
+        state_db,
+        state_db.parent / "platform-catalog-refresh",
+        owner,
+    )
+
+
+def _failed_retry_state(state_db_path: str, *, create: bool) -> dict:
+    connector = (
+        decision_store.connect_state_db
+        if create else decision_store.connect_state_db_readonly
+    )
+    conn = connector(state_db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (FAILED_RETRY_SETTING_KEY,),
+        ).fetchone()
+        if row is not None:
+            try:
+                payload = json.loads(row["value"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("one-time failed retry state is invalid") from exc
+            cutoff = platform_catalog._parse_time(payload.get("cutoff"))
+            if payload.get("state") not in {"active", "completed"} or cutoff is None:
+                raise RuntimeError("one-time failed retry state is invalid")
+            return payload
+
+        cutoff = conn.execute(
+            """
+            SELECT MAX(last_attempt_at)
+            FROM catalog_platform_stats
+            WHERE status IN ('not_found', 'error')
+            """
+        ).fetchone()[0]
+        cutoff = cutoff or platform_catalog._utc_text(platform_catalog.utc_now())
+        payload = {
+            "state": "active" if create else "preview",
+            "cutoff": cutoff,
+            "started_at": platform_catalog._utc_text(platform_catalog.utc_now()),
+        }
+        if create:
+            with decision_store.transaction(conn):
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (FAILED_RETRY_SETTING_KEY, json.dumps(payload, sort_keys=True)),
+                )
+        return payload
+    finally:
+        conn.close()
+
+
+def _complete_failed_retry(state_db_path: str, cutoff: str, result: dict) -> None:
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (FAILED_RETRY_SETTING_KEY,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("one-time failed retry state disappeared")
+        payload = json.loads(row["value"])
+        if payload.get("state") != "active" or payload.get("cutoff") != cutoff:
+            raise RuntimeError("one-time failed retry state changed unexpectedly")
+        payload.update({
+            "state": "completed",
+            "completed_at": platform_catalog._utc_text(platform_catalog.utc_now()),
+            "selected_titles": result["selected_titles"],
+            "selected_platforms": result["selected_platforms"],
+        })
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?",
+                (json.dumps(payload, sort_keys=True), FAILED_RETRY_SETTING_KEY),
+            )
+    finally:
+        conn.close()
+
+
+def retry_failed_once(args: argparse.Namespace, *, progress=None) -> tuple:
+    state = _failed_retry_state(args.state_db, create=False)
+    cutoff = platform_catalog._parse_time(state["cutoff"])
+    assert cutoff is not None
+    if state["state"] == "completed":
+        return None, {
+            "dry_run": bool(args.dry_run),
+            "already_completed": True,
+            "retry_state": state,
+        }
+    if args.dry_run:
+        result = platform_catalog.preview_catalog_refresh(
+            args.state_db,
+            limit=None,
+            failed_only=True,
+            failure_retry_cutoff=cutoff,
+        )
+        result.pop("titles", None)
+        return None, {**result, "retry_cutoff": state["cutoff"]}
+
+    backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+    state = _failed_retry_state(args.state_db, create=True)
+    cutoff = platform_catalog._parse_time(state["cutoff"])
+    assert cutoff is not None
+    if state["state"] == "completed":
+        return backup, {
+            "dry_run": False,
+            "already_completed": True,
+            "file_metadata": metadata,
+            "retry_state": state,
+        }
+    with _platform_refresh_lock(args.state_db, "platform-failed-retry-once"):
+        # A second button click may have waited for the first process here.
+        # Re-read the persistent marker after acquiring the lock so it cannot
+        # start another pass in the tiny gap around completion.
+        state = _failed_retry_state(args.state_db, create=True)
+        if state["state"] == "completed":
+            return backup, {
+                "dry_run": False,
+                "already_completed": True,
+                "file_metadata": metadata,
+                "retry_state": state,
+            }
+        cutoff = platform_catalog._parse_time(state["cutoff"])
+        assert cutoff is not None
+        result = platform_catalog.refresh_catalog(
+            args.state_db,
+            limit=None,
+            delay_seconds=args.delay_seconds,
+            timeout=args.timeout,
+            failed_only=True,
+            failure_retry_cutoff=cutoff,
+            error_retry_seconds=args.error_retry_seconds,
+            progress=progress,
+        )
+        _complete_failed_retry(args.state_db, state["cutoff"], result)
+    return backup, {
+        "file_metadata": metadata,
+        "retry_cutoff": state["cutoff"],
+        **result,
+    }
+
+
+def run(args: argparse.Namespace, *, progress=None):
     if args.command == "refresh":
         limit = None if args.all else args.limit
         if args.dry_run:
             backup = None
-            result = platform_catalog.preview_catalog_refresh(
-                args.state_db,
-                limit=limit,
-                retry_not_found=args.retry_not_found,
-                refresh_after_days=args.refresh_after_days,
-                force=args.force,
-            )
+            metadata = file_metadata_status(args.state_db)
+            if (
+                not metadata["schema_ready"]
+                or metadata["stale"]
+                or metadata["missing_files"]
+                or metadata["index_missing_db"]
+            ):
+                result = {
+                    "dry_run": True,
+                    "platform_preview_blocked": True,
+                    "reason": "file metadata sync required",
+                    "file_metadata": metadata,
+                }
+            else:
+                result = platform_catalog.preview_catalog_refresh(
+                    args.state_db,
+                    limit=limit,
+                    retry_not_found=args.retry_not_found,
+                    refresh_after_days=args.refresh_after_days,
+                    force=args.force,
+                )
         else:
-            backup = ensure_catalog_schema(args.state_db)
-            result = platform_catalog.refresh_catalog(
-                args.state_db,
-                limit=limit,
-                delay_seconds=args.delay_seconds,
-                timeout=args.timeout,
-                retry_not_found=args.retry_not_found,
-                refresh_after_days=args.refresh_after_days,
-                force=args.force,
-                error_retry_seconds=args.error_retry_seconds,
-            )
+            backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+            with _platform_refresh_lock(args.state_db, "platform-catalog-refresh"):
+                result = platform_catalog.refresh_catalog(
+                    args.state_db,
+                    limit=limit,
+                    delay_seconds=args.delay_seconds,
+                    timeout=args.timeout,
+                    retry_not_found=args.retry_not_found,
+                    refresh_after_days=args.refresh_after_days,
+                    force=args.force,
+                    error_retry_seconds=args.error_retry_seconds,
+                    progress=progress,
+                )
+            result = {"file_metadata": metadata, **result}
+            if getattr(args, "sync_sheet", False):
+                result = {**result, "sheet_sync": sync_google_sheet(args.state_db)}
+    elif args.command == "retry-failed-once":
+        backup, result = retry_failed_once(args, progress=progress)
+    elif args.command == "file-metadata-sync":
+        if args.dry_run:
+            backup = None
+            result = {"dry_run": True, **file_metadata_status(args.state_db)}
+        else:
+            backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+            result = {"dry_run": False, **metadata}
+    elif args.command == "sheet-sync":
+        backup = None
+        result = sync_google_sheet(args.state_db, dry_run=args.dry_run)
     elif args.command == "status":
         backup = None
         result = platform_catalog.catalog_status(args.state_db)
@@ -134,7 +488,7 @@ def run(args: argparse.Namespace):
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        result = run(args)
+        result = run(args, progress=_progress_reporter())
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
