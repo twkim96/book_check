@@ -2,6 +2,7 @@ import hashlib
 from datetime import datetime, timezone
 
 import pytest
+from requests.exceptions import ReadTimeout
 
 import decision_store
 import platform_catalog
@@ -90,24 +91,29 @@ def test_sheet_projection_is_read_only_groups_titles_and_blanks_not_found(tmp_pa
     assert before == after
     assert snapshot.works.title == "도서 목록"
     assert snapshot.works.headers == (
-        "원본 도서명", "보유 범위", "작가", "보유 파일 수",
-        "시리즈 작품명", "시리즈 다운로드 수", "시리즈 평점", "시리즈 링크",
-        "카카오 작품명", "카카오 조회 수", "카카오 평점", "카카오 링크",
-        "노벨피아 작품명", "노벨피아 조회 수", "노벨피아 좋아요 수", "노벨피아 링크",
+        "원본 도서명", "보유 범위", "작가",
+        "작품명", "다운로드 수", "평점", "링크",
+        "작품명", "조회 수", "평점", "링크",
+        "작품명", "조회 수", "좋아요 수", "링크",
+    )
+    assert snapshot.works.group_headers == (
+        "메타데이터", None, None,
+        "시리즈", None, None, None,
+        "카카오", None, None, None,
+        "노벨피아", None, None, None,
     )
     assert len(snapshot.works.rows) == 1
-    work = dict(zip(snapshot.works.headers, snapshot.works.rows[0]))
-    assert work["원본 도서명"] == "합성 작품"
-    assert work["보유 범위"] == "30화"
-    assert work["보유 파일 수"] == 2
-    assert work["시리즈 작품명"] == "합성 작품"
-    assert work["시리즈 링크"] == "https://series.example/1"
-    assert work["시리즈 다운로드 수"] == 1234
-    assert work["카카오 작품명"] == ""
-    assert work["카카오 링크"] == ""
-    assert work["카카오 조회 수"] == ""
-    assert work["카카오 평점"] == ""
-    assert work["노벨피아 좋아요 수"] == 88
+    work = snapshot.works.rows[0]
+    assert work[0] == "합성 작품"
+    assert work[1] == "30화"
+    assert work[3] == "합성 작품"
+    assert work[6] == "https://series.example/1"
+    assert work[4] == 1234
+    assert work[7] == ""
+    assert work[10] == ""
+    assert work[8] == ""
+    assert work[9] == ""
+    assert work[13] == 88
     assert snapshot.errors.rows == ()
 
 
@@ -143,7 +149,7 @@ def test_sheet_sync_dry_run_never_loads_google_credentials(tmp_path, monkeypatch
     assert result["dry_run"] is True
     assert result["works_rows"] == 1
     assert result["error_rows"] == 0
-    assert result["works_columns"] == 16
+    assert result["works_columns"] == 15
     assert result["error_columns"] == 8
 
 
@@ -247,7 +253,7 @@ def test_sheet_writer_uses_temporary_tabs_then_atomically_swaps_targets():
         for request in frozen
     }
     assert frozen_by_sheet[100] == {
-        "frozenRowCount": 1, "frozenColumnCount": 2
+        "frozenRowCount": 1, "frozenColumnCount": 1
     }
     assert frozen_by_sheet[101] == {
         "frozenRowCount": 1, "frozenColumnCount": 1
@@ -278,28 +284,44 @@ def test_sheet_writer_splits_large_value_writes_into_small_requests():
         snapshot, client, batch_rows=1000
     )
 
-    assert len(client.value_calls) == 2
-    assert [len(call) for call in client.value_calls] == [4, 3]
+    assert len(client.value_calls) == 4
+    assert [len(call) for call in client.value_calls] == [2, 2, 2, 1]
     assert all(
-        len(call) <= platform_sheet_export.MAX_VALUE_RANGES_PER_REQUEST
+        len(call) <= platform_sheet_export.MAX_RAW_RANGES_PER_REQUEST
         for call in client.value_calls
     )
 
 
+def test_google_value_write_retries_only_timeout_failures(monkeypatch):
+    client = object.__new__(platform_sheet_export.GoogleSheetsRestClient)
+    client._base = "https://sheets.example/test"
+    attempts = []
+
+    def request(method, url, *, body=None):
+        attempts.append((method, url, body))
+        if len(attempts) < 3:
+            raise ReadTimeout("synthetic timeout")
+        return {"totalUpdatedCells": 1}
+
+    monkeypatch.setattr(client, "_request", request)
+
+    result = client.values_batch_update([{"range": "A1", "values": [[1]]}])
+
+    assert result == {"totalUpdatedCells": 1}
+    assert len(attempts) == 3
+
+
 def test_sheet_writer_replaces_link_urls_with_hyperlink_formulas():
-    row = tuple(
-        {
-            "시리즈 링크": "https://series.example/1",
-            "카카오 링크": "",
-            "노벨피아 링크": "https://novelpia.example/1",
-        }.get(header, "")
-        for header in platform_sheet_export.WORK_HEADERS
-    )
+    row_values = [""] * len(platform_sheet_export.WORK_HEADERS)
+    row_values[6] = "https://series.example/1"
+    row_values[14] = "https://novelpia.example/1"
+    row = tuple(row_values)
     snapshot = platform_sheet_export.SheetSnapshot(
         works=platform_sheet_export.SheetTable(
             platform_sheet_export.WORKS_TAB,
             platform_sheet_export.WORK_HEADERS,
             (row,),
+            group_headers=platform_sheet_export.WORK_GROUP_HEADERS,
         ),
         errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
         synced_at="2026-07-17T00:00:00+00:00",
@@ -314,14 +336,141 @@ def test_sheet_writer_replaces_link_urls_with_hyperlink_formulas():
         for item in call
     ]
     assert [item["range"].rsplit("!", 1)[1] for item in formula_ranges] == [
-        "H2", "L2", "P2"
+        "G3", "K3", "O3"
     ]
     assert formula_ranges[0]["values"] == [
         ['=HYPERLINK("https://series.example/1","열기")']
     ]
-    assert formula_ranges[1]["values"] == [[""]]
+    assert formula_ranges[1]["values"] == [[None]]
     assert formula_ranges[2]["values"] == [
         ['=HYPERLINK("https://novelpia.example/1","열기")']
+    ]
+
+
+def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
+    row = tuple("" for _ in platform_sheet_export.WORK_HEADERS)
+    snapshot = platform_sheet_export.SheetSnapshot(
+        works=platform_sheet_export.SheetTable(
+            platform_sheet_export.WORKS_TAB,
+            platform_sheet_export.WORK_HEADERS,
+            (row,),
+            group_headers=platform_sheet_export.WORK_GROUP_HEADERS,
+        ),
+        errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
+        synced_at="2026-07-17T00:00:00+00:00",
+    )
+    client = _FakeSheetsClient()
+
+    platform_sheet_export.sync_snapshot_to_google(snapshot, client)
+
+    final_call = client.batch_calls[-1]
+    frozen = next(
+        request["updateSheetProperties"]["properties"]["gridProperties"]
+        for request in final_call
+        if "updateSheetProperties" in request
+        and request["updateSheetProperties"]["properties"]["sheetId"] == 100
+        and "gridProperties" in request["updateSheetProperties"].get("fields", "")
+    )
+    assert frozen == {"frozenRowCount": 2, "frozenColumnCount": 3}
+
+    work_filter = next(
+        request["setBasicFilter"]["filter"]["range"]
+        for request in final_call
+        if request.get("setBasicFilter", {}).get("filter", {}).get("range", {}).get(
+            "sheetId"
+        ) == 100
+    )
+    assert work_filter["startRowIndex"] == 1
+
+    merged_columns = [
+        (
+            request["mergeCells"]["range"]["startColumnIndex"],
+            request["mergeCells"]["range"]["endColumnIndex"],
+        )
+        for request in final_call
+        if "mergeCells" in request
+    ]
+    assert merged_columns == [
+        (0, 3), (3, 7), (7, 11), (11, 15),
+    ]
+
+    widths = {
+        request["updateDimensionProperties"]["range"]["startIndex"]:
+        request["updateDimensionProperties"]["properties"]["pixelSize"]
+        for request in final_call
+        if "updateDimensionProperties" in request
+    }
+    assert widths == {
+        0: 250, 1: 80, 2: 80,
+        3: 250, 4: 90, 5: 80, 6: 80,
+        7: 250, 8: 90, 9: 80, 10: 80,
+        11: 250, 12: 90, 14: 80,
+    }
+
+    platform_fills = {
+        (
+            request["repeatCell"]["range"]["startRowIndex"],
+            request["repeatCell"]["range"]["startColumnIndex"],
+            request["repeatCell"]["range"]["endColumnIndex"],
+        ): request["repeatCell"]["cell"]["userEnteredFormat"]["backgroundColor"]
+        for request in final_call
+        if "backgroundColor"
+        in request.get("repeatCell", {}).get("cell", {}).get(
+            "userEnteredFormat", {}
+        )
+    }
+    assert platform_fills[(0, 0, 3)] == {
+        "red": 56 / 255, "green": 118 / 255, "blue": 218 / 255,
+    }
+    assert platform_fills[(0, 3, 7)] == {
+        "red": 1 / 255, "green": 228 / 255, "blue": 79 / 255,
+    }
+    assert platform_fills[(0, 7, 11)] == {
+        "red": 1, "green": 214 / 255, "blue": 23 / 255,
+    }
+    assert platform_fills[(0, 11, 15)] == {
+        "red": 118 / 255, "green": 50 / 255, "blue": 1,
+    }
+    assert platform_fills[(1, 0, 3)] == {
+        "red": 195 / 255, "green": 214 / 255, "blue": 244 / 255,
+    }
+    assert platform_fills[(1, 3, 7)] == {
+        "red": 179 / 255, "green": 247 / 255, "blue": 202 / 255,
+    }
+    assert platform_fills[(1, 7, 11)] == {
+        "red": 1, "green": 243 / 255, "blue": 185 / 255,
+    }
+    assert platform_fills[(1, 11, 15)] == {
+        "red": 214 / 255, "green": 194 / 255, "blue": 1,
+    }
+
+
+def test_sheet_writer_keeps_missing_values_as_truly_blank_cells():
+    snapshot = platform_sheet_export.SheetSnapshot(
+        works=platform_sheet_export.SheetTable(
+            platform_sheet_export.WORKS_TAB,
+            ("제목", "조회 수", "링크"),
+            (("없는 정보", "", None),),
+        ),
+        errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
+        synced_at="2026-07-17T00:00:00+00:00",
+    )
+    client = _FakeSheetsClient()
+
+    platform_sheet_export.sync_snapshot_to_google(snapshot, client)
+
+    raw_ranges = [
+        item
+        for option, call in zip(client.value_input_options, client.value_calls)
+        if option == "RAW"
+        for item in call
+    ]
+    works_values = next(
+        item["values"] for item in raw_ranges if item["range"].endswith("!A1")
+    )
+    assert works_values == [
+        ["제목", "조회 수", "링크"],
+        ["없는 정보", None, None],
     ]
 
 

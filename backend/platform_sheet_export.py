@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import decision_store
+from requests.exceptions import Timeout as RequestTimeout
 
 
 WORKS_TAB = "도서 목록"
@@ -19,26 +21,36 @@ LEGACY_SYNC_TABS = ("작품 현황",)
 TEMP_PREFIX = "__file_check_tmp_"
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 DEFAULT_BATCH_ROWS = 1000
-MAX_VALUE_RANGES_PER_REQUEST = 4
+MAX_RAW_RANGES_PER_REQUEST = 2
+MAX_FORMULA_RANGES_PER_REQUEST = 4
+GOOGLE_VALUE_WRITE_ATTEMPTS = 3
+GOOGLE_RATE_LIMIT_ATTEMPTS = 3
+GOOGLE_RATE_LIMIT_DELAY_SECONDS = 30
 GOOGLE_REQUEST_TIMEOUT = (10, 180)
 
 WORK_HEADERS = (
     "원본 도서명",
     "보유 범위",
     "작가",
-    "보유 파일 수",
-    "시리즈 작품명",
-    "시리즈 다운로드 수",
-    "시리즈 평점",
-    "시리즈 링크",
-    "카카오 작품명",
-    "카카오 조회 수",
-    "카카오 평점",
-    "카카오 링크",
-    "노벨피아 작품명",
-    "노벨피아 조회 수",
-    "노벨피아 좋아요 수",
-    "노벨피아 링크",
+    "작품명",
+    "다운로드 수",
+    "평점",
+    "링크",
+    "작품명",
+    "조회 수",
+    "평점",
+    "링크",
+    "작품명",
+    "조회 수",
+    "좋아요 수",
+    "링크",
+)
+
+WORK_GROUP_HEADERS = (
+    "메타데이터", None, None,
+    "시리즈", None, None, None,
+    "카카오", None, None, None,
+    "노벨피아", None, None, None,
 )
 
 ERROR_HEADERS = (
@@ -58,6 +70,7 @@ class SheetTable:
     title: str
     headers: Tuple[str, ...]
     rows: Tuple[Tuple[object, ...], ...]
+    group_headers: Optional[Tuple[object, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +148,6 @@ def build_sheet_snapshot(
                     "candidates": [],
                     "authors": set(),
                     "ranges": [],
-                    "file_count": 0,
                 },
             )
             candidate = (
@@ -150,7 +162,6 @@ def build_sheet_snapshot(
                 str(row["unit"] or "미상"),
                 bool(row["complete"]),
             ))
-            group["file_count"] += 1
 
         sync_text = _utc_text(synced_at)
         works_rows: List[Tuple[object, ...]] = []
@@ -191,7 +202,6 @@ def build_sheet_snapshot(
                 display_title,
                 range_text,
                 ", ".join(sorted(group["authors"])),
-                group["file_count"],
                 platform_field(series, "remote_title"),
                 platform_field(series, "download_count"),
                 platform_field(series, "rating"),
@@ -224,7 +234,12 @@ def build_sheet_snapshot(
             error_rows.append(tuple(_empty(row[name]) for name in ERROR_HEADERS))
 
         return SheetSnapshot(
-            works=SheetTable(WORKS_TAB, WORK_HEADERS, tuple(works_rows)),
+            works=SheetTable(
+                WORKS_TAB,
+                WORK_HEADERS,
+                tuple(works_rows),
+                group_headers=WORK_GROUP_HEADERS,
+            ),
             errors=SheetTable(ERRORS_TAB, ERROR_HEADERS, tuple(error_rows)),
             synced_at=sync_text,
         )
@@ -268,12 +283,28 @@ class GoogleSheetsRestClient:
         return cls(spreadsheet_id, credentials)
 
     def _request(self, method: str, url: str, *, body=None):
-        response = self._session.request(
-            method,
-            url,
-            json=body,
-            timeout=GOOGLE_REQUEST_TIMEOUT,
-        )
+        for attempt in range(GOOGLE_RATE_LIMIT_ATTEMPTS):
+            response = self._session.request(
+                method,
+                url,
+                json=body,
+                timeout=GOOGLE_REQUEST_TIMEOUT,
+            )
+            if response.status_code != 429:
+                break
+            if attempt + 1 == GOOGLE_RATE_LIMIT_ATTEMPTS:
+                break
+            retry_after = response.headers.get("Retry-After", "")
+            delay = (
+                int(retry_after)
+                if str(retry_after).isdigit()
+                else GOOGLE_RATE_LIMIT_DELAY_SECONDS
+            )
+            print(
+                f"⏳ Google Sheets 쓰기 한도 대기: {delay}초 후 재시도",
+                flush=True,
+            )
+            time.sleep(delay)
         if not response.ok:
             message = ""
             try:
@@ -306,26 +337,51 @@ class GoogleSheetsRestClient:
     ) -> dict:
         if value_input_option not in {"RAW", "USER_ENTERED"}:
             raise ValueError("invalid Google Sheets value input option")
-        return self._request(
-            "POST",
-            self._base + "/values:batchUpdate",
-            body={"valueInputOption": value_input_option, "data": list(data)},
-        )
+        body = {"valueInputOption": value_input_option, "data": list(data)}
+        for attempt in range(GOOGLE_VALUE_WRITE_ATTEMPTS):
+            try:
+                return self._request(
+                    "POST",
+                    self._base + "/values:batchUpdate",
+                    body=body,
+                )
+            except RequestTimeout:
+                if attempt + 1 == GOOGLE_VALUE_WRITE_ATTEMPTS:
+                    raise
+        raise AssertionError("unreachable")
 
 
 def _a1_title(title: str) -> str:
     return "'" + title.replace("'", "''") + "'"
 
 
+def _google_cell_value(value: object):
+    """Keep missing values as untouched Sheet cells, not empty-string cells."""
+    return None if value is None or value == "" else value
+
+
+def _header_rows(table: SheetTable) -> List[Sequence[object]]:
+    rows: List[Sequence[object]] = []
+    if table.group_headers is not None:
+        if len(table.group_headers) != len(table.headers):
+            raise ValueError("group headers must match the column count")
+        rows.append(table.group_headers)
+    rows.append(table.headers)
+    return rows
+
+
 def _value_ranges(table: SheetTable, temp_title: str, batch_rows: int) -> List[dict]:
-    all_rows: List[Sequence[object]] = [table.headers, *table.rows]
+    all_rows: List[Sequence[object]] = [*_header_rows(table), *table.rows]
     ranges = []
     for offset in range(0, len(all_rows), batch_rows):
         chunk = all_rows[offset:offset + batch_rows]
         ranges.append({
             "range": f"{_a1_title(temp_title)}!A{offset + 1}",
             "majorDimension": "ROWS",
-            "values": [list(row) for row in chunk],
+            "values": [
+                [_google_cell_value(value) for value in row]
+                for row in chunk
+            ],
         })
     return ranges
 
@@ -341,10 +397,10 @@ def _column_name(index: int) -> str:
     return letters
 
 
-def _hyperlink_formula(value: object) -> str:
+def _hyperlink_formula(value: object) -> Optional[str]:
     url = str(value or "").strip()
     if not url.startswith(("https://", "http://")):
-        return ""
+        return None
     return '=HYPERLINK("' + url.replace('"', '""') + '","열기")'
 
 
@@ -360,10 +416,11 @@ def _hyperlink_ranges(
     ]
     for column_index in link_columns:
         column = _column_name(column_index)
+        first_data_row = len(_header_rows(table)) + 1
         for offset in range(0, len(table.rows), batch_rows):
             rows = table.rows[offset:offset + batch_rows]
             ranges.append({
-                "range": f"{_a1_title(temp_title)}!{column}{offset + 2}",
+                "range": f"{_a1_title(temp_title)}!{column}{offset + first_data_row}",
                 "majorDimension": "ROWS",
                 "values": [
                     [_hyperlink_formula(row[column_index])]
@@ -373,15 +430,25 @@ def _hyperlink_ranges(
     return ranges
 
 
-def _format_requests(sheet_id: int, row_count: int, column_count: int, *, errors: bool):
+def _format_requests(
+    sheet_id: int,
+    row_count: int,
+    column_count: int,
+    *,
+    headers: Sequence[str],
+    group_headers: Optional[Sequence[object]],
+    errors: bool,
+):
+    header_row_count = 2 if group_headers is not None else 1
+    frozen_column_count = 1 if errors else min(3, column_count)
     requests = [
         {
             "updateSheetProperties": {
                 "properties": {
                     "sheetId": sheet_id,
                     "gridProperties": {
-                        "frozenRowCount": 1,
-                        "frozenColumnCount": 1 if errors else 2,
+                        "frozenRowCount": header_row_count,
+                        "frozenColumnCount": frozen_column_count,
                     },
                 },
                 "fields": (
@@ -395,7 +462,7 @@ def _format_requests(sheet_id: int, row_count: int, column_count: int, *, errors
                 "filter": {
                     "range": {
                         "sheetId": sheet_id,
-                        "startRowIndex": 0,
+                        "startRowIndex": header_row_count - 1,
                         "endRowIndex": max(1, row_count),
                         "startColumnIndex": 0,
                         "endColumnIndex": column_count,
@@ -408,17 +475,16 @@ def _format_requests(sheet_id: int, row_count: int, column_count: int, *, errors
                 "range": {
                     "sheetId": sheet_id,
                     "startRowIndex": 0,
-                    "endRowIndex": 1,
+                    "endRowIndex": header_row_count,
                     "startColumnIndex": 0,
                     "endColumnIndex": column_count,
                 },
                 "cell": {
                     "userEnteredFormat": {
                         "textFormat": {"bold": True},
-                        "backgroundColor": {"red": 0.86, "green": 0.92, "blue": 0.98},
                     }
                 },
-                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+                "fields": "userEnteredFormat.textFormat.bold",
             }
         },
         {
@@ -433,18 +499,138 @@ def _format_requests(sheet_id: int, row_count: int, column_count: int, *, errors
         },
     ]
     if not errors:
-        requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 0,
-                    "endIndex": 1,
-                },
-                "properties": {"pixelSize": 360},
-                "fields": "pixelSize",
+        if group_headers is not None:
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": column_count,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "horizontalAlignment": "CENTER",
+                        }
+                    },
+                    "fields": "userEnteredFormat.horizontalAlignment",
+                }
+            })
+            starts = [
+                index for index, value in enumerate(group_headers)
+                if value is not None and value != ""
+            ]
+            for position, start in enumerate(starts):
+                end = starts[position + 1] if position + 1 < len(starts) else column_count
+                spans = [(start, end)]
+                frozen_boundary = frozen_column_count
+                if start < frozen_boundary < end:
+                    spans = [(start, frozen_boundary), (frozen_boundary, end)]
+                for merge_start, merge_end in spans:
+                    if merge_end - merge_start <= 1:
+                        continue
+                    requests.append({
+                        "mergeCells": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": 0,
+                                "endRowIndex": 1,
+                                "startColumnIndex": merge_start,
+                                "endColumnIndex": merge_end,
+                            },
+                            "mergeType": "MERGE_ALL",
+                        }
+                    })
+
+            group_colors = {
+                "메타데이터": (
+                    {"red": 56 / 255, "green": 118 / 255, "blue": 218 / 255},
+                    {"red": 1, "green": 1, "blue": 1},
+                    {"red": 195 / 255, "green": 214 / 255, "blue": 244 / 255},
+                ),
+                "시리즈": (
+                    {"red": 1 / 255, "green": 228 / 255, "blue": 79 / 255},
+                    {"red": 1, "green": 1, "blue": 1},
+                    {"red": 179 / 255, "green": 247 / 255, "blue": 202 / 255},
+                ),
+                "카카오": (
+                    {"red": 1, "green": 214 / 255, "blue": 23 / 255},
+                    {"red": 0, "green": 0, "blue": 0},
+                    {"red": 1, "green": 243 / 255, "blue": 185 / 255},
+                ),
+                "노벨피아": (
+                    {"red": 118 / 255, "green": 50 / 255, "blue": 1},
+                    {"red": 1, "green": 1, "blue": 1},
+                    {"red": 214 / 255, "green": 194 / 255, "blue": 1},
+                ),
             }
-        })
+            for position, start in enumerate(starts):
+                title = str(group_headers[start] or "")
+                colors = group_colors.get(title)
+                if colors is None:
+                    continue
+                end = starts[position + 1] if position + 1 < len(starts) else column_count
+                background, foreground, content_background = colors
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": start,
+                            "endColumnIndex": end,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": background,
+                                "textFormat": {"foregroundColor": foreground},
+                            }
+                        },
+                        "fields": (
+                            "userEnteredFormat(backgroundColor,"
+                            "textFormat.foregroundColor)"
+                        ),
+                    }
+                })
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": row_count,
+                            "startColumnIndex": start,
+                            "endColumnIndex": end,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": content_background,
+                            }
+                        },
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                })
+
+        for index, header in enumerate(headers):
+            pixel_size = 250 if header in {"원본 도서명", "작품명"} else None
+            if header in {"보유 범위", "작가", "평점", "링크"}:
+                pixel_size = 80
+            if header in {"다운로드 수", "조회 수"}:
+                pixel_size = 90
+            if pixel_size is None:
+                continue
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": index,
+                        "endIndex": index + 1,
+                    },
+                    "properties": {"pixelSize": pixel_size},
+                    "fields": "pixelSize",
+                }
+            })
     if errors and row_count > 1:
         status_range = {
             "sheetId": sheet_id,
@@ -502,7 +688,10 @@ def sync_snapshot_to_google(
                 "properties": {
                     "title": temp_titles[table.title],
                     "gridProperties": {
-                        "rowCount": max(1000, len(table.rows) + 1),
+                        "rowCount": max(
+                            1000,
+                            len(table.rows) + len(_header_rows(table)),
+                        ),
                         "columnCount": len(table.headers),
                     },
                 }
@@ -520,9 +709,9 @@ def sync_snapshot_to_google(
     value_ranges = []
     for table in (snapshot.works, snapshot.errors):
         value_ranges.extend(_value_ranges(table, temp_titles[table.title], batch_rows))
-    for offset in range(0, len(value_ranges), MAX_VALUE_RANGES_PER_REQUEST):
+    for offset in range(0, len(value_ranges), MAX_RAW_RANGES_PER_REQUEST):
         client.values_batch_update(
-            value_ranges[offset:offset + MAX_VALUE_RANGES_PER_REQUEST]
+            value_ranges[offset:offset + MAX_RAW_RANGES_PER_REQUEST]
         )
 
     hyperlink_ranges = _hyperlink_ranges(
@@ -530,9 +719,9 @@ def sync_snapshot_to_google(
         temp_titles[snapshot.works.title],
         batch_rows,
     )
-    for offset in range(0, len(hyperlink_ranges), MAX_VALUE_RANGES_PER_REQUEST):
+    for offset in range(0, len(hyperlink_ranges), MAX_FORMULA_RANGES_PER_REQUEST):
         client.values_batch_update(
-            hyperlink_ranges[offset:offset + MAX_VALUE_RANGES_PER_REQUEST],
+            hyperlink_ranges[offset:offset + MAX_FORMULA_RANGES_PER_REQUEST],
             value_input_option="USER_ENTERED",
         )
 
@@ -541,8 +730,10 @@ def sync_snapshot_to_google(
         sheet_id = temp_ids[temp_titles[table.title]]
         final_requests.extend(_format_requests(
             sheet_id,
-            len(table.rows) + 1,
+            len(table.rows) + len(_header_rows(table)),
             len(table.headers),
+            headers=table.headers,
+            group_headers=table.group_headers,
             errors=table.title == ERRORS_TAB,
         ))
     for title in (WORKS_TAB, ERRORS_TAB, *LEGACY_SYNC_TABS):
