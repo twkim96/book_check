@@ -19,6 +19,8 @@ LEGACY_SYNC_TABS = ("작품 현황",)
 TEMP_PREFIX = "__file_check_tmp_"
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 DEFAULT_BATCH_ROWS = 1000
+MAX_VALUE_RANGES_PER_REQUEST = 4
+GOOGLE_REQUEST_TIMEOUT = (10, 180)
 
 WORK_HEADERS = (
     "원본 도서명",
@@ -266,7 +268,12 @@ class GoogleSheetsRestClient:
         return cls(spreadsheet_id, credentials)
 
     def _request(self, method: str, url: str, *, body=None):
-        response = self._session.request(method, url, json=body, timeout=60)
+        response = self._session.request(
+            method,
+            url,
+            json=body,
+            timeout=GOOGLE_REQUEST_TIMEOUT,
+        )
         if not response.ok:
             message = ""
             try:
@@ -513,17 +520,19 @@ def sync_snapshot_to_google(
     value_ranges = []
     for table in (snapshot.works, snapshot.errors):
         value_ranges.extend(_value_ranges(table, temp_titles[table.title], batch_rows))
-    for offset in range(0, len(value_ranges), 20):
-        client.values_batch_update(value_ranges[offset:offset + 20])
+    for offset in range(0, len(value_ranges), MAX_VALUE_RANGES_PER_REQUEST):
+        client.values_batch_update(
+            value_ranges[offset:offset + MAX_VALUE_RANGES_PER_REQUEST]
+        )
 
     hyperlink_ranges = _hyperlink_ranges(
         snapshot.works,
         temp_titles[snapshot.works.title],
         batch_rows,
     )
-    for offset in range(0, len(hyperlink_ranges), 20):
+    for offset in range(0, len(hyperlink_ranges), MAX_VALUE_RANGES_PER_REQUEST):
         client.values_batch_update(
-            hyperlink_ranges[offset:offset + 20],
+            hyperlink_ranges[offset:offset + MAX_VALUE_RANGES_PER_REQUEST],
             value_input_option="USER_ENTERED",
         )
 

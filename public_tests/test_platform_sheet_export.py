@@ -263,6 +263,29 @@ def test_sheet_writer_uses_temporary_tabs_then_atomically_swaps_targets():
     assert renamed == {"도서 목록", "수집 오류"}
 
 
+def test_sheet_writer_splits_large_value_writes_into_small_requests():
+    rows = tuple((index,) for index in range(5000))
+    snapshot = platform_sheet_export.SheetSnapshot(
+        works=platform_sheet_export.SheetTable(
+            platform_sheet_export.WORKS_TAB, ("n",), rows
+        ),
+        errors=platform_sheet_export.SheetTable("수집 오류", ("n",), ()),
+        synced_at="2026-07-17T00:00:00+00:00",
+    )
+    client = _FakeSheetsClient()
+
+    platform_sheet_export.sync_snapshot_to_google(
+        snapshot, client, batch_rows=1000
+    )
+
+    assert len(client.value_calls) == 2
+    assert [len(call) for call in client.value_calls] == [4, 3]
+    assert all(
+        len(call) <= platform_sheet_export.MAX_VALUE_RANGES_PER_REQUEST
+        for call in client.value_calls
+    )
+
+
 def test_sheet_writer_replaces_link_urls_with_hyperlink_formulas():
     row = tuple(
         {
