@@ -407,6 +407,23 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
         11: 250, 12: 90, 14: 80,
     }
 
+    comma_formats = [
+        request["repeatCell"]
+        for request in final_call
+        if request.get("repeatCell", {}).get("cell", {}).get(
+            "userEnteredFormat", {}
+        ).get("numberFormat", {}).get("pattern") == "#,##0"
+    ]
+    assert [
+        request["range"]["startColumnIndex"] for request in comma_formats
+    ] == [4, 8, 12, 13]
+    assert all(request["range"]["startRowIndex"] == 2 for request in comma_formats)
+    assert all(
+        request["cell"]["userEnteredFormat"]["numberFormat"]
+        == {"type": "NUMBER", "pattern": "#,##0"}
+        for request in comma_formats
+    )
+
     platform_fills = {
         (
             request["repeatCell"]["range"]["startRowIndex"],

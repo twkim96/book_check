@@ -27,6 +27,7 @@ GOOGLE_VALUE_WRITE_ATTEMPTS = 3
 GOOGLE_RATE_LIMIT_ATTEMPTS = 3
 GOOGLE_RATE_LIMIT_DELAY_SECONDS = 30
 GOOGLE_REQUEST_TIMEOUT = (10, 180)
+COMMA_NUMBER_HEADERS = frozenset({"다운로드 수", "조회 수", "좋아요 수"})
 
 WORK_HEADERS = (
     "원본 도서명",
@@ -617,20 +618,40 @@ def _format_requests(
                 pixel_size = 80
             if header in {"다운로드 수", "조회 수"}:
                 pixel_size = 90
-            if pixel_size is None:
-                continue
-            requests.append({
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": index,
-                        "endIndex": index + 1,
-                    },
-                    "properties": {"pixelSize": pixel_size},
-                    "fields": "pixelSize",
-                }
-            })
+            if pixel_size is not None:
+                requests.append({
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": index,
+                            "endIndex": index + 1,
+                        },
+                        "properties": {"pixelSize": pixel_size},
+                        "fields": "pixelSize",
+                    }
+                })
+            if header in COMMA_NUMBER_HEADERS:
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": header_row_count,
+                            "endRowIndex": row_count,
+                            "startColumnIndex": index,
+                            "endColumnIndex": index + 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {
+                                    "type": "NUMBER",
+                                    "pattern": "#,##0",
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
     if errors and row_count > 1:
         status_range = {
             "sheetId": sheet_id,
