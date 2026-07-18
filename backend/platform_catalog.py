@@ -394,14 +394,26 @@ def _number(value: object) -> Optional[float]:
         parsed = float(value)
         return parsed if math.isfinite(parsed) and parsed >= 0 else None
     text = html.unescape(str(value)).replace(",", "").strip()
+    unit_values = {
+        "억": 100_000_000,
+        "천만": 10_000_000,
+        "만": 10_000,
+        "천": 1_000,
+    }
+    unit_matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*(천만|억|만|천)",
+        text,
+    )
+    if unit_matches:
+        parsed = sum(
+            float(number) * unit_values[unit]
+            for number, unit in unit_matches
+        )
+        return parsed if math.isfinite(parsed) and parsed >= 0 else None
     matched = re.search(r"\d+(?:\.\d+)?", text)
     if not matched:
         return None
     parsed = float(matched.group(0))
-    if "만" in text:
-        parsed *= 10000
-    elif "천" in text:
-        parsed *= 1000
     return parsed if math.isfinite(parsed) and parsed >= 0 else None
 
 

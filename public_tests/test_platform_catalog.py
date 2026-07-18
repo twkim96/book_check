@@ -1230,6 +1230,20 @@ def test_public_platform_response_fixtures_cover_all_three_parsers():
     assert by_platform["novelpia"].recommend_count == 450
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1.2만", 12_000),
+        ("91.2만", 912_000),
+        ("2억 6,344만", 263_440_000),
+        ("2억 6천만", 260_000_000),
+        ("1,234", 1_234),
+    ],
+)
+def test_count_parses_compound_korean_units(text, expected):
+    assert platform_catalog._count(text) == expected
+
+
 def test_one_titles_three_platforms_are_looked_up_in_parallel(monkeypatch):
     barrier = threading.Barrier(3, timeout=2)
     lock = threading.Lock()
