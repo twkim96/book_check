@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import stat
+import time
 import unicodedata
 import uuid
 from contextlib import contextmanager, nullcontext
@@ -470,14 +471,30 @@ def connect_state_db(path: os.PathLike | str, *, create: bool = False) -> sqlite
     return conn
 
 
-def connect_state_db_readonly(path: os.PathLike | str) -> sqlite3.Connection:
+def connect_state_db_readonly(
+    path: os.PathLike | str, *, attempts: int = 3
+) -> sqlite3.Connection:
     db_path = Path(path).resolve()
-    if not db_path.is_file():
-        raise FileNotFoundError(db_path)
-    conn = sqlite3.connect(
-        f"file:{db_path.as_posix()}?mode=ro", uri=True,
-        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
-    )
+    attempts = max(1, int(attempts))
+    conn = None
+    for attempt in range(attempts):
+        if not db_path.is_file():
+            if attempt + 1 == attempts:
+                raise FileNotFoundError(db_path)
+        else:
+            try:
+                conn = sqlite3.connect(
+                    f"file:{db_path.as_posix()}?mode=ro",
+                    uri=True,
+                    timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
+                )
+                break
+            except sqlite3.OperationalError:
+                if attempt + 1 == attempts:
+                    raise
+        time.sleep((0.1, 0.25)[min(attempt, 1)])
+    if conn is None:  # pragma: no cover - loop exits by connect or exception
+        raise sqlite3.OperationalError(f"unable to open read-only database: {db_path}")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     conn.execute(f"PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_MS}")
@@ -1911,7 +1928,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     if row["action"] not in {
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
-        "title_cleanup_requeue",
+        "title_cleanup_requeue", "user_title_requeue",
     }:
         raise ValueError("operation is not a queue move")
     if row["state"] not in {"planned", "fs_done", "db_done"}:
@@ -1924,7 +1941,9 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     }:
         assert_actual_run_path(actual_run, source, "temp_root")
         assert_actual_run_path(actual_run, destination, "house_root")
-    elif row["action"] in {"house_review_move", "title_cleanup_requeue"}:
+    elif row["action"] in {
+        "house_review_move", "title_cleanup_requeue", "user_title_requeue"
+    }:
         assert_actual_run_path(actual_run, source, "house_root")
         assert_actual_run_path(actual_run, destination, "temp_root")
     else:
@@ -1952,6 +1971,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "user_queue_accept": "queue",
                 "house_review_move": "house",
                 "title_cleanup_requeue": "house",
+                "user_title_requeue": "house",
             }.get(row["action"], "temp")
             _rollback_owned_destination(
                 conn, row, destination, source, source_bucket
@@ -1963,6 +1983,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "user_queue_accept": "queue",
                 "house_review_move": "house",
                 "title_cleanup_requeue": "house",
+                "user_title_requeue": "house",
             }.get(row["action"], "temp")
             _finalize_existing_source_rollback(
                 conn, row, source, source_bucket
@@ -1975,7 +1996,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
         "SELECT canonical_path, source, active FROM files WHERE file_id = ?",
         (row["file_id"],),
     ).fetchone()
-    if row["action"] == "title_cleanup_requeue":
+    if row["action"] in {"title_cleanup_requeue", "user_title_requeue"}:
         db_committed = (
             file_row is not None
             and file_row["canonical_path"] == str(source)
@@ -1987,7 +2008,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 with transaction(conn):
                     transition_operation(
                         conn, operation_id, "stale",
-                        error="db_done title cleanup destination ownership mismatch",
+                        error="db_done title requeue destination ownership mismatch",
                     )
                 return "stale"
             with transaction(conn):
@@ -1996,7 +2017,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
         with transaction(conn):
             transition_operation(
                 conn, operation_id, "failed",
-                error="db_done title cleanup state mismatch",
+                error="db_done title requeue state mismatch",
             )
         return "failed"
     expected_source = {
@@ -2111,7 +2132,7 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
     if row["action"] in {
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
-        "title_cleanup_requeue",
+        "title_cleanup_requeue", "user_title_requeue",
     }:
         return _recover_interrupted_queue_operation(conn, operation_id)
     if row["action"] == "quarantine_purge":

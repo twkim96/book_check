@@ -75,6 +75,20 @@ def test_title_cleanup_apply_entry_point_is_dry_run_first():
     assert "--confirm-plan-sha256" in completed.stdout
 
 
+def test_library_server_entry_point_is_available_at_root():
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "run_library_server.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert "--host" in completed.stdout
+    assert "--port" in completed.stdout
+    assert "--frontend-dist" in completed.stdout
+
+
 def test_public_source_has_no_literal_user_home_path():
     user_home_prefix = "/" + "Users/"
     paths = [*ROOT.glob("*.py"), *ROOT.glob("backend/*.py")]

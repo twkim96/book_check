@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+library_frontend/node_modules/
+library_frontend/dist/
+library_frontend/*.tsbuildinfo
 
 # OS
 .DS_Store

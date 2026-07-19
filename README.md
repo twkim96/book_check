@@ -21,6 +21,8 @@ deduplicator.py               기존 dry-run 호환 실행기
 folderling.py                 기존 command 파일 호환 실행기
 run_title_cleanup_candidates.py  1.2.7 제목 후보 read-only 감사기
 run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
+run_library_server.py             1.2.8 독립 도서 관리 웹 서버
+library_frontend/                 React 기반 도서 관리 화면
 ```
 
 mutable runtime 파일은 계속 프로젝트 루트에 생성됩니다.
@@ -66,6 +68,48 @@ python3 run_folderling_one_button.py --help
 
 `run_folderling_one_button.py`는 실제 파일 입고를 수행할 수 있으므로 라이브 환경에서는
 상태 DB의 doctor 결과와 backup을 확인한 뒤 사용해야 합니다.
+
+## 도서 관리 웹 서버 (1.2.8)
+
+1.2.8부터 `file_check`는 기존 컨트롤서버와 분리된 로컬 웹 서버를 제공합니다. 기본 주소는
+`http://127.0.0.1:9012`이며 외부망에 직접 노출하지 않습니다. 현재 화면에는 DB·index·입고
+대기 상태를 보여주는 대시보드, 플랫폼 `ok` 정보가 없는 파일의 수동 제목 교정, 작업 이력이
+있습니다.
+
+```bash
+# Python 의존성
+python3 -m pip install -r requirements.txt
+
+# 웹 화면 빌드
+cd library_frontend
+npm ci
+npm run build
+cd ..
+
+# 운영 서버 시작
+python3 run_library_server.py
+
+# 경로와 포트를 바꿀 때
+python3 run_library_server.py --help
+```
+
+컨트롤서버의 `Servers`에는 이 저장소를 작업 디렉터리로 하고 다음과 같은 명령을 일반 서버로
+등록하면 됩니다. 컨트롤서버가 도서 DB를 직접 열거나 파일을 이동할 필요는 없습니다.
+
+```text
+command: .venv/bin/python run_library_server.py --server waitress --host 127.0.0.1 --port 9012
+health:  http://127.0.0.1:9012/health
+url:     http://127.0.0.1:9012/
+```
+
+제목 교정 화면은 새 파일명의 확장자를 자동 보존하고 같은 Python normalizer로 변경 후
+`core_title`을 미리 보여줍니다. 실행 전 대상 건수와 plan SHA-256을 다시 확인합니다. 승인된
+파일만 house에서 `txt_temp`로 이동하며 기존 DB 파일 행은 삭제하지 않고 비활성 이력으로
+남깁니다. 다음 Folderling은 이를 새 입고 파일로 처리해 기존 중복 판정을 전부 다시 수행합니다.
+대표·보호·관리 관계가 있는 파일은 1.2.8 화면에서 변경하지 않고 차단합니다.
+
+완료·실패·서버 중단 작업은 `.dedup_state/library-server/`에 남습니다. 이 디렉터리와 실제
+라이브러리 경로, 운영 DB, 인증 정보는 Git에 포함되지 않습니다.
 
 ## 제목 정규화 후보 감사 (1.2.7)
 

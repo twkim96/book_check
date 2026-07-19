@@ -1,2 +1,4 @@
 tqdm>=4.60,<5
 google-auth[requests]>=2.30,<3
+Flask>=3,<4
+waitress>=3,<4
