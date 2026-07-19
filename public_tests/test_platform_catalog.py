@@ -54,6 +54,89 @@ def test_catalog_keeps_six_platform_metrics_without_touching_files(tmp_path):
         conn.close()
 
 
+def test_catalog_search_uses_readable_title_not_compact_core_for_tagged_post(tmp_path):
+    state_db = _make_db(
+        tmp_path,
+        "[19禁완) 야설(근친) 작가로 살아가는 법 1-155 완 [ txt + epub ].txt",
+    )
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        [title] = platform_catalog.discover_catalog_titles(conn)
+        assert title.title_key == "야설근친작가로살아가는법"
+        assert title.display_title == "야설(근친) 작가로 살아가는 법"
+        assert title.query_title == "야설(근친) 작가로 살아가는 법"
+        assert platform_catalog.titles_match(
+            title.query_title, "야설(근친) 작가로 살아가는 법"
+        )
+    finally:
+        conn.close()
+
+
+def test_file_metadata_rekey_preserves_success_and_drops_failed_lookup(tmp_path):
+    state_db = _make_db(tmp_path, "최강 헌터의 자화상  1 125 완.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        file_id = conn.execute("SELECT file_id FROM file_analysis").fetchone()[0]
+        old_key = "최강헌터의자화상1"
+        new_key = "최강헌터의자화상"
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE file_analysis SET core_title = ?, normalizer_version = '1.2.1' "
+                "WHERE file_id = ?",
+                (old_key, file_id),
+            )
+            conn.execute(
+                "INSERT INTO catalog_titles(title_key, display_title, query_title, normalizer_version) "
+                "VALUES (?, '최강 헌터의 자화상 1', '최강 헌터의 자화상 1', '1.2.1')",
+                (old_key,),
+            )
+        platform_catalog.record_platform_stats(
+            conn,
+            old_key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", download_count=125_000, rating=9.8
+                ),
+                platform_catalog.PlatformStat("kakao", "not_found"),
+            ],
+        )
+
+        with decision_store.transaction(conn):
+            result = decision_store.sync_active_file_analysis(conn)
+
+        assert result["title_rekeys"] == {
+            "requested": 1,
+            "migrated": 1,
+            "blocked_active_source": 0,
+            "blocked_keys": [],
+            "successful_rows_preserved": 1,
+            "failed_rows_discarded": 1,
+        }
+        analysis = conn.execute(
+            "SELECT a.core_title, a.readable_title, f.episode_start, f.episode_end "
+            "FROM file_analysis AS a JOIN files AS f ON f.file_id = a.file_id "
+            "WHERE a.file_id = ?",
+            (file_id,),
+        ).fetchone()
+        assert tuple(analysis) == (new_key, "최강 헌터의 자화상", 1, 125)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM catalog_titles WHERE title_key = ?", (old_key,)
+        ).fetchone()[0] == 0
+        series = conn.execute(
+            "SELECT status, download_count, rating FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'series'",
+            (new_key,),
+        ).fetchone()
+        assert tuple(series) == ("ok", 125_000, 9.8)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'kakao'",
+            (new_key,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_catalog_refresh_only_requests_missing_platforms_and_waits_between_titles(tmp_path):
     state_db = _make_db(
         tmp_path,

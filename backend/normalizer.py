@@ -31,7 +31,7 @@ SOURCE_SITE_TAG_RE = re.compile(
 
 # normalizer 규칙 버전. 핵심 추출 로직(core_title/author/max_number/...)이 바뀌면
 # bump 한다. file_index.json에 함께 기록되어 stale index 감지에 사용된다.
-NORMALIZER_VERSION = "1.2.1"
+NORMALIZER_VERSION = "1.2.3"
 
 # pass 폴더를 거쳐 강제 입고된 파일에 부여하는 마커.
 # 짧고 전각 괄호를 사용하여 일반 도서 제목과 충돌하지 않도록 한다.
@@ -348,7 +348,7 @@ def extract_author(filename):
     @로 시작하는 태그는 보통 작가지만 사이트/위치/상태 태그(`@홈5`, `@연재중`,
     `@NF Library`)가 섞여 있다. 후보가 노이즈로 판정되면 괄호 토큰 폴백으로 이어간다.
     """
-    base = _without_extension(filename)
+    base = _strip_leading_post_status(_without_extension(filename))
 
     at_match = re.search(r"@([^\s\[\](){}【】]+)", base)
     if at_match:
@@ -377,7 +377,7 @@ def has_completion_marker(filename):
 
 
 def extract_max_number(filename):
-    name = _without_extension(filename)
+    name = _strip_leading_post_status(_without_extension(filename))
     name = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", name)
 
     numbers = []
@@ -404,6 +404,9 @@ _RANGE_WITH_UNIT_RE = re.compile(
     r"(\d+)\s*(화|회|권|장|편|부)?"
 )
 _SPACE_RANGE_RE = re.compile(r"(?<!\d)(\d+)\s+(\d+)\s*(화|회|권|장|편)(?!차)")
+_SPACE_COMPLETION_RANGE_RE = re.compile(
+    r"(?<!\d)(\d+)\s+(\d+)\s*(?:완결|完結|완|完|終)"
+)
 _UNIT_NUMBER_RE = re.compile(
     r"(?<!\d)(\d+)\s*(화|회|권|장|편|부)(?!\s*차|[가-힣A-Za-z])"
 )
@@ -426,6 +429,24 @@ _META_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _KNOWN_NUMERIC_META_RE = re.compile(r"(?:판|현)\d{6}|제\d+판", re.IGNORECASE)
+_LEADING_POST_STATUS_RE = re.compile(
+    r"^\s*[\[\({【]?\s*"
+    r"(?:(?:신작\s*)?(?:완결|完結|완|完)|"
+    r"19\s*(?:禁|금|N|n)\s*(?:완결|完結|완|完)?)"
+    r"\s*[\)\]\}】〉》:：,.\\\-_/]+\s*",
+    re.IGNORECASE,
+)
+_ATTACHED_TITLE_PAREN_RE = re.compile(
+    r"(?<=[A-Za-z0-9가-힣\u3400-\u9fff\uf900-\ufaff])"
+    r"\(([^()\[\]]{1,30})\)"
+    r"(?=\s*[A-Za-z0-9가-힣\u3400-\u9fff\uf900-\ufaff])"
+)
+_TITLE_PAREN_OPEN = "\ue000"
+_TITLE_PAREN_CLOSE = "\ue001"
+
+
+def _strip_leading_post_status(value):
+    return _LEADING_POST_STATUS_RE.sub("", value, count=1)
 
 
 @dataclass(frozen=True)
@@ -440,7 +461,7 @@ class EpisodeSpan:
 
 def _analysis_base(filename):
     """괄호/@태그를 제거한 분석용 본문 문자열."""
-    base = _without_extension(filename)
+    base = _strip_leading_post_status(_without_extension(filename))
     base = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", base)
     base = re.sub(r"@[^\s]+", " ", base)
     return base
@@ -448,7 +469,8 @@ def _analysis_base(filename):
 
 def _episode_analysis_base(filename):
     """span role 판정을 위해 외전/본편 괄호 표기는 보존하고 작가 @태그만 제거한다."""
-    return re.sub(r"@[^\s]+", " ", _without_extension(filename))
+    base = _strip_leading_post_status(_without_extension(filename))
+    return re.sub(r"@[^\s]+", " ", base)
 
 
 def _span_unit(raw_unit, explicit_range=False):
@@ -527,6 +549,18 @@ def extract_episode_spans(filename):
         if not _META_SUFFIX_RE.match(suffix):
             continue
         add(match, start, end, match.group(3), True)
+
+    # 구분자가 유실된 완료본 범위: `1 125 완`, `001 200 완결`.
+    # 완료 표지가 있으므로 단순 제목 속 숫자 쌍보다 강한 회차 증거로 취급한다.
+    for match in _SPACE_COMPLETION_RANGE_RE.finditer(base):
+        if _overlaps((match.start(), match.end()), occupied):
+            continue
+        start, end = int(match.group(1)), int(match.group(2))
+        if end < 10 or end < start:
+            continue
+        prefix = base[max(0, match.start() - 12):match.start()]
+        role = "side" if _SIDE_PREFIX_RE.search(prefix) else "main"
+        add(match, start, end, None, True, role=role)
 
     for match in _UNIT_NUMBER_RE.finditer(base):
         if _overlaps((match.start(), match.end()), occupied):
@@ -667,7 +701,7 @@ def extract_volume_number(filename):
     - '어떤 책 1-3권 모음'                → None  (권 범위만 있을 때)
     - 권/부 표기 자체가 없으면          → None
     """
-    base = _without_extension(filename)
+    base = _strip_leading_post_status(_without_extension(filename))
     base = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", base)
     base = re.sub(r"@[^\s]+", " ", base)
 
@@ -743,6 +777,18 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
     # 분리 마커 〔Dn〕는 검색/매칭에서 제거해 base와 같은 코어로 인식되게 한다.
     base = _without_extension(strip_disambig_marker(filename))
 
+    # 게시글 상태 꼬리표는 괄호가 잘못 닫혀 있어도 본문보다 먼저 떼어낸다.
+    # 예: `[19禁완) 제목 ... [txt + epub]`를 일반 대괄호 제거가 통째로 삼키지 않게 한다.
+    status_prefix = _LEADING_POST_STATUS_RE.match(base)
+    if status_prefix is not None:
+        base = base[status_prefix.end():]
+        # 상태 꼬리표가 명확했던 게시글에 한해서 제목 중간의 붙은 괄호를 보호한다.
+        # `야설(근친) 작가로...`는 보존하지만 `작품명(작가) 1-100`은 기존처럼 메타로 본다.
+        base = _ATTACHED_TITLE_PAREN_RE.sub(
+            lambda match: _TITLE_PAREN_OPEN + match.group(1) + _TITLE_PAREN_CLOSE,
+            base,
+        )
+
     # 콜론 분리: "메인: 부제"에서 부제 쪽 검색어 길이가 충분하면 부제를 코어로 본다.
     # (JS extractReadableTitle과 동기화)
     if prefer_colon_subtitle:
@@ -775,6 +821,8 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
         r"\d+\s*[~\-]\s*\d+",
         # 범위 구분자가 공백으로 치환된 변형: '1 325화' → '1'부터 컷(같은 작품의 다른 표기).
         r"\d+\s+\d+\s*(?:화|권|부|장|편)",
+        # 완료 표지가 있는 단위 없는 공백 범위: '1 125 완' → 두 숫자를 모두 컷.
+        r"\d+\s+\d+\s*(?:완결|完結|완|完|終)",
         # 하이픈+숫자만 떨어져 남은 회차 꼬리: '… -379' (작가 태그 제거 후 흔함).
         r"[~\-]\s*\d+",
         r"\d+\s*(?:화|권|부|장|편)",
@@ -798,7 +846,8 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
         base = re.sub(rf"^\s*{re.escape(keyword)}\s*", " ", base)
 
     base = re.sub(r"^[^a-zA-Z0-9가-힣\u3400-\u9fff\uf900-\ufaff]+", " ", base)
-    return re.sub(r"\s+", " ", base).strip()
+    base = re.sub(r"\s+", " ", base).strip()
+    return base.replace(_TITLE_PAREN_OPEN, "(").replace(_TITLE_PAREN_CLOSE, ")")
 
 
 def extract_readable_title(filename):

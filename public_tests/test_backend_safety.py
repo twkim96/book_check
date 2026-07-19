@@ -2,7 +2,12 @@ import os
 
 import decision_store
 import deduplicator
-from normalizer import analyze_name, has_pass_marker
+from normalizer import (
+    analyze_name,
+    extract_catalog_query_title,
+    extract_readable_title,
+    has_pass_marker,
+)
 
 
 def test_synthetic_title_rules_keep_markers_and_ranges_separate():
@@ -11,6 +16,33 @@ def test_synthetic_title_rules_keep_markers_and_ranges_separate():
     assert info["effective_max"] == 250
     assert info["complete"] is True
     assert has_pass_marker("합성연재물 1-250화 완〔P〕.txt") is True
+
+
+def test_space_separated_completed_range_does_not_leak_into_core_title():
+    info = analyze_name("최강 헌터의 자화상  1 125 완.txt")
+    assert info["core_title"] == "최강헌터의자화상"
+    assert info["start_number"] == 1
+    assert info["end_number"] == 125
+    assert info["effective_max"] == 125
+    assert info["unit"] == "화"
+
+
+def test_post_status_prefix_keeps_meaningful_attached_parenthetical():
+    name = "[19禁완) 야설(근친) 작가로 살아가는 법 1-155 완 [ txt + epub ].txt"
+    info = analyze_name(name)
+    assert info["core_title"] == "야설근친작가로살아가는법"
+    assert extract_readable_title(name) == "야설(근친) 작가로 살아가는 법"
+    assert extract_catalog_query_title(name) == "야설(근친) 작가로 살아가는 법"
+    assert info["start_number"] == 1
+    assert info["end_number"] == 155
+
+
+def test_new_completion_prefix_is_removed_without_touching_real_numeric_title():
+    tagged = "신작완결) 출근 중 사건 발생 보고서 1-209 완결.txt"
+    assert extract_readable_title(tagged) == "출근 중 사건 발생 보고서"
+    assert analyze_name(tagged)["core_title"] == "출근중사건발생보고서"
+    assert analyze_name("19호실의 비밀 1-50화 완결.txt")["core_title"] == "19호실의비밀"
+    assert analyze_name("작품명(작가명) 1-100 완.txt")["core_title"] == "작품명"
 
 
 def test_dry_run_never_removes_exact_duplicate_fixture(tmp_path):

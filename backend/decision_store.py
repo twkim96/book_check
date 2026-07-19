@@ -2647,6 +2647,157 @@ def upsert_file_analysis(
     return True
 
 
+def migrate_catalog_title_keys(
+    conn: sqlite3.Connection,
+    rekeys: Iterable[tuple[str, str]],
+) -> dict:
+    """Move catalog state after a versioned filename-analysis key correction.
+
+    The caller must update every file-analysis row in its scan scope first.  A
+    source key is migrated only when no active house file still uses it.  This
+    prevents a partial scan from stealing metadata from a still-valid title.
+
+    Successful platform rows are preserved.  Negative/error rows are discarded
+    because the corrected query title deserves a fresh lookup.  If the target
+    already has a successful row, that newer canonical row wins.
+    """
+    destinations: dict[str, set[str]] = {}
+    for old_key, new_key in rekeys:
+        old_key = str(old_key or "").strip()
+        new_key = str(new_key or "").strip()
+        if old_key and new_key and old_key != new_key:
+            destinations.setdefault(old_key, set()).add(new_key)
+
+    ambiguous = {
+        old_key: sorted(new_keys)
+        for old_key, new_keys in destinations.items()
+        if len(new_keys) != 1
+    }
+    if ambiguous:
+        raise RuntimeError(
+            "normalizer rekey is ambiguous; refusing catalog migration: "
+            + json.dumps(ambiguous, ensure_ascii=False, sort_keys=True)
+        )
+
+    mapping = {old_key: next(iter(new_keys)) for old_key, new_keys in destinations.items()}
+    chained = sorted(set(mapping) & set(mapping.values()))
+    if chained:
+        raise RuntimeError(
+            "normalizer rekey contains a chain/cycle; refusing catalog migration: "
+            + ", ".join(chained)
+        )
+
+    active_keys = {
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT a.core_title
+            FROM file_analysis AS a
+            JOIN files AS f ON f.file_id = a.file_id
+            WHERE f.active = 1 AND f.source = 'house' AND a.core_title != ''
+            """
+        )
+    }
+    blocked = sorted(old_key for old_key in mapping if old_key in active_keys)
+    migrated = 0
+    successful_rows_preserved = 0
+    failed_rows_discarded = 0
+
+    stat_columns = (
+        "platform, status, remote_id, remote_title, remote_url, "
+        "download_count, interest_count, view_count, recommend_count, "
+        "rating, rating_count, last_attempt_at, last_success_at, retry_after, "
+        "error_message, created_at, updated_at"
+    )
+    for old_key, new_key in sorted(mapping.items()):
+        if old_key in active_keys:
+            continue
+        old_title = conn.execute(
+            "SELECT 1 FROM catalog_titles WHERE title_key = ?", (old_key,)
+        ).fetchone()
+        if old_title is None:
+            continue
+        title = conn.execute(
+            """
+            SELECT a.readable_title, a.catalog_query_title
+            FROM file_analysis AS a
+            JOIN files AS f ON f.file_id = a.file_id
+            WHERE f.active = 1 AND f.source = 'house' AND a.core_title = ?
+            ORDER BY LENGTH(a.catalog_query_title), a.catalog_query_title
+            LIMIT 1
+            """,
+            (new_key,),
+        ).fetchone()
+        if title is None:
+            raise RuntimeError(
+                f"normalizer rekey target has no active file analysis: {old_key} -> {new_key}"
+            )
+
+        from normalizer import NORMALIZER_VERSION
+
+        display_title = str(title["catalog_query_title"] or title["readable_title"] or new_key)
+        query_title = str(title["catalog_query_title"] or title["readable_title"] or new_key)
+        conn.execute(
+            """
+            INSERT INTO catalog_titles(
+                title_key, display_title, query_title, normalizer_version
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(title_key) DO UPDATE SET
+                display_title = excluded.display_title,
+                query_title = excluded.query_title,
+                normalizer_version = excluded.normalizer_version,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (new_key, display_title, query_title, NORMALIZER_VERSION),
+        )
+
+        old_stats = conn.execute(
+            "SELECT platform, status FROM catalog_platform_stats WHERE title_key = ?",
+            (old_key,),
+        ).fetchall()
+        failed_rows_discarded += sum(row["status"] != "ok" for row in old_stats)
+        for row in old_stats:
+            if row["status"] != "ok":
+                continue
+            platform = row["platform"]
+            existing = conn.execute(
+                "SELECT status FROM catalog_platform_stats "
+                "WHERE title_key = ? AND platform = ?",
+                (new_key, platform),
+            ).fetchone()
+            if existing is not None and existing["status"] == "ok":
+                continue
+            if existing is not None:
+                conn.execute(
+                    "DELETE FROM catalog_platform_stats "
+                    "WHERE title_key = ? AND platform = ?",
+                    (new_key, platform),
+                )
+            conn.execute(
+                f"""
+                INSERT INTO catalog_platform_stats(title_key, {stat_columns})
+                SELECT ?, {stat_columns}
+                FROM catalog_platform_stats
+                WHERE title_key = ? AND platform = ? AND status = 'ok'
+                """,
+                (new_key, old_key, platform),
+            )
+            successful_rows_preserved += 1
+
+        # Cascades any negative rows intentionally left on the obsolete key.
+        conn.execute("DELETE FROM catalog_titles WHERE title_key = ?", (old_key,))
+        migrated += 1
+
+    return {
+        "requested": len(mapping),
+        "migrated": migrated,
+        "blocked_active_source": len(blocked),
+        "blocked_keys": blocked,
+        "successful_rows_preserved": successful_rows_preserved,
+        "failed_rows_discarded": failed_rows_discarded,
+    }
+
+
 def file_analysis_sync_status(
     conn: sqlite3.Connection,
     *,
@@ -2749,6 +2900,7 @@ def sync_active_file_analysis(
             )
         rows = [by_path[path] for path in sorted(eligible_paths)]
     changed = 0
+    rekeys = []
     for index, row in enumerate(rows, start=1):
         path = row["canonical_path"]
         try:
@@ -2756,6 +2908,12 @@ def sync_active_file_analysis(
         except OSError as exc:
             raise RuntimeError(f"active house file is missing or unreadable: {path}: {exc}") from exc
         analysis = build_file_analysis(Path(path).name)
+        previous = conn.execute(
+            "SELECT core_title FROM file_analysis WHERE file_id = ?",
+            (row["file_id"],),
+        ).fetchone()
+        if previous is not None and previous["core_title"] != analysis["core_title"]:
+            rekeys.append((previous["core_title"], analysis["core_title"]))
         if upsert_file_analysis(
             conn, row["file_id"], path, analysis=analysis, stat_result=stat_result
         ):
@@ -2767,7 +2925,15 @@ def sync_active_file_analysis(
                 "total": len(rows),
                 "changed": changed,
             })
-    return {"total": len(rows), "changed": changed, "unchanged": len(rows) - changed}
+    title_rekeys = migrate_catalog_title_keys(conn, rekeys)
+    result = {
+        "total": len(rows),
+        "changed": changed,
+        "unchanged": len(rows) - changed,
+    }
+    if title_rekeys["requested"] or title_rekeys["blocked_active_source"]:
+        result["title_rekeys"] = title_rekeys
+    return result
 
 
 def prune_file_analysis_projection(

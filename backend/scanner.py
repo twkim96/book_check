@@ -1,7 +1,9 @@
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from normalizer import (
     analyze_name,
@@ -27,6 +29,26 @@ TARGET_DIRECTORIES = [
 
 def _default_index_path(output_path):
     return os.path.join(os.path.dirname(output_path), "file_index.json")
+
+
+def _backup_before_normalizer_reanalysis(conn, state_db_path):
+    stale = conn.execute(
+        "SELECT COUNT(*) FROM file_analysis WHERE normalizer_version != ?",
+        (NORMALIZER_VERSION,),
+    ).fetchone()[0]
+    if not stale:
+        return None
+    from decision_store import backup_state_db
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = (
+        Path(state_db_path).resolve().parent
+        / "backups"
+        / f"before_normalizer_rekey_{stamp}_{uuid.uuid4().hex[:8]}.sqlite3"
+    )
+    backup = backup_state_db(conn, backup_path)
+    print(f"  💾 정규화 재분석 전 DB 백업: {backup}")
+    return backup
 
 
 def _build_entry(path, base_dir, entry_type, decision_projection=None, analysis=None):
@@ -101,10 +123,12 @@ def get_file_entries(
     entries = []
     decision_conn = None
     seen_file_ids = set()
+    analysis_rekeys = []
     if state_db_path:
         from decision_store import initialize_state_db
 
         decision_conn = initialize_state_db(state_db_path)
+        _backup_before_normalizer_reanalysis(decision_conn, state_db_path)
         decision_conn.execute("BEGIN IMMEDIATE")
     processed = 0
     last_reported = 0
@@ -138,11 +162,28 @@ def get_file_entries(
                     projection = None
                     analysis = None
                     if decision_conn is not None:
-                        from decision_store import build_file_analysis, reconcile_file_metadata
+                        from decision_store import (
+                            build_file_analysis,
+                            canonicalize_path,
+                            reconcile_file_metadata,
+                        )
 
                         name = normalize_nfc(file)
                         analysis = build_file_analysis(name)
                         legacy_marker = has_pass_marker(name) or read_disambig_marker(name) > 1
+                        previous = decision_conn.execute(
+                            """
+                            SELECT a.core_title
+                            FROM files AS f
+                            JOIN file_analysis AS a ON a.file_id = f.file_id
+                            WHERE f.canonical_path = ? AND f.active = 1
+                            """,
+                            (canonicalize_path(path),),
+                        ).fetchone()
+                        if previous is not None and previous["core_title"] != analysis["core_title"]:
+                            analysis_rekeys.append(
+                                (previous["core_title"], analysis["core_title"])
+                            )
                         projection = dict(reconcile_file_metadata(
                             decision_conn,
                             path,
@@ -173,13 +214,24 @@ def get_file_entries(
         raise
     else:
         if decision_conn is not None:
-            from decision_store import prune_file_analysis_projection
+            from decision_store import (
+                migrate_catalog_title_keys,
+                prune_file_analysis_projection,
+            )
 
             prune_file_analysis_projection(
                 decision_conn,
                 seen_file_ids=seen_file_ids,
                 scanned_roots=directory_list,
             )
+            rekey_result = migrate_catalog_title_keys(decision_conn, analysis_rekeys)
+            if rekey_result["migrated"]:
+                print(
+                    "  🔑 정규화 제목 키 이전: "
+                    f"{rekey_result['migrated']}개, "
+                    f"성공 메타데이터 보존 {rekey_result['successful_rows_preserved']}건, "
+                    f"실패 결과 폐기 {rekey_result['failed_rows_discarded']}건"
+                )
             decision_conn.commit()
     finally:
         if decision_conn is not None:

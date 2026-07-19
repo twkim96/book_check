@@ -166,6 +166,13 @@ def _backup_path(state_db: Path) -> Path:
     )
 
 
+def _metadata_rekey_backup_path(state_db: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return state_db.parent / "backups" / (
+        f"before_normalizer_rekey_{stamp}_{uuid.uuid4().hex[:8]}.sqlite3"
+    )
+
+
 def ensure_catalog_schema(state_db_path: str) -> Optional[Path]:
     """Back up an existing older schema before adding the independent catalog."""
     state_db = Path(state_db_path)
@@ -322,6 +329,15 @@ def sync_file_metadata(state_db_path: str, *, progress=None):
         conn = decision_store.connect_state_db(state_db_path)
         try:
             decision_store.validate_schema(conn)
+            if backup is None:
+                stale_versions = conn.execute(
+                    "SELECT COUNT(*) FROM file_analysis WHERE normalizer_version != ?",
+                    (platform_catalog.NORMALIZER_VERSION,),
+                ).fetchone()[0]
+                if stale_versions:
+                    backup = decision_store.backup_state_db(
+                        conn, _metadata_rekey_backup_path(Path(state_db_path))
+                    )
             with decision_store.transaction(conn):
                 result = decision_store.sync_active_file_analysis(
                     conn, eligible_paths=eligible_paths, progress=progress
