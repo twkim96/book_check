@@ -48,6 +48,33 @@ def test_platform_catalog_control_entry_point_is_available_at_root():
     assert "status" in completed.stdout
 
 
+def test_title_cleanup_candidate_audit_entry_point_is_available_at_root():
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "run_title_cleanup_candidates.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert "--state-db" in completed.stdout
+    assert "--json-out" in completed.stdout
+
+
+def test_title_cleanup_apply_entry_point_is_dry_run_first():
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "run_title_cleanup_apply.py"), "--help"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert "--manifest-out" in completed.stdout
+    assert "--confirm-count" in completed.stdout
+    assert "--confirm-plan-sha256" in completed.stdout
+
+
 def test_public_source_has_no_literal_user_home_path():
     user_home_prefix = "/" + "Users/"
     paths = [*ROOT.glob("*.py"), *ROOT.glob("backend/*.py")]

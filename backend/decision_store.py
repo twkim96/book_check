@@ -1911,6 +1911,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     if row["action"] not in {
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
+        "title_cleanup_requeue",
     }:
         raise ValueError("operation is not a queue move")
     if row["state"] not in {"planned", "fs_done", "db_done"}:
@@ -1923,7 +1924,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     }:
         assert_actual_run_path(actual_run, source, "temp_root")
         assert_actual_run_path(actual_run, destination, "house_root")
-    elif row["action"] == "house_review_move":
+    elif row["action"] in {"house_review_move", "title_cleanup_requeue"}:
         assert_actual_run_path(actual_run, source, "house_root")
         assert_actual_run_path(actual_run, destination, "temp_root")
     else:
@@ -1950,6 +1951,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "queue_restore": "queue", "user_queue_restore": "queue",
                 "user_queue_accept": "queue",
                 "house_review_move": "house",
+                "title_cleanup_requeue": "house",
             }.get(row["action"], "temp")
             _rollback_owned_destination(
                 conn, row, destination, source, source_bucket
@@ -1960,6 +1962,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "queue_restore": "queue", "user_queue_restore": "queue",
                 "user_queue_accept": "queue",
                 "house_review_move": "house",
+                "title_cleanup_requeue": "house",
             }.get(row["action"], "temp")
             _finalize_existing_source_rollback(
                 conn, row, source, source_bucket
@@ -1969,8 +1972,33 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
             transition_operation(conn, operation_id, "failed", error="both queue paths missing")
         return "failed"
     file_row = conn.execute(
-        "SELECT canonical_path, source FROM files WHERE file_id = ?", (row["file_id"],)
+        "SELECT canonical_path, source, active FROM files WHERE file_id = ?",
+        (row["file_id"],),
     ).fetchone()
+    if row["action"] == "title_cleanup_requeue":
+        db_committed = (
+            file_row is not None
+            and file_row["canonical_path"] == str(source)
+            and file_row["source"] == "house"
+            and file_row["active"] == 0
+        )
+        if db_committed and destination_exists and not source_exists:
+            if not _owned_operation_path(row, destination, "destination"):
+                with transaction(conn):
+                    transition_operation(
+                        conn, operation_id, "stale",
+                        error="db_done title cleanup destination ownership mismatch",
+                    )
+                return "stale"
+            with transaction(conn):
+                transition_operation(conn, operation_id, "committed")
+            return "committed"
+        with transaction(conn):
+            transition_operation(
+                conn, operation_id, "failed",
+                error="db_done title cleanup state mismatch",
+            )
+        return "failed"
     expected_source = {
         "queue_restore": "temp",
         "house_ingest": "house",
@@ -2083,6 +2111,7 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
     if row["action"] in {
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
+        "title_cleanup_requeue",
     }:
         return _recover_interrupted_queue_operation(conn, operation_id)
     if row["action"] == "quarantine_purge":
@@ -2899,9 +2928,12 @@ def sync_active_file_analysis(
                 f"count={len(missing_db)}"
             )
         rows = [by_path[path] for path in sorted(eligible_paths)]
-    changed = 0
+    # First calculate the complete projection without writing.  A normalizer
+    # change may cause multiple old keys to meet an existing clean key.  That is
+    # a dedup candidate, not permission to merge catalog/work state.
+    planned = []
     rekeys = []
-    for index, row in enumerate(rows, start=1):
+    for row in rows:
         path = row["canonical_path"]
         try:
             stat_result = os.stat(path, follow_symlinks=False)
@@ -2914,6 +2946,52 @@ def sync_active_file_analysis(
         ).fetchone()
         if previous is not None and previous["core_title"] != analysis["core_title"]:
             rekeys.append((previous["core_title"], analysis["core_title"]))
+        planned.append((row, path, stat_result, analysis))
+
+    destinations: dict[str, set[str]] = {}
+    sources: dict[str, set[str]] = {}
+    for old_key, new_key in rekeys:
+        old_key = str(old_key or "").strip()
+        new_key = str(new_key or "").strip()
+        if not old_key or not new_key:
+            raise RuntimeError(
+                f"normalizer produced an empty rekey: {old_key!r} -> {new_key!r}"
+            )
+        if old_key == new_key:
+            continue
+        destinations.setdefault(old_key, set()).add(new_key)
+        sources.setdefault(new_key, set()).add(old_key)
+
+    ambiguous_sources = {
+        old_key: sorted(new_keys)
+        for old_key, new_keys in destinations.items()
+        if len(new_keys) != 1
+    }
+    catalog_keys = {
+        str(row[0]) for row in conn.execute("SELECT title_key FROM catalog_titles")
+    }
+    collision_targets = {
+        new_key: {
+            "source_keys": sorted(old_keys),
+            "existing_catalog_target": new_key in catalog_keys,
+            "multiple_source_keys": len(old_keys) > 1,
+        }
+        for new_key, old_keys in sources.items()
+        if new_key in catalog_keys or len(old_keys) > 1
+    }
+    if ambiguous_sources or collision_targets:
+        detail = {
+            "ambiguous_sources": ambiguous_sources,
+            "collision_targets": collision_targets,
+        }
+        raise RuntimeError(
+            "normalizer rekey requires dedup-before-catalog migration; "
+            "run the title cleanup collision workflow first: "
+            + json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        )
+
+    changed = 0
+    for index, (row, path, stat_result, analysis) in enumerate(planned, start=1):
         if upsert_file_analysis(
             conn, row["file_id"], path, analysis=analysis, stat_result=stat_result
         ):

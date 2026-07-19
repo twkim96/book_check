@@ -49,7 +49,9 @@ from project_paths import FILE_INDEX, HOUSE_DIR, TEMP_DIR
 
 # 한 파일은 인코딩 확정 중 최대 3회, deep 검사에서 short/long 역할로 각 1회 읽힐 수 있다.
 MAX_ESTIMATED_READ_PASSES = 5
-FINGERPRINT_VERSION = "1"
+# v2: BOM UTF-16 LE/BE strict 판독을 fingerprint 의미에 포함한다.
+# 판독 규칙이 바뀌면 기존 decode_lossy 결과를 재사용하지 않도록 반드시 올린다.
+FINGERPRINT_VERSION = "2"
 AUDITOR_VERSION = "1.2.2"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True

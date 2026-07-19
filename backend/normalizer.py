@@ -4,6 +4,8 @@ import unicodedata
 from dataclasses import dataclass
 from urllib.parse import unquote
 
+from title_cleanup_rules import apply_title_cleanup_rules
+
 
 CHOSUNG_LIST = [
     "ㄱ", "ㄲ", "ㄴ", "ㄷ", "ㄸ", "ㄹ", "ㅁ", "ㅂ", "ㅃ",
@@ -31,7 +33,7 @@ SOURCE_SITE_TAG_RE = re.compile(
 
 # normalizer 규칙 버전. 핵심 추출 로직(core_title/author/max_number/...)이 바뀌면
 # bump 한다. file_index.json에 함께 기록되어 stale index 감지에 사용된다.
-NORMALIZER_VERSION = "1.2.3"
+NORMALIZER_VERSION = "1.2.7"
 
 # pass 폴더를 거쳐 강제 입고된 파일에 부여하는 마커.
 # 짧고 전각 괄호를 사용하여 일반 도서 제목과 충돌하지 않도록 한다.
@@ -292,7 +294,8 @@ def _split_supported_extension(filename):
 
 
 def _without_extension(filename):
-    base, _ = _split_supported_extension(filename)
+    candidate = apply_title_cleanup_rules(filename).candidate_name
+    base, _ = _split_supported_extension(candidate)
     return unquote(base)
 
 
@@ -350,13 +353,21 @@ def extract_author(filename):
     """
     base = _strip_leading_post_status(_without_extension(filename))
 
+    bracket_tokens = _bracket_tokens(base)
+    for token in reversed(bracket_tokens):
+        explicit_copyright = re.match(r"^[ⓒ©]\s*(.+)$", token, re.DOTALL)
+        if explicit_copyright is not None:
+            candidate = explicit_copyright.group(1).strip()
+            if candidate:
+                return candidate
+
     at_match = re.search(r"@([^\s\[\](){}【】]+)", base)
     if at_match:
         candidate = at_match.group(1).strip()
         if not _is_author_noise_token(candidate):
             return candidate
 
-    for token in reversed(_bracket_tokens(base)):
+    for token in reversed(bracket_tokens):
         if _is_completion_token(token) or _is_author_noise_token(token):
             continue
         if re.search(r"[가-힣A-Za-z]", token):

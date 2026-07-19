@@ -19,6 +19,8 @@ run_folderling_one_button.py  기존 컨트롤서버 호환 실행기
 scanner.py                    기존 Scanner 호환 실행기
 deduplicator.py               기존 dry-run 호환 실행기
 folderling.py                 기존 command 파일 호환 실행기
+run_title_cleanup_candidates.py  1.2.7 제목 후보 read-only 감사기
+run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
 ```
 
 mutable runtime 파일은 계속 프로젝트 루트에 생성됩니다.
@@ -64,6 +66,57 @@ python3 run_folderling_one_button.py --help
 
 `run_folderling_one_button.py`는 실제 파일 입고를 수행할 수 있으므로 라이브 환경에서는
 상태 DB의 doctor 결과와 backup을 확인한 뒤 사용해야 합니다.
+
+## 제목 정규화 후보 감사 (1.2.7)
+
+1.2.7 후보 감사기는 현재 SQLite와 `file_index.json`을 읽기 전용으로 비교해, 파일명에서
+명확한 회차 문법을 복원하고 배포 꼬리표를 제거했을 때 바뀌는 readable/query/core 제목을
+보고합니다. `ⓒ/©작가`와 `[완] - 작가`처럼 확정할 수 있는 작가 정보는 지우지 않습니다.
+저작권 표식이 있던 작가는 숫자 필명도 확실히 구분할 수 있도록 `[ⓒ작가]`로, 일반 작가는
+기존 파일명 관례인 `[작가]`로 보존합니다.
+네이버 시리즈·카카오페이지·노벨피아 중 하나라도 기존 `ok`인 source 제목이 바뀌면 종료
+코드 3으로 실패합니다. 새 core가 기존 target과 만나는 경우에는 자동 병합하지 않고 별도
+중복처리 대상으로 집계합니다.
+
+```bash
+# DB/index/house 및 플랫폼 데이터를 변경하지 않는 전수 감사
+python3 run_title_cleanup_candidates.py
+
+# 로컬 검토 보고서 생성
+python3 run_title_cleanup_candidates.py \
+  --json-out .dedup_state/reports/title_cleanup_1.2.7.json \
+  --csv-out .dedup_state/reports/title_cleanup_1.2.7.csv
+```
+
+감사기는 실행 전후 SQLite 논리 snapshot과 index SHA-256이 같은지 확인합니다. 보고서에는
+규칙별 문법 일치 수, 실제 변경 source 수, `not_found`/오류 상태, target 충돌과 보호 target
+충돌이 포함됩니다. normalizer 버전 변경 뒤 `file-metadata-sync`는 기존 target 충돌이나 여러
+source가 같은 target으로 모이는 경우 전체 트랜잭션을 중단하므로, 충돌 파일의 중복처리가
+끝나기 전에는 catalog key와 성공 메타데이터가 합쳐지지 않습니다.
+
+후보를 실제 파일에 적용하는 별도 진입점도 기본값은 dry-run입니다. dry-run은 교정 파일명,
+house 원본 identity, temp 목적지 충돌, assignment/protection 상태를 다시 확인하고 적용
+manifest SHA-256을 출력합니다.
+
+```bash
+# 실제 파일/DB 변경 없음
+python3 run_title_cleanup_apply.py \
+  --manifest-out .dedup_state/reports/title_cleanup_requeue_1.2.7.json
+
+# 실제 실행은 직전 dry-run의 건수와 plan SHA-256을 둘 다 명시해야 함
+python3 run_title_cleanup_apply.py --run \
+  --confirm-count DRY_RUN_COUNT \
+  --confirm-plan-sha256 DRY_RUN_PLAN_SHA256
+```
+
+실제 실행은 SQLite backup과 전체 house/temp actual manifest를 만든 뒤, 공용 mutation lock과
+operation journal 아래 교정 파일을 `txt_temp`로 옮깁니다. 기존 file ID와 fingerprint는
+비활성 이력으로 남기며 temp 경로에 연결하지 않습니다. 따라서 다음 Folderling 원버튼은
+파일을 새 intake ID로 등록하고 기존 exact hash·회차·포맷·본문 중복처리를 그대로 수행합니다.
+정리 후 이름이 같은 파일은 파일명에 `_dup_N`을 다시 붙이지 않고
+`txt_temp/title_cleanup_collision_N/` 임시 하위 폴더에 분리해 두 파일을 모두 보존합니다.
+삭제 여부는 Folderling 중복 증거로 결정합니다. 중단된 `planned/fs_done` 이동은 기존 recovery가
+원래 house 경로로 되돌릴 수 있습니다.
 
 ## 플랫폼 카탈로그와 조회용 Google Sheet (1.2.6)
 

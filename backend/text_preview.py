@@ -5,7 +5,7 @@
 
 - 대상은 `.txt`만. epub은 ZIP 바이너리라 앞부분을 그대로 읽으면 압축 헤더가 나오므로
   호출 측에서 확장자 가드를 둔다(여기서도 방어적으로 검사).
-- 인코딩은 UTF-8 → CP949(EUC-KR) → 마지막으로 errors="replace" 순으로 폴백한다.
+- BOM이 있는 UTF-8/UTF-16을 우선 판별한 뒤 UTF-8 → CP949(EUC-KR) 순으로 폴백한다.
 - 글자수는 인코딩과 무관하게 동일해야 하므로, 디코드 후 공백/개행을 제거한 문자 수를 센다.
 """
 from __future__ import annotations
@@ -113,8 +113,19 @@ def _normalize_edge(text):
     return "".join(char for char in unicodedata.normalize("NFC", text.lstrip("\ufeff")) if not char.isspace())
 
 
+def _encoding_candidates_for_sample(raw):
+    """BOM이 명시한 인코딩은 다른 후보로 오인하지 않고 그대로 사용한다."""
+    if raw.startswith(codecs.BOM_UTF8):
+        return ("utf-8-sig",)
+    if raw.startswith(codecs.BOM_UTF16_LE):
+        return ("utf-16-le",)
+    if raw.startswith(codecs.BOM_UTF16_BE):
+        return ("utf-16-be",)
+    return _ENCODING_CANDIDATES
+
+
 def _decode_front(raw):
-    candidates = ("utf-8-sig",) if raw.startswith(codecs.BOM_UTF8) else ("utf-8", "cp949")
+    candidates = _encoding_candidates_for_sample(raw)
     errors = []
     for encoding in candidates:
         try:
@@ -239,11 +250,11 @@ def _validate_encoding(path, encoding, budget, chunk_bytes):
 
 
 def detect_text_encoding(path, budget=None, chunk_bytes=_CHUNK_BYTES):
-    """전체 파일 strict decode로 UTF-8 BOM/UTF-8/CP949를 판별한다."""
+    """전체 파일 strict decode로 BOM UTF-8/UTF-16, UTF-8, CP949를 판별한다."""
     budget = budget or ReadBudget()
     with open(path, "rb") as stream:
         bom = stream.read(3)
-    candidates = ("utf-8-sig",) if bom.startswith(codecs.BOM_UTF8) else ("utf-8", "cp949")
+    candidates = _encoding_candidates_for_sample(bom)
     errors = []
     for encoding in candidates:
         try:
@@ -395,7 +406,7 @@ def analyze_text_file(
     try:
         with open(path, "rb") as stream:
             bom = stream.read(3)
-        candidates = ("utf-8-sig", "utf-8", "cp949") if bom.startswith(codecs.BOM_UTF8) else ("utf-8", "cp949")
+        candidates = _encoding_candidates_for_sample(bom)
         values = None
         encoding = None
         decode_errors = []
@@ -541,9 +552,9 @@ def _is_txt(path):
 
 def _decode_best_effort(raw):
     """바이트열을 후보 인코딩으로 차례로 디코드 시도, 모두 실패하면 replace."""
-    for encoding in _ENCODING_CANDIDATES:
+    for encoding in _encoding_candidates_for_sample(raw):
         try:
-            return raw.decode(encoding)
+            return raw.decode(encoding).lstrip("\ufeff")
         except UnicodeDecodeError:
             continue
     return raw.decode("utf-8", errors="replace")
@@ -594,8 +605,12 @@ def count_text_chars(path):
 
             decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
             chunk = head
+            first_chunk = True
             while chunk:
                 text = decoder.decode(chunk)
+                if first_chunk:
+                    text = text.lstrip("\ufeff")
+                    first_chunk = False
                 total += len(_strip_ws(text))
                 chunk = f.read(_CHUNK_BYTES)
             text = decoder.decode(b"", final=True)
@@ -608,7 +623,7 @@ def count_text_chars(path):
 
 def _pick_encoding(sample):
     """샘플 바이트로 디코딩 가능한 첫 후보 인코딩을 고른다. 없으면 utf-8(replace)."""
-    for encoding in _ENCODING_CANDIDATES:
+    for encoding in _encoding_candidates_for_sample(sample):
         try:
             sample.decode(encoding)
             return encoding

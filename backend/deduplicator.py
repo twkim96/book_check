@@ -1384,6 +1384,15 @@ def _review_id_for_unordered_pair(conn, left_file_id, right_file_id, classificat
     return row[0] if row else None
 
 
+def _auditor_relation_queue_eligible(classification, left, right):
+    """본문을 읽지 못한 서로 다른 제목을 유사도만으로 격리하지 않는다."""
+    if classification != "decode_lossy":
+        return True
+    left_core = normalize_nfc(left.get("core_title") or "")
+    right_core = normalize_nfc(right.get("core_title") or "")
+    return bool(left_core and right_core and left_core == right_core)
+
+
 def _managed_auditor_queue_records(
     auditor_groups,
     auditor_relations,
@@ -1406,6 +1415,8 @@ def _managed_auditor_queue_records(
 
     def queue_temp(entry, reference, classification, destination, status):
         if classification not in HUMAN_REVIEW_CLASSES:
+            return
+        if not _auditor_relation_queue_eligible(classification, entry, reference):
             return
         if not decision_store.coordinates_compatible(
             decision_store.coordinate_fields_from_name(entry["name"]),
@@ -1449,6 +1460,8 @@ def _managed_auditor_queue_records(
 
     def queue_house(entry, reference, classification, destination, status):
         if classification not in HUMAN_REVIEW_CLASSES:
+            return
+        if not _auditor_relation_queue_eligible(classification, entry, reference):
             return
         if not decision_store.coordinates_compatible(
             decision_store.coordinate_fields_from_name(entry["name"]),
@@ -1506,6 +1519,8 @@ def _managed_auditor_queue_records(
                 continue
             left, right = relation["left"], relation["right"]
             if {left.get("source"), right.get("source")} != {"house", "temp"}:
+                continue
+            if not _auditor_relation_queue_eligible(classification, left, right):
                 continue
             temp_entry = left if left.get("source") == "temp" else right
             house_entry = right if temp_entry is left else left
