@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import unicodedata
+import zipfile
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -45,14 +46,15 @@ from text_preview import (
     extract_position_anchors,
 )
 from project_paths import FILE_INDEX, HOUSE_DIR, TEMP_DIR
+from mutation_io import inspect_epub_content
 
 
 # 한 파일은 인코딩 확정 중 최대 3회, deep 검사에서 short/long 역할로 각 1회 읽힐 수 있다.
 MAX_ESTIMATED_READ_PASSES = 5
 # v2: BOM UTF-16 LE/BE strict 판독을 fingerprint 의미에 포함한다.
 # 판독 규칙이 바뀌면 기존 decode_lossy 결과를 재사용하지 않도록 반드시 올린다.
-FINGERPRINT_VERSION = "2"
-AUDITOR_VERSION = "1.2.2"
+FINGERPRINT_VERSION = "3"
+AUDITOR_VERSION = "1.2.10"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 
@@ -147,12 +149,22 @@ def build_parser():
     parser.add_argument("--report-dir")
     parser.add_argument("--state-db")
     parser.add_argument("--house-only", action="store_true")
+    parser.add_argument(
+        "--same-coordinate-only",
+        action="store_true",
+        help="inspect only equal extension/core-title/canonical-coordinate groups",
+    )
     parser.add_argument("--include-pass", action="store_true")
     parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument("--write-report", action="store_true")
     parser.add_argument("--max-file-bytes", type=parse_binary_size, default=DEFAULT_MAX_FILE_BYTES)
     parser.add_argument("--max-read-bytes", type=parse_binary_size, default=DEFAULT_MAX_READ_BYTES)
     parser.add_argument("--max-candidates", type=int, default=50_000)
+    parser.add_argument(
+        "--max-candidate-files",
+        type=int,
+        help="cap unique files whose content may be read; excess candidates are deferred",
+    )
     parser.add_argument("--max-core-group-pairs", type=int, default=5_000)
     parser.add_argument("--max-neighbors-per-entry", type=int, default=1_024)
     parser.add_argument("--max-title-checks-per-entry", type=int, default=24)
@@ -171,6 +183,8 @@ def _validate_positive_args(args, parser):
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.max_candidate_files is not None and args.max_candidate_files <= 0:
+        parser.error("--max-candidate-files must be positive")
 
 
 def _is_relative_safe(rel_path):
@@ -390,6 +404,22 @@ def generate_candidates(entries, config):
                 candidate.reasons.append("pass_recheck")
 
     for (_ext, _core), group in sorted(groups.items(), key=lambda item: item[0]):
+        same_bucket_groups = defaultdict(list)
+        for entry in group:
+            same_bucket_groups[_bucket(entry)].append(entry)
+        for bucket_group in same_bucket_groups.values():
+            same_bucket_pair_count = len(bucket_group) * (len(bucket_group) - 1) // 2
+            if same_bucket_pair_count > config.max_core_group_pairs:
+                stop_reasons.append("core_group_overflow")
+                coverage["same_bucket_unprocessed_pairs"] += same_bucket_pair_count
+                continue
+            bucket_group = sorted(bucket_group, key=_endpoint)
+            for index, left in enumerate(bucket_group):
+                for right in bucket_group[index + 1:]:
+                    add(left, right, "same_core_same_bucket")
+
+        if getattr(config, "same_coordinate_only", False):
+            continue
         pair_count = len(group) * (len(group) - 1) // 2
         if pair_count > config.max_core_group_pairs:
             stop_reasons.append("core_group_overflow")
@@ -402,6 +432,17 @@ def generate_candidates(entries, config):
                     add(left, right, "same_core_cross_bucket")
                 if left.disambig != right.disambig:
                     add(left, right, "marker_recheck")
+
+    if getattr(config, "same_coordinate_only", False):
+        ordered = sorted(candidates.values(), key=lambda candidate: candidate.pair_id)
+        if len(ordered) > config.max_candidates:
+            stop_reasons.append("candidate_overflow")
+        return ordered[:config.max_candidates], coverage, sorted(set(stop_reasons)), {
+            "posting_cap": 0,
+            "posting_max": 0,
+            "posting_mean": 0,
+            "posting_p95": 0,
+        }
 
     # 조사 한 글자 삽입/삭제는 academy처럼 고빈도 제목군의 top-K에서 밀릴 수 있으므로,
     # O(N²) 전수 비교 대신 조사 제거 key의 bounded 그룹 안에서만 직접 회수한다.
@@ -851,7 +892,7 @@ class PersistentAuditCache:
 
     def store_pair_results(self, candidates, results):
         stable = {
-            "text_equivalent", "marker_recheck", "near_identical", "contained_exact",
+            "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
             "contained_version", "longer_unresolved", "boilerplate_only", "different",
             "decode_lossy", "empty_text", "insufficient_text", "metadata_only",
         }
@@ -886,7 +927,7 @@ class PersistentAuditCache:
 
     def _store_review_item(self, candidate, result, ordered_left_fp, ordered_right_fp):
         reviewable = {
-            "text_equivalent", "marker_recheck", "near_identical", "contained_exact",
+            "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
             "contained_version", "longer_unresolved", "decode_lossy",
             "metadata_only", "insufficient_text",
         }
@@ -1029,8 +1070,106 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
                 flush=True,
             )
 
+    epub_items = [
+        (path, entry) for path, entry in sorted(unique_entries.items())
+        if entry.ext == ".epub"
+    ]
+    for item_index, (path, entry) in enumerate(epub_items, start=1):
+        try:
+            analysis = persistent.analysis(entry) if persistent is not None else None
+            if analysis is None:
+                evidence = inspect_epub_content(path, budget=budget)
+                analysis = TextAnalysis(
+                    path=path,
+                    size=evidence.file_evidence.size,
+                    mtime_ns=evidence.file_evidence.mtime_ns,
+                    encoding="epub-zip",
+                    lossy=False,
+                    error=None,
+                    raw_sha256=evidence.file_evidence.sha256,
+                    normalized_sha256=evidence.content_sha256,
+                    normalized_length=evidence.uncompressed_size,
+                    front_anchor="",
+                    tail_anchor="",
+                    status="epub_content",
+                    read_bytes=evidence.uncompressed_size,
+                )
+                if persistent is not None:
+                    persistent.store_analysis(entry, analysis)
+            analyses[path] = analysis
+        except BodyBudgetExceeded:
+            budget_exhausted = True
+            stop_reasons.append("body_budget_exhausted")
+            break
+        except (StaleInputDuringAnalysis, OSError):
+            stop_reasons.append("stale_input")
+            break
+        except (RuntimeError, zipfile.BadZipFile) as exc:
+            analyses[path] = TextAnalysis(
+                path=path,
+                size=entry.size,
+                mtime_ns=entry.mtime_ns,
+                encoding="epub-zip",
+                lossy=False,
+                error=str(exc),
+                raw_sha256=None,
+                normalized_sha256=None,
+                normalized_length=0,
+                front_anchor="",
+                tail_anchor="",
+                status="epub_error",
+                read_bytes=0,
+            )
+        if getattr(config, "progress", False) and (
+            item_index % 100 == 0 or item_index == len(epub_items)
+        ):
+            print(
+                f"  ... EPUB 내용 분석 {item_index}/{len(epub_items)} "
+                f"({budget.read_bytes / (1024 ** 3):.2f} GiB read)",
+                flush=True,
+            )
+
     deep_pairs = []
     for candidate in candidates:
+        if candidate.left.ext == ".epub" and candidate.right.ext == ".epub":
+            left = analyses.get(candidate.left.path)
+            right = analyses.get(candidate.right.path)
+            if left is None or right is None:
+                results[candidate.pair_id] = _basic_result(
+                    candidate, "body_budget_exhausted"
+                )
+                continue
+            if persistent is not None:
+                cached_result = persistent.pair_result(candidate)
+                if cached_result is not None:
+                    results[candidate.pair_id] = cached_result
+                    continue
+            evidence = {
+                "left_status": left.status,
+                "right_status": right.status,
+                "left_raw_sha256": left.raw_sha256,
+                "right_raw_sha256": right.raw_sha256,
+                "left_normalized_sha256": left.normalized_sha256,
+                "right_normalized_sha256": right.normalized_sha256,
+                "left_normalized_length": left.normalized_length,
+                "right_normalized_length": right.normalized_length,
+                "left_error": left.error,
+                "right_error": right.error,
+            }
+            if (
+                left.status == "epub_content"
+                and right.status == "epub_content"
+                and left.normalized_sha256
+                and left.normalized_sha256 == right.normalized_sha256
+            ):
+                results[candidate.pair_id] = _basic_result(
+                    candidate, "epub_equivalent", evidence
+                )
+            else:
+                results[candidate.pair_id] = _basic_result(
+                    candidate, "metadata_only", evidence
+                )
+            continue
         if candidate.left.ext != ".txt" or candidate.right.ext != ".txt":
             results[candidate.pair_id] = _basic_result(candidate, "metadata_only")
             continue
@@ -1174,12 +1313,34 @@ def run_audit(args):
     entries = house_entries + temp_entries
     snapshot = _snapshot(entries)
     candidates, coverage, stop_reasons, posting_stats = generate_candidates(entries, args)
-    mandatory_candidates, missing_representatives = generate_managed_representative_candidates(
-        entries, getattr(args, "state_db", None)
-    )
+    if getattr(args, "same_coordinate_only", False):
+        mandatory_candidates, missing_representatives = [], []
+    else:
+        mandatory_candidates, missing_representatives = generate_managed_representative_candidates(
+            entries, getattr(args, "state_db", None)
+        )
     if missing_representatives:
         stop_reasons.append("managed_representative_missing")
     candidates = merge_mandatory_candidates(candidates, mandatory_candidates)
+    max_candidate_files = getattr(args, "max_candidate_files", None)
+    if max_candidate_files is not None:
+        selected = []
+        selected_paths = set()
+        deferred_pairs = 0
+        deferred_paths = set()
+        for candidate in candidates:
+            pair_paths = {candidate.left.path, candidate.right.path}
+            if len(selected_paths | pair_paths) <= max_candidate_files:
+                selected.append(candidate)
+                selected_paths.update(pair_paths)
+            else:
+                deferred_pairs += 1
+                deferred_paths.update(pair_paths - selected_paths)
+        if deferred_pairs:
+            coverage["candidate_file_limit_deferred_pairs"] += deferred_pairs
+            coverage["candidate_file_limit_deferred_files"] += len(deferred_paths)
+            stop_reasons.append("candidate_file_limit")
+        candidates = selected
     persistent = None
     try:
         if getattr(args, "state_db", None) and getattr(args, "cache_write", True):
@@ -1275,7 +1436,7 @@ def _text_report(report, include_details=True):
         f"메타 후보 {report.stats['candidate_pairs']}쌍 / 결과 {report.stats['result_pairs']}쌍",
     ]
     for key in (
-        "text_equivalent", "near_identical", "contained_exact", "contained_version",
+        "text_equivalent", "epub_equivalent", "near_identical", "contained_exact", "contained_version",
         "marker_recheck", "boilerplate_only", "longer_unresolved", "metadata_only",
         "decode_lossy", "empty_text", "insufficient_text", "oversize_deferred",
         "normalization_deferred", "deep_check_deferred", "body_budget_exhausted", "different",

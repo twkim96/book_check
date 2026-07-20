@@ -76,6 +76,14 @@ python3 run_folderling_one_button.py --help
 대기 상태를 보여주는 대시보드, 플랫폼 `ok` 정보가 없는 파일의 수동 제목 교정, 작업 이력과
 1.2.9 분권 후보 검토 화면이 있습니다.
 
+## 동일 좌표 중복 재검사 (1.2.10)
+
+Folderling은 같은 `core_title`과 권/회차 좌표를 가진 TXT·EPUB 쌍을 필수 후보로
+검사합니다. EPUB은 ZIP 컨테이너 전체 바이트가 아니라 내부 파일명과 비압축 내용을
+비교하므로 재압축된 동일 도서를 찾을 수 있습니다. 운영 라이브러리의 제한된 읽기 전용
+재감사는 `python3 run_same_coordinate_audit.py`로 실행하며 고유 파일 80개를 넘지 않습니다.
+결과 보고서는 파일 이동 없이 temp의 `dedup_logs`에만 저장됩니다.
+
 ```bash
 # Python 의존성
 python3 -m pip install -r requirements.txt

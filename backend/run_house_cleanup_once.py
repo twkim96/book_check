@@ -36,7 +36,24 @@ def _entry(row):
     }
 
 
-QUEUEABLE = {"text_equivalent", "near_identical", "contained_exact", "contained_version"}
+def _better_house_entry(left, right):
+    """Use content/completeness rules, then prefer the shallower identical name."""
+    if left["name"] == right["name"]:
+        return min(
+            (left, right),
+            key=lambda entry: (
+                len(Path(entry["path"]).parts),
+                len(entry["path"]),
+                entry["path"],
+            ),
+        )
+    return get_better_entry(left, right)
+
+
+QUEUEABLE = {
+    "text_equivalent", "epub_equivalent",
+    "near_identical", "contained_exact", "contained_version",
+}
 
 
 def build_plan(conn, scope="queueable", review_ids=None):
@@ -114,7 +131,7 @@ def build_plan(conn, scope="queueable", review_ids=None):
         keep = protected[0] if protected else files[component[0]]
         candidates = protected[1:] if protected else [files[node] for node in component[1:]]
         for candidate in candidates:
-            keep = get_better_entry(keep, candidate)
+            keep = _better_house_entry(keep, candidate)
         root = keep["file_id"]
         parent = {root: None}
         parent_edge = {}
@@ -183,7 +200,8 @@ def run(state_db, house, temp, execute=False, scope="queueable", review_ids=None
                     queue_name = "house_human_review"
                 else:
                     queue_name = (
-                        "house_cleanup_review" if plan["classification"] == "text_equivalent"
+                        "house_cleanup_review"
+                        if plan["classification"] in {"text_equivalent", "epub_equivalent"}
                         else "house_cleanup_warning"
                     )
                 result = house_review_move(

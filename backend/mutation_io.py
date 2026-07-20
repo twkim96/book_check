@@ -9,9 +9,11 @@ import json
 import os
 import re
 import stat
+import struct
 import tempfile
 import threading
 import unicodedata
+import zipfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -41,6 +43,14 @@ class CopiedFile:
     destination: Path
     source_evidence: FileEvidence
     destination_evidence: FileEvidence
+
+
+@dataclass(frozen=True)
+class EpubContentEvidence:
+    file_evidence: FileEvidence
+    content_sha256: str
+    member_count: int
+    uncompressed_size: int
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -396,6 +406,102 @@ def inspect_normalized_text(path):
         ):
             raise SourceIdentityChanged(f"source changed during normalized hash: {path}")
         return _identity(after, raw_sha), normalized_sha
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+def inspect_epub_content(
+    path,
+    *,
+    max_members=10_000,
+    max_uncompressed_bytes=1024 * 1024 * 1024,
+    budget=None,
+):
+    """Hash normalized EPUB member names and uncompressed bytes, not ZIP headers.
+
+    ZIP timestamps, compression levels, central-directory layout, and comments do
+    not affect this digest.  The archive is never extracted.  Duplicate member
+    names, encrypted members, symlinks, and expansion-limit violations fail
+    closed so this digest can be used as mutation evidence.
+    """
+
+    parent_fd, fd, _ = _open_regular_nofollow(path)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"source is not a regular file: {path}")
+        raw_sha = _hash_fd(fd)
+        os.lseek(fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(fd), "rb", closefd=True) as stream:
+            with zipfile.ZipFile(stream) as archive:
+                infos = [info for info in archive.infolist() if not info.is_dir()]
+                if len(infos) > int(max_members):
+                    raise RuntimeError(
+                        f"EPUB member limit exceeded: {len(infos)}>{max_members}"
+                    )
+                normalized_names = [
+                    unicodedata.normalize("NFC", info.filename) for info in infos
+                ]
+                if len(normalized_names) != len(set(normalized_names)):
+                    raise RuntimeError("EPUB contains duplicate normalized member names")
+                uncompressed_size = sum(int(info.file_size) for info in infos)
+                if uncompressed_size > int(max_uncompressed_bytes):
+                    raise RuntimeError(
+                        "EPUB uncompressed limit exceeded: "
+                        f"{uncompressed_size}>{max_uncompressed_bytes}"
+                    )
+                if budget is not None:
+                    budget.reserve_pass(uncompressed_size)
+
+                digest = hashlib.sha256()
+                ordered = sorted(zip(normalized_names, infos), key=lambda item: item[0])
+                for normalized_name, info in ordered:
+                    if info.flag_bits & 0x1:
+                        raise RuntimeError("encrypted EPUB member is unsupported")
+                    member_mode = (info.external_attr >> 16) & 0o170000
+                    if member_mode == stat.S_IFLNK:
+                        raise RuntimeError("EPUB symlink member is unsupported")
+                    name_bytes = normalized_name.encode("utf-8", "surrogatepass")
+                    digest.update(struct.pack(">Q", len(name_bytes)))
+                    digest.update(name_bytes)
+                    digest.update(struct.pack(">Q", int(info.file_size)))
+                    consumed = 0
+                    with archive.open(info, "r") as member:
+                        while True:
+                            chunk = member.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            consumed += len(chunk)
+                            if budget is not None:
+                                budget.consume(len(chunk))
+                            digest.update(chunk)
+                    if consumed != int(info.file_size):
+                        raise RuntimeError(
+                            f"EPUB member size changed while read: {normalized_name}"
+                        )
+
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_ctime_ns,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_ctime_ns,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise SourceIdentityChanged(f"source changed during EPUB hash: {path}")
+        return EpubContentEvidence(
+            file_evidence=_identity(after, raw_sha),
+            content_sha256=digest.hexdigest(),
+            member_count=len(infos),
+            uncompressed_size=uncompressed_size,
+        )
     finally:
         os.close(fd)
         os.close(parent_fd)

@@ -50,9 +50,9 @@ DEFAULT_HOUSE_DIR = str(HOUSE_DIR)
 DEFAULT_TEMP_DIR = str(TEMP_DIR)
 DEFAULT_STATE_DB = str(STATE_DB)
 
-AUDITOR_STRONG_CLASSES = frozenset({"text_equivalent"})
+AUDITOR_STRONG_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
 AUDITOR_RELATION_CLASSES = frozenset({
-    "text_equivalent", "marker_recheck",
+    "text_equivalent", "epub_equivalent", "marker_recheck",
     "near_identical", "contained_exact", "contained_version", "longer_unresolved",
     "decode_lossy", "metadata_only", "insufficient_text", "boilerplate_only",
     "different",
@@ -919,7 +919,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.2.2"
+        duplicate_auditor.AUDITOR_VERSION == "1.2.10"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -944,7 +944,7 @@ def run_auditor_queue_report(
 def build_auditor_suspect_groups(
     report, entries, excluded_paths=(), blocked_relations=None
 ):
-    """Build mutation groups from text_equivalent edges only.
+    """Build mutation groups from strong TXT/EPUB equivalence edges only.
 
     Weak/report-only classifications never enter this DSU.  Existing unassigned
     house files and conflicting coordinates/managed identities are also vetoed
@@ -1113,6 +1113,10 @@ def build_auditor_suspect_groups(
             "authors": authors,
             "distinct_authors": any(_authors_conflict(keep, entry) for entry in members if entry is not keep),
             "audit_classifications": sorted(classifications),
+            "classification": (
+                next(iter(classifications))
+                if len(classifications) == 1 else "text_equivalent"
+            ),
             "mutation_blocked": component_blocked,
         })
     return groups
@@ -1187,7 +1191,10 @@ def find_multi_representative_candidates(exact_groups, report, entries):
 
     if report is not None and getattr(report, "completed", False):
         for result in getattr(report, "results", []):
-            if result.get("origin") != "auditor_aux" or result.get("classification") != "text_equivalent":
+            if (
+                result.get("origin") != "auditor_aux"
+                or result.get("classification") not in AUDITOR_STRONG_CLASSES
+            ):
                 continue
             resolved = []
             for label in ("left", "right"):
@@ -1509,8 +1516,9 @@ def _managed_auditor_queue_records(
         warning_dir = os.path.join(temp_dir, "trash_bin", "warning")
         for group in auditor_groups:
             reference = group["keep"]
+            classification = group.get("classification", "text_equivalent")
             for entry in group.get("move_entries", []):
-                queue_temp(entry, reference, "text_equivalent", suspected_dir, "moved")
+                queue_temp(entry, reference, classification, suspected_dir, "moved")
 
         by_temp = defaultdict(list)
         for relation in auditor_relations:

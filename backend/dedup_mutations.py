@@ -6,14 +6,16 @@ import decision_store
 from mutation_io import (
     evidence_matches,
     ensure_directory_nofollow,
+    inspect_epub_content,
     inspect_regular_file,
     inspect_normalized_text,
     mutation_lock,
 )
 
 
-STRONG_QUEUE_CLASSES = frozenset({"text_equivalent"})
+STRONG_QUEUE_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
 NORMALIZED_EQUAL_CLASSES = frozenset({"text_equivalent", "marker_recheck"})
+EPUB_EQUAL_CLASSES = frozenset({"epub_equivalent"})
 WEAK_QUEUE_CLASSES = frozenset({
     "near_identical",
     "contained_exact",
@@ -23,7 +25,7 @@ REPORT_ONLY_CLASSES = frozenset({
     "longer_unresolved", "decode_lossy", "metadata_only", "insufficient_text",
 })
 HUMAN_REVIEW_CLASSES = (
-    NORMALIZED_EQUAL_CLASSES | WEAK_QUEUE_CLASSES | REPORT_ONLY_CLASSES
+    NORMALIZED_EQUAL_CLASSES | EPUB_EQUAL_CLASSES | WEAK_QUEUE_CLASSES | REPORT_ONLY_CLASSES
     | frozenset({"exact_bytes"})
 )
 
@@ -329,6 +331,19 @@ def house_review_move(
                 or move_normalized != move["normalized_sha256"]
             ):
                 raise RuntimeError("house cleanup normalized SHA revalidation failed")
+        elif classification in EPUB_EQUAL_CLASSES:
+            move_epub = inspect_epub_content(move_path)
+            keep_epub = inspect_epub_content(keep_path)
+            move_evidence = move_epub.file_evidence
+            keep_evidence = keep_epub.file_evidence
+            if (
+                not move["normalized_sha256"]
+                or move["normalized_sha256"] != keep["normalized_sha256"]
+                or move_epub.content_sha256 != keep_epub.content_sha256
+                or move_epub.content_sha256 != move["normalized_sha256"]
+                or keep_epub.content_sha256 != keep["normalized_sha256"]
+            ):
+                raise RuntimeError("house cleanup EPUB SHA revalidation failed")
         else:
             move_evidence = inspect_regular_file(move_path)
             keep_evidence = inspect_regular_file(keep_path)
@@ -945,7 +960,7 @@ def _queue_candidate(
     if actual != expected:
         raise RuntimeError("queue review evidence does not match current pair")
 
-    strong = classification in NORMALIZED_EQUAL_CLASSES
+    strong = classification in STRONG_QUEUE_CLASSES
     source_evidence = None
     if exact_sha256 is not None:
         candidate_evidence = inspect_regular_file(candidate_path)
@@ -957,19 +972,34 @@ def _queue_candidate(
             raise RuntimeError("exact review current raw SHA-256 revalidation failed")
         source_evidence = candidate_evidence
     elif strong:
-        candidate_evidence, candidate_normalized = inspect_normalized_text(candidate_path)
-        reference_evidence, reference_normalized = inspect_normalized_text(
-            reference["canonical_path"]
-        )
-        if (
-            not candidate["normalized_sha256"]
-            or candidate["normalized_sha256"] != reference["normalized_sha256"]
-            or candidate_normalized != reference_normalized
-            or candidate_normalized != candidate["normalized_sha256"]
-            or reference_normalized != reference["normalized_sha256"]
-        ):
-            raise RuntimeError("strong queue current normalized SHA-256 revalidation failed")
-        source_evidence = candidate_evidence
+        if classification in EPUB_EQUAL_CLASSES:
+            candidate_epub = inspect_epub_content(candidate_path)
+            reference_epub = inspect_epub_content(reference["canonical_path"])
+            candidate_evidence = candidate_epub.file_evidence
+            reference_evidence = reference_epub.file_evidence
+            if (
+                not candidate["normalized_sha256"]
+                or candidate["normalized_sha256"] != reference["normalized_sha256"]
+                or candidate_epub.content_sha256 != reference_epub.content_sha256
+                or candidate_epub.content_sha256 != candidate["normalized_sha256"]
+                or reference_epub.content_sha256 != reference["normalized_sha256"]
+            ):
+                raise RuntimeError("strong queue EPUB SHA-256 revalidation failed")
+            source_evidence = candidate_evidence
+        else:
+            candidate_evidence, candidate_normalized = inspect_normalized_text(candidate_path)
+            reference_evidence, reference_normalized = inspect_normalized_text(
+                reference["canonical_path"]
+            )
+            if (
+                not candidate["normalized_sha256"]
+                or candidate["normalized_sha256"] != reference["normalized_sha256"]
+                or candidate_normalized != reference_normalized
+                or candidate_normalized != candidate["normalized_sha256"]
+                or reference_normalized != reference["normalized_sha256"]
+            ):
+                raise RuntimeError("strong queue current normalized SHA-256 revalidation failed")
+            source_evidence = candidate_evidence
     action = "suspected_move" if strong and managed_reference else "warning_move"
     destination = _unique_destination(queue_dir, candidate_path.name)
     source_evidence = source_evidence or inspect_regular_file(candidate_path)
