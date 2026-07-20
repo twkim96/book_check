@@ -40,6 +40,24 @@ class LibraryServerConfig:
     frontend_dist: Path
 
 
+def _open_state_db_readonly_keeper(state_db: Path):
+    """Prepare WAL sidecars, then keep one read-only connection alive.
+
+    Some macOS Python SQLite builds cannot be the first ``mode=ro`` opener of a
+    WAL database after the last writer removed ``-wal``/``-shm``.  A short
+    normal connection recreates only those SQLite coordination files.  Opening
+    the read-only keeper before closing the bootstrap connection makes all
+    request-scoped read-only connections reliable for the server lifetime.
+    """
+    bootstrap = decision_store.connect_state_db(state_db)
+    try:
+        bootstrap.execute("PRAGMA query_only = ON")
+        keeper = decision_store.connect_state_db_readonly(state_db)
+    finally:
+        bootstrap.close()
+    return keeper
+
+
 def _count_supported(root: Path, *, intake_only: bool = False) -> int:
     if not root.is_dir():
         return 0
@@ -168,6 +186,10 @@ def create_app(
         runtime_dir=Path(runtime_dir).expanduser().resolve(),
         frontend_dist=Path(frontend_dist).expanduser().resolve(),
     )
+    readonly_keeper = (
+        _open_state_db_readonly_keeper(config.state_db)
+        if config.state_db.is_file() else None
+    )
     store = JobStore(config.runtime_dir)
     store.mark_interrupted()
     runner = JobRunner(store)
@@ -212,6 +234,7 @@ def create_app(
 
     app = Flask(__name__)
     app.config["library_server_config"] = config
+    app.extensions["library_state_db_readonly_keeper"] = readonly_keeper
     app.extensions["library_review_registry"] = registry
     app.extensions["library_job_runner"] = runner
 

@@ -214,6 +214,58 @@ def test_missing_state_db_returns_structured_service_error(tmp_path):
     assert response.get_json()["error"]["code"] == "missing_resource"
 
 
+def test_server_bootstraps_wal_before_opening_readonly_keeper(tmp_path, monkeypatch):
+    state_db = tmp_path / "state.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    conn.close()
+    events = []
+    writer_open = False
+    real_writer = decision_store.connect_state_db
+    real_reader = decision_store.connect_state_db_readonly
+
+    class TrackedWriter:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def close(self):
+            nonlocal writer_open
+            events.append("writer_close")
+            writer_open = False
+            self.connection.close()
+
+    def open_writer(path, *args, **kwargs):
+        nonlocal writer_open
+        events.append("writer_open")
+        writer_open = True
+        return TrackedWriter(real_writer(path, *args, **kwargs))
+
+    def open_reader(path, *args, **kwargs):
+        assert writer_open is True
+        events.append("reader_open")
+        return real_reader(path, *args, **kwargs)
+
+    monkeypatch.setattr(decision_store, "connect_state_db", open_writer)
+    monkeypatch.setattr(decision_store, "connect_state_db_readonly", open_reader)
+    app = create_app(
+        state_db=state_db,
+        house_dir=tmp_path / "house",
+        temp_dir=tmp_path / "temp",
+        index_path=tmp_path / "index.json",
+        runtime_dir=tmp_path / "runtime",
+        frontend_dist=tmp_path / "dist",
+    )
+
+    keeper = app.extensions["library_state_db_readonly_keeper"]
+    try:
+        assert keeper.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+        assert events == ["writer_open", "reader_open", "writer_close"]
+    finally:
+        keeper.close()
+
+
 def test_readonly_connection_retries_a_transient_open_failure(tmp_path, monkeypatch):
     state_db = tmp_path / "state.sqlite3"
     conn = sqlite3.connect(state_db)
