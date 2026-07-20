@@ -970,7 +970,7 @@ def test_platform_entry_backs_up_before_explicit_schema_migration(tmp_path):
         before.close()
     current = decision_store.initialize_state_db(state_db)
     try:
-        assert current.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert current.execute("PRAGMA user_version").fetchone()[0] == decision_store.SCHEMA_VERSION
         assert current.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'file_analysis'"
         ).fetchone()[0] == 1
@@ -1004,9 +1004,33 @@ def test_v9_migration_and_file_metadata_sync_backfill_active_house_files(tmp_pat
         row = current.execute("SELECT * FROM file_analysis").fetchone()
         assert row["core_title"] == "부제목"
         assert row["catalog_query_title"] == "합성 메인 제목: 부제목"
-        assert current.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert current.execute("PRAGMA user_version").fetchone()[0] == decision_store.SCHEMA_VERSION
     finally:
         current.close()
+
+
+def test_v10_migration_adds_title_override_column_only_with_explicit_permission(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        conn.execute("ALTER TABLE file_analysis DROP COLUMN title_override_json")
+        conn.execute("PRAGMA user_version = 10")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="migration required"):
+        decision_store.initialize_state_db(state_db)
+
+    migrated = decision_store.initialize_state_db(state_db, migrate=True)
+    try:
+        columns = {
+            row[1] for row in migrated.execute("PRAGMA table_info(file_analysis)")
+        }
+        assert "title_override_json" in columns
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 11
+    finally:
+        migrated.close()
 
 
 def test_catalog_title_discovery_reads_file_analysis_without_reparsing(tmp_path, monkeypatch):

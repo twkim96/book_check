@@ -9,6 +9,7 @@ from tqdm import tqdm
 from normalizer import (
     add_pass_marker,
     get_chosung,
+    materialize_title_literals,
     normalize_filename,
     should_exclude_dir,
     strip_pass_marker,
@@ -372,8 +373,8 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                 # normalize_filename(_→공백 치환)이 돌기 전에 미리 떼어낸다.
                 raw_name = strip_trash_suffix(item)
 
-                clean_name = normalize_filename(raw_name)
-                if not clean_name:
+                transport_name = normalize_filename(raw_name)
+                if not transport_name:
                     failure_count += 1
                     f_log.write(
                         f"[{now_str}] {src_path} | 이름이 비어있어 실패 | "
@@ -383,6 +384,12 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
 
                 is_dir = os.path.isdir(src_path)
                 is_file = os.path.isfile(src_path)
+                # ``[[...]]``는 제목 교정 정보를 temp의 새 file_id로 운반하는
+                # 표시다. 중복 감사가 끝난 뒤 house 파일명에서는 괄호만 제거한다.
+                clean_name = (
+                    materialize_title_literals(transport_name)
+                    if is_file else transport_name
+                )
                 ext = os.path.splitext(clean_name)[1].lower()
 
                 if is_file and ext not in SUPPORTED_EXTENSIONS:

@@ -17,7 +17,7 @@ from typing import Mapping, Optional, Sequence
 
 import decision_store
 from mutation_io import mutation_lock_for_roots
-from normalizer import get_chosung
+from normalizer import extract_author, get_chosung
 from volume_group_mutations import (
     cleanup_staging,
     merge_staged_volume_group,
@@ -124,6 +124,10 @@ def _source_revision(rows: Sequence[Mapping[str, object]]) -> str:
             "volume_num": row["volume_num"],
             "volume_den": row["volume_den"],
             "coordinate_symbol": row["coordinate_symbol"],
+            "author": row["author"],
+            "effective_max": row["effective_max"],
+            "unit": row["unit"],
+            "complete": row["complete"],
         }
         for row in sorted(rows, key=lambda item: str(item["file_id"]))
     ]
@@ -137,7 +141,7 @@ def _source_revision(rows: Sequence[Mapping[str, object]]) -> str:
 def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
-        return conn.execute(
+        rows = conn.execute(
             """
             SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns,
                    f.dev, f.ino, f.ctime_ns, f.current_fingerprint_id,
@@ -146,7 +150,8 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
                    f.volume_num, f.volume_den, f.coordinate_symbol,
                    f.coordinate_sort_key, f.coordinate_raw, f.span_ambiguous,
                    fa.analyzed_name, fa.core_title, fa.readable_title,
-                   fa.author, fa.disambig, fa.updated_at AS analysis_updated_at,
+                   fa.author, fa.disambig, fa.effective_max, fa.unit,
+                   fa.complete, fa.updated_at AS analysis_updated_at,
                    v.work_bucket_id,
                    CASE WHEN rep.file_id IS NULL THEN 0 ELSE 1 END AS representative
             FROM files AS f
@@ -158,8 +163,68 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
             ORDER BY fa.core_title COLLATE NOCASE, f.canonical_path COLLATE NOCASE
             """
         ).fetchall()
+        return [
+            {
+                **dict(row),
+                # Re-evaluate with the current parser so the review screen does
+                # not wait for a full scanner pass after an author-rule fix.
+                "author": extract_author(str(row["analyzed_name"])),
+            }
+            for row in rows
+        ]
     finally:
         conn.close()
+
+
+def _is_parallel_side_story_formats(rows: Sequence[Mapping[str, object]]) -> bool:
+    """Return whether one completed side story is stored in multiple formats."""
+
+    if len(rows) < 2 or any(
+        row["coordinate_kind"] != "symbol"
+        or row["coordinate_symbol"] != "side_story"
+        or not bool(row["complete"])
+        or int(row["effective_max"] or 0) <= 0
+        for row in rows
+    ):
+        return False
+    stems = {
+        unicodedata.normalize(
+            "NFC", Path(str(row["canonical_path"])).stem
+        ).casefold()
+        for row in rows
+    }
+    extensions = {
+        Path(str(row["canonical_path"])).suffix.lower() for row in rows
+    }
+    coverage = {
+        (int(row["effective_max"]), str(row["unit"] or "")) for row in rows
+    }
+    authors = {str(row["author"] or "") for row in rows}
+    return (
+        len(stems) == 1
+        and len(extensions) == len(rows)
+        and "" not in extensions
+        and len(coverage) == 1
+        and len(authors) == 1
+    )
+
+
+def _has_incompatible_coordinate_kinds(rows: Sequence[Mapping[str, object]]) -> bool:
+    """Allow ordinary volumes/parts plus a side story in one work folder."""
+
+    main_kinds = {
+        str(row["coordinate_kind"])
+        for row in rows
+        if row["coordinate_kind"] != "symbol"
+    }
+    if len(main_kinds) > 1:
+        return True
+    return any(
+        row["coordinate_kind"] == "symbol"
+        and row["coordinate_symbol"] != "side_story"
+        and bool(main_kinds)
+        for row in rows
+    )
 
 
 def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house_dir: Path) -> dict:
@@ -167,6 +232,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     house_dir = Path(house_dir).expanduser().resolve()
     coordinates = []
     coordinate_labels = {}
+    rows_by_coordinate = defaultdict(list)
     items = []
     parents = set()
     parent_paths = set()
@@ -176,6 +242,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         sort_key, coordinate_label, coordinate_key = _coordinate(row)
         coordinates.append(coordinate_key)
         coordinate_labels[coordinate_key] = coordinate_label
+        rows_by_coordinate[coordinate_key].append(row)
         relative_parent, inside = _relative_parent(path, house_dir)
         outside_house = outside_house or not inside
         parents.add(relative_parent)
@@ -192,6 +259,12 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
                 "coordinate_kind": row["coordinate_kind"],
                 "coordinate": coordinate_label,
                 "coordinate_sort": [str(part) for part in sort_key],
+                "coordinate_raw": row["coordinate_raw"],
+                "effective_max": row["effective_max"],
+                "unit": row["unit"],
+                "complete": bool(row["complete"]),
+                "span_ambiguous": bool(row["span_ambiguous"]),
+                "_coordinate_key": coordinate_key,
                 "_sort_key": sort_key,
                 "assignment_state": row["assignment_state"],
                 "variant_id": row["variant_id"],
@@ -200,13 +273,21 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
                 "representative": bool(row["representative"]),
             }
         )
-    items.sort(key=lambda item: (item["_sort_key"], item["name"], item["file_id"]))
-    for item in items:
-        item.pop("_sort_key")
-
     coordinate_counts = Counter(coordinates)
+    repeated_coordinate_keys = {
+        key for key, count in coordinate_counts.items() if count > 1
+    }
+    parallel_format_keys = {
+        key
+        for key in repeated_coordinate_keys
+        if _is_parallel_side_story_formats(rows_by_coordinate[key])
+    }
     duplicate_coordinates = sorted(
-        coordinate_labels[key] for key, count in coordinate_counts.items() if count > 1
+        coordinate_labels[key]
+        for key in repeated_coordinate_keys - parallel_format_keys
+    )
+    parallel_format_coordinates = sorted(
+        coordinate_labels[key] for key in parallel_format_keys
     )
     kinds = {str(row["coordinate_kind"]) for row in rows}
     authors = sorted({str(row["author"]) for row in rows if row["author"]})
@@ -223,15 +304,39 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
                     f"{number}권" for number in range(1, maximum + 1) if Fraction(number) not in values
                 ]
 
+    incompatible_coordinate_kinds = _has_incompatible_coordinate_kinds(rows)
+    conflicting_coordinate_keys = repeated_coordinate_keys - parallel_format_keys
+    for item in items:
+        item_issues = []
+        coordinate_key = item["_coordinate_key"]
+        if coordinate_key in conflicting_coordinate_keys:
+            item_issues.append("duplicate_coordinate")
+        if incompatible_coordinate_kinds:
+            item_issues.append("mixed_coordinate_kind")
+        if len(authors) > 1:
+            item_issues.append("author_conflict")
+        if len(work_ids) > 1:
+            item_issues.append("work_conflict")
+        if item["span_ambiguous"]:
+            item_issues.append("ambiguous_coordinate")
+        item["same_coordinate_count"] = coordinate_counts[coordinate_key]
+        item["issues"] = item_issues
+    items.sort(key=lambda item: (item["_sort_key"], item["name"], item["file_id"]))
+    for item in items:
+        item.pop("_sort_key")
+        item.pop("_coordinate_key")
+
     blockers = []
     if not any(character.isalpha() for character in core_title):
         blockers.append("non_title_core")
-    if len(kinds) != 1:
+    if incompatible_coordinate_kinds:
         blockers.append("mixed_coordinate_kind")
     if duplicate_coordinates:
         blockers.append("duplicate_coordinate")
-    if missing_coordinates:
-        blockers.append("missing_coordinate")
+    # A missing volume is useful review information, but it is not a conflict.
+    # Keep the gap visible so a user can spot an incomplete set while allowing
+    # the known, non-overlapping volumes to share one work folder.  A later
+    # Folderling intake can then fill the gap or append a newer volume.
     if len(authors) > 1:
         blockers.append("author_conflict")
     if len(work_ids) > 1:
@@ -287,6 +392,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         "coordinate_kinds": sorted(kinds),
         "coordinate_range": [items[0]["coordinate"], items[-1]["coordinate"]],
         "duplicate_coordinates": duplicate_coordinates,
+        "parallel_format_coordinates": parallel_format_coordinates,
         "missing_coordinates": missing_coordinates,
         "authors": authors,
         "work_bucket_ids": work_ids,
@@ -419,6 +525,7 @@ def preview_volume_group(
     source_revision: str,
     selected_file_ids: Optional[Sequence[str]] = None,
     target_folder_name: Optional[str] = None,
+    allow_duplicate_coordinates: bool = False,
 ) -> dict:
     case = get_volume_case(state_db, house_dir=house_dir, case_id=case_id)
     selected = set(
@@ -439,6 +546,8 @@ def preview_volume_group(
         item for item in case["items"] if item["file_id"] in selected
     ]
     blockers = list(selected_case["blocked_reasons"] if selected_case else [])
+    if allow_duplicate_coordinates:
+        blockers = [reason for reason in blockers if reason != "duplicate_coordinate"]
     if source_revision != case["source_revision"]:
         blockers.append("source_revision_stale")
     if len(items) < 2:
@@ -495,6 +604,7 @@ def preview_volume_group(
         "source_revision": case["source_revision"],
         "selected_file_ids": [item["file_id"] for item in items],
         "target_folder_name": folder_name,
+        "allow_duplicate_coordinates": bool(allow_duplicate_coordinates),
         "destination_root": str(destination_root),
         "tree": tree,
         "moved_count": moved_count,
@@ -526,6 +636,7 @@ def apply_volume_plan(
     source_revision: str,
     selected_file_ids: Optional[Sequence[str]],
     target_folder_name: Optional[str],
+    allow_duplicate_coordinates: bool = False,
     confirm_count: int,
     confirm_plan_sha256: str,
     progress=None,
@@ -543,6 +654,7 @@ def apply_volume_plan(
             source_revision=source_revision,
             selected_file_ids=selected_file_ids,
             target_folder_name=target_folder_name,
+            allow_duplicate_coordinates=allow_duplicate_coordinates,
         )
         if not plan["apply_available"]:
             raise RuntimeError(

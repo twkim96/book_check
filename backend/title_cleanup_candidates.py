@@ -62,7 +62,7 @@ def _logical_snapshot(conn: sqlite3.Connection) -> Dict[str, str]:
         "file_analysis": _hash_rows(conn.execute(
             """
             SELECT file_id, normalizer_version, analyzed_name, core_title,
-                   readable_title, catalog_query_title, analyzed_size,
+                   readable_title, catalog_query_title, title_override_json, analyzed_size,
                    analyzed_mtime_ns, analyzed_ctime_ns
             FROM file_analysis ORDER BY file_id
             """
@@ -138,7 +138,8 @@ def _candidate_rows(conn: sqlite3.Connection, states: Mapping[str, dict]) -> Lis
         """
         SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns,
                a.analyzed_name, a.normalizer_version,
-               a.readable_title, a.catalog_query_title, a.core_title
+               a.readable_title, a.catalog_query_title, a.core_title,
+               a.title_override_json
         FROM files AS f
         JOIN file_analysis AS a ON a.file_id = f.file_id
         WHERE f.active = 1 AND f.source = 'house'
@@ -147,6 +148,10 @@ def _candidate_rows(conn: sqlite3.Connection, states: Mapping[str, dict]) -> Lis
     ).fetchall()
     candidates = []
     for row in rows:
+        # 사용자 literal 제목은 자동 정리 규칙보다 우선한다. 다시 바꾸려면
+        # 1.2.8 제목 교정 화면에서 사용자가 명시적으로 수정한다.
+        if row["title_override_json"]:
+            continue
         proposal = apply_title_cleanup_rules(row["analyzed_name"])
         if not proposal.matched:
             continue

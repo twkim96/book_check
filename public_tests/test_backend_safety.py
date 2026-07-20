@@ -7,6 +7,8 @@ from normalizer import (
     extract_catalog_query_title,
     extract_readable_title,
     has_pass_marker,
+    materialize_title_literals,
+    title_literal_syntax_error,
 )
 
 
@@ -43,6 +45,32 @@ def test_new_completion_prefix_is_removed_without_touching_real_numeric_title():
     assert analyze_name(tagged)["core_title"] == "출근중사건발생보고서"
     assert analyze_name("19호실의 비밀 1-50화 완결.txt")["core_title"] == "19호실의비밀"
     assert analyze_name("작품명(작가명) 1-100 완.txt")["core_title"] == "작품명"
+
+
+def test_single_character_noise_tag_does_not_hide_real_trailing_author():
+    name = (
+        "노 게임·노 라이프 (게이머 남매는 한 턴 쉬겠다는데요) "
+        "── 9권 (카미야 유우).epub"
+    )
+    assert analyze_name(name)["author"] == "카미야 유우"
+    assert analyze_name("노 게임 노 라이프 1권 (카미야 유우).epub")["author"] == "카미야 유우"
+
+
+def test_user_title_literal_preserves_real_noise_word_without_becoming_metadata():
+    name = "[[19금]] 떡타지의 주인공 친구가 되었다 [스투피르] 0-631 완.txt"
+    info = analyze_name(name)
+    assert info["core_title"] == "19금떡타지의주인공친구가되었다"
+    assert info["author"] == "스투피르"
+    assert info["effective_max"] == 631
+    assert info["complete"] is True
+    assert info["title_literal_tokens"] == ("19금",)
+    assert extract_catalog_query_title(name) == "19금 떡타지의 주인공 친구가 되었다"
+    assert materialize_title_literals(name) == (
+        "19금 떡타지의 주인공 친구가 되었다 [스투피르] 0-631 완.txt"
+    )
+    assert title_literal_syntax_error(name) is None
+    assert title_literal_syntax_error("[[19금] 제목.txt") is not None
+    assert title_literal_syntax_error("[[   ]] 제목.txt") is not None
 
 
 def test_dry_run_never_removes_exact_duplicate_fixture(tmp_path):

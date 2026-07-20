@@ -25,6 +25,8 @@ def _fixture(tmp_path):
         _add_file(conn, house / "ㅈ" / "중복 작품 1권.epub")
         _add_file(conn, house / "ㄴ" / "누락 작품 1권.txt")
         _add_file(conn, house / "ㄴ" / "누락 작품 3권.txt")
+        _add_file(conn, house / "ㅎ" / "형식 작품 1-182 외전 완 [한작가].txt")
+        _add_file(conn, house / "ㅎ" / "형식 작품 1-182 외전 완 [한작가].epub")
         numeric_rows = [
             _add_file(conn, house / "숫자" / "24 1권.txt"),
             _add_file(conn, house / "숫자" / "24 2권.txt"),
@@ -51,17 +53,27 @@ def test_volume_inventory_classifies_without_mutating_files(tmp_path):
     cases = _by_title(listing)
 
     assert listing["readonly"] is False
-    assert listing["total"] == 5
+    assert listing["total"] == 6
     assert listing["summary"] == {
         "already_grouped": 1,
-        "auto_ready": 1,
+        "auto_ready": 3,
         "excluded": 1,
-        "review_required": 2,
+        "review_required": 1,
     }
     assert cases["우주도서"]["classification"] == "auto_ready"
     assert cases["도시이야기"]["classification"] == "already_grouped"
     assert cases["중복작품"]["blocked_reasons"] == ["duplicate_coordinate"]
+    assert all(
+        item["issues"] == ["duplicate_coordinate"]
+        and item["same_coordinate_count"] == 2
+        for item in cases["중복작품"]["items"]
+    )
     assert cases["누락작품"]["missing_coordinates"] == ["2권"]
+    assert cases["누락작품"]["blocked_reasons"] == []
+    assert cases["누락작품"]["plan_ready"] is True
+    assert cases["형식작품"]["classification"] == "auto_ready"
+    assert cases["형식작품"]["duplicate_coordinates"] == []
+    assert cases["형식작품"]["parallel_format_coordinates"] == ["side_story"]
     assert cases["24"]["classification"] == "excluded"
 
     after = sorted(str(path.relative_to(house)) for path in house.rglob("*") if path.is_file())
@@ -71,7 +83,11 @@ def test_volume_inventory_classifies_without_mutating_files(tmp_path):
 def test_volume_preview_is_revision_bound_and_confirmation_ready(tmp_path):
     state_db, house = _fixture(tmp_path)
     listing = list_volume_cases(
-        state_db, house_dir=house, classification="auto_ready", limit=10
+        state_db,
+        house_dir=house,
+        search="우주 도서",
+        classification="auto_ready",
+        limit=10,
     )
     [case] = listing["items"]
     preview = preview_volume_group(
@@ -95,6 +111,88 @@ def test_volume_preview_is_revision_bound_and_confirmation_ready(tmp_path):
     )
     assert stale["plan_ready"] is False
     assert "source_revision_stale" in stale["blocked_reasons"]
+
+
+def test_volume_preview_allows_missing_coordinates(tmp_path):
+    state_db, house = _fixture(tmp_path)
+    listing = list_volume_cases(
+        state_db,
+        house_dir=house,
+        search="누락 작품",
+        classification="auto_ready",
+        limit=10,
+    )
+    [case] = listing["items"]
+
+    preview = preview_volume_group(
+        state_db,
+        house_dir=house,
+        case_id=case["case_id"],
+        source_revision=case["source_revision"],
+    )
+
+    assert case["missing_coordinates"] == ["2권"]
+    assert preview["blocked_reasons"] == []
+    assert preview["apply_available"] is True
+
+
+def test_side_story_parallel_formats_conflict_when_coverage_differs(tmp_path):
+    state_db, house = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        epub = conn.execute(
+            "SELECT file_id FROM files WHERE canonical_path LIKE ?",
+            ("%형식 작품%.epub",),
+        ).fetchone()
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE file_analysis SET effective_max = 181 WHERE file_id = ?",
+                (epub["file_id"],),
+            )
+    finally:
+        conn.close()
+
+    listing = list_volume_cases(
+        state_db,
+        house_dir=house,
+        search="형식 작품",
+        classification="review_required",
+        limit=10,
+    )
+    [case] = listing["items"]
+
+    assert case["duplicate_coordinates"] == ["side_story"]
+    assert case["parallel_format_coordinates"] == []
+    assert case["blocked_reasons"] == ["duplicate_coordinate"]
+
+
+def test_volume_and_side_story_are_a_compatible_group(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add_file(conn, house / "ㄷ" / "다정한 작품 1권 [한작가].epub")
+        _add_file(conn, house / "ㄷ" / "다정한 작품 2권 [한작가].epub")
+        _add_file(conn, house / "ㄷ" / "다정한 작품 외전 [한작가].epub")
+    finally:
+        conn.close()
+
+    listing = list_volume_cases(
+        state_db,
+        house_dir=house,
+        search="다정한 작품",
+        classification="auto_ready",
+        limit=10,
+    )
+    [case] = listing["items"]
+
+    assert case["coordinate_kinds"] == ["symbol", "volume"]
+    assert case["blocked_reasons"] == []
+    assert case["plan_ready"] is True
+    assert {item["author"] for item in case["items"]} == {"한작가"}
+    assert {item["coordinate"] for item in case["items"]} == {"1권", "2권", "side_story"}
+    assert all(item["issues"] == [] for item in case["items"])
 
 
 def test_volume_preview_reuses_existing_group_folder(tmp_path):
@@ -121,18 +219,18 @@ def test_volume_listing_search_filter_and_cursor(tmp_path):
         state_db,
         house_dir=house,
         search="작품",
-        classification="review_required",
+        classification="all",
         limit=1,
         sort="title",
     )
-    assert result["total"] == 2
+    assert result["total"] == 3
     assert len(result["items"]) == 1
     assert result["next_cursor"]
     second = list_volume_cases(
         state_db,
         house_dir=house,
         search="작품",
-        classification="review_required",
+        classification="all",
         limit=1,
         sort="title",
         cursor=result["next_cursor"],

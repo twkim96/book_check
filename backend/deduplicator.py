@@ -218,6 +218,10 @@ def load_index_entries(
         # 핵심 분류 필드는 항상 현재 normalizer 결과를 우선한다.
         # name/rel_path/size 같은 파일시스템 메타만 index/stat 값을 사용.
         info = analyze_name(name)
+        if entry.get("title_override") and entry.get("core_title"):
+            # Scanner가 DB의 사용자 제목 override를 검증해 기록한 경우에만
+            # 깨끗한 실제 파일명에서 다시 제거된 제목보다 인덱스 key를 우선한다.
+            info["core_title"] = str(entry["core_title"])
         try:
             size = os.path.getsize(path)
         except OSError:

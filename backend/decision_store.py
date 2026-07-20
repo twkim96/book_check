@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS file_analysis (
     core_title TEXT NOT NULL,
     readable_title TEXT NOT NULL,
     catalog_query_title TEXT NOT NULL,
+    title_override_json TEXT,
     author TEXT,
     max_number INTEGER NOT NULL CHECK (max_number >= 0),
     effective_max INTEGER NOT NULL CHECK (effective_max >= 0),
@@ -755,6 +756,26 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 10")
         conn.commit()
         version = 10
+    if version == 10:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(file_analysis)")}
+        if "title_override_json" not in columns:
+            conn.execute("ALTER TABLE file_analysis ADD COLUMN title_override_json TEXT")
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v11 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute("DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')")
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 11")
+        conn.commit()
+        version = 11
     validate_schema(conn)
     return conn
 
@@ -779,6 +800,12 @@ def validate_schema(conn: sqlite3.Connection) -> None:
     missing_views = REQUIRED_VIEWS - views
     if missing_views:
         raise RuntimeError(f"schema views missing: {sorted(missing_views)}")
+
+    analysis_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(file_analysis)")
+    }
+    if "title_override_json" not in analysis_columns:
+        raise RuntimeError("file_analysis.title_override_json is missing")
 
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if integrity != "ok":
@@ -2630,12 +2657,17 @@ def build_file_analysis(name: str) -> dict:
 
     analyzed_name = normalize_nfc(name)
     info = analyze_name(analyzed_name)
+    literal_tokens = tuple(info.get("title_literal_tokens") or ())
     return {
         "normalizer_version": NORMALIZER_VERSION,
         "analyzed_name": analyzed_name,
         "core_title": str(info.get("core_title") or "").strip(),
         "readable_title": extract_readable_title(analyzed_name).strip(),
         "catalog_query_title": extract_catalog_query_title(analyzed_name).strip(),
+        "title_override_json": (
+            json.dumps(literal_tokens, ensure_ascii=False, separators=(",", ":"))
+            if literal_tokens else None
+        ),
         "author": info.get("author"),
         "max_number": int(info.get("max_number") or 0),
         "effective_max": int(info.get("effective_max") or 0),
@@ -2649,11 +2681,40 @@ def build_file_analysis(name: str) -> dict:
     }
 
 
+def _effective_file_analysis(current, analysis: dict) -> dict:
+    """Preserve a human literal-title override after its transport markers are gone."""
+    effective = dict(analysis)
+    if effective.get("title_override_json"):
+        return effective
+    if current is not None and current["title_override_json"]:
+        effective.update({
+            "core_title": current["core_title"],
+            "readable_title": current["readable_title"],
+            "catalog_query_title": current["catalog_query_title"],
+            "title_override_json": current["title_override_json"],
+        })
+    return effective
+
+
+def build_effective_file_analysis(
+    conn: sqlite3.Connection, file_id: str, name: str
+) -> dict:
+    """Build filename metadata while honoring an existing user title override."""
+    current = conn.execute(
+        "SELECT * FROM file_analysis WHERE file_id = ?", (file_id,)
+    ).fetchone()
+    return _effective_file_analysis(current, build_file_analysis(name))
+
+
 def _file_analysis_current(row, analysis: dict, stat_result) -> bool:
     return bool(
         row
         and row["normalizer_version"] == analysis["normalizer_version"]
         and row["analyzed_name"] == analysis["analyzed_name"]
+        and row["core_title"] == analysis["core_title"]
+        and row["readable_title"] == analysis["readable_title"]
+        and row["catalog_query_title"] == analysis["catalog_query_title"]
+        and row["title_override_json"] == analysis.get("title_override_json")
         and row["analyzed_size"] == stat_result.st_size
         and row["analyzed_mtime_ns"] == stat_result.st_mtime_ns
         and (
@@ -2674,26 +2735,29 @@ def upsert_file_analysis(
     """Store one file's derived title metadata; return whether the row changed."""
     canonical_path = canonicalize_path(path)
     stat_result = stat_result or os.stat(canonical_path, follow_symlinks=False)
-    analysis = analysis or build_file_analysis(Path(canonical_path).name)
     current = conn.execute(
         "SELECT * FROM file_analysis WHERE file_id = ?", (file_id,)
     ).fetchone()
+    analysis = _effective_file_analysis(
+        current, analysis or build_file_analysis(Path(canonical_path).name)
+    )
     if _file_analysis_current(current, analysis, stat_result):
         return False
     conn.execute(
         """
         INSERT INTO file_analysis(
             file_id, normalizer_version, analyzed_name,
-            core_title, readable_title, catalog_query_title, author,
+            core_title, readable_title, catalog_query_title, title_override_json, author,
             max_number, effective_max, unit, complete, disambig,
             analyzed_size, analyzed_mtime_ns, analyzed_ctime_ns
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(file_id) DO UPDATE SET
             normalizer_version = excluded.normalizer_version,
             analyzed_name = excluded.analyzed_name,
             core_title = excluded.core_title,
             readable_title = excluded.readable_title,
             catalog_query_title = excluded.catalog_query_title,
+            title_override_json = excluded.title_override_json,
             author = excluded.author,
             max_number = excluded.max_number,
             effective_max = excluded.effective_max,
@@ -2712,6 +2776,7 @@ def upsert_file_analysis(
             analysis["core_title"],
             analysis["readable_title"],
             analysis["catalog_query_title"],
+            analysis.get("title_override_json"),
             analysis.get("author"),
             analysis["max_number"],
             analysis["effective_max"],
@@ -2989,7 +3054,9 @@ def sync_active_file_analysis(
             stat_result = os.stat(path, follow_symlinks=False)
         except OSError as exc:
             raise RuntimeError(f"active house file is missing or unreadable: {path}: {exc}") from exc
-        analysis = build_file_analysis(Path(path).name)
+        analysis = build_effective_file_analysis(
+            conn, row["file_id"], Path(path).name
+        )
         previous = conn.execute(
             "SELECT core_title FROM file_analysis WHERE file_id = ?",
             (row["file_id"],),
@@ -3218,6 +3285,15 @@ def reconcile_file_metadata(
         upsert_file_analysis(
             conn, file_id, canonical_path, analysis=analysis, stat_result=stat
         )
+    elif source == "temp":
+        # ``[[...]]`` 제목 literal은 temp 운반 파일명에서 처음 발견된다.
+        # house 입고 때 같은 file_id가 유지되므로 여기서 override를 붙여 둔다.
+        temp_analysis = analysis or build_file_analysis(Path(canonical_path).name)
+        if temp_analysis.get("title_override_json"):
+            upsert_file_analysis(
+                conn, file_id, canonical_path,
+                analysis=temp_analysis, stat_result=stat,
+            )
 
     return conn.execute(
         """

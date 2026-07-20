@@ -1,6 +1,11 @@
+import json
+
 import decision_store
-from dedup_mutations import _ensure_intake_fingerprint, _file_state
+import deduplicator
+import duplicate_auditor
+from dedup_mutations import _ensure_intake_fingerprint, _file_state, ingest_to_house
 from mutation_io import inspect_regular_file
+from scanner import generate_file_list
 from title_review import (
     apply_title_plan,
     build_title_plan,
@@ -104,6 +109,124 @@ def test_preview_preserves_extension_and_detects_stale_revision(tmp_path):
     )
     assert stale["runnable"] is False
     assert "source_revision_stale" in stale["blocked_reasons"]
+
+
+def test_preview_title_literal_shows_clean_final_name_and_platform_query(tmp_path):
+    state_db, house, temp, editable_id, _ = _fixture(tmp_path)
+    [case] = list_title_cases(state_db)["items"]
+    preview = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=editable_id,
+        new_body="[[19금]] 떡타지의 주인공 친구가 되었다 [스투피르] 0-631 완",
+        source_revision=case["source_revision"],
+    )
+    assert preview["runnable"] is True
+    assert preview["candidate_name"].startswith("[[19금]]")
+    assert preview["materialized_candidate_name"] == (
+        "19금 떡타지의 주인공 친구가 되었다 [스투피르] 0-631 완.txt"
+    )
+    assert preview["after_core_title"] == "19금떡타지의주인공친구가되었다"
+    assert preview["after_query_title"] == "19금 떡타지의 주인공 친구가 되었다"
+    assert preview["after_author"] == "스투피르"
+    assert preview["after_effective_max"] == 631
+    assert preview["title_literal_tokens"] == ["19금"]
+
+    malformed = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=editable_id,
+        new_body="[[19금] 잘못된 표시",
+        source_revision=case["source_revision"],
+    )
+    assert malformed["runnable"] is False
+    assert any(reason.startswith("invalid_new_name:") for reason in malformed["blocked_reasons"])
+
+
+def test_title_literal_override_survives_clean_house_name_and_scanner(tmp_path):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    marked = temp / "[[19금]] 떡타지의 주인공 친구가 되었다 [스투피르] 0-631 완.txt"
+    marked.write_text("보호 제목 합성 본문 " * 100, encoding="utf-8")
+
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            source = decision_store.reconcile_file_metadata(conn, marked, source="temp")
+        file_id = source["file_id"]
+        saved = conn.execute(
+            "SELECT * FROM file_analysis WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        assert saved["core_title"] == "19금떡타지의주인공친구가되었다"
+        assert json.loads(saved["title_override_json"]) == ["19금"]
+        _ensure_intake_fingerprint(conn, _file_state(conn, file_id))
+        backup = state_db.parent / "backups" / "before-title-literal-ingest.sqlite3"
+        decision_store.backup_state_db(conn, backup)
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+
+    run_id, _ = decision_store.prepare_actual_run(state_db, house, temp)
+    destination_dir = house / "숫자"
+    destination_dir.mkdir()
+    destination = destination_dir / (
+        "19금 떡타지의 주인공 친구가 되었다 [스투피르] 0-631 완.txt"
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        ingest_to_house(
+            conn,
+            source_file_id=file_id,
+            destination=destination,
+            run_id=run_id,
+        )
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
+
+    assert destination.is_file()
+    assert not marked.exists()
+    index_path = tmp_path / "file_index.json"
+    assert generate_file_list(
+        [str(house)],
+        str(tmp_path / "file_list.json"),
+        str(index_path),
+        state_db_path=str(state_db),
+    ) is True
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    [entry] = [item for item in payload["entries"] if item["type"] == "file"]
+    assert entry["name"] == destination.name
+    assert entry["core_title"] == "19금떡타지의주인공친구가되었다"
+    assert entry["title_override"] is True
+    dedup_entries = deduplicator.load_index_entries(
+        str(house), str(index_path), allow_write=False
+    )
+    assert dedup_entries[0]["core_title"] == "19금떡타지의주인공친구가되었다"
+    audit_entries, invalid = duplicate_auditor.load_house_entries(
+        str(index_path), str(house)
+    )
+    assert invalid == []
+    assert audit_entries[0].core_title == "19금떡타지의주인공친구가되었다"
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        saved = conn.execute(
+            "SELECT * FROM file_analysis WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        assert saved["analyzed_name"] == destination.name
+        assert saved["catalog_query_title"] == "19금 떡타지의 주인공 친구가 되었다"
+        assert saved["author"] == "스투피르"
+        assert saved["effective_max"] == 631
+        assert json.loads(saved["title_override_json"]) == ["19금"]
+    finally:
+        conn.close()
 
 
 def test_user_title_plan_moves_only_selected_file_and_uses_new_identity(tmp_path):

@@ -30,6 +30,11 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat("ko-KR").format(value);
 }
 
+function formatBytes(value: number): string {
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function statusLabel(status: PlatformStatus): string {
   return {
     ok: "확인",
@@ -357,9 +362,10 @@ function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; o
       </div></td>
       <td>
         <div className="filename-input">
-          <input value={value} disabled={!item.editable} onChange={(event) => requestPreview(event.target.value)} placeholder="확장자 제외 새 파일명" />
+          <input value={value} disabled={!item.editable} onChange={(event) => requestPreview(event.target.value)} placeholder="확장자 제외 새 파일명 · 보존할 제목은 [[19금]]" />
           <span>{item.extension}</span>
         </div>
+        <small className="muted">등급·상태처럼 보이지만 실제 제목인 말은 <code>[[단어]]</code>로 보호합니다.</small>
         {draft?.loading && <small className="muted">분석 중…</small>}
         {draft?.error && <small className="blocked">{draft.error}</small>}
         {draft?.preview?.blocked_reasons.map((reason) => <small className="blocked" key={reason}>{reason}</small>)}
@@ -367,6 +373,9 @@ function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; o
       <td>
         {draft?.preview ? <>
           <code className={draft.preview.runnable ? "core core-new" : "core core-bad"}>{draft.preview.after_core_title || "-"}</code>
+          <small className="path">검색어: {draft.preview.after_query_title || "-"}</small>
+          <small className="path">{draft.preview.after_author ? `작가 ${draft.preview.after_author} · ` : ""}{draft.preview.after_effective_max ? `${draft.preview.after_effective_max}${draft.preview.after_unit}` : "범위 미상"}{draft.preview.after_complete ? " · 완결" : ""}</small>
+          {draft.preview.title_literal_tokens.length > 0 && <small className="safe-note">제목 보호: {draft.preview.title_literal_tokens.join(", ")} · 최종 파일명에서는 [[ ]] 제거</small>}
           {draft.preview.target_exists && <small className="collision">기존 core 존재{draft.preview.target_has_ok ? " · 플랫폼 정보 있음" : ""}</small>}
         </> : <span className="muted">입력 대기</span>}
       </td>
@@ -380,14 +389,14 @@ function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: b
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="plan-title">
         <span className="eyebrow">FINAL CONFIRMATION</span>
         <h2 id="plan-title">{plan.item_count}개 파일을 txt_temp로 보냅니다</h2>
-        <p>실제 파일명이 변경되고 기존 DB 행은 비활성 이력으로 남습니다. 다음 Folderling에서 전체 중복처리를 다시 수행합니다.</p>
+        <p>실제 파일명이 변경되고 기존 DB 행은 비활성 이력으로 남습니다. <code>[[ ]]</code> 표시는 temp에서만 보호값을 운반하고 다음 Folderling 입고 때 제거됩니다.</p>
         <div className="plan-summary">
           <span><small>대상</small><strong>{plan.item_count}</strong></span>
           <span><small>차단</small><strong>{plan.blocked_count}</strong></span>
           <span className="sha"><small>Plan SHA-256</small><code>{plan.plan_sha256}</code></span>
         </div>
         <div className="plan-list">
-          {plan.items.map((item) => <div key={item.file_id}><span>{item.current_name}</span><b>→</b><strong>{item.candidate_name}</strong></div>)}
+          {plan.items.map((item) => <div key={item.file_id}><span>{item.current_name}</span><b>→</b><strong>{item.materialized_candidate_name}</strong></div>)}
         </div>
         <footer>
           <button className="button secondary" disabled={busy} onClick={onClose}>취소</button>
@@ -407,7 +416,7 @@ const volumeClassLabels: Record<VolumeClassification, string> = {
 
 const volumeBlockerLabels: Record<string, string> = {
   non_title_core: "제목으로 보기 어려운 core",
-  mixed_coordinate_kind: "권·부·외전 좌표 혼합",
+  mixed_coordinate_kind: "권과 부 등 서로 다른 본편 좌표 체계 혼합",
   duplicate_coordinate: "같은 권 좌표 중복",
   missing_coordinate: "중간 권 누락",
   author_conflict: "작가 충돌",
@@ -429,6 +438,12 @@ const volumeBlockerLabels: Record<string, string> = {
 function VolumeClassBadge({ value }: { value: VolumeClassification }) {
   return <span className={`volume-class class-${value}`}>{volumeClassLabels[value]}</span>;
 }
+
+const volumeCoordinateLabels: Record<string, string> = {
+  volume: "권",
+  part: "부",
+  symbol: "외전/부속"
+};
 
 function VolumeReview() {
   const [listing, setListing] = useState<VolumeListing>();
@@ -526,6 +541,7 @@ function VolumeReview() {
                     {item.blocked_reasons.length === 0 ? <span className="safe-note">충돌 없음</span> : item.blocked_reasons.map((reason) => (
                       <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}</small>
                     ))}
+                    {item.duplicate_coordinates.length > 0 && <small className="collision">중복 좌표 {item.duplicate_coordinates.join(", ")}</small>}
                     {item.missing_coordinates.length > 0 && <small className="collision">누락 {item.missing_coordinates.slice(0, 8).join(", ")}{item.missing_coordinates.length > 8 ? "…" : ""}</small>}
                   </td>
                   <td><button className="button secondary" onClick={() => setActiveCase(item)}>구성 보기</button></td>
@@ -554,6 +570,7 @@ function VolumeReview() {
 function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: () => void }) {
   const [selected, setSelected] = useState(() => new Set(value.items.map((item) => item.file_id)));
   const [folderName, setFolderName] = useState(value.target_folder_name);
+  const [allowDuplicateCoordinates, setAllowDuplicateCoordinates] = useState(false);
   const [preview, setPreview] = useState<VolumePreview>();
   const [busy, setBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
@@ -568,7 +585,8 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
         case_id: value.case_id,
         source_revision: value.source_revision,
         selected_file_ids: [...selected],
-        target_folder_name: folderName
+        target_folder_name: folderName,
+        allow_duplicate_coordinates: allowDuplicateCoordinates
       }));
       setConfirmed(false);
     } catch (reason) {
@@ -589,6 +607,7 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
         source_revision: value.source_revision,
         selected_file_ids: preview.selected_file_ids,
         target_folder_name: preview.target_folder_name,
+        allow_duplicate_coordinates: preview.allow_duplicate_coordinates,
         confirm_count: preview.item_count,
         confirm_plan_sha256: preview.plan_sha256
       });
@@ -613,21 +632,38 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
       <label className="field-label">결과 폴더명
         <input value={folderName} onChange={(event) => { setFolderName(event.target.value); setPreview(undefined); setConfirmed(false); }} />
       </label>
-      <div className="volume-file-list">
-        {value.items.map((item) => <label key={item.file_id}>
-          <input type="checkbox" checked={selected.has(item.file_id)} onChange={(event) => {
-            setSelected((current) => {
-              const next = new Set(current);
-              if (event.target.checked) next.add(item.file_id); else next.delete(item.file_id);
-              return next;
-            });
-            setPreview(undefined);
-            setConfirmed(false);
-          }} />
-          <span><strong>{item.coordinate}</strong><b>{item.name}</b><small>{item.parent}</small></span>
-          <NavLink to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink>
-        </label>)}
+      <div className="volume-file-table-wrap">
+        <table className="volume-file-table">
+          <thead><tr><th>선택</th><th>원본 제목</th><th>좌표·분류</th><th>작가</th><th>파일</th><th>확인할 점</th><th>교정</th></tr></thead>
+          <tbody>{value.items.map((item) => <tr key={item.file_id}>
+            <td><input aria-label={`${item.name} 선택`} type="checkbox" checked={selected.has(item.file_id)} onChange={(event) => {
+              setSelected((current) => {
+                const next = new Set(current);
+                if (event.target.checked) next.add(item.file_id); else next.delete(item.file_id);
+                return next;
+              });
+              setPreview(undefined);
+              setConfirmed(false);
+            }} /></td>
+            <td><strong title={item.canonical_path}>{item.name}</strong><small>{item.parent}</small></td>
+            <td><b>{item.coordinate}</b><small>{volumeCoordinateLabels[item.coordinate_kind] ?? item.coordinate_kind}{item.complete ? " · 완결" : ""}</small></td>
+            <td>{item.author ?? <span className="muted-value">미상</span>}</td>
+            <td><b>{item.extension.replace(".", "").toUpperCase()}</b><small>{formatBytes(item.size)}</small></td>
+            <td>{item.issues.length === 0 ? <span className="safe-note">없음</span> : item.issues.map((reason) => (
+              <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}{reason === "duplicate_coordinate" ? ` (${item.same_coordinate_count}개)` : ""}</small>
+            ))}</td>
+            <td><NavLink to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink></td>
+          </tr>)}</tbody>
+        </table>
       </div>
+      {value.duplicate_coordinates.length > 0 && <label className="volume-override">
+        <input type="checkbox" checked={allowDuplicateCoordinates} onChange={(event) => {
+          setAllowDuplicateCoordinates(event.target.checked);
+          setPreview(undefined);
+          setConfirmed(false);
+        }} />
+        <span><strong>같은 좌표 파일도 서로 다른 판본으로 함께 보관</strong><small>중복 격리에서 동일 파일로 확정되지 않은 파일만 대상으로, 삭제하지 않고 같은 작품 폴더의 별도 variant로 연결합니다.</small></span>
+      </label>}
       {error && <div className="inline-error">{error}</div>}
       {preview && <div className="volume-tree">
         <div><strong>{preview.item_count}개 중 {preview.moved_count}개 이동</strong><code>{preview.plan_sha256}</code></div>

@@ -56,15 +56,15 @@ def suggest_folderling_volume_target(
     if source_row is None:
         return None
     source = dict(source_row)
+    current_source_analysis = decision_store.build_file_analysis(
+        Path(str(source["canonical_path"])).name
+    )
+    source["author"] = current_source_analysis["author"]
     if source["core_title"] is None:
-        analysis = decision_store.build_file_analysis(
-            Path(str(source["canonical_path"])).name
-        )
         source.update(
-            core_title=analysis["core_title"],
-            readable_title=analysis["readable_title"],
-            author=analysis["author"],
-            disambig=analysis["disambig"],
+            core_title=current_source_analysis["core_title"],
+            readable_title=current_source_analysis["readable_title"],
+            disambig=current_source_analysis["disambig"],
         )
     if (
         source["coordinate_kind"] not in {"volume", "part"}
@@ -76,30 +76,46 @@ def suggest_folderling_volume_target(
     if source_coordinate is None:
         return None
 
-    existing = conn.execute(
-        """
-        SELECT f.*, fa.readable_title, fa.author, fa.disambig, v.work_bucket_id
-        FROM files AS f
-        JOIN file_analysis AS fa ON fa.file_id = f.file_id
-        LEFT JOIN variants AS v ON v.variant_id = f.variant_id
-        WHERE f.active = 1 AND f.source = 'house' AND fa.core_title = ?
-        ORDER BY f.canonical_path
-        """,
-        (source["core_title"],),
-    ).fetchall()
+    existing = [
+        {
+            **dict(row),
+            "author": decision_store.build_file_analysis(
+                Path(str(row["canonical_path"])).name
+            )["author"],
+        }
+        for row in conn.execute(
+            """
+            SELECT f.*, fa.readable_title, fa.author, fa.disambig, v.work_bucket_id
+            FROM files AS f
+            JOIN file_analysis AS fa ON fa.file_id = f.file_id
+            LEFT JOIN variants AS v ON v.variant_id = f.variant_id
+            WHERE f.active = 1 AND f.source = 'house' AND fa.core_title = ?
+            ORDER BY f.canonical_path
+            """,
+            (source["core_title"],),
+        ).fetchall()
+    ]
     if not existing:
         return None
     if any(
-        row["coordinate_kind"] != source["coordinate_kind"]
+        (
+            row["coordinate_kind"] != source["coordinate_kind"]
+            and not (
+                row["coordinate_kind"] == "symbol"
+                and row["coordinate_symbol"] == "side_story"
+            )
+        )
         or row["span_ambiguous"]
         or int(row["disambig"] or 1) > 1
         for row in existing
     ):
         return None
-    coordinates = [_coordinate_key(row) for row in existing]
+    main_existing = [
+        row for row in existing
+        if row["coordinate_kind"] == source["coordinate_kind"]
+    ]
+    coordinates = [_coordinate_key(row) for row in main_existing]
     if None in coordinates or source_coordinate in coordinates:
-        return None
-    if len(coordinates) != len(set(coordinates)):
         return None
 
     authors = {str(row["author"]) for row in existing if row["author"]}
@@ -113,6 +129,15 @@ def suggest_folderling_volume_target(
         if row["work_bucket_id"] is not None
     }
     if len(works) > 1:
+        return None
+    if len(coordinates) != len(set(coordinates)) and not (
+        len(works) == 1
+        and all(
+            row["work_bucket_id"] is not None
+            and row["assignment_state"] == "managed"
+            for row in existing
+        )
+    ):
         return None
 
     parents = {Path(str(row["canonical_path"])).resolve().parent for row in existing}

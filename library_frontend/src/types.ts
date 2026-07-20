@@ -50,6 +50,7 @@ export interface TitlePreview {
   before_core_title: string;
   new_body: string;
   candidate_name: string;
+  materialized_candidate_name: string;
   destination_path: string;
   after_core_title: string;
   after_readable_title: string;
@@ -58,6 +59,7 @@ export interface TitlePreview {
   after_effective_max: number;
   after_unit: string;
   after_complete: boolean;
+  title_literal_tokens: string[];
   target_exists: boolean;
   target_has_ok: boolean;
   blocked_reasons: string[];
@@ -86,6 +88,13 @@ export interface VolumeItem {
   author: string | null;
   coordinate_kind: string;
   coordinate: string;
+  coordinate_raw: string | null;
+  effective_max: number;
+  unit: string;
+  complete: boolean;
+  span_ambiguous: boolean;
+  same_coordinate_count: number;
+  issues: string[];
   assignment_state: string;
   variant_id: number | null;
   work_bucket_id: number | null;
@@ -106,6 +115,7 @@ export interface VolumeCase {
   coordinate_kinds: string[];
   coordinate_range: [string, string];
   duplicate_coordinates: string[];
+  parallel_format_coordinates: string[];
   missing_coordinates: string[];
   authors: string[];
   work_bucket_ids: number[];
@@ -136,6 +146,7 @@ export interface VolumePreview {
   source_revision: string;
   selected_file_ids: string[];
   target_folder_name: string;
+  allow_duplicate_coordinates: boolean;
   destination_root: string;
   tree: string[];
   moved_count: number;

@@ -71,6 +71,7 @@ def _build_entry(path, base_dir, entry_type, decision_projection=None, analysis=
         "span_ambiguous": info["span_ambiguous"],
         "disambig": info["disambig"],
         "complete": info["complete"],
+        "title_override": bool(info.get("title_override")),
     }
 
     if entry_type == "file":
@@ -173,13 +174,19 @@ def get_file_entries(
                         legacy_marker = has_pass_marker(name) or read_disambig_marker(name) > 1
                         previous = decision_conn.execute(
                             """
-                            SELECT a.core_title
+                            SELECT f.file_id, a.core_title
                             FROM files AS f
                             JOIN file_analysis AS a ON a.file_id = f.file_id
                             WHERE f.canonical_path = ? AND f.active = 1
                             """,
                             (canonicalize_path(path),),
                         ).fetchone()
+                        if previous is not None:
+                            from decision_store import build_effective_file_analysis
+
+                            analysis = build_effective_file_analysis(
+                                decision_conn, previous["file_id"], name
+                            )
                         if previous is not None and previous["core_title"] != analysis["core_title"]:
                             analysis_rekeys.append(
                                 (previous["core_title"], analysis["core_title"])
@@ -191,6 +198,28 @@ def get_file_entries(
                             legacy_marker=legacy_marker,
                             analysis=analysis,
                         ))
+                        stored_analysis = decision_conn.execute(
+                            """
+                            SELECT core_title, readable_title, catalog_query_title,
+                                   author, max_number, effective_max, unit, complete,
+                                   disambig, title_override_json
+                            FROM file_analysis WHERE file_id = ?
+                            """,
+                            (projection["file_id"],),
+                        ).fetchone()
+                        if stored_analysis is not None:
+                            analysis.update({
+                                "core_title": stored_analysis["core_title"],
+                                "readable_title": stored_analysis["readable_title"],
+                                "catalog_query_title": stored_analysis["catalog_query_title"],
+                                "author": stored_analysis["author"],
+                                "max_number": stored_analysis["max_number"],
+                                "effective_max": stored_analysis["effective_max"],
+                                "unit": stored_analysis["unit"],
+                                "complete": bool(stored_analysis["complete"]),
+                                "disambig": stored_analysis["disambig"],
+                                "title_override": bool(stored_analysis["title_override_json"]),
+                            })
                         seen_file_ids.add(projection["file_id"])
                     if projection:
                         from decision_store import canonicalize_path

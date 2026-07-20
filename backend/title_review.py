@@ -18,8 +18,11 @@ from mutation_io import mutation_lock_for_roots
 from normalizer import (
     NORMALIZER_VERSION,
     analyze_name,
+    extract_title_literal_tokens,
     extract_catalog_query_title,
     extract_readable_title,
+    materialize_title_literals,
+    title_literal_syntax_error,
 )
 from title_review_mutations import EDITABLE_ASSIGNMENT_STATES, requeue_user_title_file
 
@@ -265,6 +268,9 @@ def _validated_new_body(value: object, extension: str) -> str:
         raise ValueError("새 파일명에 경로 구분자를 사용할 수 없습니다")
     if any(ord(char) < 32 for char in body):
         raise ValueError("새 파일명에 제어 문자를 사용할 수 없습니다")
+    literal_error = title_literal_syntax_error(body)
+    if literal_error:
+        raise ValueError(literal_error)
     if extension and body.lower().endswith(extension.lower()):
         raise ValueError("확장자는 입력하지 마세요. 기존 확장자가 자동 보존됩니다")
     materialized = body + extension
@@ -325,6 +331,7 @@ def preview_title_change(
             body = str(new_body or "")
             blockers.append(f"invalid_new_name:{exc}")
         candidate_name = body + current["extension"]
+        materialized_candidate_name = materialize_title_literals(candidate_name)
         if unicodedata.normalize("NFC", body) == unicodedata.normalize(
             "NFC", current["current_body"]
         ):
@@ -360,6 +367,7 @@ def preview_title_change(
         "before_core_title": current["core_title"],
         "new_body": body,
         "candidate_name": candidate_name,
+        "materialized_candidate_name": materialized_candidate_name,
         "destination_path": str(destination),
         "after_core_title": analysis["core_title"],
         "after_readable_title": extract_readable_title(candidate_name),
@@ -368,6 +376,7 @@ def preview_title_change(
         "after_effective_max": analysis["effective_max"],
         "after_unit": analysis["unit"],
         "after_complete": bool(analysis["complete"]),
+        "title_literal_tokens": list(extract_title_literal_tokens(candidate_name)),
         "target_exists": target is not None,
         "target_has_ok": bool(target is not None and target["ok_count"]),
         "blocked_reasons": blockers,
@@ -383,6 +392,7 @@ def _plan_sha256(items: Sequence[Mapping[str, object]]) -> str:
             "source_path": item["source_path"],
             "new_body": item["new_body"],
             "candidate_name": item["candidate_name"],
+            "materialized_candidate_name": item["materialized_candidate_name"],
             "destination_path": item["destination_path"],
             "before_core_title": item["before_core_title"],
             "after_core_title": item["after_core_title"],
@@ -406,7 +416,7 @@ def build_title_plan(
 ) -> dict:
     if not changes:
         return {
-            "version": "1.2.8",
+            "version": "1.2.10",
             "provider": "title_correction",
             "item_count": 0,
             "blocked_count": 0,
@@ -449,7 +459,7 @@ def build_title_plan(
 
     blocked_count = sum(bool(item["blocked_reasons"]) for item in items)
     return {
-        "version": "1.2.8",
+        "version": "1.2.10",
         "provider": "title_correction",
         "normalizer_version": NORMALIZER_VERSION,
         "state_db": str(Path(state_db).resolve()),

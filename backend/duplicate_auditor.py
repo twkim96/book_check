@@ -213,9 +213,14 @@ def _contains_symlink(root, candidate):
     return False
 
 
-def _entry_from_stat(source, name, rel_path, path, recorded_size=None, pass_recheck=False):
+def _entry_from_stat(
+    source, name, rel_path, path, recorded_size=None, pass_recheck=False,
+    core_title_override=None,
+):
     stat = os.stat(path, follow_symlinks=False)
     info = analyze_name(name)
+    if core_title_override:
+        info["core_title"] = str(core_title_override)
     volume = info.get("volume_number")
     if volume is not None:
         volume = tuple(volume)
@@ -281,6 +286,9 @@ def load_house_entries(index_path, house_root, include_pass=False):
             continue
         entries.append(_entry_from_stat(
             "house", name, rel_path, resolved, raw.get("size"), pass_recheck=pass_entry,
+            core_title_override=(
+                raw.get("core_title") if raw.get("title_override") else None
+            ),
         ))
     return entries, invalid
 

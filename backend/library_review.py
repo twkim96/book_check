@@ -173,6 +173,9 @@ class VolumeGroupProvider:
                 if payload.get("target_folder_name") is not None
                 else None
             ),
+            allow_duplicate_coordinates=(
+                payload.get("allow_duplicate_coordinates") is True
+            ),
         )
 
     def apply_plan(
@@ -197,6 +200,9 @@ class VolumeGroupProvider:
                 str(payload["target_folder_name"])
                 if payload.get("target_folder_name") is not None
                 else None
+            ),
+            allow_duplicate_coordinates=(
+                payload.get("allow_duplicate_coordinates") is True
             ),
             confirm_count=confirm_count,
             confirm_plan_sha256=confirm_plan_sha256,

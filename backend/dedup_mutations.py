@@ -481,6 +481,12 @@ def _ingest_to_house(conn, *, source_file_id, destination, run_id):
                 coordinates["coordinate_raw"], coordinates["span_ambiguous"], source_file_id,
             ),
         )
+        decision_store.upsert_file_analysis(
+            conn,
+            source_file_id,
+            destination,
+            stat_result=moved_stat,
+        )
         decision_store.transition_operation(conn, operation_id, "db_done")
     with decision_store.transaction(conn):
         decision_store.transition_operation(conn, operation_id, "committed")

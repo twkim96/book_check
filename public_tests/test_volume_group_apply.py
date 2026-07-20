@@ -161,6 +161,69 @@ def test_preview_can_resolve_duplicate_coordinate_by_selection(tmp_path):
     assert plan["blocked_reasons"] == []
     assert plan["apply_available"] is True
 
+    all_files_plan = preview_volume_group(
+        state_db,
+        house_dir=house,
+        case_id=case["case_id"],
+        source_revision=case["source_revision"],
+        allow_duplicate_coordinates=True,
+    )
+    assert all_files_plan["allow_duplicate_coordinates"] is True
+    assert all_files_plan["item_count"] == 3
+    assert all_files_plan["blocked_reasons"] == []
+    assert all_files_plan["apply_available"] is True
+    assert all_files_plan["plan_sha256"] != plan["plan_sha256"]
+
+
+def test_volume_group_apply_keeps_human_approved_coordinate_variants(tmp_path):
+    state_db, house, temp, _ = _fixture(
+        tmp_path,
+        [
+            "ㄷ/대장간 작품 1권.epub",
+            "ㄷ/대장간 작품 1권_dup_1.epub",
+            "ㄷ/대장간 작품 2권.epub",
+        ],
+    )
+    case = _case(state_db, house, classification="review_required")
+    plan = preview_volume_group(
+        state_db,
+        house_dir=house,
+        case_id=case["case_id"],
+        source_revision=case["source_revision"],
+        target_folder_name="대장간 작품",
+        allow_duplicate_coordinates=True,
+    )
+
+    result = apply_volume_plan(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        case_id=case["case_id"],
+        source_revision=case["source_revision"],
+        selected_file_ids=plan["selected_file_ids"],
+        target_folder_name=plan["target_folder_name"],
+        allow_duplicate_coordinates=True,
+        confirm_count=plan["item_count"],
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+
+    destination = house / "ㄷ" / "대장간 작품"
+    assert len(list(destination.glob("*.epub"))) == 3
+    assert result["moved"]
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        work_ids = conn.execute(
+            """
+            SELECT DISTINCT v.work_bucket_id
+            FROM files AS f JOIN variants AS v ON v.variant_id = f.variant_id
+            WHERE f.active = 1 AND f.source = 'house'
+            """
+        ).fetchall()
+        assert len(work_ids) == 1
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
 
 def test_preview_blocks_folder_with_unselected_companion(tmp_path):
     state_db, house, _, _ = _fixture(

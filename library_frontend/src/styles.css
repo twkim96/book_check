@@ -135,6 +135,27 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .volume-file-list > label > span b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .volume-file-list > label > span small { grid-column: 2; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .volume-file-list a { color: var(--blue); text-decoration: none; font-size: 12px; }
+.volume-file-table-wrap { max-height: 370px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; background: #10141a; }
+.volume-file-table { width: 100%; min-width: 980px; border-collapse: collapse; font-size: 12px; }
+.volume-file-table th { position: sticky; top: 0; z-index: 1; padding: 9px 10px; text-align: left; color: #9eabba; background: #171d26; border-bottom: 1px solid #343d49; }
+.volume-file-table td { padding: 9px 10px; vertical-align: top; border-bottom: 1px solid #282f39; }
+.volume-file-table tr:last-child td { border-bottom: 0; }
+.volume-file-table th:first-child, .volume-file-table td:first-child { width: 42px; text-align: center; }
+.volume-file-table th:nth-child(2) { width: 38%; }
+.volume-file-table th:nth-child(3) { width: 105px; }
+.volume-file-table th:nth-child(4) { width: 125px; }
+.volume-file-table th:nth-child(5) { width: 80px; }
+.volume-file-table th:nth-child(6) { width: 155px; }
+.volume-file-table td > strong, .volume-file-table td > small, .volume-file-table td > b { display: block; }
+.volume-file-table td > strong { line-height: 1.4; word-break: break-word; }
+.volume-file-table td > small { margin-top: 4px; color: var(--muted); }
+.volume-file-table a { color: var(--blue); text-decoration: none; white-space: nowrap; }
+.volume-file-table input { min-height: 0; }
+.muted-value { color: var(--muted); }
+.volume-override { display: grid; grid-template-columns: 24px 1fr; gap: 9px; margin-top: 12px; padding: 12px; border: 1px solid #685634; border-radius: 9px; background: #272116; color: #f0d899; }
+.volume-override input { min-height: 0; }
+.volume-override strong, .volume-override small { display: block; }
+.volume-override small { margin-top: 4px; color: #c4af7f; line-height: 1.45; }
 .volume-tree { display: grid; gap: 7px; margin-top: 12px; padding: 12px; border: 1px solid #30415e; border-radius: 10px; background: #101721; }
 .volume-tree > div { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-bottom: 3px; }
 .volume-tree code { color: #7f8da3; font-size: 9px; word-break: break-all; }
