@@ -483,31 +483,36 @@ def get_volume_case(state_db: Path, *, house_dir: Path, case_id: str) -> dict:
     raise KeyError(case_id)
 
 
-def _folder_content_blocked(items: Sequence[Mapping[str, object]], house_dir: Path) -> bool:
-    """Return true when consuming a work folder would strand unselected content."""
+def _preserved_source_items(
+    items: Sequence[Mapping[str, object]], house_dir: Path
+) -> list[str]:
+    """List unselected source-folder content that the manual move will preserve."""
 
     house_dir = Path(house_dir).resolve()
-    selected = {Path(str(item["canonical_path"])).resolve() for item in items}
-    parents = {path.parent for path in selected}
+    selected_paths = {Path(str(item["canonical_path"])).resolve() for item in items}
+    selected = {
+        decision_store.canonicalize_path(path) for path in selected_paths
+    }
+    parents = {path.parent for path in selected_paths}
+    preserved = set()
     for parent in parents:
         try:
             relative = parent.relative_to(house_dir)
         except ValueError:
-            return True
+            continue
         if len(relative.parts) <= 1:
             continue
         for current, directories, filenames in os.walk(parent, followlinks=False):
             current_path = Path(current)
             for name in directories:
-                if (current_path / name).is_symlink():
-                    return True
+                candidate = current_path / name
+                if candidate.is_symlink():
+                    preserved.add(str(candidate.relative_to(house_dir)))
             for name in filenames:
                 candidate = current_path / name
-                if candidate.is_symlink() or not candidate.is_file():
-                    return True
-                if candidate.resolve() not in selected:
-                    return True
-    return False
+                if decision_store.canonicalize_path(candidate.resolve()) not in selected:
+                    preserved.add(str(candidate.relative_to(house_dir)))
+    return sorted(preserved, key=str.casefold)
 
 
 def _backup_path(state_db: Path) -> Path:
@@ -593,8 +598,9 @@ def preview_volume_group(
         moved_count += 1
         if destination.exists() or destination.is_symlink():
             blockers.append("target_filename_collision")
-    if items and _folder_content_blocked(items, Path(house_dir)):
-        blockers.append("source_folder_contains_unselected_files")
+    preserved_source_items = (
+        _preserved_source_items(items, Path(house_dir)) if items else []
+    )
     if moved_count == 0:
         blockers.append("no_files_to_move")
     blockers = list(dict.fromkeys(blockers))
@@ -608,6 +614,7 @@ def preview_volume_group(
         "destination_root": str(destination_root),
         "tree": tree,
         "moved_count": moved_count,
+        "preserved_source_items": preserved_source_items,
         "blocked_reasons": blockers,
     }
     plan_sha256 = hashlib.sha256(

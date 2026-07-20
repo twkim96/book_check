@@ -150,6 +150,7 @@ export interface VolumePreview {
   destination_root: string;
   tree: string[];
   moved_count: number;
+  preserved_source_items: string[];
   blocked_reasons: string[];
   item_count: number;
   plan_sha256: string;

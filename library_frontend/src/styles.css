@@ -114,6 +114,8 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .class-already_grouped { color: #a8c8ff; background: #1d345a; }
 .class-excluded { color: #aeb6c3; background: #2b313a; }
 .safe-note { color: #83d9a7; font-size: 11px; }
+.volume-preserved { display: grid; gap: 4px; margin-top: 10px; padding: 10px; border: 1px solid #65572f; border-radius: 8px; background: #2a2619; color: #e9d48d; }
+.volume-preserved small { color: #c9bc8d; overflow-wrap: anywhere; }
 .inline-error, .error-panel { border: 1px solid #6e3940; background: #321c21; color: #ffb2b2; padding: 13px 16px; border-radius: 10px; margin-bottom: 14px; }
 .error-panel { padding: 28px; }
 .loading, .empty { min-height: 140px; display: flex; align-items: center; justify-content: center; gap: 12px; color: var(--muted); }

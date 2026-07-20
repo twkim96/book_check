@@ -668,6 +668,11 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
       {preview && <div className="volume-tree">
         <div><strong>{preview.item_count}개 중 {preview.moved_count}개 이동</strong><code>{preview.plan_sha256}</code></div>
         {preview.tree.map((path) => <span key={path}>{path}</span>)}
+        {preview.preserved_source_items.length > 0 && <div className="volume-preserved">
+          <strong>선택하지 않아 원래 폴더에 남겨둘 항목 {preview.preserved_source_items.length}개</strong>
+          {preview.preserved_source_items.slice(0, 8).map((path) => <small key={path}>{path}</small>)}
+          {preview.preserved_source_items.length > 8 && <small>외 {preview.preserved_source_items.length - 8}개</small>}
+        </div>}
         {preview.blocked_reasons.map((reason) => <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}</small>)}
       </div>}
       {preview?.apply_available && <label className="volume-confirm">

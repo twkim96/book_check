@@ -225,15 +225,17 @@ def test_volume_group_apply_keeps_human_approved_coordinate_variants(tmp_path):
         conn.close()
 
 
-def test_preview_blocks_folder_with_unselected_companion(tmp_path):
-    state_db, house, _, _ = _fixture(
+def test_manual_group_preserves_unselected_companion_in_source_folder(tmp_path):
+    state_db, house, temp, _ = _fixture(
         tmp_path,
         [
             "ㅍ/폴더 작품 1-2권/폴더 작품 1권.txt",
             "ㅍ/폴더 작품 1-2권/폴더 작품 2권.txt",
         ],
     )
-    (house / "ㅍ" / "폴더 작품 1-2권" / "cover.jpg").write_bytes(b"image")
+    source_folder = house / "ㅍ" / "폴더 작품 1-2권"
+    companion = source_folder / "cover.jpg"
+    companion.write_bytes(b"image")
     case = _case(state_db, house, classification="already_grouped")
     plan = preview_volume_group(
         state_db,
@@ -242,8 +244,28 @@ def test_preview_blocks_folder_with_unselected_companion(tmp_path):
         source_revision=case["source_revision"],
         target_folder_name="폴더 작품",
     )
-    assert "source_folder_contains_unselected_files" in plan["blocked_reasons"]
-    assert plan["apply_available"] is False
+    assert "source_folder_contains_unselected_files" not in plan["blocked_reasons"]
+    assert plan["apply_available"] is True
+    assert plan["preserved_source_items"] == [
+        "ㅍ/폴더 작품 1-2권/cover.jpg"
+    ]
+
+    apply_volume_plan(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        case_id=case["case_id"],
+        source_revision=case["source_revision"],
+        selected_file_ids=plan["selected_file_ids"],
+        target_folder_name=plan["target_folder_name"],
+        confirm_count=plan["item_count"],
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    assert companion.read_bytes() == b"image"
+    assert sorted(path.name for path in (house / "ㅍ" / "폴더 작품").iterdir()) == [
+        "폴더 작품 1권.txt",
+        "폴더 작품 2권.txt",
+    ]
 
 
 def test_interrupted_volume_move_recovers_original_house_file(tmp_path):
