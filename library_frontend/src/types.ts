@@ -74,6 +74,80 @@ export interface TitlePlan {
   items: TitlePreview[];
 }
 
+export type VolumeClassification = "auto_ready" | "review_required" | "already_grouped" | "excluded";
+
+export interface VolumeItem {
+  file_id: string;
+  name: string;
+  canonical_path: string;
+  parent: string;
+  extension: string;
+  size: number;
+  author: string | null;
+  coordinate_kind: string;
+  coordinate: string;
+  assignment_state: string;
+  variant_id: number | null;
+  work_bucket_id: number | null;
+  protected: boolean;
+  representative: boolean;
+}
+
+export interface VolumeCase {
+  provider: "volume_group";
+  case_id: string;
+  source_revision: string;
+  core_title: string;
+  display_title: string;
+  classification: VolumeClassification;
+  file_count: number;
+  parent_count: number;
+  parents: string[];
+  coordinate_kinds: string[];
+  coordinate_range: [string, string];
+  duplicate_coordinates: string[];
+  missing_coordinates: string[];
+  authors: string[];
+  work_bucket_ids: number[];
+  target_folder_name: string;
+  target_folder_path: string;
+  blocked_reasons: string[];
+  plan_ready: boolean;
+  items: VolumeItem[];
+}
+
+export interface VolumeListing {
+  items: VolumeCase[];
+  total: number;
+  summary: Record<VolumeClassification, number>;
+  limit: number;
+  cursor: string | null;
+  next_cursor: string | null;
+  search: string;
+  classification: string;
+  sort: string;
+  direction: string;
+  readonly: boolean;
+}
+
+export interface VolumePreview {
+  provider: "volume_group";
+  case_id: string;
+  source_revision: string;
+  selected_file_ids: string[];
+  target_folder_name: string;
+  destination_root: string;
+  tree: string[];
+  moved_count: number;
+  blocked_reasons: string[];
+  item_count: number;
+  plan_sha256: string;
+  plan_ready: boolean;
+  apply_available: boolean;
+  readonly_reason: string | null;
+  items: VolumeItem[];
+}
+
 export interface JobRecord {
   job_id: string;
   job_type: string;

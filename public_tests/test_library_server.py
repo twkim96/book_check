@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 
 import decision_store
 from library_jobs import JobStore
@@ -70,8 +71,7 @@ def test_health_dashboard_and_title_review_api(tmp_path):
         {
             "id": "volume_group",
             "label": "분권 묶기",
-            "enabled": False,
-            "planned_version": "1.2.9",
+            "enabled": True,
         },
     ]
     dashboard = client.get("/api/dashboard").get_json()["data"]
@@ -108,6 +108,83 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     assert plan["runnable"] is True
     assert len(plan["plan_sha256"]) == 64
     assert client.get("/review/titles").status_code == 200
+
+
+def test_dashboard_pending_matches_folderling_intake_exclusions(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    (config.temp_dir / "dedup_logs").mkdir()
+    (config.temp_dir / "dedup_logs" / "report.txt").write_text("log", encoding="utf-8")
+    warning = config.temp_dir / "trash_bin" / "warning"
+    warning.mkdir(parents=True)
+    (warning / "review.txt").write_text("warning", encoding="utf-8")
+    nested = config.temp_dir / "title_cleanup_collision_1"
+    nested.mkdir()
+    (nested / "intake.epub").write_text("book", encoding="utf-8")
+    (config.temp_dir / "direct.txt").write_text("book", encoding="utf-8")
+
+    dashboard = app.test_client().get("/api/dashboard").get_json()["data"]
+    assert dashboard["filesystem"]["folderling_pending"] == 2
+    assert dashboard["filesystem"]["warning_files"] == 1
+
+
+def test_volume_review_api_builds_confirmation_bound_plan(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        for number in (1, 2):
+            path = config.house_dir / "ㅂ" / f"별빛 도서 {number}권.txt"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("volume", encoding="utf-8")
+            with decision_store.transaction(conn):
+                decision_store.reconcile_file_metadata(conn, path, source="house")
+    finally:
+        conn.close()
+
+    client = app.test_client()
+    listing = client.get("/api/review/volumes?classification=auto_ready").get_json()["data"]
+    assert listing["total"] == 1
+    [case] = listing["items"]
+    preview = client.post(
+        "/api/review/volumes/preview",
+        json={
+            "case_id": case["case_id"],
+            "source_revision": case["source_revision"],
+        },
+    ).get_json()["data"]
+    assert preview["plan_ready"] is True
+    assert preview["apply_available"] is True
+    response = client.post(
+        "/api/review/volumes/apply",
+        json={
+            "case_id": case["case_id"],
+            "source_revision": case["source_revision"],
+            "selected_file_ids": preview["selected_file_ids"],
+            "target_folder_name": preview["target_folder_name"],
+            "confirm_count": preview["item_count"],
+            "confirm_plan_sha256": preview["plan_sha256"],
+        },
+    )
+    assert response.status_code == 202
+    job_id = response.get_json()["data"]["job_id"]
+    runner = app.extensions["library_job_runner"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = runner.get(job_id)
+        if job["state"] in {"succeeded", "failed"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "succeeded", job
+    assert job["result"]["index_updated"] is True
+    destination = config.house_dir / "ㅂ" / "별빛 도서"
+    assert sorted(path.name for path in destination.iterdir()) == [
+        "별빛 도서 1권.txt",
+        "별빛 도서 2권.txt",
+    ]
+    index_payload = json.loads(config.index_path.read_text(encoding="utf-8"))
+    indexed = {item["rel_path"] for item in index_payload["entries"] if item["type"] == "file"}
+    assert "ㅂ/별빛 도서/별빛 도서 1권.txt" in indexed
 
 
 def test_job_store_marks_running_records_interrupted_after_restart(tmp_path):

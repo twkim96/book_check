@@ -166,6 +166,31 @@ def move_to_house(
     conflict_suffix = PASS_CONFLICT_SUFFIX if is_pass else NORMAL_CONFLICT_SUFFIX
 
     target_folder = os.path.join(dst_dir, folder_name)
+    auto_volume = None
+    if state_db_path and os.path.isfile(src_path) and not is_pass:
+        import decision_store
+        from volume_group_mutations import suggest_folderling_volume_target
+
+        conn = decision_store.connect_state_db(state_db_path)
+        try:
+            source_row = conn.execute(
+                "SELECT file_id FROM files WHERE canonical_path = ? AND active = 1",
+                (decision_store.canonicalize_path(src_path),),
+            ).fetchone()
+            if source_row is not None:
+                auto_volume = suggest_folderling_volume_target(
+                    conn,
+                    source_file_id=source_row["file_id"],
+                    house_root=dst_dir,
+                )
+        finally:
+            conn.close()
+        if auto_volume is not None:
+            proposed = os.path.join(auto_volume["target_folder"], final_name_candidate)
+            if os.path.exists(proposed) or os.path.islink(proposed):
+                auto_volume = None
+            else:
+                target_folder = auto_volume["target_folder"]
     candidate_path = os.path.join(target_folder, final_name_candidate)
     if os.path.exists(candidate_path):
         if os.path.isdir(src_path):
@@ -184,6 +209,10 @@ def move_to_house(
     if state_db_path and os.path.isfile(src_path):
         import decision_store
         from dedup_mutations import ingest_to_house
+        from volume_group_mutations import (
+            ensure_volume_fingerprints,
+            link_volume_relationships,
+        )
 
         conn = decision_store.connect_state_db(state_db_path)
         try:
@@ -199,6 +228,20 @@ def move_to_house(
                 destination=dst_path,
                 run_id=run_id or f"folderling-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
             )
+            if auto_volume is not None:
+                volume_file_ids = auto_volume["existing_file_ids"] + [row["file_id"]]
+                ensure_volume_fingerprints(conn, volume_file_ids)
+                with decision_store.transaction(conn):
+                    relationship = link_volume_relationships(
+                        conn,
+                        file_ids=volume_file_ids,
+                        display_title=auto_volume["display_title"],
+                        origin="strong_match",
+                    )
+                source_label += (
+                    f"[volume-auto work={relationship['work_bucket_id']} "
+                    f"core={auto_volume['core_title']}] "
+                )
         finally:
             conn.close()
     elif state_db_path and os.path.isdir(src_path):

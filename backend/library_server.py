@@ -16,14 +16,15 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 import decision_store
 from library_jobs import JobRunner, JobStore
 from library_review import (
-    ProviderDescriptor,
     ReviewProviderRegistry,
     TitleCorrectionProvider,
+    VolumeGroupProvider,
 )
+from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.2.8"
+SERVER_VERSION = "1.2.9"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -39,16 +40,28 @@ class LibraryServerConfig:
     frontend_dist: Path
 
 
-def _count_supported(root: Path, *, exclude_trash: bool = False) -> int:
+def _count_supported(root: Path, *, intake_only: bool = False) -> int:
     if not root.is_dir():
         return 0
     count = 0
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-        if exclude_trash and "trash_bin" in path.relative_to(root).parts:
-            continue
-        count += 1
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        if intake_only:
+            directories[:] = [
+                name
+                for name in directories
+                if not should_exclude_dir(name)
+                and not (Path(current) / name).is_symlink()
+            ]
+        for filename in filenames:
+            path = Path(current) / filename
+            if intake_only and should_exclude_file(filename):
+                continue
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            ):
+                count += 1
     return count
 
 
@@ -121,7 +134,7 @@ def dashboard_snapshot(config: LibraryServerConfig, runner: JobRunner) -> dict:
             "pending_reviews": pending_reviews,
         },
         "filesystem": {
-            "folderling_pending": _count_supported(config.temp_dir, exclude_trash=True),
+            "folderling_pending": _count_supported(config.temp_dir, intake_only=True),
             "warning_files": _count_supported(warning_dir),
             "index": _index_counts(config.index_path),
         },
@@ -164,10 +177,14 @@ def create_app(
         house_dir=config.house_dir,
         temp_dir=config.temp_dir,
     )
-    registry.register(title_provider)
-    registry.register_planned(
-        ProviderDescriptor("volume_group", "분권 묶기", False, "1.2.9")
+    volume_provider = VolumeGroupProvider(
+        state_db=config.state_db,
+        house_dir=config.house_dir,
+        temp_dir=config.temp_dir,
+        index_path=config.index_path,
     )
+    registry.register(title_provider)
+    registry.register(volume_provider)
 
     def apply_title_job(payload, progress):
         return title_provider.apply_plan(
@@ -180,6 +197,18 @@ def create_app(
         )
 
     runner.register("title_requeue", apply_title_job)
+
+    def apply_volume_job(payload, progress):
+        return volume_provider.apply_plan(
+            payload,
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"분권 묶기 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    runner.register("volume_group_merge", apply_volume_job)
 
     app = Flask(__name__)
     app.config["library_server_config"] = config
@@ -285,6 +314,55 @@ def create_app(
         )
         return jsonify({"ok": True, "data": record}), 202
 
+    @app.get("/api/review/volumes")
+    def volume_cases():
+        result = volume_provider.list_cases(
+            search=request.args.get("search", ""),
+            classification=request.args.get("classification", "all"),
+            cursor=request.args.get("cursor") or None,
+            limit=request.args.get("limit", 50, type=int),
+            sort=request.args.get("sort", "classification"),
+            direction=request.args.get("direction", "asc"),
+        )
+        return jsonify({"ok": True, "data": result})
+
+    @app.get("/api/review/volumes/<case_id>")
+    def volume_case(case_id):
+        return jsonify({"ok": True, "data": volume_provider.get_case(case_id)})
+
+    @app.post("/api/review/volumes/preview")
+    def volume_preview():
+        return jsonify({"ok": True, "data": volume_provider.preview(_json_body())})
+
+    @app.post("/api/review/volumes/apply")
+    def volume_apply():
+        body = _json_body()
+        confirm_count = int(body.get("confirm_count", -1))
+        confirm_sha = str(body.get("confirm_plan_sha256") or "")
+        plan = volume_provider.preview(body)
+        if not plan["apply_available"]:
+            return jsonify({
+                "ok": False,
+                "error": {"code": "plan_blocked", "message": "실행할 수 없는 분권 계획입니다"},
+                "data": plan,
+            }), 409
+        if confirm_count != plan["item_count"] or confirm_sha != plan["plan_sha256"]:
+            return jsonify({
+                "ok": False,
+                "error": {"code": "confirmation_stale", "message": "확인한 계획과 현재 계획이 다릅니다"},
+                "data": plan,
+            }), 409
+        payload = {
+            "case_id": body.get("case_id"),
+            "source_revision": body.get("source_revision"),
+            "selected_file_ids": body.get("selected_file_ids"),
+            "target_folder_name": body.get("target_folder_name"),
+            "confirm_count": confirm_count,
+            "confirm_plan_sha256": confirm_sha,
+        }
+        record = runner.start("volume_group_merge", payload)
+        return jsonify({"ok": True, "data": record}), 202
+
     @app.get("/api/jobs")
     def jobs():
         return jsonify({"ok": True, "data": runner.list(limit=request.args.get("limit", 50, type=int))})
@@ -314,7 +392,7 @@ def create_app(
         return (
             "<!doctype html><meta charset='utf-8'><title>file_check</title>"
             "<body style='font-family:system-ui;padding:32px'>"
-            "<h1>도서 관리 서버 1.2.8</h1>"
+            "<h1>도서 관리 서버 1.2.9</h1>"
             "<p>프런트 빌드가 없습니다. library_frontend에서 npm run build를 실행하세요.</p>"
             "</body>",
             503,

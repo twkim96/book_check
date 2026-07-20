@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useNavigate, useSearchParams } from "react-router-dom";
 
 import { ApiError, api, postJson } from "./api";
 import type {
@@ -9,7 +9,11 @@ import type {
   TitleCase,
   TitleListing,
   TitlePlan,
-  TitlePreview
+  TitlePreview,
+  VolumeCase,
+  VolumeClassification,
+  VolumeListing,
+  VolumePreview
 } from "./types";
 
 type Draft = {
@@ -48,13 +52,13 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.2.8</small>
+            <small>file_check 1.2.9</small>
           </div>
         </div>
         <nav>
           <NavLink to="/" end>대시보드</NavLink>
           <NavLink to="/review/titles">제목 교정</NavLink>
-          <span className="nav-disabled">분권 묶기 <small>1.2.9</small></span>
+          <NavLink to="/review/volumes">분권 묶기</NavLink>
           <NavLink to="/jobs">작업 이력</NavLink>
         </nav>
         <div className="sidebar-note">로컬 전용 · 실제 변경 전 계획 확인</div>
@@ -63,6 +67,7 @@ function Shell() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/review/titles" element={<TitleReview />} />
+          <Route path="/review/volumes" element={<VolumeReview />} />
           <Route path="/jobs" element={<Jobs />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
@@ -145,9 +150,11 @@ function Dashboard() {
 }
 
 function TitleReview() {
+  const [urlParams] = useSearchParams();
+  const initialSearch = urlParams.get("search") ?? "";
   const [listing, setListing] = useState<TitleListing>();
-  const [search, setSearch] = useState("");
-  const [submittedSearch, setSubmittedSearch] = useState("");
+  const [search, setSearch] = useState(initialSearch);
+  const [submittedSearch, setSubmittedSearch] = useState(initialSearch);
   const [status, setStatus] = useState("all");
   const [sort, setSort] = useState("name");
   const [direction, setDirection] = useState("asc");
@@ -391,6 +398,257 @@ function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: b
   );
 }
 
+const volumeClassLabels: Record<VolumeClassification, string> = {
+  auto_ready: "자동 가능",
+  review_required: "검토 필요",
+  already_grouped: "이미 한 폴더",
+  excluded: "제외"
+};
+
+const volumeBlockerLabels: Record<string, string> = {
+  non_title_core: "제목으로 보기 어려운 core",
+  mixed_coordinate_kind: "권·부·외전 좌표 혼합",
+  duplicate_coordinate: "같은 권 좌표 중복",
+  missing_coordinate: "중간 권 누락",
+  author_conflict: "작가 충돌",
+  work_conflict: "기존 work 충돌",
+  disambig_conflict: "서로 다른 작품 표시 충돌",
+  ambiguous_coordinate: "권 좌표 불명확",
+  source_outside_house: "house 밖 파일",
+  source_revision_stale: "파일 또는 DB 상태 변경",
+  at_least_two_files_required: "두 파일 이상 필요",
+  unknown_selected_file: "현재 그룹에 없는 파일 선택",
+  target_filename_collision: "목적 폴더 파일명 충돌",
+  target_folder_invalid: "목적 폴더 경로가 안전하지 않음",
+  source_missing_or_not_regular: "원본 파일 누락 또는 링크",
+  source_identity_stale: "원본 파일 상태 변경",
+  source_folder_contains_unselected_files: "기존 폴더에 선택하지 않은 파일 또는 부속 파일 존재",
+  no_files_to_move: "이미 결과 폴더에 정리됨"
+};
+
+function VolumeClassBadge({ value }: { value: VolumeClassification }) {
+  return <span className={`volume-class class-${value}`}>{volumeClassLabels[value]}</span>;
+}
+
+function VolumeReview() {
+  const [listing, setListing] = useState<VolumeListing>();
+  const [search, setSearch] = useState("");
+  const [submittedSearch, setSubmittedSearch] = useState("");
+  const [classification, setClassification] = useState("all");
+  const [sort, setSort] = useState("classification");
+  const [direction, setDirection] = useState("asc");
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<(string | null)[]>([]);
+  const [activeCase, setActiveCase] = useState<VolumeCase>();
+  const [error, setError] = useState("");
+
+  const resetPage = () => {
+    setCursor(null);
+    setCursorHistory([]);
+  };
+  const load = () => {
+    const params = new URLSearchParams({
+      search: submittedSearch,
+      classification,
+      sort,
+      direction,
+      limit: "30"
+    });
+    if (cursor) params.set("cursor", cursor);
+    setError("");
+    setListing(undefined);
+    api<VolumeListing>(`/api/review/volumes?${params}`)
+      .then(setListing)
+      .catch((reason) => setError(reason.message));
+  };
+  useEffect(load, [submittedSearch, classification, sort, direction, cursor]);
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="VOLUME GROUPING · 1.2.9"
+        title="분권·다권본 묶기"
+        description="권·부·상중하 좌표와 기존 폴더를 분석합니다. 선택한 파일은 staging 검증과 journal 기록 후 한 작품 폴더로 이동합니다."
+        action={<span className="readonly-pill">STAGING + JOURNAL</span>}
+      />
+      <section className="toolbar">
+        <form onSubmit={(event) => { event.preventDefault(); setSubmittedSearch(search); resetPage(); }} className="search-form">
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="작품명, core_title, 폴더 검색" />
+          <button className="button secondary">검색</button>
+        </form>
+        <select value={classification} onChange={(event) => { setClassification(event.target.value); resetPage(); }}>
+          <option value="all">모든 분류</option>
+          <option value="review_required">검토 필요</option>
+          <option value="auto_ready">자동 가능</option>
+          <option value="already_grouped">이미 한 폴더</option>
+          <option value="excluded">제외</option>
+        </select>
+        <select value={sort} onChange={(event) => { setSort(event.target.value); resetPage(); }}>
+          <option value="classification">분류순</option>
+          <option value="title">작품명순</option>
+          <option value="files">파일수순</option>
+          <option value="parents">폴더수순</option>
+        </select>
+        <button className="button ghost" onClick={() => { setDirection(direction === "asc" ? "desc" : "asc"); resetPage(); }}>
+          {direction === "asc" ? "오름차순" : "내림차순"}
+        </button>
+      </section>
+      {error && <div className="inline-error">{error}</div>}
+      {!listing ? <Loading /> : <>
+        <section className="volume-summary-grid">
+          {(Object.keys(volumeClassLabels) as VolumeClassification[]).map((key) => (
+            <button key={key} className={classification === key ? "active" : ""} onClick={() => { setClassification(key); resetPage(); }}>
+              <span>{volumeClassLabels[key]}</span><strong>{formatNumber(listing.summary[key])}</strong>
+            </button>
+          ))}
+        </section>
+        <section className="table-panel">
+          <div className="table-summary">
+            <span>분권 그룹 <strong>{formatNumber(listing.total)}</strong>개</span>
+            <span>후보 분석은 DB와 파일을 변경하지 않습니다.</span>
+          </div>
+          <div className="table-scroll volume-scroll">
+            <table className="volume-table">
+              <thead><tr>
+                <th>분류</th><th>제안 작품</th><th>권 범위</th><th>구성</th><th>확인할 점</th><th>계획</th>
+              </tr></thead>
+              <tbody>{listing.items.map((item) => (
+                <tr key={item.case_id}>
+                  <td><VolumeClassBadge value={item.classification} /></td>
+                  <td>
+                    <strong className="filename">{item.display_title}</strong>
+                    <code className="core">{item.core_title}</code>
+                    {item.authors.length > 0 && <small className="path">작가 {item.authors.join(", ")}</small>}
+                  </td>
+                  <td><strong>{item.coordinate_range.join(" → ")}</strong><small className="path">{item.coordinate_kinds.join(" + ")}</small></td>
+                  <td><strong>{item.file_count}개 파일</strong><small className="path">{item.parent_count}개 위치</small></td>
+                  <td>
+                    {item.blocked_reasons.length === 0 ? <span className="safe-note">충돌 없음</span> : item.blocked_reasons.map((reason) => (
+                      <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}</small>
+                    ))}
+                    {item.missing_coordinates.length > 0 && <small className="collision">누락 {item.missing_coordinates.slice(0, 8).join(", ")}{item.missing_coordinates.length > 8 ? "…" : ""}</small>}
+                  </td>
+                  <td><button className="button secondary" onClick={() => setActiveCase(item)}>구성 보기</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+          <div className="pagination">
+            <button className="button secondary" disabled={!cursorHistory.length} onClick={() => {
+              const history = [...cursorHistory];
+              setCursor(history.pop() ?? null);
+              setCursorHistory(history);
+            }}>이전</button>
+            <button className="button secondary" disabled={!listing.next_cursor} onClick={() => {
+              setCursorHistory((history) => [...history, cursor]);
+              setCursor(listing.next_cursor);
+            }}>다음</button>
+          </div>
+        </section>
+      </>}
+      {activeCase && <VolumePreviewDialog value={activeCase} onClose={() => setActiveCase(undefined)} />}
+    </>
+  );
+}
+
+function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: () => void }) {
+  const [selected, setSelected] = useState(() => new Set(value.items.map((item) => item.file_id)));
+  const [folderName, setFolderName] = useState(value.target_folder_name);
+  const [preview, setPreview] = useState<VolumePreview>();
+  const [busy, setBusy] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  const [error, setError] = useState("");
+  const navigate = useNavigate();
+
+  const refresh = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      setPreview(await postJson<VolumePreview>("/api/review/volumes/preview", {
+        case_id: value.case_id,
+        source_revision: value.source_revision,
+        selected_file_ids: [...selected],
+        target_folder_name: folderName
+      }));
+      setConfirmed(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "분권 계획을 만들지 못했습니다.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => { void refresh(); }, []);
+
+  const apply = async () => {
+    if (!preview?.apply_available || !confirmed) return;
+    setBusy(true);
+    setError("");
+    try {
+      const job = await postJson<JobRecord>("/api/review/volumes/apply", {
+        case_id: value.case_id,
+        source_revision: value.source_revision,
+        selected_file_ids: preview.selected_file_ids,
+        target_folder_name: preview.target_folder_name,
+        confirm_count: preview.item_count,
+        confirm_plan_sha256: preview.plan_sha256
+      });
+      onClose();
+      navigate(`/jobs?focus=${job.job_id}`);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.code === "confirmation_stale") {
+        setError("파일이나 DB 상태가 바뀌었습니다. 미리보기를 다시 확인하세요.");
+      } else {
+        setError(reason instanceof Error ? reason.message : "분권 묶기를 시작하지 못했습니다.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <div className="modal-backdrop" role="presentation">
+    <section className="modal volume-modal" role="dialog" aria-modal="true" aria-labelledby="volume-plan-title">
+      <span className="eyebrow">STAGED GROUP PLAN</span>
+      <h2 id="volume-plan-title">{value.display_title}</h2>
+      <p>포함할 파일과 결과 폴더를 검토합니다. 실행하면 staging 복사 검증 후 원본과 DB를 함께 이동합니다.</p>
+      <label className="field-label">결과 폴더명
+        <input value={folderName} onChange={(event) => { setFolderName(event.target.value); setPreview(undefined); setConfirmed(false); }} />
+      </label>
+      <div className="volume-file-list">
+        {value.items.map((item) => <label key={item.file_id}>
+          <input type="checkbox" checked={selected.has(item.file_id)} onChange={(event) => {
+            setSelected((current) => {
+              const next = new Set(current);
+              if (event.target.checked) next.add(item.file_id); else next.delete(item.file_id);
+              return next;
+            });
+            setPreview(undefined);
+            setConfirmed(false);
+          }} />
+          <span><strong>{item.coordinate}</strong><b>{item.name}</b><small>{item.parent}</small></span>
+          <NavLink to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink>
+        </label>)}
+      </div>
+      {error && <div className="inline-error">{error}</div>}
+      {preview && <div className="volume-tree">
+        <div><strong>{preview.item_count}개 중 {preview.moved_count}개 이동</strong><code>{preview.plan_sha256}</code></div>
+        {preview.tree.map((path) => <span key={path}>{path}</span>)}
+        {preview.blocked_reasons.map((reason) => <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}</small>)}
+      </div>}
+      {preview?.apply_available && <label className="volume-confirm">
+        <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+        파일 {preview.item_count}개와 결과 폴더를 확인했습니다
+      </label>}
+      <footer>
+        <button className="button secondary" disabled={busy} onClick={onClose}>닫기</button>
+        <button className="button primary" disabled={busy} onClick={refresh}>{busy ? "계산 중…" : "미리보기 갱신"}</button>
+        <button className="button danger" disabled={busy || !confirmed || !preview?.apply_available} onClick={apply}>
+          {busy ? "등록 중…" : `${preview?.item_count ?? 0}개 묶기`}
+        </button>
+      </footer>
+    </section>
+  </div>;
+}
+
 function Jobs() {
   const [jobs, setJobs] = useState<JobRecord[]>();
   const [error, setError] = useState("");
@@ -416,7 +674,7 @@ function JobList({ jobs, empty, detailed = false }: { jobs: JobRecord[]; empty: 
     return <article className="job" key={job.job_id}>
       <div className={`job-state state-${job.state}`}>{job.state}</div>
       <div className="job-main">
-        <strong>{job.job_type === "title_requeue" ? "제목 교정 재입고" : job.job_type}</strong>
+        <strong>{job.job_type === "title_requeue" ? "제목 교정 재입고" : job.job_type === "volume_group_merge" ? "분권 묶기" : job.job_type}</strong>
         <span>{job.message}</span>
         {job.progress.total > 0 && <div className="progress"><i style={{ width: `${percent}%` }} /><small>{job.progress.current}/{job.progress.total}</small></div>}
         {job.error && <div className="job-error">{job.error.message}</div>}

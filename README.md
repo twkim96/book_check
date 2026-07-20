@@ -21,7 +21,7 @@ deduplicator.py               기존 dry-run 호환 실행기
 folderling.py                 기존 command 파일 호환 실행기
 run_title_cleanup_candidates.py  1.2.7 제목 후보 read-only 감사기
 run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
-run_library_server.py             1.2.8 독립 도서 관리 웹 서버
+run_library_server.py             1.2.8+ 독립 도서 관리 웹 서버
 library_frontend/                 React 기반 도서 관리 화면
 ```
 
@@ -69,12 +69,12 @@ python3 run_folderling_one_button.py --help
 `run_folderling_one_button.py`는 실제 파일 입고를 수행할 수 있으므로 라이브 환경에서는
 상태 DB의 doctor 결과와 backup을 확인한 뒤 사용해야 합니다.
 
-## 도서 관리 웹 서버 (1.2.8)
+## 도서 관리 웹 서버 (1.2.8~1.2.9)
 
 1.2.8부터 `file_check`는 기존 컨트롤서버와 분리된 로컬 웹 서버를 제공합니다. 기본 주소는
 `http://127.0.0.1:9012`이며 외부망에 직접 노출하지 않습니다. 현재 화면에는 DB·index·입고
-대기 상태를 보여주는 대시보드, 플랫폼 `ok` 정보가 없는 파일의 수동 제목 교정, 작업 이력이
-있습니다.
+대기 상태를 보여주는 대시보드, 플랫폼 `ok` 정보가 없는 파일의 수동 제목 교정, 작업 이력과
+1.2.9 분권 후보 검토 화면이 있습니다.
 
 ```bash
 # Python 의존성
@@ -107,6 +107,17 @@ url:     http://127.0.0.1:9012/
 파일만 house에서 `txt_temp`로 이동하며 기존 DB 파일 행은 삭제하지 않고 비활성 이력으로
 남깁니다. 다음 Folderling은 이를 새 입고 파일로 처리해 기존 중복 판정을 전부 다시 수행합니다.
 대표·보호·관리 관계가 있는 파일은 1.2.8 화면에서 변경하지 않고 차단합니다.
+
+`/review/volumes`는 DB의 권·부·상중하 좌표와 현재 폴더 위치를 읽어 `자동 가능`, `검토 필요`,
+`이미 한 폴더`, `제외`로 분류합니다. 포함 파일과 결과 트리, 이동 건수와 plan SHA-256을 다시
+확인한 항목만 실행할 수 있습니다. 실행 시 모든 원본을 `txt_temp/.volume_group_staging`에 먼저
+복사·검증하고 DB backup, actual-run manifest, `volume_group_merge` journal 아래에서 한 작품
+폴더와 하나의 work로 묶습니다. 권 좌표가 겹치거나 작가·판본·목적 파일이 충돌하면 실행하지
+않습니다.
+
+Folderling은 이미 정상적인 작품 폴더에 들어 있는 분권들과 제목·작가·권 좌표가 명확히 맞고
+좌표가 겹치지 않는 신규 파일만 같은 폴더와 work에 자동 연결합니다. 기존의 흩어진 파일을
+Folderling 실행 중 재배치하지 않으며, 애매한 후보는 `/review/volumes`에서 사람이 확인합니다.
 
 완료·실패·서버 중단 작업은 `.dedup_state/library-server/`에 남습니다. 이 디렉터리와 실제
 라이브러리 경로, 운영 DB, 인증 정보는 Git에 포함되지 않습니다.

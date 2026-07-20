@@ -1928,7 +1928,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     if row["action"] not in {
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
-        "title_cleanup_requeue", "user_title_requeue",
+        "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
     }:
         raise ValueError("operation is not a queue move")
     if row["state"] not in {"planned", "fs_done", "db_done"}:
@@ -1946,6 +1946,9 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     }:
         assert_actual_run_path(actual_run, source, "house_root")
         assert_actual_run_path(actual_run, destination, "temp_root")
+    elif row["action"] == "volume_group_merge":
+        assert_actual_run_path(actual_run, source, "house_root")
+        assert_actual_run_path(actual_run, destination, "house_root")
     else:
         assert_actual_run_path(actual_run, source, "temp_root")
         assert_actual_run_path(actual_run, destination, "temp_root")
@@ -1972,6 +1975,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "house_review_move": "house",
                 "title_cleanup_requeue": "house",
                 "user_title_requeue": "house",
+                "volume_group_merge": "house",
             }.get(row["action"], "temp")
             _rollback_owned_destination(
                 conn, row, destination, source, source_bucket
@@ -1984,6 +1988,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "house_review_move": "house",
                 "title_cleanup_requeue": "house",
                 "user_title_requeue": "house",
+                "volume_group_merge": "house",
             }.get(row["action"], "temp")
             _finalize_existing_source_rollback(
                 conn, row, source, source_bucket
@@ -2018,6 +2023,30 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
             transition_operation(
                 conn, operation_id, "failed",
                 error="db_done title requeue state mismatch",
+            )
+        return "failed"
+    if row["action"] == "volume_group_merge":
+        db_committed = (
+            file_row is not None
+            and file_row["canonical_path"] == str(destination)
+            and file_row["source"] == "house"
+            and file_row["active"] == 1
+        )
+        if db_committed and destination_exists and not source_exists:
+            if not _owned_operation_path(row, destination, "destination"):
+                with transaction(conn):
+                    transition_operation(
+                        conn, operation_id, "stale",
+                        error="db_done volume destination ownership mismatch",
+                    )
+                return "stale"
+            with transaction(conn):
+                transition_operation(conn, operation_id, "committed")
+            return "committed"
+        with transaction(conn):
+            transition_operation(
+                conn, operation_id, "failed",
+                error="db_done volume group state mismatch",
             )
         return "failed"
     expected_source = {
@@ -2132,7 +2161,7 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
     if row["action"] in {
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
-        "title_cleanup_requeue", "user_title_requeue",
+        "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
     }:
         return _recover_interrupted_queue_operation(conn, operation_id)
     if row["action"] == "quarantine_purge":
