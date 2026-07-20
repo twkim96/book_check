@@ -574,6 +574,18 @@ def generate_managed_representative_candidates(entries, state_db_path):
     finally:
         conn.close()
 
+    # 이 보강 경로는 TXT normalized SHA join 전용이다. EPUB 대표는 아래
+    # ``representatives`` 입력에도 들어가지 않으므로 누락 판정 모수에서도 제외해야 한다.
+    # 그렇지 않으면 정상 인덱스에 존재하는 EPUB 대표를 모두 missing으로 오판한다.
+    representative_rows = [
+        row for row in representative_rows
+        if Path(row[0]).suffix.lower() == ".txt"
+    ]
+    cached_rows = [
+        row for row in cached_rows
+        if Path(row[0]).suffix.lower() == ".txt"
+    ]
+
     def current_hashes(rows):
         values = {}
         for row in rows:

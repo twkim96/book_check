@@ -2,6 +2,7 @@ import os
 
 import decision_store
 import deduplicator
+import duplicate_auditor
 from normalizer import (
     analyze_name,
     extract_catalog_query_title,
@@ -71,6 +72,47 @@ def test_user_title_literal_preserves_real_noise_word_without_becoming_metadata(
     assert title_literal_syntax_error(name) is None
     assert title_literal_syntax_error("[[19금] 제목.txt") is not None
     assert title_literal_syntax_error("[[   ]] 제목.txt") is not None
+
+
+def test_epub_representative_is_not_missing_from_txt_only_full_scan(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    representative = house / "합성 분권 1권.epub"
+    representative.write_bytes(b"synthetic epub representative")
+    state_db = tmp_path / "state.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            row = decision_store.reconcile_file_metadata(
+                conn, representative, source="house"
+            )
+            work_id = conn.execute(
+                "INSERT INTO works(display_title) VALUES ('합성 분권')"
+            ).lastrowid
+            variant_id = conn.execute(
+                "INSERT INTO variants(work_bucket_id, variant_kind) VALUES (?, 'base')",
+                (work_id,),
+            ).lastrowid
+            conn.execute(
+                """
+                UPDATE files SET variant_id = ?, assignment_state = 'managed',
+                    assignment_origin = 'strong_match', protected = 1
+                WHERE file_id = ?
+                """,
+                (variant_id, row["file_id"]),
+            )
+            conn.execute(
+                "INSERT INTO representatives(variant_id, file_id) VALUES (?, ?)",
+                (variant_id, row["file_id"]),
+            )
+    finally:
+        conn.close()
+
+    candidates, missing = duplicate_auditor.generate_managed_representative_candidates(
+        [], str(state_db)
+    )
+    assert candidates == []
+    assert missing == []
 
 
 def test_dry_run_never_removes_exact_duplicate_fixture(tmp_path):
