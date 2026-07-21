@@ -95,6 +95,24 @@ def test_volume_group_apply_stages_moves_and_links_one_work(tmp_path):
         conn.close()
 
 
+def test_same_folder_duplicate_coordinate_without_human_work_stays_review_required(tmp_path):
+    state_db, house, _, _ = _fixture(
+        tmp_path,
+        [
+            "ㄷ/미승인 작품/미승인 작품 1권.epub",
+            "ㄷ/미승인 작품/미승인 작품 1권_dup_1.epub",
+            "ㄷ/미승인 작품/미승인 작품 2권.epub",
+        ],
+    )
+
+    case = _case(state_db, house, classification="review_required")
+
+    assert case["duplicate_coordinates"] == ["1권"]
+    assert case["approved_duplicate_coordinates"] == []
+    assert case["unapproved_duplicate_coordinates"] == ["1권"]
+    assert "duplicate_coordinate" in case["blocked_reasons"]
+
+
 def test_volume_group_apply_merges_two_existing_volume_folders(tmp_path):
     state_db, house, temp, _ = _fixture(
         tmp_path,
@@ -223,6 +241,19 @@ def test_volume_group_apply_keeps_human_approved_coordinate_variants(tmp_path):
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()
+
+    grouped = _case(state_db, house, classification="already_grouped")
+    assert grouped["blocked_reasons"] == []
+    assert grouped["duplicate_coordinates"] == ["1권"]
+    assert grouped["approved_duplicate_coordinates"] == ["1권"]
+    assert grouped["unapproved_duplicate_coordinates"] == []
+    duplicate_items = [
+        item for item in grouped["items"] if item["coordinate"] == "1권"
+    ]
+    assert all(
+        item["issues"] == ["approved_duplicate_coordinate"]
+        for item in duplicate_items
+    )
 
 
 def test_manual_group_preserves_unselected_companion_in_source_folder(tmp_path):

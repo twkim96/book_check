@@ -114,6 +114,7 @@ def _source_revision(rows: Sequence[Mapping[str, object]]) -> str:
             "ctime_ns": row["ctime_ns"],
             "fingerprint_id": row["current_fingerprint_id"],
             "assignment_state": row["assignment_state"],
+            "assignment_origin": row["assignment_origin"],
             "variant_id": row["variant_id"],
             "work_bucket_id": row["work_bucket_id"],
             "core_title": row["core_title"],
@@ -145,7 +146,7 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
             """
             SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns,
                    f.dev, f.ino, f.ctime_ns, f.current_fingerprint_id,
-                   f.assignment_state, f.variant_id, f.protected,
+                   f.assignment_state, f.assignment_origin, f.variant_id, f.protected,
                    f.coordinate_kind, f.part_num, f.part_den,
                    f.volume_num, f.volume_den, f.coordinate_symbol,
                    f.coordinate_sort_key, f.coordinate_raw, f.span_ambiguous,
@@ -267,6 +268,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
                 "_coordinate_key": coordinate_key,
                 "_sort_key": sort_key,
                 "assignment_state": row["assignment_state"],
+                "assignment_origin": row["assignment_origin"],
                 "variant_id": row["variant_id"],
                 "work_bucket_id": row["work_bucket_id"],
                 "protected": bool(row["protected"]),
@@ -282,9 +284,9 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         for key in repeated_coordinate_keys
         if _is_parallel_side_story_formats(rows_by_coordinate[key])
     }
+    conflicting_coordinate_keys = repeated_coordinate_keys - parallel_format_keys
     duplicate_coordinates = sorted(
-        coordinate_labels[key]
-        for key in repeated_coordinate_keys - parallel_format_keys
+        coordinate_labels[key] for key in conflicting_coordinate_keys
     )
     parallel_format_coordinates = sorted(
         coordinate_labels[key] for key in parallel_format_keys
@@ -292,6 +294,49 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     kinds = {str(row["coordinate_kind"]) for row in rows}
     authors = sorted({str(row["author"]) for row in rows if row["author"]})
     work_ids = sorted({int(row["work_bucket_id"]) for row in rows if row["work_bucket_id"] is not None})
+    deep_parents = []
+    for parent in parent_paths:
+        try:
+            relative = parent.relative_to(house_dir)
+        except ValueError:
+            continue
+        if len(relative.parts) > 1:
+            deep_parents.append(parent)
+    already_grouped = len(parent_paths) == 1 and bool(deep_parents)
+
+    # A user may deliberately keep two different EPUB variants at the same
+    # volume coordinate.  Once every file is safely linked to one managed work
+    # and the repeated coordinate itself carries a human-decision origin, the
+    # review inventory should describe that fact instead of reopening it as a
+    # blocking conflict.  Keep the coordinate evidence in the response.
+    one_managed_work = (
+        already_grouped
+        and len(work_ids) == 1
+        and all(
+            row["work_bucket_id"] == work_ids[0]
+            and row["assignment_state"] == "managed"
+            and row["variant_id"] is not None
+            and bool(row["protected"])
+            and bool(row["representative"])
+            for row in rows
+        )
+    )
+    approved_duplicate_keys = {
+        key
+        for key in conflicting_coordinate_keys
+        if one_managed_work
+        and all(
+            row["assignment_origin"] == "human_decision"
+            for row in rows_by_coordinate[key]
+        )
+    }
+    unapproved_duplicate_keys = conflicting_coordinate_keys - approved_duplicate_keys
+    approved_duplicate_coordinates = sorted(
+        coordinate_labels[key] for key in approved_duplicate_keys
+    )
+    unapproved_duplicate_coordinates = sorted(
+        coordinate_labels[key] for key in unapproved_duplicate_keys
+    )
     missing_coordinates = []
     if kinds == {"volume"}:
         values = {
@@ -305,12 +350,13 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
                 ]
 
     incompatible_coordinate_kinds = _has_incompatible_coordinate_kinds(rows)
-    conflicting_coordinate_keys = repeated_coordinate_keys - parallel_format_keys
     for item in items:
         item_issues = []
         coordinate_key = item["_coordinate_key"]
-        if coordinate_key in conflicting_coordinate_keys:
+        if coordinate_key in unapproved_duplicate_keys:
             item_issues.append("duplicate_coordinate")
+        elif coordinate_key in approved_duplicate_keys:
+            item_issues.append("approved_duplicate_coordinate")
         if incompatible_coordinate_kinds:
             item_issues.append("mixed_coordinate_kind")
         if len(authors) > 1:
@@ -331,7 +377,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         blockers.append("non_title_core")
     if incompatible_coordinate_kinds:
         blockers.append("mixed_coordinate_kind")
-    if duplicate_coordinates:
+    if unapproved_duplicate_coordinates:
         blockers.append("duplicate_coordinate")
     # A missing volume is useful review information, but it is not a conflict.
     # Keep the gap visible so a user can spot an incomplete set while allowing
@@ -348,15 +394,6 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     if outside_house:
         blockers.append("source_outside_house")
 
-    deep_parents = []
-    for parent in parent_paths:
-        try:
-            relative = parent.relative_to(house_dir)
-        except ValueError:
-            continue
-        if len(relative.parts) > 1:
-            deep_parents.append(parent)
-    already_grouped = len(parent_paths) == 1 and bool(deep_parents)
     if "non_title_core" in blockers:
         classification = "excluded"
     elif blockers:
@@ -392,6 +429,8 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         "coordinate_kinds": sorted(kinds),
         "coordinate_range": [items[0]["coordinate"], items[-1]["coordinate"]],
         "duplicate_coordinates": duplicate_coordinates,
+        "approved_duplicate_coordinates": approved_duplicate_coordinates,
+        "unapproved_duplicate_coordinates": unapproved_duplicate_coordinates,
         "parallel_format_coordinates": parallel_format_coordinates,
         "missing_coordinates": missing_coordinates,
         "authors": authors,

@@ -24,7 +24,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.2.10"
+SERVER_VERSION = "1.2.11"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -198,6 +198,7 @@ def create_app(
         state_db=config.state_db,
         house_dir=config.house_dir,
         temp_dir=config.temp_dir,
+        index_path=config.index_path,
     )
     volume_provider = VolumeGroupProvider(
         state_db=config.state_db,
@@ -416,7 +417,7 @@ def create_app(
         return (
             "<!doctype html><meta charset='utf-8'><title>file_check</title>"
             "<body style='font-family:system-ui;padding:32px'>"
-            "<h1>도서 관리 서버 1.2.10</h1>"
+            "<h1>도서 관리 서버 1.2.11</h1>"
             "<p>프런트 빌드가 없습니다. library_frontend에서 npm run build를 실행하세요.</p>"
             "</body>",
             503,

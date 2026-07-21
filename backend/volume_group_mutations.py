@@ -39,10 +39,18 @@ def _coordinate_key(row: Mapping[str, object]):
     return None
 
 
-def suggest_folderling_volume_target(
+def classify_folderling_volume_target(
     conn, *, source_file_id: str, house_root: Path
-) -> dict | None:
-    """Return one fail-closed existing-folder target for a new volume intake."""
+) -> dict:
+    """Classify one volume as targetable, coordinate-conflicting, or unrelated.
+
+    A same-coordinate source is held before it can become a second house parent.
+    Later non-overlapping volumes in the same intake batch can therefore still
+    use the coherent existing work folder.
+    """
+
+    def no_target(reason):
+        return {"status": "no_target", "reason": reason}
 
     house_root = Path(house_root).resolve()
     source_row = conn.execute(
@@ -54,7 +62,7 @@ def suggest_folderling_volume_target(
         (source_file_id,),
     ).fetchone()
     if source_row is None:
-        return None
+        return no_target("missing_active_temp_source")
     source = dict(source_row)
     current_source_analysis = decision_store.build_file_analysis(
         Path(str(source["canonical_path"])).name
@@ -71,10 +79,10 @@ def suggest_folderling_volume_target(
         or source["span_ambiguous"]
         or int(source["disambig"] or 1) > 1
     ):
-        return None
+        return no_target("unsupported_or_ambiguous_coordinate")
     source_coordinate = _coordinate_key(source)
     if source_coordinate is None:
-        return None
+        return no_target("missing_coordinate")
 
     existing = [
         {
@@ -96,7 +104,7 @@ def suggest_folderling_volume_target(
         ).fetchall()
     ]
     if not existing:
-        return None
+        return no_target("no_existing_core")
     if any(
         (
             row["coordinate_kind"] != source["coordinate_kind"]
@@ -109,27 +117,43 @@ def suggest_folderling_volume_target(
         or int(row["disambig"] or 1) > 1
         for row in existing
     ):
-        return None
+        return no_target("existing_coordinate_shape_conflict")
     main_existing = [
         row for row in existing
         if row["coordinate_kind"] == source["coordinate_kind"]
     ]
     coordinates = [_coordinate_key(row) for row in main_existing]
-    if None in coordinates or source_coordinate in coordinates:
-        return None
+    if None in coordinates:
+        return no_target("existing_coordinate_missing")
+    coordinate_matches = [
+        row for row in main_existing
+        if _coordinate_key(row) == source_coordinate
+    ]
+    if coordinate_matches:
+        return {
+            "status": "coordinate_conflict",
+            "reason": "existing_same_coordinate",
+            "core_title": str(source["core_title"]),
+            "display_title": str(source["readable_title"] or source["core_title"]),
+            "coordinate_kind": source_coordinate[0],
+            "coordinate_num": source_coordinate[1],
+            "coordinate_den": source_coordinate[2],
+            "conflicting_file_ids": [str(row["file_id"]) for row in coordinate_matches],
+            "conflicting_paths": [str(row["canonical_path"]) for row in coordinate_matches],
+        }
 
     authors = {str(row["author"]) for row in existing if row["author"]}
     if source["author"]:
         authors.add(str(source["author"]))
     if len(authors) > 1:
-        return None
+        return no_target("author_conflict")
     works = {
         int(row["work_bucket_id"])
         for row in existing
         if row["work_bucket_id"] is not None
     }
     if len(works) > 1:
-        return None
+        return no_target("multiple_existing_works")
     if len(coordinates) != len(set(coordinates)) and not (
         len(works) == 1
         and all(
@@ -138,24 +162,151 @@ def suggest_folderling_volume_target(
             for row in existing
         )
     ):
-        return None
+        return no_target("duplicate_existing_coordinates")
 
     parents = {Path(str(row["canonical_path"])).resolve().parent for row in existing}
     if len(parents) != 1:
-        return None
+        return no_target("multiple_existing_parents")
     target = next(iter(parents))
     try:
         relative = target.relative_to(house_root)
     except ValueError:
-        return None
+        return no_target("target_outside_house")
     if len(relative.parts) <= 1 or target.is_symlink() or not target.is_dir():
-        return None
+        return no_target("existing_work_folder_required")
     return {
+        "status": "target",
         "target_folder": str(target),
         "existing_file_ids": [str(row["file_id"]) for row in existing],
         "display_title": str(source["readable_title"] or source["core_title"]),
         "core_title": str(source["core_title"]),
     }
+
+
+def suggest_folderling_volume_target(
+    conn, *, source_file_id: str, house_root: Path
+) -> dict | None:
+    """Return one fail-closed existing-folder target for a new volume intake."""
+    decision = classify_folderling_volume_target(
+        conn, source_file_id=source_file_id, house_root=house_root
+    )
+    return decision if decision["status"] == "target" else None
+
+
+def hold_folderling_volume_conflict(
+    conn,
+    *,
+    source_file_id: str,
+    temp_root: Path,
+    run_id: str,
+    conflict: Mapping[str, object],
+) -> dict:
+    """Journal a same-coordinate intake into a non-destructive warning queue."""
+    if conflict.get("status") != "coordinate_conflict":
+        raise ValueError("volume hold requires a coordinate conflict decision")
+
+    temp_root = Path(temp_root).resolve()
+    with mutation_lock(conn, f"volume-coordinate-hold:{run_id}", run_id=run_id):
+        actual_run = decision_store.assert_active_actual_run(conn, run_id)
+        source = _ensure_intake_fingerprint(conn, _file_state(conn, source_file_id))
+        if source["source"] != "temp":
+            raise RuntimeError("volume coordinate hold source must be temp")
+        if (
+            source["variant_id"] is not None
+            or source["protected"]
+            or source["representative"]
+            or source["assignment_state"] == "managed"
+        ):
+            raise RuntimeError(
+                "managed volume conflict requires relationship-preserving review"
+            )
+        source_path = _preflight(source)
+        decision_store.assert_actual_run_path(actual_run, source_path, "temp_root")
+        source_evidence = inspect_regular_file(source_path)
+        decision_store.assert_manifest_source(
+            actual_run, source_path, "temp_root", source_evidence
+        )
+
+        destination_dir = (
+            temp_root / "trash_bin" / "warning" / "volume_coordinate_conflicts"
+        )
+        ensure_directory_nofollow(destination_dir)
+        destination = destination_dir / source_path.name
+        counter = 1
+        while destination.exists() or destination.is_symlink():
+            destination = destination_dir / (
+                f"{source_path.stem}_conflict_{counter}{source_path.suffix}"
+            )
+            counter += 1
+        decision_store.assert_actual_run_path(actual_run, destination, "temp_root")
+
+        with decision_store.transaction(conn):
+            operation_id = decision_store.create_operation(
+                conn,
+                run_id=run_id,
+                action="volume_coordinate_hold",
+                source_path=str(source_path),
+                dest_path=str(destination),
+                file_id=source_file_id,
+                expected_size=source["size"],
+                expected_mtime_ns=source["mtime_ns"],
+                expected_fingerprint_id=source["current_fingerprint_id"],
+                source_dev=source_evidence.dev,
+                source_ino=source_evidence.ino,
+                source_ctime_ns=source_evidence.ctime_ns,
+                source_sha256=source_evidence.sha256,
+            )
+
+        def guard():
+            decision_store.assert_active_actual_run(conn, run_id)
+            current = _file_state(conn, source_file_id)
+            if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
+                raise RuntimeError("volume conflict source changed before consume")
+
+        destination_evidence = decision_store.copy_record_consume_operation(
+            conn,
+            operation_id,
+            source_path,
+            destination,
+            source_evidence,
+            guard=guard,
+        )
+        with decision_store.transaction(conn):
+            conn.execute(
+                """
+                UPDATE files
+                SET canonical_path = ?, source = 'queue',
+                    assignment_state = 'decision_required', assignment_origin = NULL,
+                    variant_id = NULL, protected = 0,
+                    dev = ?, ino = ?, ctime_ns = ?, size = ?, mtime_ns = ?,
+                    last_seen_at = CURRENT_TIMESTAMP
+                WHERE file_id = ?
+                """,
+                (
+                    str(destination),
+                    destination_evidence.dev,
+                    destination_evidence.ino,
+                    destination_evidence.ctime_ns,
+                    destination_evidence.size,
+                    destination_evidence.mtime_ns,
+                    source_file_id,
+                ),
+            )
+            decision_store.transition_operation(conn, operation_id, "db_done")
+        with decision_store.transaction(conn):
+            decision_store.transition_operation(conn, operation_id, "committed")
+        return {
+            "operation_id": operation_id,
+            "action": "volume_coordinate_hold",
+            "file_id": source_file_id,
+            "source_path": str(source_path),
+            "dest_path": str(destination),
+            "conflicting_file_ids": list(conflict.get("conflicting_file_ids") or ()),
+            "conflicting_paths": list(conflict.get("conflicting_paths") or ()),
+            "coordinate_kind": conflict.get("coordinate_kind"),
+            "coordinate_num": conflict.get("coordinate_num"),
+            "coordinate_den": conflict.get("coordinate_den"),
+        }
 
 
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -466,6 +617,12 @@ def merge_staged_volume_group(
                         evidence.ctime_ns, evidence.size, evidence.mtime_ns,
                         record["file_id"],
                     ),
+                )
+                decision_store.upsert_file_analysis(
+                    conn,
+                    record["file_id"],
+                    record["destination"],
+                    stat_result=os.stat(record["destination"], follow_symlinks=False),
                 )
                 decision_store.transition_operation(
                     conn, record["operation_id"], "db_done"

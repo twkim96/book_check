@@ -177,6 +177,7 @@ def test_volume_review_api_builds_confirmation_bound_plan(tmp_path):
         time.sleep(0.01)
     assert job["state"] == "succeeded", job
     assert job["result"]["index_updated"] is True
+    assert job["result"]["index_mode"] == "state_db_projection"
     destination = config.house_dir / "ㅂ" / "별빛 도서"
     assert sorted(path.name for path in destination.iterdir()) == [
         "별빛 도서 1권.txt",

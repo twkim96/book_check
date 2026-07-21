@@ -17,7 +17,12 @@ from normalizer import (
     strip_trash_suffix,
     SUPPORTED_EXTENSIONS,
 )
-from scanner import generate_file_list
+from scanner import (
+    IndexSnapshotStale,
+    generate_file_list,
+    generate_file_list_from_state_db,
+    validate_index_snapshot,
+)
 from deduplicator import clean_duplicates, unique_path
 from project_paths import HOUSE_DIR, PROJECT_ROOT, TEMP_DIR
 
@@ -32,6 +37,19 @@ NORMAL_CONFLICT_SUFFIX = "_dup"
 PASS_CONFLICT_SUFFIX = "_pass"
 EXTENSION_INDEX_PATH = os.path.join("extension", "file_index.json")
 HOUSE_INDEX_FILENAME = "file_index.json"
+
+
+class VolumeCoordinateConflict(RuntimeError):
+    """One incoming volume overlaps an existing coordinate and must be held."""
+
+    def __init__(self, decision):
+        self.decision = dict(decision)
+        coordinate = (
+            self.decision.get("coordinate_kind"),
+            self.decision.get("coordinate_num"),
+            self.decision.get("coordinate_den"),
+        )
+        super().__init__(f"existing volume coordinate conflict: {coordinate}")
 
 
 def get_now():
@@ -170,7 +188,7 @@ def move_to_house(
     auto_volume = None
     if state_db_path and os.path.isfile(src_path) and not is_pass:
         import decision_store
-        from volume_group_mutations import suggest_folderling_volume_target
+        from volume_group_mutations import classify_folderling_volume_target
 
         conn = decision_store.connect_state_db(state_db_path)
         try:
@@ -179,11 +197,15 @@ def move_to_house(
                 (decision_store.canonicalize_path(src_path),),
             ).fetchone()
             if source_row is not None:
-                auto_volume = suggest_folderling_volume_target(
+                volume_decision = classify_folderling_volume_target(
                     conn,
                     source_file_id=source_row["file_id"],
                     house_root=dst_dir,
                 )
+                if volume_decision["status"] == "coordinate_conflict":
+                    raise VolumeCoordinateConflict(volume_decision)
+                if volume_decision["status"] == "target":
+                    auto_volume = volume_decision
         finally:
             conn.close()
         if auto_volume is not None:
@@ -332,12 +354,29 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
     print("=" * 60)
     print("📦 1단계: 중복/검토 큐 정리 (house + temp 통합)")
     print("=" * 60)
+    snapshot = validate_index_snapshot(
+        dst_dir,
+        file_index_json,
+        state_db_path,
+        allowed_active_run_id=actual_run_id,
+    )
+    pre_index_mode = "verified_snapshot" if snapshot["valid"] else "full_scan_fallback"
+    if snapshot["valid"]:
+        print(
+            "⚡ 기존 house index 재사용: "
+            f"revision={snapshot['inventory_revision'][:12]}"
+        )
+    else:
+        print(
+            "🔄 house 전체 Scanner fallback: "
+            f"{snapshot['reason']}"
+        )
     dedup_summary = clean_duplicates(
         house_dir=dst_dir,
         temp_dir=src_dir,
         dry_run=False,
         index_path=file_index_json,
-        rescan=True,
+        rescan=not snapshot["valid"],
         move_suspects=True,
         delete_exact=True,
         include_temp=True,
@@ -356,6 +395,7 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
     pass_count = 0
     failure_count = 0
     empty_dir_cleanup_count = 0
+    volume_conflict_hold_count = 0
 
     with open(success_log, "w", encoding="utf-8") as s_log, \
          open(fail_log, "w", encoding="utf-8") as f_log:
@@ -418,6 +458,49 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                 else:
                     move_count += 1
 
+            except VolumeCoordinateConflict as conflict_exc:
+                try:
+                    import decision_store
+                    from volume_group_mutations import hold_folderling_volume_conflict
+
+                    conn = decision_store.connect_state_db(state_db_path)
+                    try:
+                        source_row = conn.execute(
+                            "SELECT file_id FROM files "
+                            "WHERE canonical_path = ? AND active = 1 AND source = 'temp'",
+                            (decision_store.canonicalize_path(src_path),),
+                        ).fetchone()
+                        if source_row is None:
+                            raise RuntimeError(
+                                "volume coordinate conflict source is not active in temp"
+                            )
+                        held = hold_folderling_volume_conflict(
+                            conn,
+                            source_file_id=source_row["file_id"],
+                            temp_root=src_dir,
+                            run_id=actual_run_id,
+                            conflict=conflict_exc.decision,
+                        )
+                    finally:
+                        conn.close()
+                    volume_conflict_hold_count += 1
+                    conflicts = ", ".join(held["conflicting_paths"])
+                    s_log.write(
+                        f"[{now_str}] [volume-coordinate-hold] "
+                        f"{held['source_path']} -> {held['dest_path']} | "
+                        f"existing={conflicts}\n"
+                    )
+                    print(
+                        "  ⚠️ 동일 권 좌표 보류: "
+                        f"{os.path.basename(held['source_path'])} "
+                        f"→ {held['dest_path']}"
+                    )
+                except Exception as hold_exc:
+                    failure_count += 1
+                    f_log.write(
+                        f"[{now_str}] {src_path} | 동일 권 좌표 보류 실패: {hold_exc} | "
+                        "조치: 원본과 기존 동일 권 파일을 직접 비교\n"
+                    )
             except Exception as e:
                 failure_count += 1
                 f_log.write(
@@ -432,6 +515,8 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
         print(f"  - temp 빈 디렉터리 {empty_dir_cleanup_count}개 정리")
     if pass_count > 0:
         print(f"  - pass 폴더 승인 항목 {pass_count}개 강제 입고됨")
+    if volume_conflict_hold_count:
+        print(f"  - 동일 권 좌표 보류 {volume_conflict_hold_count}개")
     print(f"→ 로그 파일({script_dir} 위치)을 확인하세요.")
     print("  - success.log / fail.log")
 
@@ -440,23 +525,52 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
     print("=" * 60)
     print("🔄 3단계: 인덱스 갱신")
     print("=" * 60)
+    index_mode = "state_db_projection"
+    index_fallback_reason = None
+    index_ready = False
     try:
-        index_ok = generate_file_list(
-            [dst_dir],
+        projection = generate_file_list_from_state_db(
+            dst_dir,
             file_list_json,
             file_index_json,
-            state_db_path=os.path.join(script_dir, ".dedup_state", "dedup_decisions.sqlite3"),
+            state_db_path,
+            allowed_active_run_id=actual_run_id,
         )
-        if not index_ok:
-            raise RuntimeError("scanner index generation returned failure")
-        print("✨ file_list.json / file_index.json 업데이트 완료")
-        if not sync_house_index(file_index_json, dst_dir):
-            raise RuntimeError("house index sync failed")
-        if not sync_extension_index(file_index_json, script_dir):
-            raise RuntimeError("extension index sync failed")
+        if not projection["ok"]:
+            raise RuntimeError("DB snapshot index generation returned failure")
+        index_ready = True
+        print("✨ file_list.json / file_index.json 증분 projection 완료")
+    except IndexSnapshotStale as exc:
+        index_mode = "full_scan_fallback"
+        index_fallback_reason = str(exc)
+        print(f"🔄 DB snapshot 검증 실패, 전체 Scanner fallback: {exc}")
+        try:
+            index_ok = generate_file_list(
+                [dst_dir],
+                file_list_json,
+                file_index_json,
+                state_db_path=state_db_path,
+            )
+            if not index_ok:
+                raise RuntimeError("scanner index generation returned failure")
+            index_ready = True
+            print("✨ file_list.json / file_index.json 전체 갱신 완료")
+        except Exception as fallback_exc:
+            failure_count += 1
+            print(f"⚠️ 파일 인덱스 fallback 중 에러가 발생했습니다: {fallback_exc}")
     except Exception as e:
         failure_count += 1
         print(f"⚠️ 파일 인덱스 업데이트 중 에러가 발생했습니다: {e}")
+
+    if index_ready:
+        try:
+            if not sync_house_index(file_index_json, dst_dir):
+                raise RuntimeError("house index sync failed")
+            if not sync_extension_index(file_index_json, script_dir):
+                raise RuntimeError("extension index sync failed")
+        except Exception as e:
+            failure_count += 1
+            print(f"⚠️ 파일 인덱스 배포 중 에러가 발생했습니다: {e}")
 
     # ── 요약 ──
     print()
@@ -471,6 +585,7 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
             f"작가 충돌 {dedup_summary.get('author_conflict_count', 0)})"
         )
     print(f"  폴더링  : 입고 {move_count}개, pass {pass_count}개")
+    print(f"  좌표 충돌: warning 보류 {volume_conflict_hold_count}개")
     print(f"  빈 폴더 : temp 디렉터리 {empty_dir_cleanup_count}개 정리")
     if failure_count:
         print(f"  실패/부분 완료: {failure_count}건 (actual run은 failed 처리)")
@@ -492,6 +607,11 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
         "pass_count": pass_count,
         "empty_dir_cleanup_count": empty_dir_cleanup_count,
         "failure_count": failure_count,
+        "volume_conflict_hold_count": volume_conflict_hold_count,
+        "pre_index_mode": pre_index_mode,
+        "pre_index_fallback_reason": snapshot["reason"],
+        "index_mode": index_mode,
+        "index_fallback_reason": index_fallback_reason,
     }
 
 

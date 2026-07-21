@@ -416,7 +416,7 @@ def build_title_plan(
 ) -> dict:
     if not changes:
         return {
-            "version": "1.2.10",
+            "version": "1.2.11",
             "provider": "title_correction",
             "item_count": 0,
             "blocked_count": 0,
@@ -459,7 +459,7 @@ def build_title_plan(
 
     blocked_count = sum(bool(item["blocked_reasons"]) for item in items)
     return {
-        "version": "1.2.10",
+        "version": "1.2.11",
         "provider": "title_correction",
         "normalizer_version": NORMALIZER_VERSION,
         "state_db": str(Path(state_db).resolve()),

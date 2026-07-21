@@ -418,6 +418,7 @@ const volumeBlockerLabels: Record<string, string> = {
   non_title_core: "제목으로 보기 어려운 core",
   mixed_coordinate_kind: "권과 부 등 서로 다른 본편 좌표 체계 혼합",
   duplicate_coordinate: "같은 권 좌표 중복",
+  approved_duplicate_coordinate: "같은 작품으로 승인된 동일 권 판본",
   missing_coordinate: "중간 권 누락",
   author_conflict: "작가 충돌",
   work_conflict: "기존 work 충돌",
@@ -541,7 +542,8 @@ function VolumeReview() {
                     {item.blocked_reasons.length === 0 ? <span className="safe-note">충돌 없음</span> : item.blocked_reasons.map((reason) => (
                       <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}</small>
                     ))}
-                    {item.duplicate_coordinates.length > 0 && <small className="collision">중복 좌표 {item.duplicate_coordinates.join(", ")}</small>}
+                    {item.unapproved_duplicate_coordinates.length > 0 && <small className="collision">중복 좌표 {item.unapproved_duplicate_coordinates.join(", ")}</small>}
+                    {item.approved_duplicate_coordinates.length > 0 && <small className="safe-note">승인된 동일 권 판본 {item.approved_duplicate_coordinates.join(", ")}</small>}
                     {item.missing_coordinates.length > 0 && <small className="collision">누락 {item.missing_coordinates.slice(0, 8).join(", ")}{item.missing_coordinates.length > 8 ? "…" : ""}</small>}
                   </td>
                   <td><button className="button secondary" onClick={() => setActiveCase(item)}>구성 보기</button></td>
@@ -650,13 +652,13 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
             <td>{item.author ?? <span className="muted-value">미상</span>}</td>
             <td><b>{item.extension.replace(".", "").toUpperCase()}</b><small>{formatBytes(item.size)}</small></td>
             <td>{item.issues.length === 0 ? <span className="safe-note">없음</span> : item.issues.map((reason) => (
-              <small className="blocked" key={reason}>{volumeBlockerLabels[reason] ?? reason}{reason === "duplicate_coordinate" ? ` (${item.same_coordinate_count}개)` : ""}</small>
+              <small className={reason === "approved_duplicate_coordinate" ? "safe-note" : "blocked"} key={reason}>{volumeBlockerLabels[reason] ?? reason}{reason === "duplicate_coordinate" || reason === "approved_duplicate_coordinate" ? ` (${item.same_coordinate_count}개)` : ""}</small>
             ))}</td>
             <td><NavLink to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink></td>
           </tr>)}</tbody>
         </table>
       </div>
-      {value.duplicate_coordinates.length > 0 && <label className="volume-override">
+      {value.unapproved_duplicate_coordinates.length > 0 && <label className="volume-override">
         <input type="checkbox" checked={allowDuplicateCoordinates} onChange={(event) => {
           setAllowDuplicateCoordinates(event.target.checked);
           setPreview(undefined);

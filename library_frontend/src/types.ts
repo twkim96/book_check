@@ -96,6 +96,7 @@ export interface VolumeItem {
   same_coordinate_count: number;
   issues: string[];
   assignment_state: string;
+  assignment_origin: string | null;
   variant_id: number | null;
   work_bucket_id: number | null;
   protected: boolean;
@@ -115,6 +116,8 @@ export interface VolumeCase {
   coordinate_kinds: string[];
   coordinate_range: [string, string];
   duplicate_coordinates: string[];
+  approved_duplicate_coordinates: string[];
+  unapproved_duplicate_coordinates: string[];
   parallel_format_coordinates: string[];
   missing_coordinates: string[];
   authors: string[];

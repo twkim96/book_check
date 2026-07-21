@@ -1956,6 +1956,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
         "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
+        "volume_coordinate_hold",
     }:
         raise ValueError("operation is not a queue move")
     if row["state"] not in {"planned", "fs_done", "db_done"}:
@@ -2189,6 +2190,7 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
         "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
+        "volume_coordinate_hold",
     }:
         return _recover_interrupted_queue_operation(conn, operation_id)
     if row["action"] == "quarantine_purge":

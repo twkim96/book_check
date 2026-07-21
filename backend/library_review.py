@@ -21,6 +21,47 @@ from volume_review import (
 )
 
 
+def _refresh_review_index(*, state_db: Path, house_dir: Path, index_path: Path) -> dict:
+    """Refresh review mutation surfaces from DB, with a safe full-scan fallback."""
+    from folderling import sync_house_index
+    from scanner import (
+        IndexSnapshotStale,
+        generate_file_list,
+        generate_file_list_from_state_db,
+    )
+
+    file_list_path = index_path.with_name("file_list.json")
+    mode = "state_db_projection"
+    fallback_reason = None
+    try:
+        result = generate_file_list_from_state_db(
+            str(house_dir),
+            str(file_list_path),
+            str(index_path),
+            str(state_db),
+        )
+        updated = bool(result["ok"])
+    except IndexSnapshotStale as exc:
+        mode = "full_scan_fallback"
+        fallback_reason = str(exc)
+        updated = bool(
+            generate_file_list(
+                [str(house_dir)],
+                str(file_list_path),
+                str(index_path),
+                state_db_path=str(state_db),
+            )
+        )
+    return {
+        "index_updated": updated,
+        "index_mode": mode,
+        "index_fallback_reason": fallback_reason,
+        "house_index_synced": bool(
+            updated and sync_house_index(str(index_path), str(house_dir))
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class ProviderDescriptor:
     provider_id: str
@@ -92,10 +133,18 @@ class TitleCorrectionProvider:
     descriptor = ProviderDescriptor("title_correction", "제목 교정", True)
     job_type = "title_requeue"
 
-    def __init__(self, *, state_db: Path, house_dir: Path, temp_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        state_db: Path,
+        house_dir: Path,
+        temp_dir: Path,
+        index_path: Path,
+    ) -> None:
         self.state_db = Path(state_db)
         self.house_dir = Path(house_dir)
         self.temp_dir = Path(temp_dir)
+        self.index_path = Path(index_path)
 
     def list_cases(self, **filters) -> dict:
         return list_title_cases(self.state_db, **filters)
@@ -129,7 +178,7 @@ class TitleCorrectionProvider:
         confirm_plan_sha256: str,
         progress=None,
     ) -> dict:
-        return apply_title_plan(
+        result = apply_title_plan(
             self.state_db,
             house_dir=self.house_dir,
             temp_dir=self.temp_dir,
@@ -138,6 +187,24 @@ class TitleCorrectionProvider:
             confirm_plan_sha256=confirm_plan_sha256,
             progress=progress,
         )
+        try:
+            result.update(
+                _refresh_review_index(
+                    state_db=self.state_db,
+                    house_dir=self.house_dir,
+                    index_path=self.index_path,
+                )
+            )
+            if not result["index_updated"]:
+                result["warning"] = "제목 교정은 완료됐지만 index 갱신에 실패했습니다"
+        except Exception as exc:
+            result.update({
+                "index_updated": False,
+                "index_mode": "failed",
+                "house_index_synced": False,
+                "warning": f"제목 교정은 완료됐지만 index 갱신 중 오류가 발생했습니다: {exc}",
+            })
+        return result
 
 
 class VolumeGroupProvider:
@@ -208,27 +275,20 @@ class VolumeGroupProvider:
             confirm_plan_sha256=confirm_plan_sha256,
             progress=progress,
         )
-        from folderling import sync_house_index
-        from scanner import generate_file_list
-
-        file_list_path = self.index_path.with_name("file_list.json")
         try:
-            result["index_updated"] = bool(
-                generate_file_list(
-                    [str(self.house_dir)],
-                    str(file_list_path),
-                    str(self.index_path),
-                    state_db_path=str(self.state_db),
+            result.update(
+                _refresh_review_index(
+                    state_db=self.state_db,
+                    house_dir=self.house_dir,
+                    index_path=self.index_path,
                 )
             )
             if not result["index_updated"]:
                 result["warning"] = "파일 병합은 완료됐지만 index 갱신에 실패했습니다"
-            else:
-                result["house_index_synced"] = bool(
-                    sync_house_index(str(self.index_path), str(self.house_dir))
-                )
         except Exception as exc:
             result["index_updated"] = False
+            result["index_mode"] = "failed"
+            result["house_index_synced"] = False
             result["warning"] = (
                 "파일 병합은 완료됐지만 index 갱신 중 오류가 발생했습니다: "
                 f"{exc}"

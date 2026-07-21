@@ -1,5 +1,7 @@
 import json
+import hashlib
 import os
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -112,6 +114,317 @@ def _build_entry(path, base_dir, entry_type, decision_projection=None, analysis=
             })
 
     return entry
+
+
+class IndexSnapshotStale(RuntimeError):
+    """The DB/index snapshot cannot prove the current house inventory."""
+
+
+def _atomic_json_write(path, payload):
+    """Replace one JSON surface atomically without exposing a partial index."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _write_index_surfaces(
+    entries,
+    output_path,
+    index_output_path,
+    *,
+    index_mode="full_scan",
+    inventory_revision=None,
+):
+    files = sorted({entry["name"] for entry in entries})
+    payload = {
+        "version": 2,
+        "normalizer_version": NORMALIZER_VERSION,
+        "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "entries": entries,
+    }
+    if index_mode:
+        payload["index_mode"] = index_mode
+    if inventory_revision:
+        payload["inventory_revision"] = inventory_revision
+    _atomic_json_write(output_path, files)
+    _atomic_json_write(index_output_path, payload)
+    return {
+        "ok": True,
+        "index_mode": index_mode,
+        "file_name_count": len(files),
+        "file_entry_count": sum(entry["type"] == "file" for entry in entries),
+        "entry_count": len(entries),
+        "inventory_revision": inventory_revision,
+    }
+
+
+def _strict_identity_matches(row, stat_result):
+    return bool(
+        row["size"] == stat_result.st_size
+        and row["mtime_ns"] == stat_result.st_mtime_ns
+        and (row["dev"] is None or row["dev"] == stat_result.st_dev)
+        and (row["ino"] is None or row["ino"] == stat_result.st_ino)
+        and (row["ctime_ns"] is None or row["ctime_ns"] == stat_result.st_ctime_ns)
+    )
+
+
+def _analysis_identity_matches(row, name, stat_result):
+    return bool(
+        row["analysis_normalizer_version"] == NORMALIZER_VERSION
+        and row["analyzed_name"] == name
+        and row["analyzed_size"] == stat_result.st_size
+        and row["analyzed_mtime_ns"] == stat_result.st_mtime_ns
+        and (
+            row["analyzed_ctime_ns"] is None
+            or row["analyzed_ctime_ns"] == stat_result.st_ctime_ns
+        )
+    )
+
+
+def _state_projection_rows(conn):
+    return conn.execute(
+        """
+        SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns,
+               f.dev, f.ino, f.ctime_ns, f.variant_id,
+               f.assignment_state, f.protected,
+               f.coordinate_kind, f.episode_start, f.episode_end,
+               f.span_ambiguous,
+               v.work_bucket_id,
+               CASE WHEN r.file_id IS NULL THEN 0 ELSE 1 END AS representative,
+               a.normalizer_version AS analysis_normalizer_version,
+               a.analyzed_name, a.core_title, a.author,
+               a.max_number, a.effective_max, a.unit, a.complete, a.disambig,
+               a.analyzed_size, a.analyzed_mtime_ns, a.analyzed_ctime_ns,
+               a.title_override_json
+        FROM files AS f
+        LEFT JOIN variants AS v ON v.variant_id = f.variant_id
+        LEFT JOIN representatives AS r ON r.file_id = f.file_id
+        LEFT JOIN file_analysis AS a ON a.file_id = f.file_id
+        WHERE f.active = 1 AND f.source = 'house'
+        ORDER BY f.canonical_path
+        """
+    ).fetchall()
+
+
+def build_index_entries_from_state_db(
+    house_dir,
+    state_db_path,
+    *,
+    allowed_active_run_id=None,
+    verify_doctor=True,
+):
+    """Project the current index from journaled DB rows after a cheap path walk.
+
+    The walk proves that no supported file was added or removed outside the
+    program.  File identity and stored analysis must match exactly.  Any gap is
+    fail-closed so the caller can fall back to the complete Scanner reconcile.
+    """
+    import decision_store
+
+    house_root = Path(house_dir).expanduser().resolve()
+    if not house_root.is_dir():
+        raise IndexSnapshotStale(f"house root is missing: {house_root}")
+
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        if verify_doctor:
+            issues = decision_store.doctor_issues(
+                conn, allowed_active_run_id=allowed_active_run_id
+            )
+            if issues:
+                raise IndexSnapshotStale(
+                    f"doctor issues: {len(issues)} ({issues[0]['kind']})"
+                )
+        rows = _state_projection_rows(conn)
+    finally:
+        conn.close()
+
+    rows_by_path = {row["canonical_path"]: row for row in rows}
+    expected_paths = set()
+    for row in rows:
+        path = Path(row["canonical_path"])
+        try:
+            relative = path.relative_to(house_root)
+        except ValueError as exc:
+            raise IndexSnapshotStale(
+                f"active house row is outside the configured root: {path}"
+            ) from exc
+        if (
+            any(should_exclude_dir(part) for part in relative.parts[:-1])
+            or should_exclude_file(relative.name)
+            or not is_supported_file(relative.name)
+        ):
+            continue
+        expected_paths.add(normalize_nfc(str(relative)))
+
+    entries = []
+    seen_paths = set()
+    revision_rows = []
+    base_dir = str(house_root)
+    for root, dirs, files in os.walk(house_root, followlinks=False):
+        dirs[:] = [directory for directory in dirs if not should_exclude_dir(directory)]
+        for filename in files:
+            if should_exclude_file(filename) or not is_supported_file(filename):
+                continue
+            path = Path(root) / filename
+            canonical_path = decision_store.canonicalize_path(path)
+            row = rows_by_path.get(canonical_path)
+            if row is None:
+                raise IndexSnapshotStale(
+                    f"supported house file is absent from state DB: {path}"
+                )
+            try:
+                stat_result = os.stat(path, follow_symlinks=False)
+            except OSError as exc:
+                raise IndexSnapshotStale(f"house file cannot be statted: {path}") from exc
+            if not _strict_identity_matches(row, stat_result):
+                raise IndexSnapshotStale(f"house file identity changed: {path}")
+            normalized_name = normalize_nfc(filename)
+            if not _analysis_identity_matches(row, normalized_name, stat_result):
+                raise IndexSnapshotStale(f"file analysis is stale: {path}")
+
+            analysis = analyze_name(normalized_name)
+            analysis.update({
+                "core_title": row["core_title"],
+                "author": row["author"],
+                "max_number": row["max_number"],
+                "effective_max": row["effective_max"],
+                "unit": row["unit"],
+                "complete": bool(row["complete"]),
+                "disambig": row["disambig"],
+                "title_override": bool(row["title_override_json"]),
+            })
+            projection = {
+                "file_id": row["file_id"],
+                "variant_id": row["variant_id"],
+                "assignment_state": row["assignment_state"],
+                "protected": row["protected"],
+                "work_bucket_id": row["work_bucket_id"],
+                "representative": row["representative"],
+            }
+            entries.append(
+                _build_entry(
+                    str(path), base_dir, "file",
+                    {canonical_path: projection}, analysis=analysis,
+                )
+            )
+            relative = normalize_nfc(os.path.relpath(path, house_root))
+            seen_paths.add(relative)
+            revision_rows.append((
+                row["file_id"], relative, stat_result.st_size,
+                stat_result.st_mtime_ns, stat_result.st_ctime_ns,
+                row["analysis_normalizer_version"], row["core_title"],
+                row["variant_id"], row["assignment_state"], row["protected"],
+                row["work_bucket_id"], row["representative"],
+            ))
+
+        if os.path.abspath(root) != base_dir:
+            for directory_name in dirs:
+                entries.append(
+                    _build_entry(
+                        os.path.join(root, directory_name), base_dir, "dir"
+                    )
+                )
+
+    if seen_paths != expected_paths:
+        missing = sorted(expected_paths - seen_paths)[:3]
+        extra = sorted(seen_paths - expected_paths)[:3]
+        raise IndexSnapshotStale(
+            f"house inventory differs from state DB: missing={missing}, extra={extra}"
+        )
+
+    entries.sort(key=lambda item: (item["rel_path"], item["name"]))
+    revision = hashlib.sha256(
+        json.dumps(
+            revision_rows, ensure_ascii=False, sort_keys=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return entries, revision
+
+
+def validate_index_snapshot(
+    house_dir,
+    index_path,
+    state_db_path,
+    *,
+    allowed_active_run_id=None,
+):
+    """Return a reusable projected snapshot or a fail-closed fallback reason."""
+    try:
+        with open(index_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("version") != 2 or not isinstance(payload.get("entries"), list):
+            raise IndexSnapshotStale("index is not a v2 payload")
+        if payload.get("normalizer_version") != NORMALIZER_VERSION:
+            raise IndexSnapshotStale("normalizer version changed")
+        entries, revision = build_index_entries_from_state_db(
+            house_dir,
+            state_db_path,
+            allowed_active_run_id=allowed_active_run_id,
+        )
+        if payload["entries"] != entries:
+            raise IndexSnapshotStale("index entries differ from the verified DB projection")
+        return {
+            "valid": True,
+            "entries": entries,
+            "inventory_revision": revision,
+            "reason": None,
+        }
+    except Exception as exc:
+        return {
+            "valid": False,
+            "entries": None,
+            "inventory_revision": None,
+            "reason": str(exc),
+        }
+
+
+def generate_file_list_from_state_db(
+    house_dir,
+    output_path,
+    index_output_path,
+    state_db_path,
+    *,
+    allowed_active_run_id=None,
+):
+    """Write final public indexes without a second Scanner reconciliation."""
+    entries, revision = build_index_entries_from_state_db(
+        house_dir,
+        state_db_path,
+        allowed_active_run_id=allowed_active_run_id,
+    )
+    result = _write_index_surfaces(
+        entries,
+        output_path,
+        index_output_path,
+        index_mode="state_db_projection",
+        inventory_revision=revision,
+    )
+    print(
+        "\n✅ DB snapshot index 완료: "
+        f"파일 {result['file_entry_count']}개, revision={revision[:12]}"
+    )
+    print(f"👉 {output_path}")
+    print(f"👉 {index_output_path}")
+    return result
 
 
 def get_file_entries(
@@ -282,34 +595,21 @@ def generate_file_list(
 ):
     """지정된 디렉토리들을 스캔하여 레거시 목록과 구조화 인덱스를 저장합니다."""
     entries = get_file_entries(directory_list, state_db_path=state_db_path)
-    files = sorted({entry["name"] for entry in entries})
     index_output_path = index_output_path or _default_index_path(output_path)
 
     try:
         if not entries:
             print("\nℹ️ 스캔된 파일이 없습니다. 빈 인덱스를 저장합니다.")
-
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(files, f, ensure_ascii=False, indent=2)
-
-        index_dir = os.path.dirname(index_output_path)
-        if index_dir:
-            os.makedirs(index_dir, exist_ok=True)
-
-        index_payload = {
-            "version": 2,
-            "normalizer_version": NORMALIZER_VERSION,
-            "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-            "entries": entries,
-        }
-        with open(index_output_path, "w", encoding="utf-8") as f:
-            json.dump(index_payload, f, ensure_ascii=False, indent=2)
-
-        print(f"\n✅ 스캔 완료! 총 {len(files)}개의 파일 목록을 다음 위치에 저장했습니다:")
+        result = _write_index_surfaces(
+            entries,
+            output_path,
+            index_output_path,
+            index_mode="full_scan",
+        )
+        print(
+            f"\n✅ 스캔 완료! 총 {result['file_name_count']}개의 파일 목록을 "
+            "다음 위치에 저장했습니다:"
+        )
         print(f"👉 {output_path}")
         print(f"👉 {index_output_path}")
         return True
