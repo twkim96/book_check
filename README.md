@@ -159,6 +159,25 @@ core title에서 `외전` 단독 EPUB과 본편 `N권` EPUB 사이의 `metadata_
 fingerprint가 갱신된 같은 파일쌍은 오래된 open review를 `superseded`하고 최신 증거 하나만
 남깁니다.
 
+### 전체 카탈로그 탐색기 (1.3.1)
+
+`/catalog`는 작품·파일·폴더·격리의 네 읽기 전용 탭을 제공합니다.
+
+- `작품`: 보유 파일과 시리즈·카카오·노벨피아 수집 상태
+- `파일`: 활성·비활성·house·temp·queue 상태, 분석 좌표, work/variant, fingerprint와 검토·결정·작업 이력
+- `폴더`: DB가 알고 있는 house 폴더를 먼저 조회하고, 상세를 열 때만 실제 파일을 읽어 DB 등록 파일과
+  표지 같은 미등록 부속 파일을 구분
+- `격리`: committed operation과 실제 `txt_temp/trash_bin`을 대조해 보관·누락·미추적·삭제 이력을 구분
+
+파일 두 개를 선택하면 core title, 작가, 권·부·회차 좌표, 크기, raw/normalized SHA와 기존 review·decision
+근거를 나란히 비교할 수 있습니다. 관계 판정, 격리, 복원, 이동, 영구 삭제 버튼은 미리보기만 표시하며
+1.3.1에서는 실행되지 않습니다. 제목 교정으로 퇴역한 `.dedup_state/retired_paths` 가상 경로도 실제
+폴더나 격리 파일로 세지 않고 파일 이력에서만 표시합니다.
+
+16,000개 이상 운영 규모를 위해 파일·작품 목록은 SQLite read model에서 페이지 단위로 읽습니다.
+폴더 목록은 DB projection을 짧게 캐시하고 사용자가 `실제 상태 갱신`을 눌렀을 때 명시적으로 새로
+계산합니다. 실제 폴더와 격리 파일 순회는 상세 확인 또는 격리 탭에서만 안전 상한을 두고 수행합니다.
+
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
 읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로

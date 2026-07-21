@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { ApiError, api, postJson } from "./api";
+import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
 import { SettingsPage } from "./Settings";
 import type {
   CatalogItem,
@@ -74,7 +75,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.0</small>
+            <small>file_check 1.3.1</small>
           </div>
         </div>
         <nav>
@@ -233,6 +234,14 @@ function catalogMetric(item: CatalogItem, platform: "series" | "kakao" | "novelp
 }
 
 function Catalog() {
+  const [params] = useSearchParams();
+  const requested = params.get("tab") ?? "works";
+  const tab: CatalogTab = requested === "files" || requested === "folders" || requested === "quarantine" ? requested : "works";
+  if (tab !== "works") return <CatalogExplorer tab={tab} />;
+  return <WorksCatalog />;
+}
+
+function WorksCatalog() {
   const [params, setParams] = useSearchParams();
   const [listing, setListing] = useState<CatalogListing>();
   const [error, setError] = useState("");
@@ -259,7 +268,8 @@ function Catalog() {
   };
   if (error && !listing) return <ErrorPanel message={error} retry={load} />;
   return <>
-    <PageHeader eyebrow="READ-ONLY CATALOG" title="보유 도서 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 한 화면에서 찾습니다. 1.3.0에서는 조회만 가능합니다." action={<span className="readonly-pill">READ ONLY</span>} />
+    <PageHeader eyebrow="READ-ONLY CATALOG" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 한 화면에서 찾습니다. 모든 탐색 기능은 읽기 전용입니다." action={<span className="readonly-pill">READ ONLY</span>} />
+    <CatalogTabs active="works" />
     {error && <div className="inline-error">{error}</div>}
     <div className="toolbar catalog-toolbar">
       <form className="search-form" onSubmit={submit}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="원본 제목·core title·작가 검색" /><button className="button secondary">검색</button></form>
@@ -279,13 +289,13 @@ function Catalog() {
           const isOpen = expanded.has(item.title_key);
           return <Fragment key={item.title_key}>
             <tr>
-              <td><strong>{item.display_title}</strong><code className="core">{item.title_key}</code>{item.author && <small>{item.author}</small>}</td>
-              <td><b>{item.file_count}개</b><small>{item.effective_max ? `~${formatNumber(item.effective_max)}${item.unit}${item.complete ? " 완" : ""}` : "범위 미상"}</small></td>
+              <td><strong>{item.display_title}</strong><code className="core">{item.title_key}</code>{item.author && <small>{item.author}</small>}{item.work_bucket_ids.length > 0 && <small>work {item.work_bucket_ids.join(", ")} · 판본 {item.variant_ids.length}</small>}</td>
+              <td><b>{item.file_count}개</b><small>{item.effective_max ? `~${formatNumber(item.effective_max)}${item.unit}${item.complete ? " 완" : ""}` : "범위 미상"}</small><small>{item.folders.length > 1 ? `${item.folders.length}개 폴더 분산` : "한 폴더"}</small></td>
               {(["series", "kakao", "novelpia"] as const).map((platform) => <td key={platform}><StatusBadge status={item.platforms[platform].status} /><span>{catalogMetric(item, platform)}</span>{item.platforms[platform].remote_url && <a href={item.platforms[platform].remote_url ?? undefined} target="_blank" rel="noreferrer">원문 ↗</a>}</td>)}
               <td><button className="button ghost" onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(item.title_key)) next.delete(item.title_key); else next.add(item.title_key); return next; })}>{isOpen ? "접기" : "파일 보기"}</button></td>
             </tr>
             {isOpen && <tr className="catalog-detail-row"><td colSpan={6}><div className="catalog-detail-grid">
-              <section><strong>보유 파일 {item.files.length}개</strong>{item.files.map((file) => <div className="catalog-file" key={file.file_id}><b>{file.name}</b><small title={file.path}>{file.path}</small></div>)}</section>
+              <section><strong>보유 파일 {item.files.length}개 · 판본 {item.variant_ids.length}개</strong>{item.folders.length > 1 && <div className="catalog-relation-note"><b>여러 폴더에 분산</b>{item.folders.map((folder) => <small key={folder}>{folder}</small>)}</div>}{item.files.map((file) => <NavLink className="catalog-file" to={`/catalog?tab=files&search=${encodeURIComponent(file.file_id)}`} key={file.file_id}><b>{file.name}{item.representative_file_ids.includes(file.file_id) ? " · 대표" : ""}</b><small title={file.path}>{file.path}</small></NavLink>)}</section>
               <section><strong>플랫폼 수집 근거</strong>{(["series", "kakao", "novelpia"] as const).map((platform) => { const value = item.platforms[platform]; return <div className="catalog-platform-detail" key={platform}><b>{platformLabels[platform]} · {statusLabel(value.status)}</b><small>{value.remote_title ?? "원문 제목 없음"}</small><small>마지막 시도 {value.last_attempt_at ? new Date(value.last_attempt_at).toLocaleString("ko-KR") : "없음"}</small>{value.error_message && <small className="blocked">{value.error_message}</small>}</div>; })}</section>
             </div></td></tr>}
           </Fragment>;

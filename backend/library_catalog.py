@@ -123,13 +123,22 @@ def catalog_listing(
         keys = [row["title_key"] for row in rows]
         files_by_key = {key: [] for key in keys}
         stats_by_key = {key: {} for key in keys}
+        relations_by_key = {
+            key: {"work_bucket_ids": set(), "variant_ids": set(), "folders": set(), "representative_file_ids": []}
+            for key in keys
+        }
         if keys:
             placeholders = ",".join("?" for _ in keys)
             file_rows = conn.execute(
                 f"""
                 SELECT a.core_title AS title_key, f.file_id, f.canonical_path,
-                       a.readable_title, a.author, a.effective_max, a.unit, a.complete
-                FROM files AS f JOIN file_analysis AS a ON a.file_id = f.file_id
+                       a.readable_title, a.author, a.effective_max, a.unit, a.complete,
+                       f.variant_id, v.work_bucket_id,
+                       CASE WHEN r.file_id IS NULL THEN 0 ELSE 1 END AS representative
+                FROM files AS f
+                JOIN file_analysis AS a ON a.file_id = f.file_id
+                LEFT JOIN variants AS v ON v.variant_id = f.variant_id
+                LEFT JOIN representatives AS r ON r.file_id = f.file_id
                 WHERE f.active = 1 AND f.source = 'house'
                   AND a.core_title IN ({placeholders})
                 ORDER BY a.core_title, f.canonical_path
@@ -138,6 +147,14 @@ def catalog_listing(
             ).fetchall()
             for row in file_rows:
                 path = str(row["canonical_path"])
+                relation = relations_by_key[row["title_key"]]
+                relation["folders"].add(str(Path(path).parent))
+                if row["work_bucket_id"] is not None:
+                    relation["work_bucket_ids"].add(int(row["work_bucket_id"]))
+                if row["variant_id"] is not None:
+                    relation["variant_ids"].add(int(row["variant_id"]))
+                if row["representative"]:
+                    relation["representative_file_ids"].append(row["file_id"])
                 files_by_key[row["title_key"]].append({
                     "file_id": row["file_id"],
                     "name": Path(path).name,
@@ -169,6 +186,7 @@ def catalog_listing(
         items = []
         for row in rows:
             key = row["title_key"]
+            relation = relations_by_key[key]
             items.append({
                 "title_key": key,
                 "display_title": row["display_title"],
@@ -179,6 +197,10 @@ def catalog_listing(
                 "complete": bool(row["complete"]),
                 "unit": row["unit"],
                 "files": files_by_key[key],
+                "work_bucket_ids": sorted(relation["work_bucket_ids"]),
+                "variant_ids": sorted(relation["variant_ids"]),
+                "folders": sorted(relation["folders"], key=str.casefold),
+                "representative_file_ids": relation["representative_file_ids"],
                 "platforms": {
                     platform: stats_by_key[key].get(platform, {
                         "platform": platform,

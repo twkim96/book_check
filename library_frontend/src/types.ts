@@ -308,6 +308,10 @@ export interface CatalogItem {
   unit: string;
   complete: boolean;
   files: CatalogFile[];
+  work_bucket_ids: number[];
+  variant_ids: number[];
+  folders: string[];
+  representative_file_ids: string[];
   platforms: Record<"series" | "kakao" | "novelpia", CatalogPlatform>;
 }
 
@@ -319,6 +323,190 @@ export interface CatalogListing {
   next_cursor: string | null;
   search: string;
   status: string;
+  readonly: true;
+}
+
+export interface ExplorerFile {
+  file_id: string;
+  canonical_path: string;
+  name: string;
+  parent: string;
+  extension: string;
+  source: string;
+  active: boolean;
+  size: number;
+  mtime_ns: number;
+  last_seen_at: string;
+  assignment_state: string;
+  assignment_origin: string | null;
+  variant_id: number | null;
+  protected: boolean;
+  representative: boolean;
+  work_bucket_id: number | null;
+  variant_kind: string | null;
+  variant_label: string | null;
+  core_title: string | null;
+  readable_title: string | null;
+  catalog_query_title: string | null;
+  author: string | null;
+  coordinate_kind: string | null;
+  coordinate_raw: string | null;
+  part_num: number | null;
+  part_den: number | null;
+  volume_num: number | null;
+  volume_den: number | null;
+  coordinate_symbol: string | null;
+  episode_start: number | null;
+  episode_end: number | null;
+  effective_max: number;
+  unit: string;
+  complete: boolean;
+  fingerprint_id: number | null;
+  fingerprint_status: string | null;
+  raw_sha256: string | null;
+  normalized_sha256: string | null;
+  normalized_length: number | null;
+  retired_virtual_path: boolean;
+}
+
+export interface ExplorerFileListing {
+  items: ExplorerFile[];
+  total: number;
+  limit: number;
+  cursor: string | null;
+  next_cursor: string | null;
+  search: string;
+  source: string;
+  extension: string;
+  sort: string;
+  direction: string;
+  readonly: true;
+}
+
+export interface ExplorerHistoryItem {
+  review_id?: number;
+  decision_id?: number;
+  operation_id?: number;
+  run_id?: string;
+  classification?: string;
+  verdict?: string;
+  action?: string;
+  state?: string;
+  operation_state?: string;
+  source_path?: string | null;
+  dest_path?: string | null;
+  quarantine_path?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  decided_at?: string;
+  note?: string | null;
+  evidence?: unknown;
+}
+
+export interface ExplorerFileDetail {
+  file: ExplorerFile & Record<string, unknown>;
+  reviews: ExplorerHistoryItem[];
+  decisions: ExplorerHistoryItem[];
+  operations: ExplorerHistoryItem[];
+  same_coordinate: Array<{ file_id: string; canonical_path: string; size: number; source: string; active: number; author: string | null }>;
+  actions: { compare: boolean; title_correction: boolean; quarantine: false; move: false; blocked_reasons: string[]; future_version: string };
+  readonly: true;
+}
+
+export interface ExplorerComparison {
+  left: ExplorerFile & Record<string, unknown>;
+  right: ExplorerFile & Record<string, unknown>;
+  comparison: {
+    same_core_title: boolean;
+    same_author: boolean;
+    same_coordinate: boolean;
+    same_raw_sha256: boolean;
+    same_normalized_sha256: boolean;
+    size_delta: number;
+  };
+  latest_review: ExplorerHistoryItem | null;
+  latest_decision: ExplorerHistoryItem | null;
+  latest_pair_cache: (ExplorerHistoryItem & { classification?: string }) | null;
+  relationship_preview: { available_verdicts: string[]; apply_available: false; future_version: string };
+  readonly: true;
+}
+
+export interface ExplorerFolder {
+  path: string;
+  name: string;
+  relative_path: string;
+  file_count: number;
+  total_size: number;
+  core_titles: string[];
+  work_bucket_ids: number[];
+  variant_ids: number[];
+  sample_files: string[];
+  mixed_core: boolean;
+  mixed_work: boolean;
+  depth: number;
+}
+
+export interface ExplorerFolderListing {
+  items: ExplorerFolder[];
+  total: number;
+  limit: number;
+  cursor: string | null;
+  next_cursor: string | null;
+  search: string;
+  state: string;
+  sort: string;
+  direction: string;
+  readonly: true;
+}
+
+export interface ExplorerFolderDetail {
+  path: string;
+  relative_path: string;
+  entries: Array<{
+    name: string;
+    path: string;
+    relative_path: string;
+    size: number;
+    extension: string;
+    registered: boolean;
+    symlink: boolean;
+    file: Record<string, unknown> | null;
+  }>;
+  registered_count: number;
+  unregistered_count: number;
+  total_size: number;
+  truncated: boolean;
+  actions: { rename: false; move: false; quarantine: false; future_version: string };
+  readonly: true;
+}
+
+export interface ExplorerQuarantineItem {
+  operation_id: number | null;
+  action: string | null;
+  source_path: string | null;
+  keep_path: string | null;
+  name: string;
+  path: string;
+  category: string;
+  physical_state: "present" | "missing" | "untracked" | "purged";
+  size: number | null;
+  modified_at: number | null;
+  age_days: number | null;
+  tracked: boolean;
+  restore_available: false;
+  purge_available: false;
+  future_version: string;
+}
+
+export interface ExplorerQuarantineListing {
+  items: ExplorerQuarantineItem[];
+  total: number;
+  limit: number;
+  cursor: string | null;
+  next_cursor: string | null;
+  search: string;
+  state: string;
+  summary: Record<"present" | "missing" | "untracked" | "purged", number>;
   readonly: true;
 }
 

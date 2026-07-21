@@ -17,6 +17,14 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 import decision_store
 from library_catalog import catalog_listing, review_queue_listing
 from library_appearance import read_appearance, reset_appearance, write_appearance
+from library_explorer import (
+    compare_files,
+    file_detail,
+    file_listing,
+    folder_detail,
+    folder_listing,
+    quarantine_listing,
+)
 from library_jobs import JobActiveError, JobRunner, JobStore
 from library_reports import (
     dedup_report_listing,
@@ -34,7 +42,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.3.0"
+SERVER_VERSION = "1.3.1"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -390,6 +398,65 @@ def create_app(
     def dashboard():
         return jsonify({"ok": True, "data": dashboard_snapshot(config, runner)})
 
+    @app.get("/api/explorer/files")
+    def explorer_files():
+        return jsonify({"ok": True, "data": file_listing(
+            config.state_db,
+            search=request.args.get("search", ""),
+            source=request.args.get("source", "active"),
+            extension=request.args.get("extension", "all"),
+            sort=request.args.get("sort", "name"),
+            direction=request.args.get("direction", "asc"),
+            limit=request.args.get("limit", 50, type=int),
+            cursor=request.args.get("cursor") or None,
+        )})
+
+    @app.get("/api/explorer/files/<file_id>")
+    def explorer_file(file_id):
+        return jsonify({"ok": True, "data": file_detail(config.state_db, file_id)})
+
+    @app.get("/api/explorer/compare")
+    def explorer_compare():
+        return jsonify({"ok": True, "data": compare_files(
+            config.state_db,
+            request.args.get("left", ""),
+            request.args.get("right", ""),
+        )})
+
+    @app.get("/api/explorer/folders")
+    def explorer_folders():
+        return jsonify({"ok": True, "data": folder_listing(
+            config.state_db,
+            config.house_dir,
+            search=request.args.get("search", ""),
+            state=request.args.get("state", "all"),
+            sort=request.args.get("sort", "name"),
+            direction=request.args.get("direction", "asc"),
+            limit=request.args.get("limit", 50, type=int),
+            cursor=request.args.get("cursor") or None,
+            refresh=request.args.get("refresh") == "1",
+        )})
+
+    @app.get("/api/explorer/folders/detail")
+    def explorer_folder_detail():
+        folder_path = request.args.get("path", "")
+        if not folder_path:
+            raise ValueError("path is required")
+        return jsonify({"ok": True, "data": folder_detail(
+            config.state_db, config.house_dir, folder_path
+        )})
+
+    @app.get("/api/explorer/quarantine")
+    def explorer_quarantine():
+        return jsonify({"ok": True, "data": quarantine_listing(
+            config.state_db,
+            config.temp_dir,
+            search=request.args.get("search", ""),
+            state=request.args.get("state", "all"),
+            limit=request.args.get("limit", 50, type=int),
+            cursor=request.args.get("cursor") or None,
+        )})
+
     @app.get("/api/settings/appearance")
     def appearance_settings():
         settings, persisted = read_appearance(appearance_path)
@@ -677,7 +744,7 @@ def create_app(
         return (
             "<!doctype html><meta charset='utf-8'><title>file_check</title>"
             "<body style='font-family:system-ui;padding:32px'>"
-            "<h1>도서 관리 서버 1.3.0</h1>"
+            "<h1>도서 관리 서버 1.3.1</h1>"
             "<p>프런트 빌드가 없습니다. library_frontend에서 npm run build를 실행하세요.</p>"
             "</body>",
             503,

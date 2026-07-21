@@ -234,10 +234,40 @@ def test_readonly_catalog_groups_owned_files_and_platform_status(tmp_path):
     [item] = listing["items"]
     assert item["display_title"] == "수동 교정 작품 146"
     assert item["files"][0]["file_id"] == file_id
+    assert item["folders"]
+    assert item["variant_ids"] == []
+    assert item["work_bucket_ids"] == []
     assert item["platforms"]["series"]["status"] == "not_found"
     assert item["platforms"]["kakao"]["status"] == "not_found"
     assert item["platforms"]["novelpia"]["status"] == "not_found"
     assert client.get("/catalog").status_code == 200
+
+
+def test_readonly_explorer_routes_expose_file_folder_and_quarantine(tmp_path):
+    app, file_id = _server_fixture(tmp_path)
+    client = app.test_client()
+
+    files = client.get("/api/explorer/files?source=house&search=수동").get_json()["data"]
+    assert files["readonly"] is True
+    assert files["items"][0]["file_id"] == file_id
+
+    detail = client.get(f"/api/explorer/files/{file_id}").get_json()["data"]
+    assert detail["file"]["name"] == "수동 교정 작품 146.txt"
+    assert detail["actions"]["quarantine"] is False
+
+    folders = client.get("/api/explorer/folders?search=house&refresh=1").get_json()["data"]
+    assert folders["readonly"] is True
+    [folder] = folders["items"]
+    folder_detail_response = client.get(
+        "/api/explorer/folders/detail", query_string={"path": folder["path"]}
+    )
+    assert folder_detail_response.status_code == 200
+    assert folder_detail_response.get_json()["data"]["registered_count"] == 1
+
+    quarantine = client.get("/api/explorer/quarantine").get_json()["data"]
+    assert quarantine["readonly"] is True
+    assert quarantine["total"] == 0
+    assert client.get("/api/explorer/compare", query_string={"left": file_id}).status_code == 400
 
 
 def test_readonly_review_queue_lists_managed_warning_files(tmp_path):
