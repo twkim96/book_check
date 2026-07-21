@@ -237,7 +237,10 @@ def main(argv=None):
     except Exception as exc:
         print(f"❌ Folderling 원버튼 실행 실패: {exc}", file=sys.stderr)
         return 2
-    return 2 if result.get("failure_count", 0) else 0
+    return 2 if (
+        result.get("failure_count", 0)
+        or result.get("unpack_cleanup_issue_count", 0)
+    ) else 0
 
 
 if __name__ == "__main__":

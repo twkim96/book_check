@@ -49,7 +49,7 @@ from library_review import (
     VolumeGroupProvider,
 )
 from library_services import LibraryServiceRegistry, ServiceBlocked
-from normalizer import should_exclude_intake_dir, should_exclude_intake_file
+from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
@@ -93,12 +93,12 @@ def _count_supported(root: Path, *, intake_only: bool = False) -> int:
             directories[:] = [
                 name
                 for name in directories
-                if not should_exclude_intake_dir(name)
+                if not should_exclude_dir(name)
                 and not (Path(current) / name).is_symlink()
             ]
         for filename in filenames:
             path = Path(current) / filename
-            if intake_only and should_exclude_intake_file(filename):
+            if intake_only and should_exclude_file(filename):
                 continue
             if (
                 path.is_file()

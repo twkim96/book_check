@@ -351,15 +351,15 @@ def test_dashboard_pending_matches_folderling_intake_exclusions(tmp_path):
     nested.mkdir()
     (nested / "intake.epub").write_text("book", encoding="utf-8")
     (config.temp_dir / "direct.txt").write_text("book", encoding="utf-8")
-    held = config.temp_dir / "hold" / "20260701 완결"
-    held.mkdir(parents=True)
-    (held / "held.txt").write_text("book", encoding="utf-8")
-    legacy_held = config.temp_dir / "___기존 보류"
-    legacy_held.mkdir()
-    (legacy_held / "held.epub").write_text("book", encoding="utf-8")
+    unpack = config.temp_dir / "unpack" / "20260701 완결"
+    unpack.mkdir(parents=True)
+    (unpack / "unpacked.txt").write_text("book", encoding="utf-8")
+    legacy_unpack = config.temp_dir / "___기존 묶음"
+    legacy_unpack.mkdir()
+    (legacy_unpack / "unpacked.epub").write_text("book", encoding="utf-8")
 
     dashboard = app.test_client().get("/api/dashboard").get_json()["data"]
-    assert dashboard["filesystem"]["folderling_pending"] == 2
+    assert dashboard["filesystem"]["folderling_pending"] == 4
     assert dashboard["filesystem"]["warning_files"] == 1
 
 

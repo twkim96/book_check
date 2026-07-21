@@ -9,9 +9,12 @@ from tqdm import tqdm
 from normalizer import (
     add_pass_marker,
     get_chosung,
+    is_supported_file,
     materialize_title_markup,
     normalize_filename,
-    should_exclude_intake_dir,
+    normalize_nfc,
+    should_exclude_dir,
+    should_exclude_file,
     strip_pass_marker,
     strip_disambig_marker,
     strip_trash_suffix,
@@ -30,6 +33,8 @@ from project_paths import HOUSE_DIR, PROJECT_ROOT, TEMP_DIR
 DEFAULT_SRC_DIR = str(TEMP_DIR)
 DEFAULT_DST_DIR = str(HOUSE_DIR)
 PASS_DIR_NAME = "pass"
+UNPACK_DIR_NAME = "unpack"
+LEGACY_UNPACK_PREFIX = "___"
 
 # 자모 폴더에 같은 이름의 파일이 이미 있을 때 새 파일에 붙는 충돌 회피 suffix.
 # 일반 입고와 pass 입고를 분리하여 의미가 섞이지 않게 한다.
@@ -113,8 +118,141 @@ def parse_args(argv):
 
 
 def should_skip_source_item(item):
-    # Check before normalize_filename turns underscores into spaces.
-    return should_exclude_intake_dir(item)
+    return should_exclude_dir(item)
+
+
+def is_unpack_source_dir(name):
+    """Recognize the explicit unpack inbox and legacy ``___*`` wrappers."""
+    normalized = normalize_nfc(name).strip()
+    return bool(normalized) and (
+        normalized.casefold() == UNPACK_DIR_NAME
+        or normalized.startswith(LEGACY_UNPACK_PREFIX)
+    )
+
+
+def _unpack_roots(src_dir):
+    roots = []
+    if not os.path.isdir(src_dir):
+        return roots
+    for name in sorted(os.listdir(src_dir)):
+        path = os.path.join(src_dir, name)
+        if os.path.isdir(path) and not os.path.islink(path) and is_unpack_source_dir(name):
+            roots.append((name, path, name.strip().casefold() == UNPACK_DIR_NAME))
+    return roots
+
+
+def iter_unpack_supported_files(root):
+    """Yield supported regular files below one unpack wrapper in stable order."""
+    paths = []
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        directories[:] = [
+            name for name in sorted(directories)
+            if not should_exclude_dir(name)
+            and not os.path.islink(os.path.join(current, name))
+        ]
+        for filename in sorted(filenames):
+            path = os.path.join(current, filename)
+            if (
+                should_exclude_file(filename)
+                or not is_supported_file(filename)
+                or os.path.islink(path)
+                or not os.path.isfile(path)
+            ):
+                continue
+            paths.append(path)
+    return paths
+
+
+def _tree_has_symlink(root):
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        if any(os.path.islink(os.path.join(current, name)) for name in directories):
+            return True
+        if any(os.path.islink(os.path.join(current, name)) for name in filenames):
+            return True
+    return False
+
+
+def _tree_file_stats(root):
+    count = 0
+    size = 0
+    for current, _, filenames in os.walk(root, followlinks=False):
+        for filename in filenames:
+            path = os.path.join(current, filename)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            count += 1
+            try:
+                size += os.path.getsize(path)
+            except OSError:
+                pass
+    return count, size
+
+
+def cleanup_unpack_sources(src_dir):
+    """Discard unpack wrappers only after every supported file left safely.
+
+    ``txt_temp/unpack`` remains as the reusable inbox. Legacy ``___*`` wrapper
+    directories are removed completely. Unsupported cover/archive assets are
+    intentionally discarded with the wrapper, matching the historic contract.
+    A symlink or any remaining supported file fails closed and preserves the
+    complete remaining tree for inspection or retry.
+    """
+    results = []
+    for name, root, reusable in _unpack_roots(src_dir):
+        remaining = iter_unpack_supported_files(root)
+        if remaining:
+            results.append({
+                "name": name,
+                "path": root,
+                "status": "pending_supported_files",
+                "remaining_supported": len(remaining),
+                "discarded_files": 0,
+                "discarded_bytes": 0,
+            })
+            continue
+        if _tree_has_symlink(root):
+            results.append({
+                "name": name,
+                "path": root,
+                "status": "symlink_blocked",
+                "remaining_supported": 0,
+                "discarded_files": 0,
+                "discarded_bytes": 0,
+            })
+            continue
+        discarded_files, discarded_bytes = _tree_file_stats(root)
+        try:
+            if reusable:
+                for child in sorted(os.listdir(root)):
+                    child_path = os.path.join(root, child)
+                    if os.path.isdir(child_path):
+                        shutil.rmtree(child_path)
+                    else:
+                        os.unlink(child_path)
+            else:
+                shutil.rmtree(root)
+            status = "cleaned"
+        except OSError as exc:
+            status = "cleanup_failed"
+            results.append({
+                "name": name,
+                "path": root,
+                "status": status,
+                "remaining_supported": 0,
+                "discarded_files": 0,
+                "discarded_bytes": 0,
+                "error": str(exc),
+            })
+            continue
+        results.append({
+            "name": name,
+            "path": root,
+            "status": status,
+            "remaining_supported": 0,
+            "discarded_files": discarded_files,
+            "discarded_bytes": discarded_bytes,
+        })
+    return results
 
 
 def prune_empty_intake_tree(path):
@@ -318,16 +456,25 @@ def move_to_house(
     return dst_path
 def iter_process_items(src_dir, pass_dir):
     normal_items = []
+    unpack_items = []
 
     if os.path.exists(src_dir):
         for item in sorted(os.listdir(src_dir)):
             if item == PASS_DIR_NAME:
                 continue
-            normal_items.append((item, os.path.join(src_dir, item), False))
+            item_path = os.path.join(src_dir, item)
+            if is_unpack_source_dir(item):
+                if os.path.isdir(item_path) and not os.path.islink(item_path):
+                    unpack_items.extend(
+                        (os.path.basename(path), path, False)
+                        for path in iter_unpack_supported_files(item_path)
+                    )
+                continue
+            normal_items.append((item, item_path, False))
 
     # 1.2.1: pass/는 더 이상 사람 판정 입력이 아니다. 기존 내용은 손대지 않고
     # dedup_decisions.py 사용 안내만 출력하며 폴더링 대상에서 제외한다.
-    return normal_items
+    return normal_items + unpack_items
 
 
 def _process_items_authorized(
@@ -378,9 +525,8 @@ def _process_items_authorized(
                 reason="legacy_pass_requires_pair_decision",
             )
 
-    # ``hold``와 기존 ``___*`` 묶음은 dedup/auditor와 아래 intake 양쪽에서
-    # 제외한다. 보류 해제는 사용자가 해당 묶음을 temp 루트로 꺼내는 명시적
-    # 파일 작업이며, Folderling은 보류 폴더를 평탄화하거나 이름을 바꾸지 않는다.
+    # ``unpack``과 기존 ``___*`` 묶음은 dedup/auditor에는 일반 temp 파일로
+    # 참여하고, 아래 intake 단계에서 지원 파일만 개별 항목으로 펼쳐 입고한다.
 
     # ── 1단계: 중복 제거 + 검토 큐 격리 (house + temp 통합 스캔) ──
     print("=" * 60)
@@ -459,6 +605,10 @@ def _process_items_authorized(
     failure_count = 0
     empty_dir_cleanup_count = 0
     volume_conflict_hold_count = 0
+    unpack_cleanup_results = []
+    unpack_cleanup_issue_count = 0
+    unpack_discarded_file_count = 0
+    unpack_discarded_bytes = 0
 
     with open(success_log, "w", encoding="utf-8") as s_log, \
          open(fail_log, "w", encoding="utf-8") as f_log:
@@ -697,16 +847,59 @@ def _process_items_authorized(
                     next_action="경로·권한 확인 후 재실행",
                 )
 
+        unpack_cleanup_results = cleanup_unpack_sources(src_dir)
+        for cleanup in unpack_cleanup_results:
+            status = cleanup["status"]
+            if status == "cleaned":
+                unpack_discarded_file_count += cleanup["discarded_files"]
+                unpack_discarded_bytes += cleanup["discarded_bytes"]
+                s_log.write(
+                    f"[{get_now()}] [unpack-cleanup] {cleanup['path']} | "
+                    f"부속 파일 {cleanup['discarded_files']}개 "
+                    f"({cleanup['discarded_bytes']} bytes) 삭제\n"
+                )
+            else:
+                unpack_cleanup_issue_count += 1
+                f_log.write(
+                    f"[{get_now()}] [unpack-preserved] {cleanup['path']} | "
+                    f"status={status} "
+                    f"remaining_supported={cleanup['remaining_supported']} "
+                    f"error={cleanup.get('error', '')}\n"
+                )
+            emit_folderling_event(
+                event_callback,
+                "unpack_cleanup",
+                status="succeeded" if status == "cleaned" else "needs_review",
+                source_path=os.path.abspath(cleanup["path"]),
+                source_name=cleanup["name"],
+                cleanup_status=status,
+                remaining_supported=cleanup["remaining_supported"],
+                discarded_files=cleanup["discarded_files"],
+                discarded_bytes=cleanup["discarded_bytes"],
+                error=cleanup.get("error"),
+                next_action=(
+                    None if status == "cleaned"
+                    else "남은 지원 파일 또는 심볼릭 링크를 확인한 뒤 재실행"
+                ),
+            )
+
         emit_folderling_event(
             event_callback,
             "intake_result",
-            status="needs_review" if failure_count or volume_conflict_hold_count else "succeeded",
+            status=(
+                "needs_review"
+                if failure_count or volume_conflict_hold_count or unpack_cleanup_issue_count
+                else "succeeded"
+            ),
             total=item_total,
             move_count=move_count,
             pass_count=pass_count,
             failure_count=failure_count,
             volume_conflict_hold_count=volume_conflict_hold_count,
             empty_dir_cleanup_count=empty_dir_cleanup_count,
+            unpack_cleanup_issue_count=unpack_cleanup_issue_count,
+            unpack_discarded_file_count=unpack_discarded_file_count,
+            unpack_discarded_bytes=unpack_discarded_bytes,
         )
 
     cleanup_recent_links(recent_dir, max_days=30)
@@ -718,6 +911,13 @@ def _process_items_authorized(
         print(f"  - pass 폴더 승인 항목 {pass_count}개 강제 입고됨")
     if volume_conflict_hold_count:
         print(f"  - 동일 권 좌표 보류 {volume_conflict_hold_count}개")
+    if unpack_discarded_file_count:
+        print(
+            "  - unpack 부속 파일 삭제 "
+            f"{unpack_discarded_file_count}개 ({unpack_discarded_bytes} bytes)"
+        )
+    if unpack_cleanup_issue_count:
+        print(f"  - unpack 정리 보류 {unpack_cleanup_issue_count}개 묶음")
     print(f"→ 로그 파일({script_dir} 위치)을 확인하세요.")
     print("  - success.log / fail.log")
 
@@ -807,6 +1007,10 @@ def _process_items_authorized(
         )
     print(f"  폴더링  : 입고 {move_count}개, pass {pass_count}개")
     print(f"  좌표 충돌: warning 보류 {volume_conflict_hold_count}개")
+    print(
+        "  unpack   : 부속 삭제 "
+        f"{unpack_discarded_file_count}개, 정리 보류 {unpack_cleanup_issue_count}개"
+    )
     print(f"  빈 폴더 : temp 디렉터리 {empty_dir_cleanup_count}개 정리")
     if failure_count:
         print(f"  실패/부분 완료: {failure_count}건 (actual run은 failed 처리)")
@@ -829,6 +1033,10 @@ def _process_items_authorized(
         "empty_dir_cleanup_count": empty_dir_cleanup_count,
         "failure_count": failure_count,
         "volume_conflict_hold_count": volume_conflict_hold_count,
+        "unpack_cleanup_results": unpack_cleanup_results,
+        "unpack_cleanup_issue_count": unpack_cleanup_issue_count,
+        "unpack_discarded_file_count": unpack_discarded_file_count,
+        "unpack_discarded_bytes": unpack_discarded_bytes,
         "pre_index_mode": pre_index_mode,
         "pre_index_fallback_reason": snapshot["reason"],
         "index_mode": index_mode,
@@ -837,7 +1045,11 @@ def _process_items_authorized(
     emit_folderling_event(
         event_callback,
         "folderling_summary",
-        status="needs_review" if failure_count or volume_conflict_hold_count else "succeeded",
+        status=(
+            "needs_review"
+            if failure_count or volume_conflict_hold_count or unpack_cleanup_issue_count
+            else "succeeded"
+        ),
         **result,
     )
     return result

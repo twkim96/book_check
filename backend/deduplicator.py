@@ -16,8 +16,8 @@ from normalizer import (
     is_supported_file,
     normalize_filename,
     normalize_nfc,
-    should_exclude_intake_dir,
-    should_exclude_intake_file,
+    should_exclude_dir,
+    should_exclude_file,
     strip_disambig_marker,
     strip_trash_suffix,
     units_comparable,
@@ -267,7 +267,7 @@ def scan_temp_files(temp_dir):
     """temp 폴더의 지원 확장자 파일을 재귀적으로 스캔한다.
 
     - 관리 폴더(`pass`, `warning`, `trash_bin`, `dedup_logs`, `_최근`, 숨김 폴더,
-      `__pycache__`)와 보류 폴더(`hold`, 기존 `___*`)는 진입을 차단한다.
+      `__pycache__` 등)는 `should_exclude_dir`을 통해 진입을 차단한다.
     - `〔P〕`/`〔Dn〕` 마커 파일도 후보에는 포함하되 legacy_unresolved로 mutation을 막는다.
     - rel_path는 temp_dir 기준의 상대경로로 보존하여 로그/복원에서 사용한다.
     """
@@ -279,10 +279,10 @@ def scan_temp_files(temp_dir):
 
     for root, dirs, files in os.walk(temp_dir):
         # 관리 폴더 진입 차단
-        dirs[:] = [d for d in sorted(dirs) if not should_exclude_intake_dir(d)]
+        dirs[:] = [d for d in sorted(dirs) if not should_exclude_dir(d)]
 
         for filename in sorted(files):
-            if should_exclude_intake_file(filename):
+            if should_exclude_file(filename):
                 continue
 
             src_path = os.path.join(root, filename)
