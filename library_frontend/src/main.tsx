@@ -3,7 +3,11 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 
 import { App } from "./App";
+import { applyAppearanceSettings, readAppearanceSettings, syncAppearanceSettingsFromServer } from "./appearance";
 import "./styles.css";
+
+applyAppearanceSettings(readAppearanceSettings());
+void syncAppearanceSettingsFromServer().catch(() => undefined);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

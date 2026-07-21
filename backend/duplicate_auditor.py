@@ -1079,6 +1079,33 @@ def _pair_configuration_hash(config):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+_AUDIT_PROGRESS_LABELS = {
+    "text_analysis": "본문 기본 분석",
+    "epub_analysis": "EPUB 내용 분석",
+    "pair_classification": "후보 쌍 판정",
+    "deep_scan": "정밀 본문 비교",
+}
+
+
+def _emit_audit_progress(config, audit_phase, completed, total, budget):
+    event = {
+        "audit_phase": audit_phase,
+        "completed": int(completed),
+        "total": int(total),
+        "read_bytes": int(budget.read_bytes),
+    }
+    label = _AUDIT_PROGRESS_LABELS.get(audit_phase, audit_phase)
+    if getattr(config, "progress", False):
+        print(
+            f"  ... {label} {completed}/{total} "
+            f"({budget.read_bytes / (1024 ** 3):.2f} GiB read)",
+            flush=True,
+        )
+    callback = getattr(config, "progress_callback", None)
+    if callable(callback):
+        callback(event)
+
+
 def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=None):
     results = {}
     budget = ReadBudget(max_bytes=config.max_read_bytes)
@@ -1096,6 +1123,8 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
     analyses = {}
     budget_exhausted = False
     txt_items = [(path, entry) for path, entry in sorted(unique_entries.items()) if entry.ext == ".txt"]
+    if txt_items:
+        _emit_audit_progress(config, "text_analysis", 0, len(txt_items), budget)
     for item_index, (path, entry) in enumerate(txt_items, start=1):
         try:
             analysis = persistent.analysis(entry) if persistent is not None else None
@@ -1119,17 +1148,17 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
         except (StaleInputDuringAnalysis, OSError):
             stop_reasons.append("stale_input")
             break
-        if getattr(config, "progress", False) and (item_index % 100 == 0 or item_index == len(txt_items)):
-            print(
-                f"  ... 본문 기본 분석 {item_index}/{len(txt_items)} "
-                f"({budget.read_bytes / (1024 ** 3):.2f} GiB read)",
-                flush=True,
+        if item_index % 100 == 0 or item_index == len(txt_items):
+            _emit_audit_progress(
+                config, "text_analysis", item_index, len(txt_items), budget
             )
 
     epub_items = [
         (path, entry) for path, entry in sorted(unique_entries.items())
         if entry.ext == ".epub"
     ]
+    if epub_items:
+        _emit_audit_progress(config, "epub_analysis", 0, len(epub_items), budget)
     for item_index, (path, entry) in enumerate(epub_items, start=1):
         try:
             analysis = persistent.analysis(entry) if persistent is not None else None
@@ -1176,17 +1205,19 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
                 status="epub_error",
                 read_bytes=0,
             )
-        if getattr(config, "progress", False) and (
-            item_index % 100 == 0 or item_index == len(epub_items)
-        ):
-            print(
-                f"  ... EPUB 내용 분석 {item_index}/{len(epub_items)} "
-                f"({budget.read_bytes / (1024 ** 3):.2f} GiB read)",
-                flush=True,
+        if item_index % 100 == 0 or item_index == len(epub_items):
+            _emit_audit_progress(
+                config, "epub_analysis", item_index, len(epub_items), budget
             )
 
     deep_pairs = []
-    for candidate in candidates:
+    if candidates:
+        _emit_audit_progress(config, "pair_classification", 0, len(candidates), budget)
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        if candidate_index > 1 and (candidate_index - 1) % 500 == 0:
+            _emit_audit_progress(
+                config, "pair_classification", candidate_index - 1, len(candidates), budget
+            )
         if candidate.left.ext == ".epub" and candidate.right.ext == ".epub":
             left = analyses.get(candidate.left.path)
             right = analyses.get(candidate.right.path)
@@ -1268,6 +1299,10 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
         evidence["front_anchor_equal"] = True
         evidence["tail_anchor_equal"] = left.tail_anchor == right.tail_anchor
         deep_pairs.append((candidate, left, right, evidence))
+    if candidates:
+        _emit_audit_progress(
+            config, "pair_classification", len(candidates), len(candidates), budget
+        )
 
     if budget_exhausted:
         return list(results.values()), budget, cache, stop_reasons
@@ -1309,7 +1344,14 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
                 continue
         grouped[long.path].append((candidate, short, long, evidence, anchor_cache[key]))
 
-    for long_path, items in sorted(grouped.items()):
+    grouped_items = sorted(grouped.items())
+    if grouped_items:
+        _emit_audit_progress(config, "deep_scan", 0, len(grouped_items), budget)
+    for group_index, (long_path, items) in enumerate(grouped_items, start=1):
+        if group_index > 1 and (group_index - 1) % 25 == 0:
+            _emit_audit_progress(
+                config, "deep_scan", group_index - 1, len(grouped_items), budget
+            )
         queries = {}
         prefix_lengths = []
         for candidate, short, _long, _evidence, anchors in items:
@@ -1350,6 +1392,10 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
             else:
                 classification = "boilerplate_only"
             results[candidate.pair_id] = _basic_result(candidate, classification, evidence)
+    if grouped_items:
+        _emit_audit_progress(
+            config, "deep_scan", len(grouped_items), len(grouped_items), budget
+        )
 
     return [results[candidate.pair_id] for candidate in candidates if candidate.pair_id in results], budget, cache, stop_reasons
 

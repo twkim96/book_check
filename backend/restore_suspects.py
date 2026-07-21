@@ -13,6 +13,7 @@
 별개 작품/별도 판본 판정은 `txt_temp/pass/` 이동이나 `〔P〕` 마커로 만들지 않습니다.
 파일을 원래 위치로 복원한 뒤 `dedup_decisions.py`로 정확한 pair verdict를 기록하세요.
 """
+import json
 import os
 import re
 import shutil
@@ -73,7 +74,7 @@ def find_latest_log(temp_dir):
     candidates = [
         os.path.join(log_dir, name)
         for name in os.listdir(log_dir)
-        if name.startswith("dedup_") and name.endswith(".txt")
+        if name.startswith("dedup_") and name.endswith((".txt", ".json"))
     ]
     if not candidates:
         return None
@@ -90,6 +91,22 @@ def parse_log_moves(log_path):
     - 반환: { 파일명: [(source, rel_path), ...] }  (같은 basename이 여러 경로에서
       이동될 수 있으므로 리스트로 누적해 앞 기록이 덮이지 않게 한다.)
     """
+    if str(log_path).lower().endswith(".json"):
+        with open(log_path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        mapping = {}
+        move_statuses = {"moved", "author_review", "warning", "metadata_only"}
+        for record in payload.get("suspect_move_records") or []:
+            if record.get("status") not in move_statuses:
+                continue
+            entry = record.get("entry") or {}
+            name = str(entry.get("name") or "").strip()
+            source = str(entry.get("source") or "").strip().lower()
+            rel_path = str(entry.get("rel_path") or "").strip()
+            if name and source and rel_path:
+                mapping.setdefault(name, []).append((source, rel_path))
+        return mapping
+
     mapping = {}
     in_suspect_section = False
     move_marker_re = re.compile(

@@ -18,10 +18,12 @@ from mutation_io import mutation_lock_for_roots
 from normalizer import (
     NORMALIZER_VERSION,
     analyze_name,
+    extract_structure_hint_tokens,
     extract_title_literal_tokens,
     extract_catalog_query_title,
     extract_readable_title,
-    materialize_title_literals,
+    materialize_title_markup,
+    structure_hint_syntax_error,
     title_literal_syntax_error,
 )
 from title_review_mutations import EDITABLE_ASSIGNMENT_STATES, requeue_user_title_file
@@ -271,6 +273,9 @@ def _validated_new_body(value: object, extension: str) -> str:
     literal_error = title_literal_syntax_error(body)
     if literal_error:
         raise ValueError(literal_error)
+    hint_error = structure_hint_syntax_error(body)
+    if hint_error:
+        raise ValueError(hint_error)
     if extension and body.lower().endswith(extension.lower()):
         raise ValueError("확장자는 입력하지 마세요. 기존 확장자가 자동 보존됩니다")
     materialized = body + extension
@@ -331,7 +336,7 @@ def preview_title_change(
             body = str(new_body or "")
             blockers.append(f"invalid_new_name:{exc}")
         candidate_name = body + current["extension"]
-        materialized_candidate_name = materialize_title_literals(candidate_name)
+        materialized_candidate_name = materialize_title_markup(candidate_name)
         if unicodedata.normalize("NFC", body) == unicodedata.normalize(
             "NFC", current["current_body"]
         ):
@@ -375,8 +380,15 @@ def preview_title_change(
         "after_author": analysis["author"],
         "after_effective_max": analysis["effective_max"],
         "after_unit": analysis["unit"],
+        "after_volume_coordinate": (
+            str(analysis["volume_number"][1])
+            if analysis.get("volume_number") is not None
+            and analysis["volume_number"][1] is not None
+            else None
+        ),
         "after_complete": bool(analysis["complete"]),
         "title_literal_tokens": list(extract_title_literal_tokens(candidate_name)),
+        "structure_hint_tokens": list(extract_structure_hint_tokens(candidate_name)),
         "target_exists": target is not None,
         "target_has_ok": bool(target is not None and target["ok_count"]),
         "blocked_reasons": blockers,

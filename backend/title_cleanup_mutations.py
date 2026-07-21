@@ -95,13 +95,17 @@ def requeue_unassigned_title_file(
             current = _file_state(conn, file_id)
             if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("title cleanup fingerprint changed before DB retire")
+            retired_path = decision_store.retired_canonical_path(
+                conn, file_id, source_path
+            )
             conn.execute(
                 """
                 UPDATE files
-                SET active = 0, protected = 0, last_seen_at = CURRENT_TIMESTAMP
+                SET canonical_path = ?, active = 0, protected = 0,
+                    last_seen_at = CURRENT_TIMESTAMP
                 WHERE file_id = ?
                 """,
-                (file_id,),
+                (retired_path, file_id),
             )
             decision_store.transition_operation(conn, operation_id, "db_done")
         with decision_store.transaction(conn):

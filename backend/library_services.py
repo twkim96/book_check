@@ -600,6 +600,7 @@ class LibraryServiceRegistry:
             "legacy_pass_skipped": "legacy pass 항목 보류",
             "dedup_start": "중복·검토 큐 판정 시작",
             "snapshot_result": "house snapshot 확인",
+            "auditor_progress": "본문 중복 감사",
             "dedup_result": "중복·검토 큐 판정 완료",
             "intake_start": "temp → house 입고 시작",
             "intake_result": "파일 입고 단계 완료",
@@ -616,7 +617,19 @@ class LibraryServiceRegistry:
             phase = str(event.get("phase") or "running")
             current = int(event.get("completed") or 0)
             total = int(event.get("total") or 0)
-            if phase == "file_result":
+            if phase == "auditor_progress":
+                audit_labels = {
+                    "text_analysis": "본문 기본 분석",
+                    "epub_analysis": "EPUB 내용 분석",
+                    "pair_classification": "후보 쌍 판정",
+                    "deep_scan": "정밀 본문 비교",
+                }
+                audit_phase = str(event.get("audit_phase") or "analysis")
+                label = audit_labels.get(audit_phase, audit_phase)
+                read_gib = int(event.get("read_bytes") or 0) / (1024 ** 3)
+                message = f"{label} {current:,}/{total:,} ({read_gib:.2f} GiB read)"
+                stage = f"auditor_{audit_phase}"
+            elif phase == "file_result":
                 status = str(event.get("status") or "result")
                 name = str(
                     event.get("source_name")

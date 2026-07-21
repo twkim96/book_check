@@ -50,13 +50,32 @@ def test_repacked_epub_is_compared_by_internal_content(tmp_path):
     index = tmp_path / "file_index.json"
     _write_index(index, house, names)
 
-    report = duplicate_auditor.run_audit(_args(index, house, temp))
+    args = _args(index, house, temp)
+    progress_events = []
+    args.progress_callback = progress_events.append
+    report = duplicate_auditor.run_audit(args)
 
     assert report.completed is True
     assert report.stats["unique_candidate_files"] == 2
     assert report.results[0]["classification"] == "epub_equivalent"
     assert report.results[0]["evidence"]["left_raw_sha256"] != \
         report.results[0]["evidence"]["right_raw_sha256"]
+    assert progress_events[0] == {
+        "audit_phase": "epub_analysis",
+        "completed": 0,
+        "total": 2,
+        "read_bytes": 0,
+    }
+    assert any(
+        event["audit_phase"] == "epub_analysis"
+        and event["completed"] == event["total"] == 2
+        for event in progress_events
+    )
+    assert any(
+        event["audit_phase"] == "pair_classification"
+        and event["completed"] == event["total"] == 1
+        for event in progress_events
+    )
 
 
 def test_candidate_file_limit_fails_closed_before_unbounded_read(tmp_path):

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { ApiError, api, postJson } from "./api";
+import { SettingsPage } from "./Settings";
 import type {
   CatalogItem,
   CatalogListing,
@@ -29,6 +30,15 @@ type Draft = {
   loading: boolean;
   preview?: TitlePreview;
   error?: string;
+};
+
+type PendingTitleJob = {
+  job_id: string;
+  file_ids: string[];
+};
+
+type PendingVolumeJob = {
+  job_id: string;
 };
 
 const platformLabels = { series: "시리즈", kakao: "카카오", novelpia: "노벨피아" };
@@ -76,6 +86,7 @@ function Shell() {
           <NavLink to="/review/queue">검토 큐</NavLink>
           <NavLink to="/jobs">작업 이력</NavLink>
           <NavLink to="/reports/dedup">Folderling 보고서</NavLink>
+          <NavLink to="/settings">설정</NavLink>
         </nav>
         <div className="sidebar-note">로컬 전용 · 실제 변경 전 계획 확인</div>
       </aside>
@@ -92,6 +103,7 @@ function Shell() {
           <Route path="/jobs/:jobId" element={<JobDetail />} />
           <Route path="/reports/dedup" element={<DedupReports />} />
           <Route path="/reports/dedup/:reportName" element={<DedupReport />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -460,9 +472,11 @@ function TitleReview() {
   const [error, setError] = useState("");
   const [plan, setPlan] = useState<TitlePlan>();
   const [planning, setPlanning] = useState(false);
+  const [pendingJob, setPendingJob] = useState<PendingTitleJob>();
+  const [jobNotice, setJobNotice] = useState<{ job_id: string; message: string }>();
   const navigate = useNavigate();
 
-  const load = () => {
+  const load = (preservePosition = false) => {
     const params = new URLSearchParams({
       search: submittedSearch,
       status,
@@ -472,10 +486,47 @@ function TitleReview() {
     });
     if (cursor) params.set("cursor", cursor);
     setError("");
-    setListing(undefined);
+    if (!preservePosition) setListing(undefined);
     api<TitleListing>(`/api/review/titles?${params}`).then(setListing).catch((reason) => setError(reason.message));
   };
-  useEffect(load, [submittedSearch, status, sort, direction, cursor]);
+  useEffect(() => { load(); }, [submittedSearch, status, sort, direction, cursor]);
+
+  useEffect(() => {
+    if (!pendingJob) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const record = await api<JobRecord>(`/api/jobs/${pendingJob.job_id}`);
+        if (cancelled) return;
+        if (["succeeded", "failed", "needs_review", "interrupted"].includes(record.state)) {
+          setPendingJob(undefined);
+          if (record.state === "succeeded" || record.state === "needs_review") {
+            const completed = new Set(pendingJob.file_ids);
+            setDrafts((current) => Object.fromEntries(
+              Object.entries(current).filter(([fileId]) => !completed.has(fileId))
+            ));
+            setJobNotice({ job_id: record.job_id, message: "제목 교정이 완료되었습니다. 현재 위치에서 계속 작업할 수 있습니다." });
+            load(true);
+          } else {
+            setJobNotice(undefined);
+            setError(record.error?.message ?? "제목 교정 작업이 완료되지 않았습니다. 작업 이력을 확인하세요.");
+          }
+          return;
+        }
+        timer = window.setTimeout(poll, 1000);
+      } catch (reason) {
+        if (cancelled) return;
+        setPendingJob(undefined);
+        setError(reason instanceof Error ? reason.message : "제목 교정 작업 상태를 확인하지 못했습니다.");
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [pendingJob?.job_id, submittedSearch, status, sort, direction, cursor]);
 
   const selectedChanges = useMemo(() => {
     if (!listing) return [];
@@ -498,8 +549,9 @@ function TitleReview() {
     }
   };
 
-  const applyPlan = async () => {
+  const applyPlan = async (moveToHistory: boolean) => {
     if (!plan) return;
+    const appliedChanges = [...selectedChanges];
     setPlanning(true);
     try {
       const job = await postJson<JobRecord>("/api/review/titles/apply", {
@@ -508,7 +560,19 @@ function TitleReview() {
         confirm_plan_sha256: plan.plan_sha256
       });
       setPlan(undefined);
-      navigate(`/jobs/${job.job_id}`);
+      if (moveToHistory) {
+        navigate(`/jobs/${job.job_id}`);
+      } else {
+        setJobNotice({ job_id: job.job_id, message: "제목 교정 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
+        setPendingJob({ job_id: job.job_id, file_ids: appliedChanges.map((change) => change.file_id) });
+        const appliedIds = new Set(appliedChanges.map((change) => change.file_id));
+        setDrafts((current) => Object.fromEntries(
+          Object.entries(current).map(([fileId, draft]) => [
+            fileId,
+            appliedIds.has(fileId) ? { ...draft, selected: false } : draft
+          ])
+        ));
+      }
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === "confirmation_stale") {
         setError("파일이나 DB 상태가 바뀌었습니다. 계획을 다시 확인하세요.");
@@ -533,11 +597,12 @@ function TitleReview() {
         title="실제 파일명 교정"
         description="플랫폼에서 확인되지 않은 활성 파일을 표시합니다. 같은 작품의 여러 파일도 따로 보이며, 입력한 파일만 txt_temp에 재입고됩니다."
         action={
-          <button className="button primary" disabled={!selectedChanges.length || planning} onClick={createPlan}>
+          <button className="button primary" disabled={!selectedChanges.length || planning || Boolean(pendingJob)} onClick={createPlan}>
             선택 {selectedChanges.length}개 계획 확인
           </button>
         }
       />
+      {jobNotice && <div className="inline-notice"><span>{jobNotice.message}</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
       <section className="toolbar">
         <form onSubmit={(event) => { event.preventDefault(); setSubmittedSearch(search); resetPage(); }} className="search-form">
           <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="파일명, core_title 검색" />
@@ -578,6 +643,7 @@ function TitleReview() {
               <tbody>
                 {listing.items.map((item) => (
                   <TitleRow key={item.file_id} item={item} draft={drafts[item.file_id]}
+                    pending={pendingJob?.file_ids.includes(item.file_id) ?? false}
                     onChange={(draft) => setDrafts((current) => ({ ...current, [item.file_id]: draft }))} />
                 ))}
               </tbody>
@@ -603,9 +669,10 @@ function TitleReview() {
   );
 }
 
-function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; onChange: (draft: Draft) => void }) {
+function TitleRow({ item, draft, pending, onChange }: { item: TitleCase; draft?: Draft; pending: boolean; onChange: (draft: Draft) => void }) {
   const timer = useRef<number | undefined>(undefined);
   const requestVersion = useRef(0);
+  const titleInput = useRef<HTMLInputElement>(null);
   const value = draft?.value ?? "";
   const requestPreview = (nextValue: string) => {
     window.clearTimeout(timer.current);
@@ -632,7 +699,18 @@ function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; o
     requestVersion.current += 1;
     window.clearTimeout(timer.current);
   }, []);
-  const blocked = !item.editable || Boolean(draft?.preview && !draft.preview.runnable);
+  const importCurrentTitle = () => {
+    window.clearTimeout(timer.current);
+    requestVersion.current += 1;
+    onChange({ value: item.current_body, selected: false, loading: false });
+    window.requestAnimationFrame(() => {
+      const input = titleInput.current;
+      if (!input) return;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+  };
+  const blocked = pending || !item.editable || Boolean(draft?.preview && !draft.preview.runnable);
   return (
     <tr className={value ? "row-dirty" : ""}>
       <td className="select-col">
@@ -653,10 +731,14 @@ function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; o
       </div></td>
       <td>
         <div className="filename-input">
-          <input value={value} disabled={!item.editable} onChange={(event) => requestPreview(event.target.value)} placeholder="확장자 제외 새 파일명 · 보존할 제목은 [[19금]]" />
+          <input ref={titleInput} value={value} disabled={pending || !item.editable} onChange={(event) => requestPreview(event.target.value)} placeholder="확장자 제외 · 제목 [[19금]] · 구조 {{힌트}}" />
           <span>{item.extension}</span>
         </div>
-        <small className="muted">등급·상태처럼 보이지만 실제 제목인 말은 <code>[[단어]]</code>로 보호합니다.</small>
+        <div className="title-input-helper">
+          <small className="muted">실제 제목은 <code>[[단어]]</code>, 구조 정보는 <code>{'{{힌트}}'}</code>로 표시합니다.</small>
+          <button type="button" className="button secondary title-import-button" disabled={pending || !item.editable} onClick={importCurrentTitle}>현재 제목 가져오기</button>
+        </div>
+        {pending && <small className="safe-note">제목 교정 작업 처리 중…</small>}
         {draft?.loading && <small className="muted">분석 중…</small>}
         {draft?.error && <small className="blocked">{draft.error}</small>}
         {draft?.preview?.blocked_reasons.map((reason) => <small className="blocked" key={reason}>{reason}</small>)}
@@ -665,8 +747,9 @@ function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; o
         {draft?.preview ? <>
           <code className={draft.preview.runnable ? "core core-new" : "core core-bad"}>{draft.preview.after_core_title || "-"}</code>
           <small className="path">검색어: {draft.preview.after_query_title || "-"}</small>
-          <small className="path">{draft.preview.after_author ? `작가 ${draft.preview.after_author} · ` : ""}{draft.preview.after_effective_max ? `${draft.preview.after_effective_max}${draft.preview.after_unit}` : "범위 미상"}{draft.preview.after_complete ? " · 완결" : ""}</small>
+          <small className="path">{draft.preview.after_author ? `작가 ${draft.preview.after_author} · ` : ""}{draft.preview.after_volume_coordinate ? `${draft.preview.after_volume_coordinate}권` : draft.preview.after_effective_max ? `${draft.preview.after_effective_max}${draft.preview.after_unit}` : "범위 미상"}{draft.preview.after_complete ? " · 완결" : ""}</small>
           {draft.preview.title_literal_tokens.length > 0 && <small className="safe-note">제목 보호: {draft.preview.title_literal_tokens.join(", ")} · 최종 파일명에서는 [[ ]] 제거</small>}
+          {draft.preview.structure_hint_tokens.length > 0 && <small className="safe-note">구조 힌트: {draft.preview.structure_hint_tokens.join(", ")} · 최종 파일명에서는 {'{{ }}'} 제거</small>}
           {draft.preview.target_exists && <small className="collision">기존 core 존재{draft.preview.target_has_ok ? " · 플랫폼 정보 있음" : ""}</small>}
         </> : <span className="muted">입력 대기</span>}
       </td>
@@ -674,13 +757,14 @@ function TitleRow({ item, draft, onChange }: { item: TitleCase; draft?: Draft; o
   );
 }
 
-function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: boolean; onClose: () => void; onApply: () => void }) {
+function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: boolean; onClose: () => void; onApply: (moveToHistory: boolean) => void }) {
+  const [moveToHistory, setMoveToHistory] = useState(false);
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="plan-title">
         <span className="eyebrow">FINAL CONFIRMATION</span>
         <h2 id="plan-title">{plan.item_count}개 파일을 txt_temp로 보냅니다</h2>
-        <p>실제 파일명이 변경되고 기존 DB 행은 비활성 이력으로 남습니다. <code>[[ ]]</code> 표시는 temp에서만 보호값을 운반하고 다음 Folderling 입고 때 제거됩니다.</p>
+        <p>실제 파일명이 변경되고 기존 DB 행은 비활성 이력으로 남습니다. <code>[[ ]]·{'{{ }}'}</code> 표시는 temp에서만 분석값을 운반하고 다음 Folderling 입고 때 제거됩니다.</p>
         <div className="plan-summary">
           <span><small>대상</small><strong>{plan.item_count}</strong></span>
           <span><small>차단</small><strong>{plan.blocked_count}</strong></span>
@@ -689,9 +773,13 @@ function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: b
         <div className="plan-list">
           {plan.items.map((item) => <div key={item.file_id}><span>{item.current_name}</span><b>→</b><strong>{item.materialized_candidate_name}</strong></div>)}
         </div>
+        <label className="plan-history-option">
+          <input type="checkbox" checked={moveToHistory} onChange={(event) => setMoveToHistory(event.target.checked)} />
+          <span><strong>실행 후 작업 이력으로 이동</strong><small>체크하지 않으면 현재 검색·페이지·입력 위치를 유지합니다.</small></span>
+        </label>
         <footer>
           <button className="button secondary" disabled={busy} onClick={onClose}>취소</button>
-          <button className="button danger" disabled={busy || !plan.runnable} onClick={onApply}>{busy ? "등록 중…" : "확인하고 실행"}</button>
+          <button className="button danger" disabled={busy || !plan.runnable} onClick={() => onApply(moveToHistory)}>{busy ? "등록 중…" : "확인하고 실행"}</button>
         </footer>
       </section>
     </div>
@@ -747,13 +835,16 @@ function VolumeReview() {
   const [cursor, setCursor] = useState<string | null>(null);
   const [cursorHistory, setCursorHistory] = useState<(string | null)[]>([]);
   const [activeCase, setActiveCase] = useState<VolumeCase>();
+  const [pendingJob, setPendingJob] = useState<PendingVolumeJob>();
+  const [jobNotice, setJobNotice] = useState<{ job_id: string; message: string }>();
   const [error, setError] = useState("");
+  const navigate = useNavigate();
 
   const resetPage = () => {
     setCursor(null);
     setCursorHistory([]);
   };
-  const load = () => {
+  const load = (preservePosition = false) => {
     const params = new URLSearchParams({
       search: submittedSearch,
       classification,
@@ -763,12 +854,55 @@ function VolumeReview() {
     });
     if (cursor) params.set("cursor", cursor);
     setError("");
-    setListing(undefined);
+    if (!preservePosition) setListing(undefined);
     api<VolumeListing>(`/api/review/volumes?${params}`)
       .then(setListing)
       .catch((reason) => setError(reason.message));
   };
   useEffect(load, [submittedSearch, classification, sort, direction, cursor]);
+
+  useEffect(() => {
+    if (!pendingJob) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const record = await api<JobRecord>(`/api/jobs/${pendingJob.job_id}`);
+        if (cancelled) return;
+        if (["succeeded", "failed", "needs_review", "interrupted"].includes(record.state)) {
+          setPendingJob(undefined);
+          if (record.state === "succeeded" || record.state === "needs_review") {
+            setJobNotice({ job_id: record.job_id, message: "분권 묶기가 완료되었습니다. 현재 위치에서 계속 작업할 수 있습니다." });
+            load(true);
+          } else {
+            setJobNotice(undefined);
+            setError(record.error?.message ?? "분권 묶기 작업이 완료되지 않았습니다. 작업 이력을 확인하세요.");
+          }
+          return;
+        }
+        timer = window.setTimeout(poll, 1000);
+      } catch (reason) {
+        if (cancelled) return;
+        setPendingJob(undefined);
+        setError(reason instanceof Error ? reason.message : "분권 묶기 작업 상태를 확인하지 못했습니다.");
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [pendingJob?.job_id, submittedSearch, classification, sort, direction, cursor]);
+
+  const handleJobStarted = (job: JobRecord, moveToHistory: boolean) => {
+    setActiveCase(undefined);
+    if (moveToHistory) {
+      navigate(`/jobs/${job.job_id}`);
+      return;
+    }
+    setJobNotice({ job_id: job.job_id, message: "분권 묶기 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
+    setPendingJob({ job_id: job.job_id });
+  };
 
   return (
     <>
@@ -778,6 +912,7 @@ function VolumeReview() {
         description="권·부·상중하 좌표와 기존 폴더를 분석합니다. 선택한 파일은 staging 검증과 journal 기록 후 한 작품 폴더로 이동합니다."
         action={<span className="readonly-pill">STAGING + JOURNAL</span>}
       />
+      {jobNotice && <div className="inline-notice"><span>{jobNotice.message}</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
       <section className="toolbar">
         <form onSubmit={(event) => { event.preventDefault(); setSubmittedSearch(search); resetPage(); }} className="search-form">
           <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="작품명, core_title, 폴더 검색" />
@@ -837,7 +972,7 @@ function VolumeReview() {
                     {item.approved_duplicate_coordinates.length > 0 && <small className="safe-note">승인된 동일 권 판본 {item.approved_duplicate_coordinates.join(", ")}</small>}
                     {item.missing_coordinates.length > 0 && <small className="collision">누락 {item.missing_coordinates.slice(0, 8).join(", ")}{item.missing_coordinates.length > 8 ? "…" : ""}</small>}
                   </td>
-                  <td><button className="button secondary" onClick={() => setActiveCase(item)}>구성 보기</button></td>
+                  <td><button className="button secondary" disabled={Boolean(pendingJob)} onClick={() => setActiveCase(item)}>구성 보기</button></td>
                 </tr>
               ))}</tbody>
             </table>
@@ -855,20 +990,28 @@ function VolumeReview() {
           </div>
         </section>
       </>}
-      {activeCase && <VolumePreviewDialog value={activeCase} onClose={() => setActiveCase(undefined)} />}
+      {activeCase && <VolumePreviewDialog value={activeCase} onClose={() => setActiveCase(undefined)} onStarted={handleJobStarted} />}
     </>
   );
 }
 
-function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: () => void }) {
+function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase; onClose: () => void; onStarted: (job: JobRecord, moveToHistory: boolean) => void }) {
   const [selected, setSelected] = useState(() => new Set(value.items.map((item) => item.file_id)));
   const [folderName, setFolderName] = useState(value.target_folder_name);
   const [allowDuplicateCoordinates, setAllowDuplicateCoordinates] = useState(false);
   const [preview, setPreview] = useState<VolumePreview>();
   const [busy, setBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
+  const [moveToHistory, setMoveToHistory] = useState(false);
   const [error, setError] = useState("");
-  const navigate = useNavigate();
+
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [busy, onClose]);
 
   const refresh = async () => {
     setBusy(true);
@@ -904,8 +1047,7 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
         confirm_count: preview.item_count,
         confirm_plan_sha256: preview.plan_sha256
       });
-      onClose();
-      navigate(`/jobs/${job.job_id}`);
+      onStarted(job, moveToHistory);
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === "confirmation_stale") {
         setError("파일이나 DB 상태가 바뀌었습니다. 미리보기를 다시 확인하세요.");
@@ -917,17 +1059,30 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
     }
   };
 
-  return <div className="modal-backdrop" role="presentation">
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+    if (event.target === event.currentTarget && !busy) onClose();
+  }}>
     <section className="modal volume-modal" role="dialog" aria-modal="true" aria-labelledby="volume-plan-title">
-      <span className="eyebrow">STAGED GROUP PLAN</span>
-      <h2 id="volume-plan-title">{value.display_title}</h2>
+      <header className="volume-modal-topbar">
+        <div className="volume-modal-heading">
+          <span className="eyebrow">STAGED GROUP PLAN</span>
+          <h2 id="volume-plan-title">{value.display_title}</h2>
+        </div>
+        <div className="volume-modal-actions">
+          <button className="button secondary" disabled={busy} onClick={onClose}>닫기</button>
+          <button className="button primary" disabled={busy} onClick={refresh}>{busy ? "계산 중…" : "미리보기 갱신"}</button>
+          <button className="button danger" disabled={busy || !confirmed || !preview?.apply_available} onClick={apply}>
+            {busy ? "등록 중…" : `${preview?.item_count ?? 0}개 묶기`}
+          </button>
+        </div>
+      </header>
       <p>포함할 파일과 결과 폴더를 검토합니다. 실행하면 staging 복사 검증 후 원본과 DB를 함께 이동합니다.</p>
       <label className="field-label">결과 폴더명
         <input value={folderName} onChange={(event) => { setFolderName(event.target.value); setPreview(undefined); setConfirmed(false); }} />
       </label>
       <div className="volume-file-table-wrap">
         <table className="volume-file-table">
-          <thead><tr><th>선택</th><th>원본 제목</th><th>좌표·분류</th><th>작가</th><th>파일</th><th>확인할 점</th><th>교정</th></tr></thead>
+          <thead><tr><th>선택</th><th>원본 제목</th><th>좌표·분류</th><th>작가</th><th>파일</th><th>확인할 점</th></tr></thead>
           <tbody>{value.items.map((item) => <tr key={item.file_id}>
             <td><input aria-label={`${item.name} 선택`} type="checkbox" checked={selected.has(item.file_id)} onChange={(event) => {
               setSelected((current) => {
@@ -938,14 +1093,17 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
               setPreview(undefined);
               setConfirmed(false);
             }} /></td>
-            <td><strong title={item.canonical_path}>{item.name}</strong><small>{item.parent}</small></td>
+            <td><div className="volume-file-title">
+              <strong title={item.canonical_path}>{item.name}</strong>
+              <small>{item.parent}</small>
+              <NavLink className="button secondary volume-correction-button" to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink>
+            </div></td>
             <td><b>{item.coordinate}</b><small>{volumeCoordinateLabels[item.coordinate_kind] ?? item.coordinate_kind}{item.complete ? " · 완결" : ""}</small></td>
             <td>{item.author ?? <span className="muted-value">미상</span>}</td>
             <td><b>{item.extension.replace(".", "").toUpperCase()}</b><small>{formatBytes(item.size)}</small></td>
             <td>{item.issues.length === 0 ? <span className="safe-note">없음</span> : item.issues.map((reason) => (
               <small className={reason === "approved_duplicate_coordinate" ? "safe-note" : "blocked"} key={reason}>{volumeBlockerLabels[reason] ?? reason}{reason === "duplicate_coordinate" || reason === "approved_duplicate_coordinate" ? ` (${item.same_coordinate_count}개)` : ""}</small>
             ))}</td>
-            <td><NavLink to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink></td>
           </tr>)}</tbody>
         </table>
       </div>
@@ -972,13 +1130,10 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
         <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
         파일 {preview.item_count}개와 결과 폴더를 확인했습니다
       </label>}
-      <footer>
-        <button className="button secondary" disabled={busy} onClick={onClose}>닫기</button>
-        <button className="button primary" disabled={busy} onClick={refresh}>{busy ? "계산 중…" : "미리보기 갱신"}</button>
-        <button className="button danger" disabled={busy || !confirmed || !preview?.apply_available} onClick={apply}>
-          {busy ? "등록 중…" : `${preview?.item_count ?? 0}개 묶기`}
-        </button>
-      </footer>
+      {preview?.apply_available && <label className="plan-history-option">
+        <input type="checkbox" checked={moveToHistory} onChange={(event) => setMoveToHistory(event.target.checked)} />
+        <span><strong>실행 후 작업 이력으로 이동</strong><small>체크하지 않으면 현재 검색·페이지 위치를 유지하고 완료 후 목록만 갱신합니다.</small></span>
+      </label>}
     </section>
   </div>;
 }
@@ -1022,7 +1177,7 @@ function DedupReports() {
     <PageHeader
       eyebrow="HISTORICAL REPORTS"
       title="Folderling 보고서"
-      description="txt_temp/dedup_logs에 누적된 과거 중복 정리·강력 후보 감사 결과를 읽기 전용으로 확인합니다."
+      description="새 실행은 JSON 원본만 보관하고, 필요할 때 화면에서 TXT로 내보냅니다. 기존 TXT 보고서도 계속 열람할 수 있습니다."
       action={<button className="button secondary" onClick={load}>새로고침</button>}
     />
     <section className="toolbar">
@@ -1043,7 +1198,7 @@ function DedupReports() {
         <span>{formatNumber(data?.total ?? 0)}개</span>
       </div>
       {!data ? <div className="empty">보고서 목록을 확인하고 있습니다.</div> : data.items.length ? <div className="report-list">
-        {data.items.map((item) => <NavLink className="report-row" to={`/reports/dedup/${encodeURIComponent(item.name)}`} key={item.name}>
+        {data.items.map((item) => <NavLink className="report-row" to={`/reports/dedup/${encodeURIComponent(item.report_id)}`} key={item.report_id}>
           <div className="report-tags">
             <span className={`report-kind report-kind-${item.kind}`}>{reportKindLabel(item.kind)}</span>
             {item.structured_available && <span className="report-format">JSON</span>}
@@ -1103,7 +1258,7 @@ function DedupReport() {
         <div><span className="eyebrow">RAW REPORT</span><h2>보고서 원문</h2></div>
         <div className="log-actions">
           <button className="button secondary" onClick={copy}>{copied ? "복사됨" : "복사"}</button>
-          <a className="button secondary" href={`/api/reports/dedup/${encoded}/download`}>TXT 다운로드</a>
+          <a className="button secondary" href={`/api/reports/dedup/${encoded}/download`}>TXT로 내보내기</a>
           {data.structured_available && <a className="button secondary" href={`/api/reports/dedup/${encoded}/download?format=json`}>JSON 다운로드</a>}
         </div>
       </div>

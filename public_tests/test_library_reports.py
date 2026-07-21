@@ -5,8 +5,31 @@ import pytest
 from library_reports import (
     dedup_report_listing,
     dedup_report_path,
+    export_dedup_report_text,
     read_dedup_report,
 )
+
+
+def _payload(*, exact_count=0, suspect_group_count=0):
+    return {
+        "schema_version": 1,
+        "kind": "folderling_dedup",
+        "generated_at": "2026-07-21T15:30:00+09:00",
+        "summary": {
+            "dry_run": False,
+            "managed_mode": True,
+            "include_temp": True,
+            "exact_count": exact_count,
+            "exact_mutation_count": exact_count,
+            "suspect_group_count": suspect_group_count,
+            "suspect_move_count": 0,
+        },
+        "exact_records": [],
+        "suspect_groups": [],
+        "suspect_move_records": [],
+        "disambig_records": [],
+        "blocked_strong_relations": [],
+    }
 
 
 def _reports(tmp_path):
@@ -19,20 +42,18 @@ def _reports(tmp_path):
         "모드: 실제 실행 | 정확 중복 quarantine 1개 | 검토 큐 그룹 2개\n",
         encoding="utf-8",
     )
-    current = root / "dedup_20260721_141500_123456.txt"
-    current.write_text(
+    paired = root / "dedup_20260721_141500_123456.txt"
+    paired.write_text(
         "[중복/검토 큐 정리 로그]\n"
         "모드: 실제 실행 | 정확 중복 quarantine 0개 | 검토 큐 그룹 0개\n",
         encoding="utf-8",
     )
-    current.with_suffix(".json").write_text(
-        json.dumps({
-            "schema_version": 1,
-            "kind": "folderling_dedup",
-            "generated_at": "2026-07-21T14:15:00+09:00",
-            "summary": {"exact_count": 0, "suspect_group_count": 0},
-        }, ensure_ascii=False),
-        encoding="utf-8",
+    paired.with_suffix(".json").write_text(
+        json.dumps(_payload(), ensure_ascii=False), encoding="utf-8"
+    )
+    current = root / "dedup_20260721_153000_654321.json"
+    current.write_text(
+        json.dumps(_payload(exact_count=3), ensure_ascii=False), encoding="utf-8"
     )
     strong = root / "strong_candidates_20260720_120535_063869.txt"
     strong.write_text(
@@ -40,40 +61,59 @@ def _reports(tmp_path):
         encoding="utf-8",
     )
     (root / "terminal.code-workspace").write_text("ignored", encoding="utf-8")
-    return temp, old, current, strong
+    return temp, old, paired, current, strong
 
 
-def test_dedup_report_listing_groups_historical_text_and_new_structured_reports(tmp_path):
-    temp, _old, current, _strong = _reports(tmp_path)
+def test_dedup_report_listing_groups_legacy_pairs_and_json_only_reports(tmp_path):
+    temp, _old, paired, current, _strong = _reports(tmp_path)
 
     listing = dedup_report_listing(temp)
 
     assert listing["readonly"] is True
-    assert listing["total"] == 3
+    assert listing["total"] == 4
     assert listing["items"][0]["name"] == current.name
+    assert listing["items"][0]["report_id"] == current.stem
+    assert listing["items"][0]["text_available"] is False
     assert listing["items"][0]["structured_available"] is True
+    paired_item = next(item for item in listing["items"] if item["report_id"] == paired.stem)
+    assert paired_item["text_available"] is True
+    assert paired_item["structured_available"] is True
     old = next(item for item in listing["items"] if item["name"].startswith("dedup_20260720"))
     assert old["structured_available"] is False
     assert "정확 중복 quarantine 1개" in old["summary"]
 
 
-def test_dedup_report_detail_reads_structured_summary_and_safe_downloads(tmp_path):
-    temp, _old, current, _strong = _reports(tmp_path)
+def test_json_only_detail_renders_text_and_exports_without_creating_txt(tmp_path):
+    temp, _old, _paired, current, _strong = _reports(tmp_path)
 
-    detail = read_dedup_report(temp, current.name)
+    detail = read_dedup_report(temp, current.stem)
+    export_name, export_text = export_dedup_report_text(temp, current.name)
 
-    assert detail["structured_summary"] == {
-        "exact_count": 0,
-        "suspect_group_count": 0,
-    }
-    assert dedup_report_path(temp, current.name) == current.resolve()
-    assert dedup_report_path(temp, current.name, structured=True) == current.with_suffix(
-        ".json"
-    ).resolve()
+    assert detail["structured_summary"]["exact_count"] == 3
+    assert "[중복/검토 큐 정리 로그]" in detail["text"]
+    assert "정확 중복 quarantine 3개" in detail["text"]
+    assert export_name == f"{current.stem}.txt"
+    assert export_text == detail["text"]
+    assert not current.with_suffix(".txt").exists()
+    assert dedup_report_path(temp, current.stem, structured=True) == current.resolve()
+    with pytest.raises(FileNotFoundError):
+        dedup_report_path(temp, current.stem)
+
+
+def test_legacy_text_detail_and_export_remain_compatible(tmp_path):
+    temp, old, _paired, _current, _strong = _reports(tmp_path)
+
+    detail = read_dedup_report(temp, old.name)
+    export_name, export_text = export_dedup_report_text(temp, old.stem)
+
+    assert detail["text"] == old.read_text(encoding="utf-8")
+    assert export_name == old.name
+    assert export_text == detail["text"]
+    assert dedup_report_path(temp, old.stem) == old.resolve()
 
 
 def test_dedup_report_rejects_non_report_names_and_missing_json(tmp_path):
-    temp, old, _current, _strong = _reports(tmp_path)
+    temp, old, _paired, _current, _strong = _reports(tmp_path)
 
     with pytest.raises(ValueError):
         read_dedup_report(temp, "../success.log")

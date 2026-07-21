@@ -8,8 +8,11 @@ from normalizer import (
     analyze_name,
     extract_catalog_query_title,
     extract_readable_title,
+    extract_structure_hint_tokens,
     has_pass_marker,
+    materialize_title_markup,
     materialize_title_literals,
+    structure_hint_syntax_error,
     title_literal_syntax_error,
 )
 
@@ -75,6 +78,60 @@ def test_user_title_literal_preserves_real_noise_word_without_becoming_metadata(
     assert title_literal_syntax_error("[[   ]] 제목.txt") is not None
 
 
+def test_structure_hint_is_excluded_from_title_and_materialized_for_final_name():
+    name = "구조 작품 {{R 307}}.epub"
+    info = analyze_name(name)
+
+    assert info["core_title"] == "구조작품"
+    assert info["effective_max"] == 307
+    assert info["structure_hint_tokens"] == ("R 307",)
+    assert extract_structure_hint_tokens(name) == ("R 307",)
+    assert materialize_title_markup(name) == "구조 작품 R 307.epub"
+    assert structure_hint_syntax_error(name) is None
+    assert structure_hint_syntax_error("구조 작품 {{R 307}.epub") is not None
+    override = json.loads(decision_store.build_file_analysis(name)["title_override_json"])
+    assert override == {"title_literals": [], "structure_hints": ["R 307"]}
+
+
+def test_auditor_bridge_accepts_path_objects_at_argparse_boundary(tmp_path, monkeypatch):
+    index = tmp_path / "file_index.json"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    state_db = tmp_path / "state.sqlite3"
+    index.write_text('{"entries": []}', encoding="utf-8")
+    house.mkdir()
+    temp.mkdir()
+    captured = {}
+    progress_events = []
+
+    def fake_run(args):
+        captured.update(vars(args))
+        args.progress_callback({
+            "audit_phase": "text_analysis",
+            "completed": 100,
+            "total": 200,
+            "read_bytes": 1024,
+        })
+        return args
+
+    monkeypatch.setattr(duplicate_auditor, "run_audit", fake_run)
+    deduplicator.run_auditor_queue_report(
+        index, house, temp, state_db_path=state_db, cache_write=False,
+        progress_callback=progress_events.append,
+    )
+
+    assert captured["index"] == str(index)
+    assert captured["house"] == str(house)
+    assert captured["temp"] == str(temp)
+    assert captured["state_db"] == str(state_db)
+    assert progress_events == [{
+        "audit_phase": "text_analysis",
+        "completed": 100,
+        "total": 200,
+        "read_bytes": 1024,
+    }]
+
+
 def test_epub_representative_is_not_missing_from_txt_only_full_scan(tmp_path):
     house = tmp_path / "house"
     house.mkdir()
@@ -138,13 +195,13 @@ def test_dry_run_never_removes_exact_duplicate_fixture(tmp_path):
     assert first.is_file()
     assert second.is_file()
     assert not (temp / "trash_bin").exists()
-    [text_report] = list((temp / "dedup_logs").glob("dedup_*.txt"))
-    structured_report = text_report.with_suffix(".json")
+    assert list((temp / "dedup_logs").glob("dedup_*.txt")) == []
+    [structured_report] = list((temp / "dedup_logs").glob("dedup_*.json"))
     assert structured_report.is_file()
     payload = json.loads(structured_report.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 1
     assert payload["summary"]["exact_count"] == 1
-    assert summary["report_path"] == str(text_report)
+    assert summary["report_path"] == str(structured_report)
     assert summary["structured_report_path"] == str(structured_report)
 
 

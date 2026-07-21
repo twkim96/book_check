@@ -113,6 +113,69 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     assert client.get("/review/titles").status_code == 200
 
 
+def test_appearance_settings_are_persisted_and_reset_in_runtime_dir(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+    config = app.config["library_server_config"]
+
+    initial = client.get("/api/settings/appearance")
+    assert initial.status_code == 200
+    assert initial.get_json()["data"] == {
+        "settings": {
+            "backgroundColor": "#0a0c10",
+            "textColor": "#edf1f7",
+            "accentColor": "#3976da",
+        },
+        "persisted": False,
+    }
+
+    saved = client.put(
+        "/api/settings/appearance",
+        json={
+            "settings": {
+                "backgroundColor": "#101820",
+                "textColor": "#F1F5F9",
+                "accentColor": "#8B5CF6",
+            }
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.get_json()["data"] == {
+        "settings": {
+            "backgroundColor": "#101820",
+            "textColor": "#f1f5f9",
+            "accentColor": "#8b5cf6",
+        },
+        "persisted": True,
+    }
+    store = config.runtime_dir / "appearance.json"
+    assert json.loads(store.read_text(encoding="utf-8")) == saved.get_json()["data"]["settings"]
+    assert client.get("/api/settings/appearance").get_json()["data"]["persisted"] is True
+
+    reset = client.delete("/api/settings/appearance")
+    assert reset.status_code == 200
+    assert reset.get_json()["data"]["persisted"] is False
+    assert reset.get_json()["data"]["settings"]["backgroundColor"] == "#0a0c10"
+    assert not store.exists()
+
+
+def test_appearance_settings_require_an_object_and_normalize_invalid_fields(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+    assert client.put("/api/settings/appearance", json={}).status_code == 400
+
+    response = client.put(
+        "/api/settings/appearance",
+        json={"settings": {"backgroundColor": "invalid", "accentColor": "#ABCDEF"}},
+    )
+    assert response.status_code == 200
+    assert response.get_json()["data"]["settings"] == {
+        "backgroundColor": "#0a0c10",
+        "textColor": "#edf1f7",
+        "accentColor": "#abcdef",
+    }
+
+
 def test_dashboard_defers_full_file_doctor_but_mutation_doctor_stays_strict(tmp_path):
     app, file_id = _server_fixture(tmp_path)
     config = app.config["library_server_config"]
@@ -222,17 +285,25 @@ def test_historical_dedup_reports_are_readonly_searchable_and_downloadable(tmp_p
     config = app.config["library_server_config"]
     reports = config.temp_dir / "dedup_logs"
     reports.mkdir()
-    text = reports / "dedup_20260721_141500_123456.txt"
-    text.write_text(
-        "[중복/검토 큐 정리 로그]\n"
-        "모드: 실제 실행 | 정확 중복 quarantine 0개 | 검토 큐 그룹 2개\n",
-        encoding="utf-8",
-    )
-    text.with_suffix(".json").write_text(
+    structured_path = reports / "dedup_20260721_141500_123456.json"
+    structured_path.write_text(
         json.dumps({
             "schema_version": 1,
             "kind": "folderling_dedup",
-            "summary": {"suspect_group_count": 2},
+            "summary": {
+                "dry_run": False,
+                "managed_mode": True,
+                "include_temp": True,
+                "exact_count": 0,
+                "exact_mutation_count": 0,
+                "suspect_group_count": 2,
+                "suspect_move_count": 0,
+            },
+            "exact_records": [],
+            "suspect_groups": [],
+            "suspect_move_records": [],
+            "disambig_records": [],
+            "blocked_strong_relations": [],
         }),
         encoding="utf-8",
     )
@@ -241,13 +312,20 @@ def test_historical_dedup_reports_are_readonly_searchable_and_downloadable(tmp_p
     listing = client.get("/api/reports/dedup?search=quarantine").get_json()["data"]
     assert listing["total"] == 1
     assert listing["items"][0]["structured_available"] is True
-    detail = client.get(f"/api/reports/dedup/{text.name}").get_json()["data"]
-    assert detail["structured_summary"] == {"suspect_group_count": 2}
-    download = client.get(f"/api/reports/dedup/{text.name}/download")
+    assert listing["items"][0]["text_available"] is False
+    report_id = listing["items"][0]["report_id"]
+    detail = client.get(f"/api/reports/dedup/{report_id}").get_json()["data"]
+    assert detail["structured_summary"]["suspect_group_count"] == 2
+    assert "[중복/검토 큐 정리 로그]" in detail["text"]
+    download = client.get(f"/api/reports/dedup/{report_id}/download")
     assert download.status_code == 200
-    assert download.data == text.read_bytes()
+    assert "[중복/검토 큐 정리 로그]" in download.get_data(as_text=True)
+    assert "filename=dedup_20260721_141500_123456.txt" in download.headers[
+        "Content-Disposition"
+    ]
+    assert not structured_path.with_suffix(".txt").exists()
     structured = client.get(
-        f"/api/reports/dedup/{text.name}/download?format=json"
+        f"/api/reports/dedup/{report_id}/download?format=json"
     )
     assert structured.status_code == 200
     assert structured.mimetype == "application/json"

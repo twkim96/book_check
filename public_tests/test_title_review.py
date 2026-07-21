@@ -145,6 +145,125 @@ def test_preview_title_literal_shows_clean_final_name_and_platform_query(tmp_pat
     assert any(reason.startswith("invalid_new_name:") for reason in malformed["blocked_reasons"])
 
 
+def test_preview_structure_hint_and_decimal_volume(tmp_path):
+    state_db, house, temp, editable_id, _ = _fixture(tmp_path)
+    [case] = list_title_cases(state_db)["items"]
+    preview = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=editable_id,
+        new_body="가끔씩 툭하고 러시아어로 부끄러워하는 옆자리의 아랴 양 {{04.5권}}",
+        source_revision=case["source_revision"],
+    )
+
+    assert preview["runnable"] is True
+    assert preview["materialized_candidate_name"].endswith("아랴 양 04.5권.txt")
+    assert preview["after_core_title"] == "가끔씩툭하고러시아어로부끄러워하는옆자리의아랴양"
+    assert preview["after_volume_coordinate"] == "4.5"
+    assert preview["after_unit"] == "권"
+    assert preview["structure_hint_tokens"] == ["04.5권"]
+
+    malformed = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=editable_id,
+        new_body="작품 {{04.5권}",
+        source_revision=case["source_revision"],
+    )
+    assert malformed["runnable"] is False
+    assert any(reason.startswith("invalid_new_name:") for reason in malformed["blocked_reasons"])
+
+
+def test_structure_hint_requeue_can_return_to_same_clean_house_path(tmp_path):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    original = house / "합성 작품 04.5권.txt"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        old_file_id, _ = _add_case(
+            conn,
+            house,
+            original.name,
+            {"series": "not_found", "kakao": "not_found", "novelpia": "not_found"},
+        )
+    finally:
+        conn.close()
+
+    [case] = list_title_cases(state_db)["items"]
+    changes = [{
+        "file_id": old_file_id,
+        "source_revision": case["source_revision"],
+        "new_body": "합성 작품 {{04.5권}}",
+    }]
+    plan = build_title_plan(
+        state_db, house_dir=house, temp_dir=temp, changes=changes
+    )
+    result = apply_title_plan(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        changes=changes,
+        confirm_count=plan["item_count"],
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    marked = temp / "합성 작품 {{04.5권}}.txt"
+    assert result["completed"] == 1
+    assert marked.is_file()
+    assert not original.exists()
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            new_row = decision_store.reconcile_file_metadata(
+                conn, marked, source="temp"
+            )
+        new_file_id = new_row["file_id"]
+        assert new_file_id != old_file_id
+        backup = state_db.parent / "backups" / "before-same-path-ingest.sqlite3"
+        decision_store.backup_state_db(conn, backup)
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+
+    run_id, _ = decision_store.prepare_actual_run(state_db, house, temp)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        ingest_to_house(
+            conn,
+            source_file_id=new_file_id,
+            destination=original,
+            run_id=run_id,
+        )
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        active = conn.execute(
+            "SELECT file_id, canonical_path, source, active FROM files "
+            "WHERE canonical_path = ?",
+            (str(original.resolve()),),
+        ).fetchone()
+        assert tuple(active) == (new_file_id, str(original.resolve()), "house", 1)
+        retired = conn.execute(
+            "SELECT canonical_path, active FROM files WHERE file_id = ?",
+            (old_file_id,),
+        ).fetchone()
+        assert retired["canonical_path"] == decision_store.retired_canonical_path(
+            conn, old_file_id, original
+        )
+        assert retired["active"] == 0
+        assert not decision_store.doctor_issues(conn)
+    finally:
+        conn.close()
+
+    assert original.is_file()
+    assert not marked.exists()
+
+
 def test_title_literal_override_survives_clean_house_name_and_scanner(tmp_path):
     state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
     house = tmp_path / "house"
@@ -264,7 +383,11 @@ def test_user_title_plan_moves_only_selected_file_and_uses_new_identity(tmp_path
             "SELECT canonical_path, source, active FROM files WHERE file_id = ?",
             (editable_id,),
         ).fetchone()
-        assert tuple(retired) == (str(editable_path.resolve()), "house", 0)
+        assert tuple(retired) == (
+            decision_store.retired_canonical_path(conn, editable_id, editable_path),
+            "house",
+            0,
+        )
         operation = conn.execute(
             "SELECT action, state FROM operations WHERE file_id = ?",
             (editable_id,),

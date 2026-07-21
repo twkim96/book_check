@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -15,10 +16,12 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import decision_store
 from library_catalog import catalog_listing, review_queue_listing
+from library_appearance import read_appearance, reset_appearance, write_appearance
 from library_jobs import JobActiveError, JobRunner, JobStore
 from library_reports import (
     dedup_report_listing,
     dedup_report_path,
+    export_dedup_report_text,
     read_dedup_report,
 )
 from library_review import (
@@ -311,6 +314,7 @@ def create_app(
     app.extensions["library_review_registry"] = registry
     app.extensions["library_job_runner"] = runner
     app.extensions["library_service_registry"] = services
+    appearance_path = config.runtime_dir / "appearance.json"
 
     @app.after_request
     def response_headers(response):
@@ -385,6 +389,33 @@ def create_app(
     @app.get("/api/dashboard")
     def dashboard():
         return jsonify({"ok": True, "data": dashboard_snapshot(config, runner)})
+
+    @app.get("/api/settings/appearance")
+    def appearance_settings():
+        settings, persisted = read_appearance(appearance_path)
+        return jsonify({
+            "ok": True,
+            "data": {"settings": settings, "persisted": persisted},
+        })
+
+    @app.put("/api/settings/appearance")
+    def update_appearance_settings():
+        body = _json_body()
+        if not isinstance(body.get("settings"), dict):
+            raise ValueError("settings 객체가 필요합니다")
+        settings = write_appearance(appearance_path, body["settings"])
+        return jsonify({
+            "ok": True,
+            "data": {"settings": settings, "persisted": True},
+        })
+
+    @app.delete("/api/settings/appearance")
+    def reset_appearance_settings():
+        settings = reset_appearance(appearance_path)
+        return jsonify({
+            "ok": True,
+            "data": {"settings": settings, "persisted": False},
+        })
 
     @app.get("/api/providers")
     def providers():
@@ -576,20 +607,20 @@ def create_app(
         report_format = request.args.get("format", "text")
         if report_format not in {"text", "json"}:
             raise ValueError("지원하지 않는 dedup 보고서 다운로드 형식입니다")
-        path = dedup_report_path(
-            config.temp_dir,
-            name,
-            structured=report_format == "json",
-        )
+        if report_format == "text":
+            download_name, text = export_dedup_report_text(config.temp_dir, name)
+            return send_file(
+                BytesIO(text.encode("utf-8")),
+                as_attachment=True,
+                download_name=download_name,
+                mimetype="text/plain; charset=utf-8",
+            )
+        path = dedup_report_path(config.temp_dir, name, structured=True)
         return send_file(
             path,
             as_attachment=True,
             download_name=path.name,
-            mimetype=(
-                "application/json"
-                if report_format == "json"
-                else "text/plain; charset=utf-8"
-            ),
+            mimetype="application/json",
         )
 
     @app.get("/api/jobs/<job_id>")

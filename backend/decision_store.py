@@ -2042,9 +2042,10 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
         (row["file_id"],),
     ).fetchone()
     if row["action"] in {"title_cleanup_requeue", "user_title_requeue"}:
+        retired_path = retired_canonical_path(conn, row["file_id"], source)
         db_committed = (
             file_row is not None
-            and file_row["canonical_path"] == str(source)
+            and file_row["canonical_path"] in {str(source), retired_path}
             and file_row["source"] == "house"
             and file_row["active"] == 0
         )
@@ -2658,6 +2659,29 @@ def canonicalize_path(path: os.PathLike | str) -> str:
     return unicodedata.normalize("NFC", os.path.abspath(os.fspath(path)))
 
 
+def retired_canonical_path(
+    conn: sqlite3.Connection,
+    file_id: str,
+    original_path: os.PathLike | str,
+) -> str:
+    """Return a stable virtual slot for one retired file identity.
+
+    Title correction deliberately creates a fresh intake identity.  The old
+    inactive row must therefore release its former real path, or a markup-only
+    correction that materializes back to the same filename violates the UNIQUE
+    ``files.canonical_path`` constraint.  Operations and immutable fingerprints
+    retain the original path as provenance; this slot is never a real file.
+    """
+    db_row = conn.execute("PRAGMA database_list").fetchone()
+    if db_row is None or not db_row[2]:
+        raise RuntimeError("retired canonical path requires a file-backed state DB")
+    state_dir = Path(db_row[2]).resolve().parent
+    original_name = Path(os.fspath(original_path)).name or "retired-file"
+    return canonicalize_path(
+        state_dir / "retired_paths" / str(file_id) / original_name
+    )
+
+
 def canonicalize_real_path(path: os.PathLike | str) -> str:
     return unicodedata.normalize(
         "NFC", os.path.realpath(os.path.abspath(os.fspath(path)))
@@ -2679,12 +2703,26 @@ def build_file_analysis(name: str) -> dict:
         analyze_name,
         extract_catalog_query_title,
         extract_readable_title,
+        extract_structure_hint_tokens,
         normalize_nfc,
     )
 
     analyzed_name = normalize_nfc(name)
     info = analyze_name(analyzed_name)
     literal_tokens = tuple(info.get("title_literal_tokens") or ())
+    structure_tokens = tuple(
+        info.get("structure_hint_tokens")
+        or extract_structure_hint_tokens(analyzed_name)
+    )
+    override_payload = None
+    if structure_tokens:
+        override_payload = {
+            "title_literals": list(literal_tokens),
+            "structure_hints": list(structure_tokens),
+        }
+    elif literal_tokens:
+        # 1.2.10 저장 형식과 호환한다.
+        override_payload = list(literal_tokens)
     return {
         "normalizer_version": NORMALIZER_VERSION,
         "analyzed_name": analyzed_name,
@@ -2692,8 +2730,8 @@ def build_file_analysis(name: str) -> dict:
         "readable_title": extract_readable_title(analyzed_name).strip(),
         "catalog_query_title": extract_catalog_query_title(analyzed_name).strip(),
         "title_override_json": (
-            json.dumps(literal_tokens, ensure_ascii=False, separators=(",", ":"))
-            if literal_tokens else None
+            json.dumps(override_payload, ensure_ascii=False, separators=(",", ":"))
+            if override_payload is not None else None
         ),
         "author": info.get("author"),
         "max_number": int(info.get("max_number") or 0),
@@ -3313,7 +3351,8 @@ def reconcile_file_metadata(
             conn, file_id, canonical_path, analysis=analysis, stat_result=stat
         )
     elif source == "temp":
-        # ``[[...]]`` 제목 literal은 temp 운반 파일명에서 처음 발견된다.
+        # ``[[...]]`` 제목 literal과 ``{{...}}`` 구조 힌트는 temp 운반
+        # 파일명에서 처음 발견된다.
         # house 입고 때 같은 file_id가 유지되므로 여기서 override를 붙여 둔다.
         temp_analysis = analysis or build_file_analysis(Path(canonical_path).name)
         if temp_analysis.get("title_override_json"):

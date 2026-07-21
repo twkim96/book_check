@@ -9,7 +9,7 @@ from tqdm import tqdm
 from normalizer import (
     add_pass_marker,
     get_chosung,
-    materialize_title_literals,
+    materialize_title_markup,
     normalize_filename,
     should_exclude_dir,
     strip_pass_marker,
@@ -518,10 +518,11 @@ def _process_items_authorized(
 
                 is_dir = os.path.isdir(src_path)
                 is_file = os.path.isfile(src_path)
-                # ``[[...]]``는 제목 교정 정보를 temp의 새 file_id로 운반하는
-                # 표시다. 중복 감사가 끝난 뒤 house 파일명에서는 괄호만 제거한다.
+                # ``[[...]]`` 제목 literal과 ``{{...}}`` 구조 힌트는 temp의
+                # 새 file_id로 분석 의도를 운반한다. 중복 감사가 끝난 뒤 house
+                # 표시 파일명에서는 운반용 괄호만 제거한다.
                 clean_name = (
-                    materialize_title_literals(transport_name)
+                    materialize_title_markup(transport_name)
                     if is_file else transport_name
                 )
                 ext = os.path.splitext(clean_name)[1].lower()

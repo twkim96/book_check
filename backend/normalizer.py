@@ -33,12 +33,17 @@ SOURCE_SITE_TAG_RE = re.compile(
 
 # normalizer 규칙 버전. 핵심 추출 로직(core_title/author/max_number/...)이 바뀌면
 # bump 한다. file_index.json에 함께 기록되어 stale index 감지에 사용된다.
-NORMALIZER_VERSION = "1.2.10"
+NORMALIZER_VERSION = "1.3.0"
 
 # 사용자가 제목 교정 화면에서 ``[[19금]]``처럼 표시한 문자열은 제목의
 # 실제 일부로 취급한다. 이 표시는 temp 운반 중에만 남고 house 입고 파일명에서는
 # 제거되며, 추출 결과는 file_analysis의 사용자 override로 보존된다.
 _TITLE_LITERAL_RE = re.compile(r"\[\[([^\[\]\r\n]+)\]\]")
+
+# ``{{...}}``는 제목 본문이 아니라 사람이 지정한 구조 힌트를 운반한다.
+# 1.3.0에서는 문법·운반·override 기반만 제공하고, 실제 해석 규칙은 안전성이
+# 확인된 패턴부터 개별적으로 연결한다. house 표시 이름에는 괄호가 남지 않는다.
+_STRUCTURE_HINT_RE = re.compile(r"\{\{([^{}\r\n]+)\}\}")
 
 # pass 폴더를 거쳐 강제 입고된 파일에 부여하는 마커.
 # 짧고 전각 괄호를 사용하여 일반 도서 제목과 충돌하지 않도록 한다.
@@ -203,6 +208,17 @@ def title_literal_syntax_error(value):
     return None
 
 
+def structure_hint_syntax_error(value):
+    """짝이 맞지 않거나 비어 있는 ``{{...}}`` 구조 힌트 오류를 반환한다."""
+    normalized = normalize_nfc(value or "")
+    if any(not match.group(1).strip() for match in _STRUCTURE_HINT_RE.finditer(normalized)):
+        return "구조 힌트 안에는 분석할 내용을 입력하세요"
+    remainder = _STRUCTURE_HINT_RE.sub("", normalized)
+    if "{{" in remainder or "}}" in remainder:
+        return "구조 힌트는 {{분석할 내용}}처럼 짝을 맞춰 입력하세요"
+    return None
+
+
 def extract_title_literal_tokens(value):
     """입력 순서대로 정리한 제목 literal 토큰을 반환한다."""
     return tuple(
@@ -212,11 +228,37 @@ def extract_title_literal_tokens(value):
     )
 
 
+def extract_structure_hint_tokens(value):
+    """입력 순서대로 정리한 사용자 구조 힌트를 반환한다."""
+    return tuple(
+        match.group(1).strip()
+        for match in _STRUCTURE_HINT_RE.finditer(normalize_nfc(value or ""))
+        if match.group(1).strip()
+    )
+
+
 def materialize_title_literals(value):
     """``[[제목]]``을 ``제목``으로 바꿔 최종 표시 파일명을 만든다."""
     return _TITLE_LITERAL_RE.sub(
         lambda match: match.group(1).strip(), normalize_nfc(value or "")
     )
+
+
+def materialize_structure_hints(value):
+    """``{{구조}}``를 ``구조``로 바꿔 최종 표시 파일명을 만든다."""
+    return _STRUCTURE_HINT_RE.sub(
+        lambda match: match.group(1).strip(), normalize_nfc(value or "")
+    )
+
+
+def materialize_title_markup(value):
+    """제목 교정용 ``[[ ]]``와 ``{{ }}`` 운반 괄호를 모두 제거한다."""
+    return materialize_structure_hints(materialize_title_literals(value))
+
+
+def _strip_structure_hints(value):
+    """사람이 구조라고 지정한 토큰을 제목 후보에서 완전히 제외한다."""
+    return _STRUCTURE_HINT_RE.sub(" ", normalize_nfc(value or ""))
 
 
 def _literal_placeholder(index):
@@ -417,7 +459,7 @@ def extract_author(filename):
     @로 시작하는 태그는 보통 작가지만 사이트/위치/상태 태그(`@홈5`, `@연재중`,
     `@NF Library`)가 섞여 있다. 후보가 노이즈로 판정되면 괄호 토큰 폴백으로 이어간다.
     """
-    base, _, _ = _mask_title_literals(_without_extension(filename))
+    base, _, _ = _mask_title_literals(_strip_structure_hints(_without_extension(filename)))
     base = _strip_leading_post_status(base)
 
     bracket_tokens = _bracket_tokens(base)
@@ -444,7 +486,7 @@ def extract_author(filename):
 
 
 def has_completion_marker(filename):
-    base, _, _ = _mask_title_literals(_without_extension(filename))
+    base, _, _ = _mask_title_literals(materialize_structure_hints(_without_extension(filename)))
     if any(_is_completion_token(token) for token in _bracket_tokens(base)):
         return True
 
@@ -455,7 +497,7 @@ def has_completion_marker(filename):
 
 
 def extract_max_number(filename):
-    name, _, _ = _mask_title_literals(_without_extension(filename))
+    name, _, _ = _mask_title_literals(materialize_structure_hints(_without_extension(filename)))
     name = _strip_leading_post_status(name)
     name = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", name)
 
@@ -487,7 +529,7 @@ _SPACE_COMPLETION_RANGE_RE = re.compile(
     r"(?<!\d)(\d+)\s+(\d+)\s*(?:완결|完結|완|完|終)"
 )
 _UNIT_NUMBER_RE = re.compile(
-    r"(?<!\d)(\d+)\s*(화|회|권|장|편|부)(?!\s*차|[가-힣A-Za-z])"
+    r"(?<![\d.])(\d+)\s*(화|회|권|장|편|부)(?!\s*차|[가-힣A-Za-z])"
 )
 _COMPLETION_NUMBER_RE = re.compile(r"(?<!\d)(\d+)\s*(?:완결|完結|완|完|終)(?![가-힣A-Za-z])")
 _HYPHEN_TAIL_RE = re.compile(r"[~\-]\s*(\d+)\s*(?=(?:완결|完結|완|完|終|종|$))")
@@ -540,7 +582,7 @@ class EpisodeSpan:
 
 def _analysis_base(filename):
     """괄호/@태그를 제거한 분석용 본문 문자열."""
-    base, _, _ = _mask_title_literals(_without_extension(filename))
+    base, _, _ = _mask_title_literals(materialize_structure_hints(_without_extension(filename)))
     base = _strip_leading_post_status(base)
     base = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", base)
     base = re.sub(r"@[^\s]+", " ", base)
@@ -549,7 +591,7 @@ def _analysis_base(filename):
 
 def _episode_analysis_base(filename):
     """span role 판정을 위해 외전/본편 괄호 표기는 보존하고 작가 @태그만 제거한다."""
-    base, _, _ = _mask_title_literals(_without_extension(filename))
+    base, _, _ = _mask_title_literals(materialize_structure_hints(_without_extension(filename)))
     base = _strip_leading_post_status(base)
     return re.sub(r"@[^\s]+", " ", base)
 
@@ -782,7 +824,7 @@ def extract_volume_number(filename):
     - '어떤 책 1-3권 모음'                → None  (권 범위만 있을 때)
     - 권/부 표기 자체가 없으면          → None
     """
-    base, _, _ = _mask_title_literals(_without_extension(filename))
+    base, _, _ = _mask_title_literals(materialize_structure_hints(_without_extension(filename)))
     base = _strip_leading_post_status(base)
     base = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|\{.*?\}", " ", base)
     base = re.sub(r"@[^\s]+", " ", base)
@@ -805,10 +847,19 @@ def extract_volume_number(filename):
         part = None
 
     # 권 범위 표기는 단일 권 매칭에서 제외한다.
-    masked = re.sub(r"\d+\s*권\s*[~\-]\s*\d+\s*권", " ", base)
-    masked = re.sub(r"\d+\s*[~\-]\s*\d+\s*권", " ", masked)
-    match_vol = re.search(r"(\d+)\s*권", masked)
-    volume = int(match_vol.group(1)) if match_vol else None
+    number = r"\d+(?:\.\d+)?"
+    masked = re.sub(rf"{number}\s*권\s*[~\-]\s*{number}\s*권", " ", base)
+    masked = re.sub(rf"{number}\s*[~\-]\s*{number}\s*권", " ", masked)
+    match_vol = re.search(rf"(?<![\d.])({number})\s*권", masked)
+    volume = None
+    if match_vol:
+        raw_volume = match_vol.group(1)
+        if "." in raw_volume:
+            whole, fraction = raw_volume.split(".", 1)
+            fraction = fraction.rstrip("0")
+            volume = f"{int(whole)}.{fraction}" if fraction else int(whole)
+        else:
+            volume = int(raw_volume)
 
     if part is None and volume is None:
         return None
@@ -842,7 +893,7 @@ def is_side_story(filename):
     단, '외전 1-N'처럼 외전 표식 바로 뒤에 자체 회차 범위가 붙은 경우는
     외전 자체의 회차이지 본편 범위가 아니므로 외전 단독으로 본다.
     """
-    name, _, _ = _mask_title_literals(_without_extension(filename))
+    name, _, _ = _mask_title_literals(materialize_structure_hints(_without_extension(filename)))
     if not re.search(r"외전|外", name):
         return False
 
@@ -857,7 +908,7 @@ def is_side_story(filename):
 
 def _extract_readable_title(filename, *, prefer_colon_subtitle):
     # 분리 마커 〔Dn〕는 검색/매칭에서 제거해 base와 같은 코어로 인식되게 한다.
-    base = _without_extension(strip_disambig_marker(filename))
+    base = _strip_structure_hints(_without_extension(strip_disambig_marker(filename)))
     base, literal_mapping, _ = _mask_title_literals(base)
 
     # 게시글 상태 꼬리표는 괄호가 잘못 닫혀 있어도 본문보다 먼저 떼어낸다.
@@ -899,6 +950,7 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
     # 들어가 제목을 과하게 잘라버리는 부작용이 있다. 진짜 회차 표기는 `1-N화` / `N권`
     # 패턴이 보통이다.
     cut_patterns = [
+        r"\d+(?:\.\d+)+\s*권",
         r"\d+\s*권\s*[~\-]\s*\d+\s*권",
         r"\d+\s*(?:화|권|부|회|장|편)\s*[~\-]\s*\d+\s*(?:화|권|부|회|장|편)?",
         r"\d+\s*[~\-]\s*\d+",
@@ -960,6 +1012,7 @@ def analyze_name(name):
     core_name = strip_pass_marker(strip_disambig_marker(normalized_name))
     _, ext = _split_supported_extension(core_name)
     episode_span, span_ambiguous = _select_episode_span(core_name)
+    volume_number = extract_volume_number(core_name)
     return {
         "name": normalized_name,
         "ext": ext.lower(),
@@ -968,12 +1021,17 @@ def analyze_name(name):
         "author": extract_author(core_name),
         "max_number": extract_max_number(core_name),
         "effective_max": 0 if span_ambiguous or episode_span is None else episode_span.end,
-        "unit": "미상" if span_ambiguous or episode_span is None else episode_span.unit,
+        "unit": (
+            "권" if volume_number is not None and volume_number[1] is not None
+            else "미상" if span_ambiguous or episode_span is None
+            else episode_span.unit
+        ),
         "complete": has_completion_marker(core_name),
-        "volume_number": extract_volume_number(core_name),
+        "volume_number": volume_number,
         "start_number": None if span_ambiguous or episode_span is None else episode_span.start,
         "end_number": None if span_ambiguous or episode_span is None else episode_span.end,
         "span_ambiguous": span_ambiguous,
         "is_side_story": is_side_story(core_name),
         "title_literal_tokens": extract_title_literal_tokens(core_name),
+        "structure_hint_tokens": extract_structure_hint_tokens(core_name),
     }

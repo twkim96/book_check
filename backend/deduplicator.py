@@ -917,7 +917,8 @@ def move_suspect_group(group, temp_dir, dry_run):
 
 
 def run_auditor_queue_report(
-    index_path, house_dir, temp_dir, state_db_path=None, cache_write=True
+    index_path, house_dir, temp_dir, state_db_path=None, cache_write=True,
+    progress_callback=None,
 ):
     """folderling 검토 큐용 read-only auditor 실행. 파일 이동은 호출 측에서만 한다."""
     import duplicate_auditor
@@ -931,17 +932,18 @@ def run_auditor_queue_report(
         raise RuntimeError("duplicate auditor feature contract mismatch; fail closed")
 
     argv = [
-        "--index", index_path,
-        "--house", house_dir,
-        "--temp", temp_dir,
+        "--index", os.fspath(index_path),
+        "--house", os.fspath(house_dir),
+        "--temp", os.fspath(temp_dir),
         "--max-file-bytes", "512MiB",
         "--max-read-bytes", "48GiB",
     ]
     if state_db_path:
-        argv.extend(("--state-db", state_db_path))
+        argv.extend(("--state-db", os.fspath(state_db_path)))
     args = duplicate_auditor.build_parser().parse_args(argv)
     args.progress = True
     args.cache_write = cache_write
+    args.progress_callback = progress_callback
     return duplicate_auditor.run_audit(args)
 
 
@@ -1601,17 +1603,6 @@ def _managed_auditor_queue_records(
     return records
 
 
-def format_entry(entry):
-    author = entry["author"] or "-"
-    source = entry.get("source", "house")
-    tag = f"[{source}]"
-    return (
-        f"{tag} {entry['name']} | {entry['rel_path']} | "
-        f"{entry['size'] / 1024:.1f} KB | 편수 {entry['max_number']} | "
-        f"완결 {entry['complete']} | 작가 {author}"
-    )
-
-
 def write_review_log(
     temp_dir, exact_records, suspect_groups, suspect_move_records, summary,
     disambig_records=None, blocked_strong_relations=None,
@@ -1620,103 +1611,10 @@ def write_review_log(
     os.makedirs(log_dir, exist_ok=True)
     generated_at = datetime.now().astimezone()
     report_stem = f"dedup_{generated_at.strftime('%Y%m%d_%H%M%S_%f')}"
-    log_path = os.path.join(log_dir, f"{report_stem}.txt")
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write("[중복/검토 큐 정리 로그]\n")
-        f.write("완전 중복은 raw SHA 재검증 뒤 quarantine으로 논리 삭제하며 즉시 unlink하지 않습니다.\n")
-        f.write("검토 큐는 핵심 제목이 같아 사람 검토가 필요한 항목입니다. 자동 삭제 대상이 아닙니다.\n")
-        f.write("- 별개 작품/판본 판정은 dedup_decisions.py에 기록하세요. pass/는 판정 입력이 아닙니다.\n")
-        f.write("- 잘못 이동된 경우 restore_suspects.py --dry-run 으로 먼저 확인 후 --run 으로 복원하세요.\n\n")
-        f.write("======================================================================\n")
-        exact_action = "quarantine" if summary.get("managed_mode") else (
-            "삭제" if summary.get("delete_exact") else "격리"
-        )
-        f.write(
-            f"모드: {'미리보기/Dry-run' if summary['dry_run'] else '실제 실행'} | "
-            f"스캔 범위: {'house + temp' if summary.get('include_temp') else 'house만'} | "
-            f"정확 중복 {exact_action} {summary.get('exact_mutation_count', summary['exact_count'])}개 | "
-            f"legacy report-only {summary.get('legacy_report_only_count', 0)}개 | "
-            f"managed report-only {summary.get('managed_report_only_count', 0)}개 | "
-            f"검토 큐 그룹 {summary['suspect_group_count']}개 | "
-            f"검토 큐 이동 {summary.get('review_queue_move_count', summary['suspect_move_count'])}개 "
-            f"(같은 작가/미상 {summary.get('same_author_count', 0)}, "
-            f"작가 충돌 {summary.get('author_conflict_count', 0)}) | "
-            f"애매 보류(warning) {summary.get('warning_count', 0)}개 | "
-            f"본문 증거 없음(metadata_only) {summary.get('metadata_only_count', 0)}개\n"
-        )
-        f.write("======================================================================\n\n")
-
-        if summary.get("unsafe_legacy_bridge"):
-            f.write("[안전 차단] unsafe_legacy_bridge=true\n")
-            f.write("- 이 auditor 연결 결과는 1.2.1 Phase D 전까지 dry-run 참고용이며 actual mutation에 사용할 수 없습니다.\n\n")
-
-        f.write("[1.5단계] 본문 유사도 기반 분리 마커 부여 (별개 작품 〔Dn〕)\n")
-        if not disambig_records:
-            f.write("- 분리 마커 부여 없음\n")
-        else:
-            for rec in disambig_records:
-                if rec.get("status") == "skipped_collision":
-                    tag = "[건너뜀: 파일명 충돌]"
-                elif rec.get("status") == "house_conflict_logged":
-                    tag = "[house 제자리: 분리 마커 미부여]"
-                elif rec.get("dry_run"):
-                    tag = "[부여 예정]"
-                else:
-                    tag = "[부여]"
-                f.write(
-                    f"  {tag} core_title: {rec['core_title']} | "
-                    f"D{rec['old_disambig']} → {('D' + str(rec['new_disambig'])) if rec['new_disambig'] else '-'} | "
-                    f"{rec['old_name']} → {rec['new_name']}\n"
-                )
-        f.write("\n")
-
-        f.write("[2단계] 제목 기반 검토 큐 (자동 삭제 아님, 사람 검토 필요)\n")
-        if not suspect_groups:
-            f.write("- 검토 큐 그룹 없음\n")
-        else:
-            moved_paths = {r["entry"]["path"] for r in suspect_move_records if r.get("status") == "moved"}
-            author_review_paths = {r["entry"]["path"] for r in suspect_move_records if r.get("status") == "author_review"}
-            warning_paths = {r["entry"]["path"] for r in suspect_move_records if r.get("status") == "warning"}
-            metadata_paths = {r["entry"]["path"] for r in suspect_move_records if r.get("status") == "metadata_only"}
-            for group in suspect_groups:
-                if group.get("origin") == "auditor_aux":
-                    reason = "auditor " + ", ".join(group.get("audit_classifications", []))
-                elif group["distinct_authors"]:
-                    reason = "핵심 제목 동일·작가 후보 다름 → byte-exact가 아니면 author_conflicts 수동 판별"
-                else:
-                    reason = "핵심 제목 동일 → 본문 same은 suspected_duplicates, 애매는 warning 보류"
-                f.write(f"- core_title: {group['core_title']} ({reason})\n")
-                f.write(f"  [유지 후보] {format_entry(group['keep'])}\n")
-                for entry in group["entries"]:
-                    if entry["path"] == group["keep"]["path"]:
-                        continue
-                    if entry["path"] in moved_paths:
-                        marker = "[중복 확정 → suspected]"
-                    elif entry["path"] in author_review_paths:
-                        marker = "[애매·작가충돌 → author_conflicts]"
-                    elif entry["path"] in warning_paths:
-                        marker = "[애매 → warning 보류]"
-                    elif entry["path"] in metadata_paths:
-                        marker = "[metadata_only → warning 보류]"
-                    else:
-                        marker = "[검토 후보]"
-                    f.write(f"  {marker} {format_entry(entry)}\n")
-        f.write("\n")
-
-        f.write("[2.5단계] mutation 차단 strong 관계 (report-only)\n")
-        if not blocked_strong_relations:
-            f.write("- 차단된 strong 관계 없음\n")
-        else:
-            for relation in blocked_strong_relations:
-                f.write(
-                    f"- [{relation['classification']}] reason={relation['reason']}\n"
-                    f"  left : {format_entry(relation['left'])}\n"
-                    f"  right: {format_entry(relation['right'])}\n"
-                )
-        f.write("\n")
-
     structured_path = os.path.join(log_dir, f"{report_stem}.json")
+    summary["report_path"] = structured_path
+    # 구버전 호출부 호환: 이제 두 경로 모두 유일한 JSON 원본을 가리킨다.
+    summary["structured_report_path"] = structured_path
     structured_payload = {
         "schema_version": 1,
         "kind": "folderling_dedup",
@@ -1745,11 +1643,11 @@ def write_review_log(
             os.unlink(temporary_path)
         except FileNotFoundError:
             pass
-        structured_path = None
+        summary["report_path"] = None
+        summary["structured_report_path"] = None
         print(f"⚠️ 구조화 dedup 보고서 저장 실패: {exc}", file=sys.stderr)
-    summary["report_path"] = log_path
-    summary["structured_report_path"] = structured_path
-    return log_path
+        return None
+    return structured_path
 
 
 def _emit_dedup_record_events(event_callback, exact_records, suspect_move_records):
@@ -1896,6 +1794,12 @@ def _clean_duplicates_impl(
             temp_dir,
             state_db_path=state_db_path if managed_mode else None,
             cache_write=not pure_plan,
+            progress_callback=(
+                lambda update: event_callback({
+                    "phase": "auditor_progress", "status": "running", **update
+                })
+                if event_callback is not None else None
+            ),
         )
         if not getattr(auditor_report, "completed", False):
             reasons = getattr(auditor_report, "stop_reasons", [])
@@ -2138,9 +2042,11 @@ def _clean_duplicates_impl(
         if metadata_only_records:
             print(f"→ 본문 증거 없음(metadata_only): {len(metadata_only_records)}개")
     if log_path:
-        print(f"📝 검토 로그 생성 완료: {log_path}")
-    else:
+        print(f"🧾 구조화 검토 보고서 생성 완료: {log_path}")
+    elif pure_plan:
         print("📝 pure-plan: DB/index/report write 없음")
+    else:
+        print("⚠️ 구조화 검토 보고서를 저장하지 못했습니다.")
     print("✨ 중복/검토 큐 정리 완료. (검토 큐는 자동 삭제 아님. 판정은 dedup_decisions.py, 복원은 restore_suspects.py)\n")
     return summary
 

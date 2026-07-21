@@ -58,8 +58,10 @@ export interface TitlePreview {
   after_author: string | null;
   after_effective_max: number;
   after_unit: string;
+  after_volume_coordinate: string | null;
   after_complete: boolean;
   title_literal_tokens: string[];
+  structure_hint_tokens: string[];
   target_exists: boolean;
   target_has_ok: boolean;
   blocked_reasons: string[];
@@ -187,12 +189,14 @@ export interface JobEvent {
 }
 
 export interface DedupReportItem {
+  report_id: string;
   name: string;
   kind: "dedup" | "strong_candidates";
   size: number;
   created_at: string;
   modified_at: string;
   summary: string;
+  text_available: boolean;
   structured_available: boolean;
 }
 

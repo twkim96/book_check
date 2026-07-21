@@ -154,7 +154,9 @@ def test_apply_requeue_requires_exact_count_and_uses_new_intake_identity(tmp_pat
             "SELECT canonical_path, source, active, current_fingerprint_id "
             "FROM files WHERE file_id = ?", (old_file_id,)
         ).fetchone()
-        assert retired["canonical_path"] == str(source.resolve())
+        assert retired["canonical_path"] == decision_store.retired_canonical_path(
+            conn, old_file_id, source
+        )
         assert retired["source"] == "house"
         assert retired["active"] == 0
         assert retired["current_fingerprint_id"] is not None
