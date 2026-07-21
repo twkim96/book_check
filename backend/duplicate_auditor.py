@@ -47,6 +47,12 @@ from text_preview import (
 )
 from project_paths import FILE_INDEX, HOUSE_DIR, TEMP_DIR
 from mutation_io import inspect_epub_content
+from review_noise import (
+    different_core_titles,
+    distinct_terminal_epub_volumes,
+    side_story_vs_numbered_epub_volume,
+    supersede_open_pair_reviews,
+)
 
 
 # 한 파일은 인코딩 확정 중 최대 3회, deep 검사에서 short/long 역할로 각 1회 읽힐 수 있다.
@@ -953,6 +959,30 @@ class PersistentAuditCache:
         }
         if result.classification not in reviewable:
             return
+        if (
+            result.classification == "metadata_only"
+            and distinct_terminal_epub_volumes(
+                candidate.left.name, candidate.right.name
+            )
+        ):
+            self.stats["distinct_volume_reviews_suppressed"] += 1
+            return
+        if (
+            result.classification == "metadata_only"
+            and side_story_vs_numbered_epub_volume(
+                candidate.left.name, candidate.right.name
+            )
+        ):
+            self.stats["side_story_volume_reviews_suppressed"] += 1
+            return
+        if (
+            result.classification == "metadata_only"
+            and different_core_titles(
+                candidate.left.core_title, candidate.right.core_title
+            )
+        ):
+            self.stats["cross_core_reviews_suppressed"] += 1
+            return
         left_file = self.file_ids[candidate.left.path]
         right_file = self.file_ids[candidate.right.path]
         rows = {
@@ -1010,6 +1040,12 @@ class PersistentAuditCache:
         ):
             self.stats["human_disposition_cache_hits"] += 1
             return
+        self.stats["stale_open_reviews_superseded"] += supersede_open_pair_reviews(
+            self.conn,
+            candidate_file_id=candidate_file,
+            reference_file_id=reference_file,
+            classification=result.classification,
+        )
         self.conn.execute(
             """
             INSERT INTO review_items(
@@ -1418,6 +1454,18 @@ def run_audit(args):
         "pair_cache_hits": persistent_stats.get("pair_cache_hits", 0),
         "pair_cache_misses": persistent_stats.get("pair_cache_misses", 0),
         "review_items_created": persistent_stats.get("review_items_created", 0),
+        "distinct_volume_reviews_suppressed": persistent_stats.get(
+            "distinct_volume_reviews_suppressed", 0
+        ),
+        "side_story_volume_reviews_suppressed": persistent_stats.get(
+            "side_story_volume_reviews_suppressed", 0
+        ),
+        "cross_core_reviews_suppressed": persistent_stats.get(
+            "cross_core_reviews_suppressed", 0
+        ),
+        "stale_open_reviews_superseded": persistent_stats.get(
+            "stale_open_reviews_superseded", 0
+        ),
         "human_disposition_cache_hits": persistent_stats.get(
             "human_disposition_cache_hits", 0
         ),
