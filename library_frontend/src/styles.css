@@ -270,6 +270,18 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .progress small { position: relative; z-index: 1; text-align: center; color: white; margin: 0; line-height: 16px; }
 .job-error { color: #ff9b9b; margin-top: 8px; font-size: 12px; }
 .job-result { color: #8ed9ac; margin-top: 8px; font-size: 12px; }
+.report-list { display: grid; gap: 8px; }
+.report-row { display: grid; grid-template-columns: 180px minmax(0, 1fr) 80px; gap: 14px; align-items: center; padding: 13px; border: 1px solid #29313d; border-radius: 10px; color: inherit; background: #10141a; text-decoration: none; transition: border-color .15s ease, background .15s ease; }
+.report-row:hover { border-color: #49658e; background: #141b25; }
+.report-row > div:nth-child(2) strong, .report-row > div:nth-child(2) small { display: block; }
+.report-row > div:nth-child(2) small { margin-top: 5px; color: var(--muted); overflow-wrap: anywhere; }
+.report-row > span:last-child { color: #7e8999; font-size: 11px; text-align: right; }
+.report-tags { display: flex; align-items: center; gap: 6px; }
+.report-kind, .report-format { width: fit-content; border-radius: 99px; padding: 5px 8px; font-size: 9px; font-weight: 800; white-space: nowrap; }
+.report-kind-dedup { color: #8cb8ff; background: #1d355b; }
+.report-kind-strong_candidates { color: #f4cc82; background: #4a3718; }
+.report-format { color: #7fe3a7; background: #183d27; }
+.report-root { display: block; margin-top: 12px; color: #687383; overflow-wrap: anywhere; }
 .job-detail-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 13px; margin-bottom: 13px; }
 .job-detail-summary article > span, .job-detail-summary article > strong, .job-detail-summary article > small { display: block; }
 .job-detail-summary article > span { color: var(--muted); font-size: 11px; }

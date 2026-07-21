@@ -16,6 +16,11 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 import decision_store
 from library_catalog import catalog_listing, review_queue_listing
 from library_jobs import JobActiveError, JobRunner, JobStore
+from library_reports import (
+    dedup_report_listing,
+    dedup_report_path,
+    read_dedup_report,
+)
 from library_review import (
     ReviewProviderRegistry,
     TitleCorrectionProvider,
@@ -546,6 +551,46 @@ def create_app(
     @app.get("/api/jobs")
     def jobs():
         return jsonify({"ok": True, "data": runner.list(limit=request.args.get("limit", 50, type=int))})
+
+    @app.get("/api/reports/dedup")
+    def dedup_reports():
+        return jsonify({
+            "ok": True,
+            "data": dedup_report_listing(
+                config.temp_dir,
+                search=request.args.get("search", ""),
+                kind=request.args.get("kind", "all"),
+                limit=request.args.get("limit", 200, type=int),
+            ),
+        })
+
+    @app.get("/api/reports/dedup/<name>")
+    def dedup_report(name):
+        return jsonify({
+            "ok": True,
+            "data": read_dedup_report(config.temp_dir, name),
+        })
+
+    @app.get("/api/reports/dedup/<name>/download")
+    def dedup_report_download(name):
+        report_format = request.args.get("format", "text")
+        if report_format not in {"text", "json"}:
+            raise ValueError("지원하지 않는 dedup 보고서 다운로드 형식입니다")
+        path = dedup_report_path(
+            config.temp_dir,
+            name,
+            structured=report_format == "json",
+        )
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=path.name,
+            mimetype=(
+                "application/json"
+                if report_format == "json"
+                else "text/plain; charset=utf-8"
+            ),
+        )
 
     @app.get("/api/jobs/<job_id>")
     def job(job_id):

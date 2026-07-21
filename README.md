@@ -128,6 +128,14 @@ identity를 다시 읽지 않습니다. 화면에서는 schema·미완료 operat
 `success.log`와 `fail.log`도 해당 job 로그에 복사되며, 플랫폼 장시간 수집은 10작품 단위 진행
 이벤트를 저장합니다. 기존 컨트롤서버의 `Folderling 실제 입고` 원버튼은 계속 유지합니다.
 
+`/reports/dedup`는 `txt_temp/dedup_logs`에 누적된 과거 `dedup_*.txt`와
+`strong_candidates_*.txt`를 실행 시각·종류·요약과 함께 읽기 전용으로 조회합니다. 검색, 원문
+열람, 복사와 다운로드를 지원하므로 서버 도입 전 실행과 컨트롤서버 원버튼 실행도 공통 이력으로
+볼 수 있습니다. 새 dedup 실행은 사람용 TXT와 schema-versioned JSON sidecar를 같은 이름으로
+함께 생성하며, UI는 JSON 요약을 우선 표시합니다. TXT는 기존 CLI 호환과 원문 근거로 유지합니다.
+이 보고서는 dedup 단계 결과이므로 preflight Doctor·backup·index·치명적 오류는 `/jobs`의 구조화
+이벤트와 raw log에서 별도로 확인합니다.
+
 Folderling 작업 상세는 doctor, snapshot, 중복 판정, temp 입고, index 갱신, 최종 doctor를
 타임라인으로 표시합니다. 파일별 결과 표에서는 정상 입고, 정확 중복, 검토 격리, warning,
 실패와 제외를 구분하고 원본 후보·기존 유지 파일·실제 목적지·다음 조치를 함께 확인할 수 있습니다.

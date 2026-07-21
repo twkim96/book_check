@@ -217,6 +217,42 @@ def test_dashboard_pending_matches_folderling_intake_exclusions(tmp_path):
     assert dashboard["filesystem"]["warning_files"] == 1
 
 
+def test_historical_dedup_reports_are_readonly_searchable_and_downloadable(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    reports = config.temp_dir / "dedup_logs"
+    reports.mkdir()
+    text = reports / "dedup_20260721_141500_123456.txt"
+    text.write_text(
+        "[중복/검토 큐 정리 로그]\n"
+        "모드: 실제 실행 | 정확 중복 quarantine 0개 | 검토 큐 그룹 2개\n",
+        encoding="utf-8",
+    )
+    text.with_suffix(".json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "kind": "folderling_dedup",
+            "summary": {"suspect_group_count": 2},
+        }),
+        encoding="utf-8",
+    )
+    client = app.test_client()
+
+    listing = client.get("/api/reports/dedup?search=quarantine").get_json()["data"]
+    assert listing["total"] == 1
+    assert listing["items"][0]["structured_available"] is True
+    detail = client.get(f"/api/reports/dedup/{text.name}").get_json()["data"]
+    assert detail["structured_summary"] == {"suspect_group_count": 2}
+    download = client.get(f"/api/reports/dedup/{text.name}/download")
+    assert download.status_code == 200
+    assert download.data == text.read_bytes()
+    structured = client.get(
+        f"/api/reports/dedup/{text.name}/download?format=json"
+    )
+    assert structured.status_code == 200
+    assert structured.mimetype == "application/json"
+
+
 def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
     app, _ = _server_fixture(tmp_path)
     client = app.test_client()

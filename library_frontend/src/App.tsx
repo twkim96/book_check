@@ -6,6 +6,8 @@ import type {
   CatalogItem,
   CatalogListing,
   DashboardData,
+  DedupReportDetail,
+  DedupReportListing,
   JobEvent,
   JobRecord,
   PlatformStatus,
@@ -73,6 +75,7 @@ function Shell() {
           <NavLink to="/review/volumes">분권 묶기</NavLink>
           <NavLink to="/review/queue">검토 큐</NavLink>
           <NavLink to="/jobs">작업 이력</NavLink>
+          <NavLink to="/reports/dedup">Folderling 보고서</NavLink>
         </nav>
         <div className="sidebar-note">로컬 전용 · 실제 변경 전 계획 확인</div>
       </aside>
@@ -87,6 +90,8 @@ function Shell() {
           <Route path="/review/queue" element={<ReviewQueue />} />
           <Route path="/jobs" element={<Jobs />} />
           <Route path="/jobs/:jobId" element={<JobDetail />} />
+          <Route path="/reports/dedup" element={<DedupReports />} />
+          <Route path="/reports/dedup/:reportName" element={<DedupReport />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -994,6 +999,118 @@ function Jobs() {
       <section className="panel"><JobList jobs={jobs ?? []} empty="실행 이력이 없습니다." detailed /></section>
     </>
   );
+}
+
+function reportKindLabel(kind: "dedup" | "strong_candidates"): string {
+  return kind === "dedup" ? "Folderling 중복 정리" : "강력 후보 감사";
+}
+
+function DedupReports() {
+  const [data, setData] = useState<DedupReportListing>();
+  const [search, setSearch] = useState("");
+  const [submittedSearch, setSubmittedSearch] = useState("");
+  const [kind, setKind] = useState<"all" | "dedup" | "strong_candidates">("all");
+  const [error, setError] = useState("");
+  const load = () => {
+    const query = new URLSearchParams({ search: submittedSearch, kind, limit: "500" });
+    api<DedupReportListing>(`/api/reports/dedup?${query}`)
+      .then((result) => { setData(result); setError(""); })
+      .catch((reason) => setError(reason.message));
+  };
+  useEffect(load, [submittedSearch, kind]);
+  return <>
+    <PageHeader
+      eyebrow="HISTORICAL REPORTS"
+      title="Folderling 보고서"
+      description="txt_temp/dedup_logs에 누적된 과거 중복 정리·강력 후보 감사 결과를 읽기 전용으로 확인합니다."
+      action={<button className="button secondary" onClick={load}>새로고침</button>}
+    />
+    <section className="toolbar">
+      <form className="search-form" onSubmit={(event) => { event.preventDefault(); setSubmittedSearch(search.trim()); }}>
+        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="날짜·요약 내용 검색" />
+        <button className="button secondary">검색</button>
+      </form>
+      <select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}>
+        <option value="all">전체 보고서</option>
+        <option value="dedup">Folderling 중복 정리</option>
+        <option value="strong_candidates">강력 후보 감사</option>
+      </select>
+    </section>
+    {error && <div className="inline-error">{error}</div>}
+    <section className="panel">
+      <div className="panel-title">
+        <div><span className="eyebrow">DEDUP LOGS</span><h2>누적 보고서</h2></div>
+        <span>{formatNumber(data?.total ?? 0)}개</span>
+      </div>
+      {!data ? <div className="empty">보고서 목록을 확인하고 있습니다.</div> : data.items.length ? <div className="report-list">
+        {data.items.map((item) => <NavLink className="report-row" to={`/reports/dedup/${encodeURIComponent(item.name)}`} key={item.name}>
+          <div className="report-tags">
+            <span className={`report-kind report-kind-${item.kind}`}>{reportKindLabel(item.kind)}</span>
+            {item.structured_available && <span className="report-format">JSON</span>}
+          </div>
+          <div><strong>{new Date(item.created_at).toLocaleString("ko-KR")}</strong><small>{item.summary || item.name}</small></div>
+          <span>{formatBytes(item.size)}</span>
+        </NavLink>)}
+      </div> : <div className="empty">조건에 맞는 보고서가 없습니다.</div>}
+      {data && <small className="report-root">읽기 전용 경로 · {data.root}</small>}
+    </section>
+  </>;
+}
+
+function DedupReport() {
+  const { reportName = "" } = useParams();
+  const [data, setData] = useState<DedupReportDetail>();
+  const [filter, setFilter] = useState("");
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const encoded = encodeURIComponent(reportName);
+  const load = () => api<DedupReportDetail>(`/api/reports/dedup/${encoded}`)
+    .then((result) => { setData(result); setError(""); })
+    .catch((reason) => setError(reason.message));
+  useEffect(() => { load(); }, [reportName]);
+  if (error && !data) return <ErrorPanel message={error} retry={load} />;
+  if (!data) return <Loading />;
+  const visible = filter
+    ? data.text.split("\n").filter((line) => line.toLocaleLowerCase().includes(filter.toLocaleLowerCase())).join("\n")
+    : data.text;
+  const copy = async () => {
+    await navigator.clipboard.writeText(visible);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
+  return <>
+    <PageHeader
+      eyebrow="HISTORICAL REPORT"
+      title={reportKindLabel(data.kind)}
+      description={`${new Date(data.created_at).toLocaleString("ko-KR")} · ${data.name}`}
+      action={<NavLink className="button secondary" to="/reports/dedup">보고서 목록</NavLink>}
+    />
+    {error && <div className="inline-error">{error}</div>}
+    <section className="job-detail-summary">
+      <article className="panel"><span>종류</span><strong>{reportKindLabel(data.kind)}</strong><small>읽기 전용</small></article>
+      <article className="panel"><span>생성 시각</span><strong>{new Date(data.created_at).toLocaleDateString("ko-KR")}</strong><small>{new Date(data.created_at).toLocaleTimeString("ko-KR")}</small></article>
+      <article className="panel"><span>크기</span><strong>{formatBytes(data.size)}</strong><small>{data.name}</small></article>
+    </section>
+    {data.structured_summary && <section className="panel result-panel">
+      <div className="panel-title">
+        <div><span className="eyebrow">STRUCTURED SUMMARY</span><h2>구조화 실행 요약</h2></div>
+        <span>schema {String(data.structured_metadata?.schema_version ?? "-")}</span>
+      </div>
+      <pre>{JSON.stringify(data.structured_summary, null, 2)}</pre>
+    </section>}
+    <section className="panel log-panel">
+      <div className="panel-title">
+        <div><span className="eyebrow">RAW REPORT</span><h2>보고서 원문</h2></div>
+        <div className="log-actions">
+          <button className="button secondary" onClick={copy}>{copied ? "복사됨" : "복사"}</button>
+          <a className="button secondary" href={`/api/reports/dedup/${encoded}/download`}>TXT 다운로드</a>
+          {data.structured_available && <a className="button secondary" href={`/api/reports/dedup/${encoded}/download?format=json`}>JSON 다운로드</a>}
+        </div>
+      </div>
+      <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="보고서에서 검색" />
+      <pre>{visible || "검색 조건에 맞는 줄이 없습니다."}</pre>
+    </section>
+  </>;
 }
 
 function jobLabel(jobType: string): string {

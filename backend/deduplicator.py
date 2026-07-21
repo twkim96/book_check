@@ -1618,7 +1618,9 @@ def write_review_log(
 ):
     log_dir = os.path.join(temp_dir, "dedup_logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"dedup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    generated_at = datetime.now().astimezone()
+    report_stem = f"dedup_{generated_at.strftime('%Y%m%d_%H%M%S_%f')}"
+    log_path = os.path.join(log_dir, f"{report_stem}.txt")
 
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("[중복/검토 큐 정리 로그]\n")
@@ -1714,6 +1716,39 @@ def write_review_log(
                 )
         f.write("\n")
 
+    structured_path = os.path.join(log_dir, f"{report_stem}.json")
+    structured_payload = {
+        "schema_version": 1,
+        "kind": "folderling_dedup",
+        "generated_at": generated_at.isoformat(),
+        "summary": dict(summary),
+        "exact_records": exact_records,
+        "suspect_groups": suspect_groups,
+        "suspect_move_records": suspect_move_records,
+        "disambig_records": disambig_records or [],
+        "blocked_strong_relations": blocked_strong_relations or [],
+    }
+    temporary_path = structured_path + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(
+                structured_payload,
+                stream,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+        os.replace(temporary_path, structured_path)
+    except OSError as exc:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        structured_path = None
+        print(f"⚠️ 구조화 dedup 보고서 저장 실패: {exc}", file=sys.stderr)
+    summary["report_path"] = log_path
+    summary["structured_report_path"] = structured_path
     return log_path
 
 
@@ -2062,6 +2097,8 @@ def _clean_duplicates_impl(
             temp_dir, exact_records, suspect_groups, suspect_move_records, summary,
             disambig_records, blocked_strong_relations,
         )
+    if log_path and not summary.get("report_path"):
+        summary["report_path"] = log_path
 
     # 실제 파일 상태가 바뀐 경우에만 인덱스를 재생성한다.
     moved_suspects = [

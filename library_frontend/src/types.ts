@@ -186,6 +186,33 @@ export interface JobEvent {
   [key: string]: unknown;
 }
 
+export interface DedupReportItem {
+  name: string;
+  kind: "dedup" | "strong_candidates";
+  size: number;
+  created_at: string;
+  modified_at: string;
+  summary: string;
+  structured_available: boolean;
+}
+
+export interface DedupReportListing {
+  items: DedupReportItem[];
+  total: number;
+  limit: number;
+  search: string;
+  kind: "all" | "dedup" | "strong_candidates";
+  readonly: true;
+  root: string;
+}
+
+export interface DedupReportDetail extends DedupReportItem {
+  text: string;
+  structured_summary: Record<string, unknown> | null;
+  structured_metadata: Record<string, unknown> | null;
+  readonly: true;
+}
+
 export interface ServiceDescriptor {
   id: string;
   job_type: string;

@@ -1,3 +1,4 @@
+import json
 import os
 
 import decision_store
@@ -137,7 +138,14 @@ def test_dry_run_never_removes_exact_duplicate_fixture(tmp_path):
     assert first.is_file()
     assert second.is_file()
     assert not (temp / "trash_bin").exists()
-    assert list((temp / "dedup_logs").glob("dedup_*.txt"))
+    [text_report] = list((temp / "dedup_logs").glob("dedup_*.txt"))
+    structured_report = text_report.with_suffix(".json")
+    assert structured_report.is_file()
+    payload = json.loads(structured_report.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    assert payload["summary"]["exact_count"] == 1
+    assert summary["report_path"] == str(text_report)
+    assert summary["structured_report_path"] == str(structured_report)
 
 
 def test_doctor_ignores_unassigned_ctime_only_but_rejects_inode_replacement(tmp_path):
