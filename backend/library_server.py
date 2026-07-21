@@ -14,17 +14,19 @@ from typing import Optional, Sequence
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import decision_store
-from library_jobs import JobRunner, JobStore
+from library_catalog import catalog_listing, review_queue_listing
+from library_jobs import JobActiveError, JobRunner, JobStore
 from library_review import (
     ReviewProviderRegistry,
     TitleCorrectionProvider,
     VolumeGroupProvider,
 )
+from library_services import LibraryServiceRegistry, ServiceBlocked
 from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.2.11"
+SERVER_VERSION = "1.3.0"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -38,23 +40,20 @@ class LibraryServerConfig:
     index_path: Path
     runtime_dir: Path
     frontend_dist: Path
+    project_root: Path
 
 
 def _open_state_db_readonly_keeper(state_db: Path):
-    """Prepare WAL sidecars, then keep one read-only connection alive.
+    """Keep one query-only normal connection alive to own WAL sidecars.
 
     Some macOS Python SQLite builds cannot be the first ``mode=ro`` opener of a
-    WAL database after the last writer removed ``-wal``/``-shm``.  A short
-    normal connection recreates only those SQLite coordination files.  Opening
-    the read-only keeper before closing the bootstrap connection makes all
-    request-scoped read-only connections reliable for the server lifetime.
+    WAL database after the last normal connection removed ``-wal``/``-shm``.
+    A read-only keeper does not reliably retain those files on macOS.  Keep the
+    normal opener itself alive with ``PRAGMA query_only`` so request-scoped
+    ``mode=ro`` connections remain reliable without granting this keeper writes.
     """
-    bootstrap = decision_store.connect_state_db(state_db)
-    try:
-        bootstrap.execute("PRAGMA query_only = ON")
-        keeper = decision_store.connect_state_db_readonly(state_db)
-    finally:
-        bootstrap.close()
+    keeper = decision_store.connect_state_db(state_db)
+    keeper.execute("PRAGMA query_only = ON")
     return keeper
 
 
@@ -132,16 +131,72 @@ def dashboard_snapshot(config: LibraryServerConfig, runner: JobRunner) -> dict:
               )
             """
         ).fetchone()[0]
-        issues = decision_store.doctor_issues(conn)
-        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        # The dashboard is informational.  Keep its status check DB-only and
+        # leave the expensive full integrity + 16k-file identity Doctor to the
+        # actual mutation preflight, where it remains fail-closed.
+        issues = decision_store.doctor_issues(
+            conn,
+            verify_files=False,
+            check_integrity=False,
+        )
+        integrity = "deferred"
     finally:
         conn.close()
     warning_dir = config.temp_dir / "trash_bin" / "warning"
+    folderling_pending = _count_supported(config.temp_dir, intake_only=True)
+    warning_files = _count_supported(warning_dir)
+    jobs = runner.list(limit=10)
+    next_actions = []
+    if issues:
+        next_actions.append({
+            "code": "doctor",
+            "label": f"Doctor 문제 {len(issues)}건 확인",
+            "detail": str(issues[0]),
+            "href": "/services/folderling",
+            "severity": "error",
+        })
+    if folderling_pending:
+        next_actions.append({
+            "code": "folderling",
+            "label": f"입고 대기 {folderling_pending:,}개",
+            "detail": "Folderling 사전 검사 후 실제 입고할 수 있습니다.",
+            "href": "/services/folderling",
+            "severity": "action",
+        })
+    if warning_files or pending_reviews:
+        next_actions.append({
+            "code": "review_queue",
+            "label": f"검토 큐 {warning_files + pending_reviews:,}건",
+            "detail": "1.3.0에서는 근거를 읽기 전용으로 확인합니다.",
+            "href": "/review/queue",
+            "severity": "warning",
+        })
+    if no_ok_titles:
+        next_actions.append({
+            "code": "metadata",
+            "label": f"메타데이터 미확인 작품 {no_ok_titles:,}개",
+            "detail": "카탈로그에서 원본 제목과 플랫폼 상태를 확인할 수 있습니다.",
+            "href": "/catalog?status=missing",
+            "severity": "info",
+        })
+    latest_failed = next(
+        (job for job in jobs if job.get("state") in {"failed", "interrupted"}),
+        None,
+    )
+    if latest_failed is not None:
+        next_actions.append({
+            "code": "failed_job",
+            "label": "최근 실패 작업 확인",
+            "detail": str(latest_failed.get("message") or latest_failed["job_id"]),
+            "href": f"/jobs/{latest_failed['job_id']}",
+            "severity": "error",
+        })
     return {
         "version": SERVER_VERSION,
         "database": {
             "path": str(config.state_db),
             "integrity": integrity,
+            "doctor_scope": "operational",
             "doctor_ok": not issues,
             "doctor_issue_count": len(issues),
             "doctor_first_issue": issues[0] if issues else None,
@@ -152,11 +207,12 @@ def dashboard_snapshot(config: LibraryServerConfig, runner: JobRunner) -> dict:
             "pending_reviews": pending_reviews,
         },
         "filesystem": {
-            "folderling_pending": _count_supported(config.temp_dir, intake_only=True),
-            "warning_files": _count_supported(warning_dir),
+            "folderling_pending": folderling_pending,
+            "warning_files": warning_files,
             "index": _index_counts(config.index_path),
         },
-        "jobs": runner.list(limit=10),
+        "next_actions": next_actions,
+        "jobs": jobs,
     }
 
 
@@ -177,6 +233,7 @@ def create_app(
     index_path: Path = FILE_INDEX,
     runtime_dir: Path = DEFAULT_RUNTIME_DIR,
     frontend_dist: Path = DEFAULT_FRONTEND_DIST,
+    project_root: Path = PROJECT_ROOT,
 ) -> Flask:
     config = LibraryServerConfig(
         state_db=Path(state_db).expanduser().resolve(),
@@ -185,6 +242,7 @@ def create_app(
         index_path=Path(index_path).expanduser().resolve(),
         runtime_dir=Path(runtime_dir).expanduser().resolve(),
         frontend_dist=Path(frontend_dist).expanduser().resolve(),
+        project_root=Path(project_root).expanduser().resolve(),
     )
     readonly_keeper = (
         _open_state_db_readonly_keeper(config.state_db)
@@ -233,11 +291,21 @@ def create_app(
 
     runner.register("volume_group_merge", apply_volume_job)
 
+    services = LibraryServiceRegistry(
+        state_db=config.state_db,
+        house_dir=config.house_dir,
+        temp_dir=config.temp_dir,
+        index_path=config.index_path,
+        project_root=config.project_root,
+        runner=runner,
+    )
+
     app = Flask(__name__)
     app.config["library_server_config"] = config
     app.extensions["library_state_db_readonly_keeper"] = readonly_keeper
     app.extensions["library_review_registry"] = registry
     app.extensions["library_job_runner"] = runner
+    app.extensions["library_service_registry"] = services
 
     @app.after_request
     def response_headers(response):
@@ -266,15 +334,48 @@ def create_app(
     def handle_sqlite(exc):
         return jsonify({"ok": False, "error": {"code": "database_error", "message": str(exc)}}), 500
 
+    @app.errorhandler(JobActiveError)
+    def handle_active_job(exc):
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "job_active",
+                "message": "다른 변경 작업이 실행 중입니다.",
+            },
+            "data": {"active_job_id": exc.job_id},
+        }), 409
+
     @app.get("/health")
     def health():
-        return jsonify(
-            {
-                "ok": config.state_db.is_file(),
+        if not config.state_db.is_file():
+            return jsonify({
+                "ok": False,
                 "version": SERVER_VERSION,
                 "state_db": str(config.state_db),
+                "database": "missing",
+            }), 503
+        try:
+            conn = decision_store.connect_state_db_readonly(config.state_db)
+            try:
+                conn.execute("SELECT 1").fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            return jsonify({
+                "ok": False,
+                "version": SERVER_VERSION,
+                "state_db": str(config.state_db),
+                "database": "unavailable",
+                "error": str(exc),
+            }), 503
+        return jsonify(
+            {
+                "ok": True,
+                "version": SERVER_VERSION,
+                "state_db": str(config.state_db),
+                "database": "ok",
             }
-        ), (200 if config.state_db.is_file() else 503)
+        )
 
     @app.get("/api/dashboard")
     def dashboard():
@@ -283,6 +384,60 @@ def create_app(
     @app.get("/api/providers")
     def providers():
         return jsonify({"ok": True, "data": registry.descriptors()})
+
+    @app.get("/api/services")
+    def service_catalog():
+        return jsonify({"ok": True, "data": services.descriptors()})
+
+    @app.get("/api/services/<service_id>")
+    def service_detail(service_id):
+        return jsonify({"ok": True, "data": services.descriptor(service_id)})
+
+    @app.get("/api/catalog")
+    def catalog():
+        return jsonify({
+            "ok": True,
+            "data": catalog_listing(
+                config.state_db,
+                search=request.args.get("search", ""),
+                status=request.args.get("status", "all"),
+                limit=request.args.get("limit", 50, type=int),
+                cursor=request.args.get("cursor"),
+            ),
+        })
+
+    @app.get("/api/review/queue")
+    def review_queue():
+        return jsonify({
+            "ok": True,
+            "data": review_queue_listing(
+                config.state_db,
+                config.temp_dir,
+                search=request.args.get("search", ""),
+                category=request.args.get("category", "all"),
+                physical=request.args.get("physical", "all"),
+                limit=request.args.get("limit", 100, type=int),
+            ),
+        })
+
+    @app.post("/api/services/<service_id>/start")
+    def service_start(service_id):
+        body = _json_body()
+        source = str(body.get("source") or "service_detail")
+        if source not in {"dashboard", "service_detail"}:
+            raise ValueError("unknown service start source")
+        try:
+            record = services.start(service_id, source=source)
+        except ServiceBlocked as exc:
+            return jsonify({
+                "ok": False,
+                "error": {
+                    "code": str(exc.descriptor.get("blocked_code") or "service_blocked"),
+                    "message": str(exc),
+                },
+                "data": exc.descriptor,
+            }), 409
+        return jsonify({"ok": True, "data": record}), 202
 
     @app.get("/api/review/titles")
     def title_cases():
@@ -328,7 +483,7 @@ def create_app(
             return jsonify({"ok": False, "error": {"code": "plan_blocked", "message": "실행할 수 없는 항목이 있습니다"}, "data": plan}), 409
         if confirm_count != plan["item_count"] or confirm_sha != plan["plan_sha256"]:
             return jsonify({"ok": False, "error": {"code": "confirmation_stale", "message": "확인한 계획과 현재 계획이 다릅니다"}, "data": plan}), 409
-        record = runner.start(
+        record = runner.start_exclusive(
             "title_requeue",
             {
                 "changes": changes,
@@ -385,7 +540,7 @@ def create_app(
             "confirm_count": confirm_count,
             "confirm_plan_sha256": confirm_sha,
         }
-        record = runner.start("volume_group_merge", payload)
+        record = runner.start_exclusive("volume_group_merge", payload)
         return jsonify({"ok": True, "data": record}), 202
 
     @app.get("/api/jobs")
@@ -410,6 +565,35 @@ def create_app(
             }
         )
 
+    @app.get("/api/jobs/<job_id>/log/download")
+    def job_log_download(job_id):
+        record = runner.get(job_id)
+        path = Path(record["log_path"]).resolve()
+        try:
+            path.relative_to(store.logs_dir)
+        except ValueError as exc:
+            raise ValueError("job log path is outside the runtime log directory") from exc
+        if not path.is_file():
+            raise FileNotFoundError(f"job log is missing: {job_id}")
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=f"file-check-{job_id}.log",
+            mimetype="text/plain; charset=utf-8",
+        )
+
+    @app.get("/api/jobs/<job_id>/events")
+    def job_events(job_id):
+        return jsonify({
+            "ok": True,
+            "data": {
+                "job_id": job_id,
+                "items": store.events(
+                    job_id, limit=request.args.get("limit", 500, type=int)
+                ),
+            },
+        })
+
     def index_response():
         index = config.frontend_dist / "index.html"
         if index.is_file():
@@ -417,7 +601,7 @@ def create_app(
         return (
             "<!doctype html><meta charset='utf-8'><title>file_check</title>"
             "<body style='font-family:system-ui;padding:32px'>"
-            "<h1>도서 관리 서버 1.2.11</h1>"
+            "<h1>도서 관리 서버 1.3.0</h1>"
             "<p>프런트 빌드가 없습니다. library_frontend에서 npm run build를 실행하세요.</p>"
             "</body>",
             503,
@@ -455,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--index", default=str(FILE_INDEX))
     parser.add_argument("--runtime-dir", default=str(DEFAULT_RUNTIME_DIR))
     parser.add_argument("--frontend-dist", default=str(DEFAULT_FRONTEND_DIST))
+    parser.add_argument("--project-root", default=str(PROJECT_ROOT))
     return parser
 
 
@@ -467,6 +652,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         index_path=Path(args.index),
         runtime_dir=Path(args.runtime_dir),
         frontend_dist=Path(args.frontend_dist),
+        project_root=Path(args.project_root),
     )
     if args.server == "flask":
         app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)

@@ -56,6 +56,12 @@ def get_now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def emit_folderling_event(event_callback, phase, **payload):
+    """Publish one structured event without coupling Folderling to the web UI."""
+    if event_callback is not None:
+        event_callback({"phase": phase, **payload})
+
+
 def create_recent_link(dst_path, clean_name, recent_dir):
     """최근 파일에 대한 심볼릭 링크 생성"""
     from mutation_io import ensure_directory_nofollow
@@ -323,7 +329,15 @@ def iter_process_items(src_dir, pass_dir):
     return normal_items
 
 
-def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manifest_path):
+def _process_items_authorized(
+    src_dir,
+    dst_dir,
+    script_dir,
+    actual_run_id,
+    manifest_path,
+    *,
+    event_callback=None,
+):
     recent_dir = os.path.join(dst_dir, "_최근")
     success_log = os.path.join(script_dir, "success.log")
     fail_log = os.path.join(script_dir, "fail.log")
@@ -335,6 +349,14 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
     intake_run_id = actual_run_id
     print(f"🔐 일회성 actual 승인 소비: {actual_run_id}")
     print(f"🧾 실행 전 manifest: {manifest_path}")
+    emit_folderling_event(
+        event_callback,
+        "workflow_started",
+        run_id=actual_run_id,
+        manifest_path=str(manifest_path),
+        source_root=os.path.abspath(src_dir),
+        destination_root=os.path.abspath(dst_dir),
+    )
 
     from mutation_io import ensure_directory_nofollow
     ensure_directory_nofollow(dst_dir)
@@ -346,6 +368,14 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                 f"⚠️ legacy pass/ 항목 {legacy_pass_count}개는 자동 입고하지 않습니다. "
                 "dedup_decisions.py로 pair 판정을 등록하세요."
             )
+            emit_folderling_event(
+                event_callback,
+                "legacy_pass_skipped",
+                status="needs_review",
+                item_count=legacy_pass_count,
+                source_path=os.path.abspath(pass_dir),
+                reason="legacy_pass_requires_pair_decision",
+            )
 
     # 1.2.1: ___ 폴더를 선행 평탄화하지 않는다. 내부 지원 파일은 감사 후
     # journaled directory intake가 stable file_id/상대 경로를 보존하며 처리한다.
@@ -354,6 +384,13 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
     print("=" * 60)
     print("📦 1단계: 중복/검토 큐 정리 (house + temp 통합)")
     print("=" * 60)
+    emit_folderling_event(
+        event_callback,
+        "dedup_start",
+        status="running",
+        source_root=os.path.abspath(src_dir),
+        house_root=os.path.abspath(dst_dir),
+    )
     snapshot = validate_index_snapshot(
         dst_dir,
         file_index_json,
@@ -361,6 +398,14 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
         allowed_active_run_id=actual_run_id,
     )
     pre_index_mode = "verified_snapshot" if snapshot["valid"] else "full_scan_fallback"
+    emit_folderling_event(
+        event_callback,
+        "snapshot_result",
+        status="succeeded" if snapshot["valid"] else "fallback",
+        index_mode=pre_index_mode,
+        inventory_revision=snapshot.get("inventory_revision"),
+        fallback_reason=snapshot.get("reason"),
+    )
     if snapshot["valid"]:
         print(
             "⚡ 기존 house index 재사용: "
@@ -385,6 +430,22 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
         state_db_path=state_db_path,
         require_state_db=True,
         authorized_run_id=actual_run_id,
+        event_callback=event_callback,
+    )
+    emit_folderling_event(
+        event_callback,
+        "dedup_result",
+        status=(
+            "needs_review"
+            if dedup_summary.get("review_queue_move_count", 0)
+            or dedup_summary.get("managed_report_only_count", 0)
+            else "succeeded"
+        ),
+        **{
+            key: value
+            for key, value in dedup_summary.items()
+            if key not in {"pure_plan", "write_surfaces"}
+        },
     )
 
     # ── 2단계: 폴더링 (temp에 남아있는 파일을 house로 이동) ──
@@ -401,9 +462,29 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
          open(fail_log, "w", encoding="utf-8") as f_log:
 
         items = iter_process_items(src_dir, pass_dir)
+        item_total = len(items)
+        emit_folderling_event(
+            event_callback,
+            "intake_start",
+            status="running",
+            total=item_total,
+        )
 
-        for item, src_path, is_pass in tqdm(items, desc="분류 및 이동 중"):
+        for item_index, (item, src_path, is_pass) in enumerate(
+            tqdm(items, desc="분류 및 이동 중"), start=1
+        ):
             if not is_pass and should_skip_source_item(item):
+                emit_folderling_event(
+                    event_callback,
+                    "file_result",
+                    stage="intake",
+                    status="skipped",
+                    reason="excluded_source_item",
+                    source_path=os.path.abspath(src_path),
+                    source_name=item,
+                    completed=item_index,
+                    total=item_total,
+                )
                 continue
 
             now_str = get_now()
@@ -420,6 +501,19 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                         f"[{now_str}] {src_path} | 이름이 비어있어 실패 | "
                         "조치: 원본 파일명을 확인하고 직접 입고하거나 삭제\n"
                     )
+                    emit_folderling_event(
+                        event_callback,
+                        "file_result",
+                        stage="intake",
+                        status="failed",
+                        reason="empty_normalized_name",
+                        source_path=os.path.abspath(src_path),
+                        source_name=item,
+                        error="정규화 후 파일명이 비었습니다.",
+                        next_action="원본 파일명을 확인하고 다시 입고",
+                        completed=item_index,
+                        total=item_total,
+                    )
                     continue
 
                 is_dir = os.path.isdir(src_path)
@@ -433,8 +527,31 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                 ext = os.path.splitext(clean_name)[1].lower()
 
                 if is_file and ext not in SUPPORTED_EXTENSIONS:
+                    emit_folderling_event(
+                        event_callback,
+                        "file_result",
+                        stage="intake",
+                        status="skipped",
+                        reason="unsupported_extension",
+                        source_path=os.path.abspath(src_path),
+                        source_name=item,
+                        extension=ext,
+                        completed=item_index,
+                        total=item_total,
+                    )
                     continue
                 if not is_dir and not is_file:
+                    emit_folderling_event(
+                        event_callback,
+                        "file_result",
+                        stage="intake",
+                        status="skipped",
+                        reason="source_missing_or_not_regular",
+                        source_path=os.path.abspath(src_path),
+                        source_name=item,
+                        completed=item_index,
+                        total=item_total,
+                    )
                     continue
                 if is_dir and not directory_has_files(src_path):
                     removed = prune_empty_intake_tree(src_path)
@@ -443,10 +560,22 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                         f"[{now_str}] [empty-dir] {src_path} | "
                         f"빈 디렉터리 {removed}개 정리\n"
                     )
+                    emit_folderling_event(
+                        event_callback,
+                        "file_result",
+                        stage="intake",
+                        status="empty_directory_cleaned",
+                        reason="empty_directory",
+                        source_path=os.path.abspath(src_path),
+                        source_name=item,
+                        removed_directories=removed,
+                        completed=item_index,
+                        total=item_total,
+                    )
                     continue
 
                 label = "[pass] " if is_pass else ""
-                move_to_house(
+                destination_path = move_to_house(
                     src_path, dst_dir, recent_dir, clean_name, s_log, label,
                     is_pass=is_pass, state_db_path=state_db_path, run_id=intake_run_id,
                 )
@@ -457,6 +586,19 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                     pass_count += 1
                 else:
                     move_count += 1
+                emit_folderling_event(
+                    event_callback,
+                    "file_result",
+                    stage="intake",
+                    status="pass_ingested" if is_pass else "ingested",
+                    reason="journaled_house_ingest",
+                    source_path=os.path.abspath(src_path),
+                    source_name=item,
+                    destination_path=os.path.abspath(destination_path),
+                    source_type="directory" if is_dir else "file",
+                    completed=item_index,
+                    total=item_total,
+                )
 
             except VolumeCoordinateConflict as conflict_exc:
                 try:
@@ -495,11 +637,42 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                         f"{os.path.basename(held['source_path'])} "
                         f"→ {held['dest_path']}"
                     )
+                    emit_folderling_event(
+                        event_callback,
+                        "file_result",
+                        stage="intake",
+                        status="warning",
+                        reason="volume_coordinate_conflict",
+                        source_path=str(held["source_path"]),
+                        source_name=os.path.basename(str(held["source_path"])),
+                        destination_path=str(held["dest_path"]),
+                        existing_paths=list(held["conflicting_paths"]),
+                        operation_id=held["operation_id"],
+                        completed=item_index,
+                        total=item_total,
+                        next_action="기존 동일 권 파일과 직접 비교",
+                    )
                 except Exception as hold_exc:
                     failure_count += 1
                     f_log.write(
                         f"[{now_str}] {src_path} | 동일 권 좌표 보류 실패: {hold_exc} | "
                         "조치: 원본과 기존 동일 권 파일을 직접 비교\n"
+                    )
+                    emit_folderling_event(
+                        event_callback,
+                        "file_result",
+                        stage="intake",
+                        status="failed",
+                        reason="volume_coordinate_hold_failed",
+                        source_path=os.path.abspath(src_path),
+                        source_name=item,
+                        existing_paths=list(
+                            conflict_exc.decision.get("conflicting_paths") or ()
+                        ),
+                        error=str(hold_exc),
+                        completed=item_index,
+                        total=item_total,
+                        next_action="원본과 기존 동일 권 파일을 직접 비교",
                     )
             except Exception as e:
                 failure_count += 1
@@ -507,6 +680,31 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                     f"[{now_str}] {src_path} | 예외: {e} | "
                     "조치: 경로/권한 확인 후 재실행 또는 수동 입고\n"
                 )
+                emit_folderling_event(
+                    event_callback,
+                    "file_result",
+                    stage="intake",
+                    status="failed",
+                    reason=type(e).__name__,
+                    source_path=os.path.abspath(src_path),
+                    source_name=item,
+                    error=str(e),
+                    completed=item_index,
+                    total=item_total,
+                    next_action="경로·권한 확인 후 재실행",
+                )
+
+        emit_folderling_event(
+            event_callback,
+            "intake_result",
+            status="needs_review" if failure_count or volume_conflict_hold_count else "succeeded",
+            total=item_total,
+            move_count=move_count,
+            pass_count=pass_count,
+            failure_count=failure_count,
+            volume_conflict_hold_count=volume_conflict_hold_count,
+            empty_dir_cleanup_count=empty_dir_cleanup_count,
+        )
 
     cleanup_recent_links(recent_dir, max_days=30)
 
@@ -525,9 +723,16 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
     print("=" * 60)
     print("🔄 3단계: 인덱스 갱신")
     print("=" * 60)
+    emit_folderling_event(
+        event_callback,
+        "index_start",
+        status="running",
+    )
     index_mode = "state_db_projection"
     index_fallback_reason = None
     index_ready = False
+    index_error = None
+    index_deployment_error = None
     try:
         projection = generate_file_list_from_state_db(
             dst_dir,
@@ -557,9 +762,11 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
             print("✨ file_list.json / file_index.json 전체 갱신 완료")
         except Exception as fallback_exc:
             failure_count += 1
+            index_error = str(fallback_exc)
             print(f"⚠️ 파일 인덱스 fallback 중 에러가 발생했습니다: {fallback_exc}")
     except Exception as e:
         failure_count += 1
+        index_error = str(e)
         print(f"⚠️ 파일 인덱스 업데이트 중 에러가 발생했습니다: {e}")
 
     if index_ready:
@@ -570,7 +777,18 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
                 raise RuntimeError("extension index sync failed")
         except Exception as e:
             failure_count += 1
+            index_deployment_error = str(e)
             print(f"⚠️ 파일 인덱스 배포 중 에러가 발생했습니다: {e}")
+    emit_folderling_event(
+        event_callback,
+        "index_result",
+        status="succeeded" if index_ready and not index_deployment_error else "failed",
+        index_ready=index_ready,
+        index_mode=index_mode,
+        fallback_reason=index_fallback_reason,
+        error=index_error,
+        deployment_error=index_deployment_error,
+    )
 
     # ── 요약 ──
     print()
@@ -601,7 +819,7 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
             total += count
             print(f"{folder}: {count}개")
     print(f"\n총합: {total}개")
-    return {
+    result = {
         "dedup_summary": dedup_summary,
         "move_count": move_count,
         "pass_count": pass_count,
@@ -613,9 +831,23 @@ def _process_items_authorized(src_dir, dst_dir, script_dir, actual_run_id, manif
         "index_mode": index_mode,
         "index_fallback_reason": index_fallback_reason,
     }
+    emit_folderling_event(
+        event_callback,
+        "folderling_summary",
+        status="needs_review" if failure_count or volume_conflict_hold_count else "succeeded",
+        **result,
+    )
+    return result
 
 
-def _process_items_with_lock_held(src_dir, dst_dir, script_dir, state_db_path=None):
+def _process_items_with_lock_held(
+    src_dir,
+    dst_dir,
+    script_dir,
+    state_db_path=None,
+    *,
+    event_callback=None,
+):
     """Run Folderling while the caller owns the roots mutation lock."""
     import decision_store
 
@@ -624,6 +856,13 @@ def _process_items_with_lock_held(src_dir, dst_dir, script_dir, state_db_path=No
     )
     actual_run_id, manifest_path = decision_store.prepare_actual_run(
         state_db_path, dst_dir, src_dir
+    )
+    emit_folderling_event(
+        event_callback,
+        "actual_run_started",
+        status="running",
+        run_id=actual_run_id,
+        manifest_path=str(manifest_path),
     )
     try:
         import review_actions
@@ -648,11 +887,31 @@ def _process_items_with_lock_held(src_dir, dst_dir, script_dir, state_db_path=No
                 f"house {len(action_summary['accepted'])}개, "
                 f"delete {len(action_summary['discarded'])}개"
             )
+        emit_folderling_event(
+            event_callback,
+            "review_actions_result",
+            status="succeeded",
+            accepted_count=len(action_summary["accepted"]),
+            discarded_count=len(action_summary["discarded"]),
+        )
         result = _process_items_authorized(
-            src_dir, dst_dir, script_dir, actual_run_id, manifest_path
+            src_dir,
+            dst_dir,
+            script_dir,
+            actual_run_id,
+            manifest_path,
+            event_callback=event_callback,
         )
         result["review_action_summary"] = action_summary
     except (Exception, KeyboardInterrupt) as exc:
+        emit_folderling_event(
+            event_callback,
+            "workflow_failed",
+            status="failed",
+            run_id=actual_run_id,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         conn = decision_store.connect_state_db(state_db_path)
         try:
             decision_store.finish_actual_run(
@@ -661,9 +920,24 @@ def _process_items_with_lock_held(src_dir, dst_dir, script_dir, state_db_path=No
         finally:
             conn.close()
         raise
-    failure_count = result.get("failure_count", 0)
+    failure_count = int(result.get("failure_count", 0))
     conn = decision_store.connect_state_db(state_db_path)
     try:
+        final_issues = decision_store.doctor_issues(
+            conn, allowed_active_run_id=actual_run_id
+        )
+        result["final_doctor_issue_count"] = len(final_issues)
+        result["final_doctor_first_issue"] = final_issues[0] if final_issues else None
+        if final_issues:
+            failure_count += 1
+            result["failure_count"] = failure_count
+        emit_folderling_event(
+            event_callback,
+            "final_doctor_result",
+            status="succeeded" if not final_issues else "failed",
+            issue_count=len(final_issues),
+            first_issue=final_issues[0] if final_issues else None,
+        )
         decision_store.finish_actual_run(
             conn,
             actual_run_id,
@@ -672,15 +946,28 @@ def _process_items_with_lock_held(src_dir, dst_dir, script_dir, state_db_path=No
         )
     finally:
         conn.close()
+    emit_folderling_event(
+        event_callback,
+        "actual_run_finished",
+        status="succeeded" if failure_count == 0 else "needs_review",
+        run_id=actual_run_id,
+        failure_count=failure_count,
+    )
     return result
 
 
-def process_items(src_dir, dst_dir, script_dir, state_db_path=None):
+def process_items(
+    src_dir, dst_dir, script_dir, state_db_path=None, *, event_callback=None
+):
     """Consume and own one persistent actual run for the complete folderling workflow."""
     from mutation_io import mutation_lock_for_roots
     with mutation_lock_for_roots(dst_dir, src_dir, "folderling-command"):
         return _process_items_with_lock_held(
-            src_dir, dst_dir, script_dir, state_db_path=state_db_path
+            src_dir,
+            dst_dir,
+            script_dir,
+            state_db_path=state_db_path,
+            event_callback=event_callback,
         )
 
 

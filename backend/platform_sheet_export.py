@@ -687,11 +687,19 @@ def sync_snapshot_to_google(
     client,
     *,
     batch_rows: int = DEFAULT_BATCH_ROWS,
+    progress=None,
 ) -> dict:
     """Write temporary tabs, then atomically replace the two public view tabs."""
     if batch_rows <= 0:
         raise ValueError("batch_rows must be positive")
     existing = client.get_sheets()
+    if progress is not None:
+        progress({
+            "phase": "sheet_write_start",
+            "works_rows": len(snapshot.works.rows),
+            "error_rows": len(snapshot.errors.rows),
+            "existing_tabs": len(existing),
+        })
     existing_by_title = {item["title"]: item for item in existing}
     token = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + secrets.token_hex(3)
     temp_titles = {
@@ -726,6 +734,8 @@ def sync_snapshot_to_google(
     temp_ids = {
         properties["title"]: properties["sheetId"] for properties in add_replies
     }
+    if progress is not None:
+        progress({"phase": "sheet_temp_tabs_created", "temp_tab_count": 2})
 
     value_ranges = []
     for table in (snapshot.works, snapshot.errors):
@@ -734,6 +744,13 @@ def sync_snapshot_to_google(
         client.values_batch_update(
             value_ranges[offset:offset + MAX_RAW_RANGES_PER_REQUEST]
         )
+    if progress is not None:
+        progress({
+            "phase": "sheet_values_written",
+            "value_range_count": len(value_ranges),
+            "works_rows": len(snapshot.works.rows),
+            "error_rows": len(snapshot.errors.rows),
+        })
 
     hyperlink_ranges = _hyperlink_ranges(
         snapshot.works,
@@ -745,6 +762,11 @@ def sync_snapshot_to_google(
             hyperlink_ranges[offset:offset + MAX_FORMULA_RANGES_PER_REQUEST],
             value_input_option="USER_ENTERED",
         )
+    if progress is not None:
+        progress({
+            "phase": "sheet_links_written",
+            "hyperlink_range_count": len(hyperlink_ranges),
+        })
 
     final_requests = []
     for table in (snapshot.works, snapshot.errors):
@@ -772,6 +794,13 @@ def sync_snapshot_to_google(
             }
         })
     client.batch_update(final_requests)
+    if progress is not None:
+        progress({
+            "phase": "sheet_swap_completed",
+            "works_rows": len(snapshot.works.rows),
+            "error_rows": len(snapshot.errors.rows),
+            "replaced_tabs": [WORKS_TAB, ERRORS_TAB],
+        })
     return {
         "works_rows": len(snapshot.works.rows),
         "error_rows": len(snapshot.errors.rows),

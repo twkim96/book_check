@@ -226,11 +226,19 @@ def test_sheet_writer_uses_temporary_tabs_then_atomically_swaps_targets():
         synced_at="2026-07-17T00:00:00+00:00",
     )
     client = _FakeSheetsClient()
+    events = []
     result = platform_sheet_export.sync_snapshot_to_google(
-        snapshot, client, batch_rows=1000
+        snapshot, client, batch_rows=1000, progress=events.append
     )
 
     assert result["works_rows"] == 1600
+    assert [event["phase"] for event in events] == [
+        "sheet_write_start",
+        "sheet_temp_tabs_created",
+        "sheet_values_written",
+        "sheet_links_written",
+        "sheet_swap_completed",
+    ]
     assert len(client.batch_calls) == 2
     create_call, final_call = client.batch_calls
     assert sum("addSheet" in request for request in create_call) == 2

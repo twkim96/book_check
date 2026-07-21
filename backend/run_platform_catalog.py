@@ -347,7 +347,12 @@ def sync_file_metadata(state_db_path: str, *, progress=None):
     return backup, result
 
 
-def sync_google_sheet(state_db_path: str, *, dry_run: bool = False) -> dict:
+def sync_google_sheet(
+    state_db_path: str,
+    *,
+    dry_run: bool = False,
+    progress=None,
+) -> dict:
     import platform_sheet_export
 
     snapshot = platform_sheet_export.build_sheet_snapshot(state_db_path)
@@ -358,6 +363,8 @@ def sync_google_sheet(state_db_path: str, *, dry_run: bool = False) -> dict:
         "error_columns": len(snapshot.errors.headers),
         "synced_at": snapshot.synced_at,
     }
+    if progress is not None:
+        progress({"phase": "sheet_snapshot", **preview})
     if dry_run:
         return {"dry_run": True, **preview}
     with mutation_lock_for_roots(
@@ -366,7 +373,11 @@ def sync_google_sheet(state_db_path: str, *, dry_run: bool = False) -> dict:
         "google-sheet-sync",
     ):
         client = platform_sheet_export.GoogleSheetsRestClient.from_environment()
-        result = platform_sheet_export.sync_snapshot_to_google(snapshot, client)
+        result = platform_sheet_export.sync_snapshot_to_google(
+            snapshot,
+            client,
+            progress=progress,
+        )
     return {"dry_run": False, **result}
 
 
@@ -784,7 +795,11 @@ def run(args: argparse.Namespace, *, progress=None):
             result = {"dry_run": False, **metadata}
     elif args.command == "sheet-sync":
         backup = None
-        result = sync_google_sheet(args.state_db, dry_run=args.dry_run)
+        result = sync_google_sheet(
+            args.state_db,
+            dry_run=args.dry_run,
+            progress=progress,
+        )
     elif args.command == "status":
         backup = None
         result = platform_catalog.catalog_status(args.state_db)

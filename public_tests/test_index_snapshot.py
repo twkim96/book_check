@@ -154,8 +154,10 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
 
     monkeypatch.setattr(folderling, "generate_file_list", unexpected_full_scan)
     monkeypatch.setattr(deduplicator, "generate_file_list", unexpected_full_scan)
+    events = []
     result = folderling._process_items_with_lock_held(
-        str(temp), str(house), str(script_dir), state_db_path=str(state_db)
+        str(temp), str(house), str(script_dir), state_db_path=str(state_db),
+        event_callback=events.append,
     )
     assert result["failure_count"] == 0
     assert result["pre_index_mode"] == "verified_snapshot"
@@ -165,6 +167,23 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
     assert validate_index_snapshot(
         house, script_dir / "file_index.json", state_db
     )["valid"] is True
+    phases = [event["phase"] for event in events]
+    assert phases[:3] == [
+        "actual_run_started", "review_actions_result", "workflow_started"
+    ]
+    assert "snapshot_result" in phases
+    assert "final_doctor_result" in phases
+    assert phases[-1] == "actual_run_finished"
+    intake = next(
+        event for event in events
+        if event["phase"] == "file_result"
+        and event.get("stage") == "intake"
+        and event.get("source_name") == incoming.name
+    )
+    assert intake["status"] == "ingested"
+    assert intake["source_path"] == str(incoming)
+    assert intake["destination_path"] == str(house / "ㅅ" / incoming.name)
+    assert result["final_doctor_issue_count"] == 0
 
 
 def test_folderling_holds_conflicting_volume_but_ingests_later_new_volume(
@@ -225,8 +244,10 @@ def test_folderling_holds_conflicting_volume_but_ingests_later_new_volume(
             "author_conflict_count": 0,
         },
     )
+    events = []
     result = folderling._process_items_with_lock_held(
-        str(temp), str(house), str(script_dir), state_db_path=str(state_db)
+        str(temp), str(house), str(script_dir), state_db_path=str(state_db),
+        event_callback=events.append,
     )
     held = (
         temp / "trash_bin" / "warning" / "volume_coordinate_conflicts" /
@@ -251,6 +272,15 @@ def test_folderling_holds_conflicting_volume_but_ingests_later_new_volume(
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()
+    warning = next(
+        event for event in events
+        if event["phase"] == "file_result"
+        and event.get("reason") == "volume_coordinate_conflict"
+    )
+    assert warning["status"] == "warning"
+    assert warning["source_path"] == str(conflict)
+    assert warning["destination_path"] == str(held)
+    assert warning["existing_paths"] == [str(work / "별빛 연대기 3권.txt")]
 
 
 def test_interrupted_volume_coordinate_hold_restores_temp_source(tmp_path):

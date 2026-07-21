@@ -176,12 +176,43 @@ export interface JobRecord {
   progress: { current: number; total: number };
   result: Record<string, unknown> | null;
   error: { code: string; message: string } | null;
+  payload?: Record<string, unknown>;
+  last_event?: JobEvent | null;
+}
+
+export interface JobEvent {
+  recorded_at: string;
+  phase: string;
+  [key: string]: unknown;
+}
+
+export interface ServiceDescriptor {
+  id: string;
+  job_type: string;
+  label: string;
+  summary: string;
+  category: string;
+  quick_action: boolean;
+  target_label: string;
+  target_count: number;
+  read_scope: string[];
+  write_scope: string[];
+  defaults: string[];
+  ready: boolean;
+  blocked_code: string | null;
+  blocked_reason: string | null;
+  configured: boolean;
+  doctor_ok: boolean;
+  preview: Record<string, unknown>;
+  active_job: JobRecord | null;
+  latest_job: JobRecord | null;
 }
 
 export interface DashboardData {
   version: string;
   database: {
     integrity: string;
+    doctor_scope: "operational" | "full";
     doctor_ok: boolean;
     doctor_issue_count: number;
     supported_house_files: number;
@@ -199,5 +230,90 @@ export interface DashboardData {
       normalizer_version?: string;
     };
   };
+  next_actions: Array<{
+    code: string;
+    label: string;
+    detail: string;
+    href: string;
+    severity: "action" | "warning" | "error" | "info";
+  }>;
   jobs: JobRecord[];
+}
+
+export interface CatalogPlatform {
+  platform: "series" | "kakao" | "novelpia";
+  status: PlatformStatus;
+  remote_title?: string | null;
+  remote_url?: string | null;
+  download_count?: number | null;
+  view_count?: number | null;
+  recommend_count?: number | null;
+  rating?: number | null;
+  rating_count?: number | null;
+  last_attempt_at?: string | null;
+  last_success_at?: string | null;
+  retry_after?: string | null;
+  error_message?: string | null;
+}
+
+export interface CatalogFile {
+  file_id: string;
+  name: string;
+  path: string;
+  readable_title: string;
+  author: string | null;
+  effective_max: number;
+  unit: string;
+  complete: boolean;
+}
+
+export interface CatalogItem {
+  title_key: string;
+  display_title: string;
+  query_title: string;
+  author: string | null;
+  file_count: number;
+  effective_max: number;
+  unit: string;
+  complete: boolean;
+  files: CatalogFile[];
+  platforms: Record<"series" | "kakao" | "novelpia", CatalogPlatform>;
+}
+
+export interface CatalogListing {
+  items: CatalogItem[];
+  total: number;
+  limit: number;
+  cursor: string | null;
+  next_cursor: string | null;
+  search: string;
+  status: string;
+  readonly: true;
+}
+
+export interface ReviewQueueItem {
+  kind: "database" | "filesystem";
+  category: string;
+  state: string;
+  physical_state: "relation_only" | "quarantined" | "queue_missing";
+  review_id?: number;
+  candidate_path?: string | null;
+  reference_path?: string | null;
+  queue_path?: string | null;
+  created_at?: string;
+  name?: string;
+  path?: string;
+  size?: number;
+  modified_at?: number;
+}
+
+export interface ReviewQueueListing {
+  items: ReviewQueueItem[];
+  total_visible: number;
+  summary: Record<"relation_only" | "quarantined" | "queue_missing", number>;
+  limit: number;
+  search: string;
+  category: string;
+  physical: string;
+  readonly: true;
 }

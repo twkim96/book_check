@@ -780,7 +780,18 @@ def initialize_state_db(
     return conn
 
 
-def validate_schema(conn: sqlite3.Connection) -> None:
+def validate_schema(
+    conn: sqlite3.Connection,
+    *,
+    check_integrity: bool = True,
+) -> None:
+    """Validate the state DB schema and, by default, its full integrity.
+
+    Mutation and recovery callers keep the fail-closed full integrity check.
+    Read-only UI previews may skip that expensive scan after validating the
+    version, required objects, and columns; the real operation validates again
+    with the default before it is allowed to mutate anything.
+    """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version != SCHEMA_VERSION:
         raise RuntimeError(f"schema version mismatch: expected={SCHEMA_VERSION}, actual={version}")
@@ -807,9 +818,10 @@ def validate_schema(conn: sqlite3.Connection) -> None:
     if "title_override_json" not in analysis_columns:
         raise RuntimeError("file_analysis.title_override_json is missing")
 
-    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if integrity != "ok":
-        raise RuntimeError(f"integrity_check failed: {integrity}")
+    if check_integrity:
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise RuntimeError(f"integrity_check failed: {integrity}")
 
 
 def verify_state_db_ready(path: os.PathLike | str) -> Tuple[bool, str]:
@@ -2198,10 +2210,22 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
     raise ValueError(f"unsupported recovery action: {row['action']}")
 
 
-def doctor_issues(conn: sqlite3.Connection, *, allowed_active_run_id=None):
+def doctor_issues(
+    conn: sqlite3.Connection,
+    *,
+    allowed_active_run_id=None,
+    verify_files: bool = True,
+    check_integrity: bool = True,
+):
+    """Return operational, schema, and optionally filesystem doctor issues.
+
+    Defaults preserve the existing full fail-closed Doctor.  The local web UI
+    uses the lightweight mode for status rendering only; Folderling and every
+    mutation path continue to use both full integrity and file identity checks.
+    """
     issues = []
     try:
-        validate_schema(conn)
+        validate_schema(conn, check_integrity=check_integrity)
     except RuntimeError as exc:
         return [{"kind": "schema", "detail": str(exc)}]
     for row in conn.execute(
@@ -2258,36 +2282,37 @@ def doctor_issues(conn: sqlite3.Connection, *, allowed_active_run_id=None):
                 "path": row["manifest_path"],
                 "error": row["error"],
             })
-    for row in conn.execute(
-        """
-        SELECT file_id, canonical_path, size, mtime_ns, dev, ino, ctime_ns, assignment_state,
-               current_fingerprint_id
-        FROM files WHERE active = 1
-        """
-    ):
-        path = Path(row["canonical_path"])
-        if not path.is_file():
-            issues.append({"kind": "missing_file", "file_id": row["file_id"], "path": str(path)})
-            continue
-        stat = path.stat()
-        if stat.st_size != row["size"] or stat.st_mtime_ns != row["mtime_ns"]:
-            issues.append({"kind": "stale_snapshot", "file_id": row["file_id"], "path": str(path)})
-        identity_changed = row["dev"] is not None and (
-            row["dev"] != stat.st_dev or row["ino"] != stat.st_ino
-        )
-        managed_ctime_changed = (
-            row["assignment_state"] == "managed"
-            and row["dev"] is not None
-            and row["ctime_ns"] != stat.st_ctime_ns
-        )
-        # chmod/xattr 같은 macOS 메타데이터 변경은 inode·size·mtime를 그대로 둔 채
-        # ctime만 바꿀 수 있다. 아직 mutation 권한의 근거가 아닌 미배정 파일은 이
-        # 차이만으로 Folderling을 막지 않는다. 반면 실제 identity(dev/ino) 교체와
-        # managed 파일의 ctime 변화는 기존 fail-closed 검사를 유지한다.
-        if identity_changed or managed_ctime_changed:
-            issues.append({"kind": "stale_identity", "file_id": row["file_id"], "path": str(path)})
-        if row["current_fingerprint_id"] is None and row["assignment_state"] == "managed":
-            issues.append({"kind": "missing_fingerprint", "file_id": row["file_id"]})
+    if verify_files:
+        for row in conn.execute(
+            """
+            SELECT file_id, canonical_path, size, mtime_ns, dev, ino, ctime_ns, assignment_state,
+                   current_fingerprint_id
+            FROM files WHERE active = 1
+            """
+        ):
+            path = Path(row["canonical_path"])
+            if not path.is_file():
+                issues.append({"kind": "missing_file", "file_id": row["file_id"], "path": str(path)})
+                continue
+            stat = path.stat()
+            if stat.st_size != row["size"] or stat.st_mtime_ns != row["mtime_ns"]:
+                issues.append({"kind": "stale_snapshot", "file_id": row["file_id"], "path": str(path)})
+            identity_changed = row["dev"] is not None and (
+                row["dev"] != stat.st_dev or row["ino"] != stat.st_ino
+            )
+            managed_ctime_changed = (
+                row["assignment_state"] == "managed"
+                and row["dev"] is not None
+                and row["ctime_ns"] != stat.st_ctime_ns
+            )
+            # chmod/xattr 같은 macOS 메타데이터 변경은 inode·size·mtime를 그대로 둔 채
+            # ctime만 바꿀 수 있다. 아직 mutation 권한의 근거가 아닌 미배정 파일은 이
+            # 차이만으로 Folderling을 막지 않는다. 반면 실제 identity(dev/ino) 교체와
+            # managed 파일의 ctime 변화는 기존 fail-closed 검사를 유지한다.
+            if identity_changed or managed_ctime_changed:
+                issues.append({"kind": "stale_identity", "file_id": row["file_id"], "path": str(path)})
+            if row["current_fingerprint_id"] is None and row["assignment_state"] == "managed":
+                issues.append({"kind": "missing_fingerprint", "file_id": row["file_id"]})
     for row in conn.execute(
         """
         SELECT r.variant_id, r.file_id, f.protected, f.active, f.assignment_state

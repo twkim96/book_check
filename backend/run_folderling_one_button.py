@@ -127,12 +127,27 @@ def _close_unfinished_approval(state_db_path, reason):
         conn.close()
 
 
-def run(src_dir, dst_dir, state_db_path):
+def run(
+    src_dir,
+    dst_dir,
+    state_db_path,
+    *,
+    script_dir=None,
+    event_callback=None,
+):
     state_db = Path(state_db_path)
     if not state_db.is_file():
         raise RuntimeError(f"managed state DB is missing: {state_db}")
     backup_dir = state_db.parent / "backups"
-    script_dir = str(PROJECT_ROOT)
+    script_dir = str(Path(script_dir or PROJECT_ROOT).resolve())
+    folderling.emit_folderling_event(
+        event_callback,
+        "preflight_start",
+        status="running",
+        state_db=str(state_db.resolve()),
+        source_root=str(Path(src_dir).resolve()),
+        destination_root=str(Path(dst_dir).resolve()),
+    )
 
     with mutation_lock_for_roots(dst_dir, src_dir, "folderling-one-button"):
         ensure_directory_nofollow(backup_dir)
@@ -174,10 +189,31 @@ def run(src_dir, dst_dir, state_db_path):
             if claimed_actions:
                 print(f"📥 검토 처리함 입력 {len(claimed_actions)}개 확인")
             print(f"🔐 일회성 actual 승인 발급: {run_id}")
+            folderling.emit_folderling_event(
+                event_callback,
+                "preflight_result",
+                status="succeeded",
+                schema_version=decision_store.SCHEMA_VERSION,
+                schema_backup=str(pre_migration) if pre_migration else None,
+                run_backup=str(run_backup),
+                doctor_issue_count=0,
+                claimed_review_actions=len(claimed_actions),
+                approved_run_id=run_id,
+            )
+            process_kwargs = {"state_db_path": str(state_db)}
+            if event_callback is not None:
+                process_kwargs["event_callback"] = event_callback
             return folderling._process_items_with_lock_held(
-                src_dir, dst_dir, script_dir, state_db_path=str(state_db)
+                src_dir, dst_dir, script_dir, **process_kwargs
             )
         except BaseException as exc:
+            folderling.emit_folderling_event(
+                event_callback,
+                "preflight_failed",
+                status="failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
             if approval_started:
                 if isinstance(exc, KeyboardInterrupt):
                     reason = "Folderling interrupted by SIGINT/KeyboardInterrupt"

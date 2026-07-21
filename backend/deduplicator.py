@@ -1717,6 +1717,74 @@ def write_review_log(
     return log_path
 
 
+def _emit_dedup_record_events(event_callback, exact_records, suspect_move_records):
+    if event_callback is None:
+        return
+    total_records = len(exact_records) + len(suspect_move_records)
+    completed = 0
+
+    def entry_fields(entry):
+        entry = entry or {}
+        return {
+            "source_path": entry.get("path"),
+            "source_name": entry.get("name"),
+            "source_kind": entry.get("source"),
+            "core_title": entry.get("core_title"),
+            "author": entry.get("author"),
+            "size": entry.get("size"),
+            "file_id": entry.get("file_id"),
+        }
+
+    for record in exact_records:
+        completed += 1
+        action = str(record.get("action") or "exact")
+        if action in {"exact_quarantine", "move", "delete"}:
+            status = "exact_duplicate"
+        else:
+            status = "skipped"
+        keep = record.get("keep") or {}
+        event_callback({
+            "phase": "file_result",
+            "stage": "dedup",
+            "status": status,
+            "reason": action,
+            "duplicate_basis": "exact_fingerprint",
+            "destination_path": record.get("dest_path"),
+            "existing_paths": [keep.get("path")] if keep.get("path") else [],
+            "operation_id": record.get("operation_id"),
+            "dry_run": bool(record.get("dry_run")),
+            "completed": completed,
+            "total": total_records,
+            **entry_fields(record.get("entry")),
+        })
+
+    status_labels = {
+        "moved": "suspected_duplicate",
+        "warning": "warning",
+        "author_review": "author_conflict",
+        "metadata_only": "metadata_only",
+    }
+    for record in suspect_move_records:
+        completed += 1
+        keep = record.get("keep") or {}
+        raw_status = str(record.get("status") or "review")
+        event_callback({
+            "phase": "file_result",
+            "stage": "dedup",
+            "status": status_labels.get(raw_status, raw_status),
+            "reason": record.get("classification") or raw_status,
+            "duplicate_basis": record.get("classification"),
+            "destination_path": record.get("dest_path"),
+            "existing_paths": [keep.get("path")] if keep.get("path") else [],
+            "operation_id": record.get("operation_id"),
+            "review_id": record.get("review_id"),
+            "dry_run": bool(record.get("dry_run")),
+            "completed": completed,
+            "total": total_records,
+            **entry_fields(record.get("entry")),
+        })
+
+
 def _clean_duplicates_impl(
     house_dir,
     temp_dir,
@@ -1733,6 +1801,7 @@ def _clean_duplicates_impl(
     require_state_db=False,
     actual_run_id=None,
     pure_plan=False,
+    event_callback=None,
 ):
     script_dir = str(PROJECT_ROOT)
     index_path = index_path or os.path.join(script_dir, "file_index.json")
@@ -1984,6 +2053,9 @@ def _clean_duplicates_impl(
         "pure_plan": pure_plan,
         "write_surfaces": [] if pure_plan else ["fingerprint_cache", "index_if_rescan", "review_log"],
     }
+    _emit_dedup_record_events(
+        event_callback, exact_records, suspect_move_records
+    )
     log_path = None
     if not pure_plan:
         log_path = write_review_log(
@@ -2052,6 +2124,7 @@ def clean_duplicates(
     require_state_db=False,
     authorized_run_id=None,
     pure_plan=False,
+    event_callback=None,
 ):
     """Public entry point; actual managed runs require a DB-backed active capability."""
     if not dry_run and not require_state_db:
@@ -2074,6 +2147,7 @@ def clean_duplicates(
         state_db_path=state_db_path,
         require_state_db=require_state_db,
         pure_plan=pure_plan,
+        event_callback=event_callback,
     )
     if dry_run or not require_state_db:
         return _clean_duplicates_impl(**kwargs, actual_run_id=None)

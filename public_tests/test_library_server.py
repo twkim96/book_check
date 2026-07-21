@@ -1,9 +1,12 @@
 import json
 import sqlite3
 import time
+from pathlib import Path
+
+import pytest
 
 import decision_store
-from library_jobs import JobStore
+from library_jobs import JobActiveError, JobRunner, JobStore
 from library_server import create_app
 
 
@@ -110,6 +113,92 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     assert client.get("/review/titles").status_code == 200
 
 
+def test_dashboard_defers_full_file_doctor_but_mutation_doctor_stays_strict(tmp_path):
+    app, file_id = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    conn = decision_store.connect_state_db_readonly(config.state_db)
+    try:
+        path = conn.execute(
+            "SELECT canonical_path FROM files WHERE file_id = ?", (file_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    Path(path).unlink()
+
+    dashboard = app.test_client().get("/api/dashboard").get_json()["data"]
+    assert dashboard["database"]["doctor_ok"] is True
+    assert dashboard["database"]["doctor_scope"] == "operational"
+    assert dashboard["database"]["integrity"] == "deferred"
+
+    conn = decision_store.connect_state_db_readonly(config.state_db)
+    try:
+        issues = decision_store.doctor_issues(conn)
+    finally:
+        conn.close()
+    assert any(issue["kind"] == "missing_file" for issue in issues)
+
+
+def test_platform_service_preview_is_shared_briefly_and_invalidatable(tmp_path, monkeypatch):
+    app, _ = _server_fixture(tmp_path)
+    registry = app.extensions["library_service_registry"]
+    calls = []
+    expected = {"platform-update": (3, {"discovered_titles": 4})}
+
+    def compute():
+        calls.append("compute")
+        return expected
+
+    monkeypatch.setattr(registry, "_compute_platform_previews", compute)
+    assert registry._platform_previews() is expected
+    assert registry._platform_previews() is expected
+    assert calls == ["compute"]
+
+    registry._invalidate_platform_previews()
+    assert registry._platform_previews() is expected
+    assert calls == ["compute", "compute"]
+
+
+def test_readonly_catalog_groups_owned_files_and_platform_status(tmp_path):
+    app, file_id = _server_fixture(tmp_path)
+    client = app.test_client()
+
+    response = client.get("/api/catalog?status=missing&search=수동")
+
+    assert response.status_code == 200
+    listing = response.get_json()["data"]
+    assert listing["readonly"] is True
+    assert listing["total"] == 1
+    [item] = listing["items"]
+    assert item["display_title"] == "수동 교정 작품 146"
+    assert item["files"][0]["file_id"] == file_id
+    assert item["platforms"]["series"]["status"] == "not_found"
+    assert item["platforms"]["kakao"]["status"] == "not_found"
+    assert item["platforms"]["novelpia"]["status"] == "not_found"
+    assert client.get("/catalog").status_code == 200
+
+
+def test_readonly_review_queue_lists_managed_warning_files(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    warning = config.temp_dir / "trash_bin" / "warning"
+    warning.mkdir(parents=True)
+    queued = warning / "사람이 확인할 작품.txt"
+    queued.write_text("review", encoding="utf-8")
+
+    response = app.test_client().get(
+        "/api/review/queue?category=warning&search=확인"
+    )
+
+    assert response.status_code == 200
+    listing = response.get_json()["data"]
+    assert listing["readonly"] is True
+    [item] = listing["items"]
+    assert item["kind"] == "filesystem"
+    assert item["category"] == "warning"
+    assert item["physical_state"] == "quarantined"
+    assert item["path"] == str(queued.resolve())
+
+
 def test_dashboard_pending_matches_folderling_intake_exclusions(tmp_path):
     app, _ = _server_fixture(tmp_path)
     config = app.config["library_server_config"]
@@ -126,6 +215,98 @@ def test_dashboard_pending_matches_folderling_intake_exclusions(tmp_path):
     dashboard = app.test_client().get("/api/dashboard").get_json()["data"]
     assert dashboard["filesystem"]["folderling_pending"] == 2
     assert dashboard["filesystem"]["warning_files"] == 1
+
+
+def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+
+    response = client.get("/api/services")
+
+    assert response.status_code == 200
+    services = response.get_json()["data"]
+    assert [item["id"] for item in services] == [
+        "folderling",
+        "scanner",
+        "platform-update",
+        "platform-retry",
+        "platform-refresh",
+        "novelpia-auth-retry",
+        "google-sheet",
+    ]
+    scanner = next(item for item in services if item["id"] == "scanner")
+    assert scanner["ready"] is True
+    assert scanner["target_count"] == 1
+    assert scanner["read_scope"] == ["txt_house", "SQLite"]
+    folderling = next(item for item in services if item["id"] == "folderling")
+    assert folderling["ready"] is False
+    assert folderling["blocked_code"] == "no_targets"
+    platform = next(item for item in services if item["id"] == "platform-update")
+    assert platform["ready"] is False
+    assert platform["blocked_code"] == "non_production_layout"
+
+
+def test_scanner_service_runs_as_persistent_job_with_events_and_log(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/services/scanner/start", json={"source": "dashboard"}
+    )
+    assert response.status_code == 202
+    job_id = response.get_json()["data"]["job_id"]
+    runner = app.extensions["library_job_runner"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = runner.get(job_id)
+        if job["state"] in {"succeeded", "failed"}:
+            break
+        time.sleep(0.01)
+
+    assert job["state"] == "succeeded", job
+    assert job["result"]["files"] == 1
+    assert job["result"]["index_mode"] == "full_scan"
+    events = client.get(f"/api/jobs/{job_id}/events").get_json()["data"]["items"]
+    assert [event["phase"] for event in events] == [
+        "scanner_start",
+        "scanner_result",
+    ]
+    log = client.get(f"/api/jobs/{job_id}/log").get_json()["data"]["text"]
+    assert "house 전체 Scanner 시작" in log
+    assert "Scanner/index 동기화 완료" in log
+    download = client.get(f"/api/jobs/{job_id}/log/download")
+    assert download.status_code == 200
+    assert download.mimetype == "text/plain"
+    config = app.config["library_server_config"]
+    assert (config.house_dir / "file_index.json").is_file()
+
+
+def test_blocked_service_start_returns_current_descriptor(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    response = app.test_client().post(
+        "/api/services/folderling/start", json={"source": "service_detail"}
+    )
+
+    assert response.status_code == 409
+    payload = response.get_json()
+    assert payload["error"]["code"] == "no_targets"
+    assert payload["data"]["id"] == "folderling"
+    assert payload["data"]["ready"] is False
+
+
+def test_service_start_is_blocked_while_another_job_is_active(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    runner = app.extensions["library_job_runner"]
+    active = runner.store.create("synthetic", {"source": "test"})
+
+    response = app.test_client().post(
+        "/api/services/scanner/start", json={"source": "dashboard"}
+    )
+
+    assert response.status_code == 409
+    payload = response.get_json()
+    assert payload["error"]["code"] == "job_active"
+    assert active["job_id"] in payload["error"]["message"]
 
 
 def test_volume_review_api_builds_confirmation_bound_plan(tmp_path):
@@ -196,6 +377,43 @@ def test_job_store_marks_running_records_interrupted_after_restart(tmp_path):
     restored = store.get(record["job_id"])
     assert restored["state"] == "interrupted"
     assert restored["error"]["code"] == "server_restarted"
+    [event] = store.events(record["job_id"])
+    assert event["phase"] == "job_interrupted"
+    assert event["status"] == "interrupted"
+
+
+def test_job_runner_persists_structured_failure_event(tmp_path):
+    runner = JobRunner(JobStore(tmp_path / "runtime"))
+    try:
+        def fail(_payload, _progress):
+            raise RuntimeError("fixture failure")
+
+        runner.register("failing", fail)
+        record = runner.start("failing", {})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = runner.get(record["job_id"])
+            if job["state"] == "failed":
+                break
+            time.sleep(0.01)
+        assert job["state"] == "failed"
+        event = runner.store.events(record["job_id"])[-1]
+        assert event["phase"] == "job_failed"
+        assert event["error_code"] == "RuntimeError"
+        assert event["error_message"] == "fixture failure"
+    finally:
+        runner.shutdown()
+
+
+def test_job_runner_exclusive_rejects_a_second_active_job(tmp_path):
+    runner = JobRunner(JobStore(tmp_path / "runtime"))
+    try:
+        active = runner.store.create("first", {})
+        with pytest.raises(JobActiveError) as raised:
+            runner.start_exclusive("second", {})
+        assert raised.value.job_id == active["job_id"]
+    finally:
+        runner.shutdown()
 
 
 def test_missing_state_db_returns_structured_service_error(tmp_path):
@@ -215,14 +433,15 @@ def test_missing_state_db_returns_structured_service_error(tmp_path):
     assert response.get_json()["error"]["code"] == "missing_resource"
 
 
-def test_server_bootstraps_wal_before_opening_readonly_keeper(tmp_path, monkeypatch):
+def test_server_keeps_query_only_normal_connection_for_wal_sidecars(
+    tmp_path, monkeypatch
+):
     state_db = tmp_path / "state.sqlite3"
     conn = decision_store.initialize_state_db(state_db)
     conn.close()
     events = []
     writer_open = False
     real_writer = decision_store.connect_state_db
-    real_reader = decision_store.connect_state_db_readonly
 
     class TrackedWriter:
         def __init__(self, connection):
@@ -243,13 +462,7 @@ def test_server_bootstraps_wal_before_opening_readonly_keeper(tmp_path, monkeypa
         writer_open = True
         return TrackedWriter(real_writer(path, *args, **kwargs))
 
-    def open_reader(path, *args, **kwargs):
-        assert writer_open is True
-        events.append("reader_open")
-        return real_reader(path, *args, **kwargs)
-
     monkeypatch.setattr(decision_store, "connect_state_db", open_writer)
-    monkeypatch.setattr(decision_store, "connect_state_db_readonly", open_reader)
     app = create_app(
         state_db=state_db,
         house_dir=tmp_path / "house",
@@ -262,9 +475,13 @@ def test_server_bootstraps_wal_before_opening_readonly_keeper(tmp_path, monkeypa
     keeper = app.extensions["library_state_db_readonly_keeper"]
     try:
         assert keeper.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
-        assert events == ["writer_open", "reader_open", "writer_close"]
+        assert keeper.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert writer_open is True
+        assert events == ["writer_open"]
+        assert app.test_client().get("/health").status_code == 200
     finally:
         keeper.close()
+    assert events == ["writer_open", "writer_close"]
 
 
 def test_readonly_connection_retries_a_transient_open_failure(tmp_path, monkeypatch):

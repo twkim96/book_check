@@ -105,6 +105,57 @@ journal과 중복 판정 기준은 변경하지 않습니다. `NORMALIZER_VERSIO
 같은 batch의 겹치지 않는 신규 권은 계속 처리해 기존 작품 폴더에 자동 합류합니다. hold 작업도
 manifest와 operation recovery를 사용하므로 중단 시 원래 temp 경로로 복구할 수 있습니다.
 
+## 서비스·작업 로그 UI (1.3.0)
+
+도서 관리 서버의 대시보드는 운영 기본값으로 실행하는 원버튼을, `/services`는 각 작업의 목적,
+대상 건수, 읽기·쓰기 범위, 사전 검사, 최근 실행을 자세히 보여줍니다. 두 화면은 별도 구현이 아니라
+같은 단일 worker job과 기존 Python domain service를 호출합니다.
+
+현재 Folderling 실제 입고, Scanner/index 갱신, 플랫폼 인기 DB 업데이트, 플랫폼 실패 결과 재검사,
+기존 인기값 상향 갱신, 노벨피아 인증 누락 재검사, Google Sheet 동기화를 등록했습니다. 실행 중에는
+다른 변경 job을 시작하지 않으며, 실행 불가 버튼에는 `대상 없음`, `doctor 문제`, `인증 누락`,
+`다른 작업 실행 중` 같은 이유가 표시됩니다.
+
+대시보드와 서비스 목록은 화면을 열 때마다 전체 SQLite `integrity_check`나 모든 house 파일의
+identity를 다시 읽지 않습니다. 화면에서는 schema·미완료 operation·대표 파일 상태 같은 DB
+운영 조건을 빠르게 확인하고, 플랫폼 대상 미리보기는 15초 동안 공유합니다. 전체 무결성,
+파일 존재·size·mtime·inode Doctor는 Folderling 등 실제 변경 작업의 preflight와 사후 검증에서
+기존처럼 fail-closed로 수행합니다. 대시보드 기본 통계와 서비스 버튼도 서로 독립적으로 표시해
+플랫폼 대상 집계가 늦어져도 도서 현황 화면을 먼저 볼 수 있습니다.
+
+`/jobs/<job_id>`에서는 서버를 다시 열어도 유지되는 진행률, 구조화 이벤트, 완료 결과와 원본 로그를
+확인할 수 있습니다. 로그는 화면 검색·복사·다운로드를 지원합니다. Folderling의 기존
+`success.log`와 `fail.log`도 해당 job 로그에 복사되며, 플랫폼 장시간 수집은 10작품 단위 진행
+이벤트를 저장합니다. 기존 컨트롤서버의 `Folderling 실제 입고` 원버튼은 계속 유지합니다.
+
+Folderling 작업 상세는 doctor, snapshot, 중복 판정, temp 입고, index 갱신, 최종 doctor를
+타임라인으로 표시합니다. 파일별 결과 표에서는 정상 입고, 정확 중복, 검토 격리, warning,
+실패와 제외를 구분하고 원본 후보·기존 유지 파일·실제 목적지·다음 조치를 함께 확인할 수 있습니다.
+이 근거는 Folderling core가 직접 JSONL event로 기록하므로 화면을 위해 stdout 문구를 다시
+해석하지 않습니다.
+
+`/catalog`는 활성 house 파일을 core title 기준 작품으로 묶어 실제 보유 파일, 작가·범위와
+시리즈·카카오·노벨피아 상태·인기 지표를 읽기 전용으로 검색합니다. `/review/queue`는 DB review와
+`trash_bin`의 warning, 작가 충돌, 중복 의심, exact quarantine을 한 화면에서 조회합니다.
+1.3.0에서는 이 두 화면이 파일이나 DB를 변경하지 않으며, 복원·격리·영구 삭제는 후속 버전의
+확인형 작업으로 추가합니다. 대시보드는 doctor, 입고 대기, 검토 큐, 메타데이터 미확인과 최근
+실패를 `확인할 일` 카드로 연결합니다.
+
+검토 큐는 `관계 검토 · 미격리`, `실제 격리됨`, `격리 경로 확인 필요`를 별도로 표시합니다.
+DB review와 실제 queue 파일이 같은 항목이면 한 행으로 합칩니다. EPUB 감사 결과가 약한
+`metadata_only`이고 두 파일의 core title이 다르면 사람 review를 만들지 않습니다. 같은 EPUB
+작품명에 마지막 분권 숫자만 다른 쌍도 이 범주에 포함됩니다. 강한 본문 동등·exact 판정과 같은
+core title에서 `외전` 단독 EPUB과 본편 `N권` EPUB 사이의 `metadata_only` 관계도 제외합니다.
+강한 본문 동등·exact 판정은 파일명에 외전이 있어도 그대로 검토 대상으로 유지합니다.
+fingerprint가 갱신된 같은 파일쌍은 오래된 open review를 `superseded`하고 최신 증거 하나만
+남깁니다.
+
+도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
+query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
+읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로
+hot reload하지는 않습니다. 장시간 Folderling·플랫폼 작업을 중간에 끊을 수 있기 때문에, 배포한
+코드는 컨트롤서버에서 `도서 관리` 서버만 한 번 재시작해 적용합니다.
+
 ```bash
 # Python 의존성
 python3 -m pip install -r requirements.txt

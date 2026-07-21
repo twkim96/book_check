@@ -1,15 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { NavLink, Navigate, Route, Routes, useNavigate, useSearchParams } from "react-router-dom";
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { ApiError, api, postJson } from "./api";
 import type {
+  CatalogItem,
+  CatalogListing,
   DashboardData,
+  JobEvent,
   JobRecord,
   PlatformStatus,
+  ServiceDescriptor,
   TitleCase,
   TitleListing,
   TitlePlan,
   TitlePreview,
+  ReviewQueueListing,
   VolumeCase,
   VolumeClassification,
   VolumeListing,
@@ -57,13 +62,16 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.2.9</small>
+            <small>file_check 1.3.0</small>
           </div>
         </div>
         <nav>
           <NavLink to="/" end>대시보드</NavLink>
+          <NavLink to="/services">서비스</NavLink>
+          <NavLink to="/catalog">카탈로그</NavLink>
           <NavLink to="/review/titles">제목 교정</NavLink>
           <NavLink to="/review/volumes">분권 묶기</NavLink>
+          <NavLink to="/review/queue">검토 큐</NavLink>
           <NavLink to="/jobs">작업 이력</NavLink>
         </nav>
         <div className="sidebar-note">로컬 전용 · 실제 변경 전 계획 확인</div>
@@ -71,9 +79,14 @@ function Shell() {
       <main className="main">
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/services" element={<Services />} />
+          <Route path="/services/:serviceId" element={<ServiceDetail />} />
+          <Route path="/catalog" element={<Catalog />} />
           <Route path="/review/titles" element={<TitleReview />} />
           <Route path="/review/volumes" element={<VolumeReview />} />
+          <Route path="/review/queue" element={<ReviewQueue />} />
           <Route path="/jobs" element={<Jobs />} />
+          <Route path="/jobs/:jobId" element={<JobDetail />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
@@ -105,13 +118,21 @@ function PageHeader({ eyebrow, title, description, action }: {
 
 function Dashboard() {
   const [data, setData] = useState<DashboardData>();
+  const [services, setServices] = useState<ServiceDescriptor[]>();
   const [error, setError] = useState("");
+  const [serviceError, setServiceError] = useState("");
   const load = () => {
     setError("");
-    api<DashboardData>("/api/dashboard").then(setData).catch((reason) => setError(reason.message));
+    setServiceError("");
+    api<DashboardData>("/api/dashboard")
+      .then(setData)
+      .catch((reason) => setError(reason.message));
+    api<ServiceDescriptor[]>("/api/services")
+      .then(setServices)
+      .catch((reason) => setServiceError(reason.message));
   };
   useEffect(load, []);
-  if (error) return <ErrorPanel message={error} retry={load} />;
+  if (error && !data) return <ErrorPanel message={error} retry={load} />;
   if (!data) return <Loading />;
   const cards = [
     ["보유 도서", data.database.supported_house_files, "활성 지원 파일"],
@@ -129,8 +150,8 @@ function Dashboard() {
       />
       <section className="health-strip">
         <span className={data.database.doctor_ok ? "health-ok" : "health-bad"} />
-        <strong>{data.database.doctor_ok ? "DB와 파일 상태 정상" : `Doctor 문제 ${data.database.doctor_issue_count}건`}</strong>
-        <span>무결성 {data.database.integrity}</span>
+        <strong>{data.database.doctor_ok ? "DB 운영 상태 정상" : `Doctor 문제 ${data.database.doctor_issue_count}건`}</strong>
+        <span>{data.database.integrity === "deferred" ? "전체 무결성은 실행 전에 재검증" : `무결성 ${data.database.integrity}`}</span>
         <span>index {formatNumber(data.filesystem.index.files)}개</span>
         <span>normalizer {data.filesystem.index.normalizer_version ?? "-"}</span>
       </section>
@@ -143,6 +164,32 @@ function Dashboard() {
           </article>
         ))}
       </section>
+      <section className="panel next-actions-panel">
+        <div className="panel-title"><div><span className="eyebrow">NEXT ACTIONS</span><h2>확인할 일</h2></div><span>{data.next_actions.length}건</span></div>
+        {data.next_actions.length ? <div className="next-action-grid">{data.next_actions.map((item) => <NavLink className={`next-action next-action-${item.severity}`} to={item.href} key={item.code}>
+          <strong>{item.label}</strong><span>{item.detail}</span><b>열기 →</b>
+        </NavLink>)}</div> : <div className="all-clear">현재 바로 확인할 작업이 없습니다.</div>}
+      </section>
+      <section className="panel service-quick-panel">
+        <div className="panel-title">
+          <div><span className="eyebrow">QUICK SERVICES</span><h2>원버튼 실행</h2></div>
+          <NavLink className="text-link" to="/services">서비스 상세</NavLink>
+        </div>
+        <div className="quick-service-grid">
+          {services?.filter((item) => item.quick_action).map((item) => (
+            <article className="quick-service" key={item.id}>
+              <div>
+                <strong>{item.label}</strong>
+                <small>{item.target_label} {formatNumber(item.target_count)}개</small>
+              </div>
+              <ServiceRunButton service={item} source="dashboard" />
+              {!item.ready && <p>{item.blocked_reason}</p>}
+            </article>
+          ))}
+          {!services && !serviceError && <div className="all-clear">서비스 실행 조건 확인 중…</div>}
+          {serviceError && <div className="all-clear">서비스 상태를 불러오지 못했습니다: {serviceError}</div>}
+        </div>
+      </section>
       <section className="panel">
         <div className="panel-title">
           <div><span className="eyebrow">RECENT JOBS</span><h2>최근 작업</h2></div>
@@ -152,6 +199,245 @@ function Dashboard() {
       </section>
     </>
   );
+}
+
+function catalogMetric(item: CatalogItem, platform: "series" | "kakao" | "novelpia"): string {
+  const value = item.platforms[platform];
+  if (value.status !== "ok") return statusLabel(value.status);
+  const metrics = platform === "series"
+    ? [["다운", value.download_count], ["평점", value.rating]]
+    : platform === "kakao"
+      ? [["조회", value.view_count], ["평점", value.rating]]
+      : [["조회", value.view_count], ["좋아요", value.recommend_count]];
+  return metrics
+    .filter((entry) => entry[1] !== null && entry[1] !== undefined)
+    .map(([label, metric]) => `${label} ${typeof metric === "number" ? formatNumber(metric) : metric}`)
+    .join(" · ") || "확인";
+}
+
+function Catalog() {
+  const [params, setParams] = useSearchParams();
+  const [listing, setListing] = useState<CatalogListing>();
+  const [error, setError] = useState("");
+  const [draft, setDraft] = useState(params.get("search") ?? "");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const search = params.get("search") ?? "";
+  const status = params.get("status") ?? "all";
+  const cursor = params.get("cursor") ?? "";
+  const load = () => {
+    const query = new URLSearchParams({ search, status, limit: "50" });
+    if (cursor) query.set("cursor", cursor);
+    api<CatalogListing>(`/api/catalog?${query}`).then((value) => { setListing(value); setError(""); }).catch((reason) => setError(reason.message));
+  };
+  useEffect(load, [search, status, cursor]);
+  const update = (next: Record<string, string>) => {
+    const value = new URLSearchParams(params);
+    Object.entries(next).forEach(([key, item]) => item ? value.set(key, item) : value.delete(key));
+    value.delete("cursor");
+    setParams(value);
+  };
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    update({ search: draft.trim() });
+  };
+  if (error && !listing) return <ErrorPanel message={error} retry={load} />;
+  return <>
+    <PageHeader eyebrow="READ-ONLY CATALOG" title="보유 도서 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 한 화면에서 찾습니다. 1.3.0에서는 조회만 가능합니다." action={<span className="readonly-pill">READ ONLY</span>} />
+    {error && <div className="inline-error">{error}</div>}
+    <div className="toolbar catalog-toolbar">
+      <form className="search-form" onSubmit={submit}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="원본 제목·core title·작가 검색" /><button className="button secondary">검색</button></form>
+      <select value={status} onChange={(event) => update({ status: event.target.value })}>
+        <option value="all">전체 플랫폼 상태</option>
+        <option value="found">하나 이상 확인</option>
+        <option value="missing">확인된 플랫폼 없음</option>
+        <option value="not_found">모두 검색 결과 없음</option>
+        <option value="error">오류 포함</option>
+      </select>
+    </div>
+    <section className="table-panel catalog-panel">
+      <div className="table-summary"><span>현재 조건 <strong>{formatNumber(listing?.total ?? 0)}</strong>작품</span><span>행을 열면 실제 보유 파일과 마지막 수집 시각을 확인합니다.</span></div>
+      {!listing ? <Loading /> : listing.items.length ? <div className="catalog-table-wrap"><table className="catalog-table">
+        <thead><tr><th>작품·core title</th><th>보유</th><th>시리즈</th><th>카카오</th><th>노벨피아</th><th>상세</th></tr></thead>
+        <tbody>{listing.items.map((item) => {
+          const isOpen = expanded.has(item.title_key);
+          return <Fragment key={item.title_key}>
+            <tr>
+              <td><strong>{item.display_title}</strong><code className="core">{item.title_key}</code>{item.author && <small>{item.author}</small>}</td>
+              <td><b>{item.file_count}개</b><small>{item.effective_max ? `~${formatNumber(item.effective_max)}${item.unit}${item.complete ? " 완" : ""}` : "범위 미상"}</small></td>
+              {(["series", "kakao", "novelpia"] as const).map((platform) => <td key={platform}><StatusBadge status={item.platforms[platform].status} /><span>{catalogMetric(item, platform)}</span>{item.platforms[platform].remote_url && <a href={item.platforms[platform].remote_url ?? undefined} target="_blank" rel="noreferrer">원문 ↗</a>}</td>)}
+              <td><button className="button ghost" onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(item.title_key)) next.delete(item.title_key); else next.add(item.title_key); return next; })}>{isOpen ? "접기" : "파일 보기"}</button></td>
+            </tr>
+            {isOpen && <tr className="catalog-detail-row"><td colSpan={6}><div className="catalog-detail-grid">
+              <section><strong>보유 파일 {item.files.length}개</strong>{item.files.map((file) => <div className="catalog-file" key={file.file_id}><b>{file.name}</b><small title={file.path}>{file.path}</small></div>)}</section>
+              <section><strong>플랫폼 수집 근거</strong>{(["series", "kakao", "novelpia"] as const).map((platform) => { const value = item.platforms[platform]; return <div className="catalog-platform-detail" key={platform}><b>{platformLabels[platform]} · {statusLabel(value.status)}</b><small>{value.remote_title ?? "원문 제목 없음"}</small><small>마지막 시도 {value.last_attempt_at ? new Date(value.last_attempt_at).toLocaleString("ko-KR") : "없음"}</small>{value.error_message && <small className="blocked">{value.error_message}</small>}</div>; })}</section>
+            </div></td></tr>}
+          </Fragment>;
+        })}</tbody>
+      </table></div> : <div className="empty">조건에 맞는 보유 작품이 없습니다.</div>}
+      {listing && <div className="pagination"><button className="button secondary" disabled={!cursor} onClick={() => { const value = new URLSearchParams(params); const previous = Math.max(0, Number(cursor || 0) - listing.limit); if (previous) value.set("cursor", String(previous)); else value.delete("cursor"); setParams(value); }}>이전</button><button className="button secondary" disabled={!listing.next_cursor} onClick={() => { const value = new URLSearchParams(params); if (listing.next_cursor) value.set("cursor", listing.next_cursor); setParams(value); }}>다음</button></div>}
+    </section>
+  </>;
+}
+
+function ReviewQueue() {
+  const [params, setParams] = useSearchParams();
+  const [listing, setListing] = useState<ReviewQueueListing>();
+  const [error, setError] = useState("");
+  const [draft, setDraft] = useState(params.get("search") ?? "");
+  const search = params.get("search") ?? "";
+  const category = params.get("category") ?? "all";
+  const physical = params.get("physical") ?? "all";
+  const load = () => {
+    const query = new URLSearchParams({ search, category, physical, limit: "100" });
+    api<ReviewQueueListing>(`/api/review/queue?${query}`).then((value) => { setListing(value); setError(""); }).catch((reason) => setError(reason.message));
+  };
+  useEffect(load, [search, category, physical]);
+  const update = (next: Record<string, string>) => {
+    const value = new URLSearchParams(params);
+    Object.entries(next).forEach(([key, item]) => item ? value.set(key, item) : value.delete(key));
+    setParams(value);
+  };
+  return <>
+    <PageHeader eyebrow="REVIEW EVIDENCE" title="검토 큐·격리 현황" description="DB review와 temp/trash_bin의 관리 파일을 함께 봅니다. 복원·중복 아님·영구 삭제는 1.3.2의 확인형 작업으로 추가됩니다." action={<span className="readonly-pill">READ ONLY</span>} />
+    {error && <div className="inline-error">{error}</div>}
+    <div className="toolbar">
+      <form className="search-form" onSubmit={(event) => { event.preventDefault(); update({ search: draft.trim() }); }}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="파일명·후보 경로 검색" /><button className="button secondary">검색</button></form>
+      <select value={category} onChange={(event) => update({ category: event.target.value })}>
+        <option value="all">전체 검토 큐</option><option value="database">DB review</option><option value="warning">warning</option><option value="author_conflicts">작가 충돌</option><option value="suspected_duplicates">중복 의심</option><option value="exact_quarantine">정확 중복 격리</option><option value="exact_duplicates">legacy 정확 중복</option>
+      </select>
+      <select value={physical} onChange={(event) => update({ physical: event.target.value })}>
+        <option value="all">전체 보관 상태</option><option value="relation_only">관계 검토 · 미격리</option><option value="quarantined">실제 격리됨</option><option value="queue_missing">격리 경로 확인 필요</option>
+      </select>
+    </div>
+    {listing && <section className="review-queue-summary">
+      <button className={physical === "relation_only" ? "active" : ""} onClick={() => update({ physical: "relation_only" })}><span>관계 검토 · 미격리</span><strong>{formatNumber(listing.summary.relation_only)}</strong></button>
+      <button className={physical === "quarantined" ? "active" : ""} onClick={() => update({ physical: "quarantined" })}><span>실제 격리됨</span><strong>{formatNumber(listing.summary.quarantined)}</strong></button>
+      <button className={physical === "queue_missing" ? "active" : ""} onClick={() => update({ physical: "queue_missing" })}><span>격리 경로 확인</span><strong>{formatNumber(listing.summary.queue_missing)}</strong></button>
+    </section>}
+    <section className="table-panel review-queue-panel">
+      <div className="table-summary"><span>현재 조건 <strong>{formatNumber(listing?.total_visible ?? 0)}</strong>건 · 최대 {formatNumber(listing?.items.length ?? 0)}건 표시</span><span>파일 조작 없음</span></div>
+      {!listing ? <Loading /> : listing.items.length ? <div className="review-queue-list">{listing.items.map((item, index) => <article key={`${item.kind}-${item.review_id ?? item.path}-${index}`}>
+        <span className={`queue-kind queue-kind-${item.physical_state}`}>{item.physical_state === "relation_only" ? "관계 검토 · 미격리" : item.physical_state === "quarantined" ? "격리됨" : "격리 경로 확인"}</span>
+        <div><strong>{item.name ?? fileBasename(item.candidate_path ?? item.path ?? item.queue_path ?? "검토 항목")}</strong><small>{item.category} · {item.state}</small></div>
+        <div className="queue-paths">{item.candidate_path && <small>후보: {item.candidate_path}</small>}{item.reference_path && <small>비교: {item.reference_path}</small>}{item.path && <small>격리: {item.path}</small>}{item.queue_path && <small>큐: {item.queue_path}</small>}</div>
+        {item.size !== undefined && <b>{formatBytes(item.size)}</b>}
+      </article>)}</div> : <div className="empty">조건에 맞는 검토 항목이 없습니다.</div>}
+    </section>
+  </>;
+}
+
+function ServiceRunButton({ service, source }: {
+  service: ServiceDescriptor;
+  source: "dashboard" | "service_detail";
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const navigate = useNavigate();
+  const run = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const job = await postJson<JobRecord>(`/api/services/${service.id}/start`, { source });
+      navigate(`/jobs/${job.job_id}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "서비스를 시작하지 못했습니다.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <div className="service-run-control">
+    <button
+      className="button primary"
+      disabled={busy || !service.ready}
+      title={service.blocked_reason ?? undefined}
+      onClick={run}
+    >{busy ? "등록 중…" : "실행"}</button>
+    {error && <small className="control-error">{error}</small>}
+  </div>;
+}
+
+function Services() {
+  const [items, setItems] = useState<ServiceDescriptor[]>();
+  const [error, setError] = useState("");
+  const load = () => {
+    setError("");
+    api<ServiceDescriptor[]>("/api/services").then(setItems).catch((reason) => setError(reason.message));
+  };
+  useEffect(load, []);
+  if (error) return <ErrorPanel message={error} retry={load} />;
+  if (!items) return <Loading />;
+  const categories = [...new Set(items.map((item) => item.category))];
+  return <>
+    <PageHeader
+      eyebrow="OPERATION SERVICES · 1.3.0"
+      title="서비스"
+      description="기존 컨트롤서버와 같은 도메인 로직을 실행합니다. 대상과 쓰기 범위, 사전 검사와 최근 결과를 확인할 수 있습니다."
+      action={<button className="button secondary" onClick={load}>상태 새로고침</button>}
+    />
+    {categories.map((category) => <section className="service-section" key={category}>
+      <div className="service-section-title"><span>{category}</span><small>{items.filter((item) => item.category === category).length}개 서비스</small></div>
+      <div className="service-grid">
+        {items.filter((item) => item.category === category).map((item) => <article className="service-card" key={item.id}>
+          <div className="service-card-head">
+            <span className={item.ready ? "service-ready" : "service-blocked"}>{item.ready ? "실행 가능" : "대기"}</span>
+            <strong>{item.label}</strong>
+          </div>
+          <p>{item.summary}</p>
+          <div className="service-count"><strong>{formatNumber(item.target_count)}</strong><span>{item.target_label}</span></div>
+          {!item.ready && <div className="service-reason">{item.blocked_reason}</div>}
+          {item.latest_job && <NavLink className="service-latest" to={`/jobs/${item.latest_job.job_id}`}>최근 실행 · {item.latest_job.state}</NavLink>}
+          <footer>
+            <NavLink className="button secondary" to={`/services/${item.id}`}>자세히</NavLink>
+            <ServiceRunButton service={item} source="service_detail" />
+          </footer>
+        </article>)}
+      </div>
+    </section>)}
+  </>;
+}
+
+function ServiceDetail() {
+  const { serviceId = "" } = useParams();
+  const [service, setService] = useState<ServiceDescriptor>();
+  const [error, setError] = useState("");
+  const load = () => {
+    setError("");
+    api<ServiceDescriptor>(`/api/services/${serviceId}`).then(setService).catch((reason) => setError(reason.message));
+  };
+  useEffect(load, [serviceId]);
+  if (error) return <ErrorPanel message={error} retry={load} />;
+  if (!service) return <Loading />;
+  return <>
+    <PageHeader
+      eyebrow={`${service.category.toUpperCase()} SERVICE`}
+      title={service.label}
+      description={service.summary}
+      action={<ServiceRunButton service={service} source="service_detail" />}
+    />
+    <section className="service-detail-grid">
+      <article className="panel service-status-panel">
+        <span className={service.ready ? "service-ready" : "service-blocked"}>{service.ready ? "실행 가능" : "현재 실행 불가"}</span>
+        <strong>{service.target_label} {formatNumber(service.target_count)}개</strong>
+        <p>{service.ready ? "운영 기본값으로 즉시 실행할 수 있습니다." : service.blocked_reason}</p>
+      </article>
+      <article className="panel service-scope-panel">
+        <h2>읽는 범위</h2>
+        <ul>{service.read_scope.map((value) => <li key={value}>{value}</li>)}</ul>
+      </article>
+      <article className="panel service-scope-panel">
+        <h2>변경하는 범위</h2>
+        <ul>{service.write_scope.map((value) => <li key={value}>{value}</li>)}</ul>
+      </article>
+    </section>
+    <section className="panel service-defaults">
+      <div className="panel-title"><div><span className="eyebrow">SAFE DEFAULTS</span><h2>이번 버전의 고정 실행 조건</h2></div></div>
+      <ul>{service.defaults.map((value) => <li key={value}>{value}</li>)}</ul>
+    </section>
+    <section className="panel">
+      <div className="panel-title"><div><span className="eyebrow">LATEST OUTPUT</span><h2>최근 실행</h2></div><NavLink className="text-link" to="/jobs">전체 이력</NavLink></div>
+      {service.latest_job ? <JobList jobs={[service.latest_job]} empty="" detailed /> : <div className="empty">이 서비스의 실행 이력이 없습니다.</div>}
+    </section>
+  </>;
 }
 
 function TitleReview() {
@@ -217,7 +503,7 @@ function TitleReview() {
         confirm_plan_sha256: plan.plan_sha256
       });
       setPlan(undefined);
-      navigate(`/jobs?focus=${job.job_id}`);
+      navigate(`/jobs/${job.job_id}`);
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === "confirmation_stale") {
         setError("파일이나 DB 상태가 바뀌었습니다. 계획을 다시 확인하세요.");
@@ -614,7 +900,7 @@ function VolumePreviewDialog({ value, onClose }: { value: VolumeCase; onClose: (
         confirm_plan_sha256: preview.plan_sha256
       });
       onClose();
-      navigate(`/jobs?focus=${job.job_id}`);
+      navigate(`/jobs/${job.job_id}`);
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === "confirmation_stale") {
         setError("파일이나 DB 상태가 바뀌었습니다. 미리보기를 다시 확인하세요.");
@@ -710,21 +996,380 @@ function Jobs() {
   );
 }
 
+function jobLabel(jobType: string): string {
+  const labels: Record<string, string> = {
+    title_requeue: "제목 교정 재입고",
+    volume_group_merge: "분권 묶기",
+    service_folderling: "Folderling 실제 입고",
+    service_scanner: "Scanner / index 갱신",
+    service_platform_update: "플랫폼 인기 DB 업데이트",
+    service_platform_retry: "플랫폼 실패 결과 재검사",
+    service_platform_refresh: "기존 인기값 상향 갱신",
+    service_novelpia_auth_retry: "노벨피아 인증 누락 재검사",
+    service_google_sheet: "Google Sheet 동기화"
+  };
+  return labels[jobType] ?? jobType;
+}
+
+const folderlingPhaseLabels: Record<string, string> = {
+  preflight_start: "사전 검사",
+  preflight_result: "사전 검사 완료",
+  preflight_failed: "사전 검사 실패",
+  actual_run_started: "안전 실행 시작",
+  review_actions_result: "기존 검토 처리함 반영",
+  workflow_started: "입고 workflow 시작",
+  legacy_pass_skipped: "legacy pass 보류",
+  dedup_start: "중복 판정 시작",
+  snapshot_result: "house snapshot 확인",
+  dedup_result: "중복 판정 완료",
+  intake_start: "temp 입고 시작",
+  intake_result: "temp 입고 완료",
+  index_start: "index 갱신 시작",
+  index_result: "index 갱신 완료",
+  folderling_summary: "결과 집계",
+  final_doctor_result: "최종 무결성 검사",
+  actual_run_finished: "안전 실행 종료",
+  workflow_failed: "입고 workflow 실패"
+};
+
+const folderlingStatusLabels: Record<string, string> = {
+  ingested: "입고",
+  pass_ingested: "승인 입고",
+  exact_duplicate: "정확 중복",
+  suspected_duplicate: "검토 격리",
+  warning: "경고 보류",
+  author_conflict: "작가 충돌",
+  metadata_only: "메타데이터 판정",
+  skipped: "제외",
+  failed: "실패",
+  empty_directory_cleaned: "빈 폴더 정리"
+};
+
+const folderlingReasonLabels: Record<string, string> = {
+  journaled_house_ingest: "journal을 남기고 house에 입고",
+  exact_fingerprint: "파일 내용·크기 fingerprint 일치",
+  volume_coordinate_conflict: "기존 파일과 같은 권 좌표",
+  volume_coordinate_hold_failed: "같은 권 좌표 보류 처리 실패",
+  excluded_source_item: "운영 보조 파일 또는 제외 폴더",
+  unsupported_extension: "지원하지 않는 확장자",
+  source_missing_or_not_regular: "파일이 없거나 일반 파일이 아님",
+  empty_normalized_name: "정규화 후 파일명이 비어 있음",
+  empty_directory: "내용 없는 temp 폴더"
+};
+
+function eventText(value: unknown): string {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function eventPaths(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item)).filter(Boolean) : [];
+}
+
+function fileBasename(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.at(-1) ?? path;
+}
+
+function FolderlingJobOutput({ events, result }: { events: JobEvent[]; result: Record<string, unknown> | null }) {
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const fileEvents = useMemo(
+    () => events.filter((event) => event.phase === "file_result"),
+    [events]
+  );
+  const timelineEvents = useMemo(
+    () => events.filter((event) => event.phase !== "file_result"),
+    [events]
+  );
+  const counts = useMemo(() => fileEvents.reduce<Record<string, number>>((acc, event) => {
+    const status = eventText(event.status) || "unknown";
+    acc[status] = (acc[status] ?? 0) + 1;
+    return acc;
+  }, {}), [fileEvents]);
+  const statusOptions = useMemo(
+    () => Object.keys(counts).sort((left, right) => (folderlingStatusLabels[left] ?? left).localeCompare(folderlingStatusLabels[right] ?? right, "ko")),
+    [counts]
+  );
+  const visibleFiles = useMemo(() => {
+    const needle = search.trim().toLocaleLowerCase();
+    return fileEvents.filter((event) => {
+      const status = eventText(event.status) || "unknown";
+      if (statusFilter !== "all" && status !== statusFilter) return false;
+      if (!needle) return true;
+      const haystack = [
+        event.source_name,
+        event.source_path,
+        event.destination_path,
+        event.reason,
+        event.error,
+        event.next_action,
+        ...eventPaths(event.existing_paths)
+      ].map(eventText).join(" ").toLocaleLowerCase();
+      return haystack.includes(needle);
+    });
+  }, [fileEvents, search, statusFilter]);
+  const moveCount = Number(result?.move_count ?? counts.ingested ?? 0) + Number(result?.pass_count ?? counts.pass_ingested ?? 0);
+  const duplicateCount = Number((result?.dedup_summary as Record<string, unknown> | undefined)?.exact_count ?? counts.exact_duplicate ?? 0);
+  const reviewCount = Number(
+    (result?.dedup_summary as Record<string, unknown> | undefined)?.review_queue_move_count
+    ?? (counts.suspected_duplicate ?? 0) + (counts.author_conflict ?? 0)
+  ) + Number(result?.volume_conflict_hold_count ?? counts.warning ?? 0);
+  const failureCount = Number(result?.failure_count ?? counts.failed ?? 0);
+
+  return <>
+    <section className="folderling-summary-grid" aria-label="Folderling 결과 요약">
+      <article className="panel"><span>house 입고</span><strong>{formatNumber(moveCount)}</strong><small>정상 이동</small></article>
+      <article className="panel"><span>정확 중복</span><strong>{formatNumber(duplicateCount)}</strong><small>기존 파일 유지</small></article>
+      <article className="panel"><span>검토 필요</span><strong>{formatNumber(reviewCount)}</strong><small>격리·충돌·경고</small></article>
+      <article className="panel"><span>실패</span><strong>{formatNumber(failureCount)}</strong><small>재확인 필요</small></article>
+    </section>
+    <section className="panel folderling-timeline-panel">
+      <div className="panel-title"><div><span className="eyebrow">FOLDERLING TIMELINE</span><h2>입고 단계</h2></div><span>{timelineEvents.length}개 단계 이벤트</span></div>
+      {timelineEvents.length ? <div className="folderling-timeline">{timelineEvents.map((event, index) => {
+        const status = eventText(event.status) || "running";
+        return <article key={`${event.recorded_at}-${event.phase}-${index}`}>
+          <i className={`folderling-dot folderling-dot-${status}`} />
+          <div><strong>{folderlingPhaseLabels[event.phase] ?? event.phase}</strong><small>{new Date(event.recorded_at).toLocaleTimeString("ko-KR")}</small></div>
+          <span className={`folderling-status folderling-status-${status}`}>{status}</span>
+          {Boolean(event.fallback_reason) && <p>{eventText(event.fallback_reason)}</p>}
+          {Boolean(event.error) && <p className="blocked">{eventText(event.error)}</p>}
+        </article>;
+      })}</div> : <div className="empty">아직 Folderling 단계 이벤트가 없습니다.</div>}
+    </section>
+    <section className="panel folderling-results-panel">
+      <div className="panel-title"><div><span className="eyebrow">FILE RESULTS</span><h2>파일별 판정</h2></div><span>{visibleFiles.length}/{fileEvents.length}개 표시</span></div>
+      <div className="folderling-toolbar">
+        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="파일명·경로·판정 검색" />
+        <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+          <option value="all">모든 판정</option>
+          {statusOptions.map((status) => <option key={status} value={status}>{folderlingStatusLabels[status] ?? status} ({counts[status]})</option>)}
+        </select>
+      </div>
+      {visibleFiles.length ? <div className="folderling-table-wrap"><table className="folderling-result-table">
+        <thead><tr><th>판정</th><th>원본 후보</th><th>기존 유지·비교 대상</th><th>목적지·다음 조치</th></tr></thead>
+        <tbody>{visibleFiles.map((event, index) => {
+          const status = eventText(event.status) || "unknown";
+          const sourcePath = eventText(event.source_path);
+          const destinationPath = eventText(event.destination_path);
+          const existingPaths = eventPaths(event.existing_paths);
+          const reason = eventText(event.reason);
+          return <tr key={`${event.recorded_at}-${sourcePath}-${index}`}>
+            <td><span className={`folderling-status folderling-status-${status}`}>{folderlingStatusLabels[status] ?? status}</span><small>{folderlingReasonLabels[reason] ?? reason}</small></td>
+            <td><strong title={sourcePath}>{eventText(event.source_name) || fileBasename(sourcePath)}</strong><small title={sourcePath}>{sourcePath}</small></td>
+            <td>{existingPaths.length ? existingPaths.map((path) => <div className="folderling-path" key={path}><strong>{fileBasename(path)}</strong><small title={path}>{path}</small></div>) : <span className="muted-value">없음</span>}</td>
+            <td>{destinationPath ? <div className="folderling-path"><strong>{fileBasename(destinationPath)}</strong><small title={destinationPath}>{destinationPath}</small></div> : <span className="muted-value">이동 없음</span>}{Boolean(event.next_action) && <em>{eventText(event.next_action)}</em>}{Boolean(event.error) && <em className="blocked">{eventText(event.error)}</em>}</td>
+          </tr>;
+        })}</tbody>
+      </table></div> : <div className="empty">조건에 맞는 파일 판정이 없습니다.</div>}
+    </section>
+  </>;
+}
+
+function formatDuration(value: unknown): string {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "-";
+  if (seconds < 60) return `${Math.round(seconds)}초`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = Math.round(seconds % 60);
+  return [hours ? `${hours}시간` : "", minutes ? `${minutes}분` : "", `${rest}초`].filter(Boolean).join(" ");
+}
+
+const platformPhaseLabels: Record<string, string> = {
+  validating: "실행 준비",
+  file_analysis: "파일 분석 DB 동기화",
+  sync_start: "카탈로그 제목 동기화",
+  start: "신규·미수집 조회 시작",
+  progress: "플랫폼 조회 진행",
+  auth_start: "인증 노벨피아 조회 시작",
+  auth_progress: "인증 노벨피아 조회 진행",
+  existing_start: "기존 인기값 갱신 시작",
+  existing_progress: "기존 인기값 갱신 진행",
+  platform_result: "검증·저장 완료",
+  job_failed: "작업 실패",
+  job_interrupted: "서버 중단 감지"
+};
+
+function PlatformJobOutput({ events, result }: { events: JobEvent[]; result: Record<string, unknown> | null }) {
+  const progressEvents = events.filter((event) => ["progress", "auth_progress", "existing_progress"].includes(event.phase));
+  const latestProgress = progressEvents.at(-1);
+  const statusCounts = (result?.status_counts ?? latestProgress?.status_counts ?? {}) as Record<string, unknown>;
+  const outcomeCounts = (result?.outcome_counts ?? latestProgress?.outcome_counts ?? {}) as Record<string, unknown>;
+  const selectedTitles = Number(result?.selected_titles ?? latestProgress?.selected_titles ?? 0);
+  const selectedPlatforms = Number(result?.selected_platforms ?? latestProgress?.selected_platforms ?? 0);
+  const resultEvent = [...events].reverse().find((event) => event.phase === "platform_result");
+  const elapsed = resultEvent?.elapsed_seconds ?? latestProgress?.elapsed_seconds;
+  const eta = latestProgress?.eta_seconds;
+  const cards = outcomeCounts.updated !== undefined ? [
+    ["갱신 작품", selectedTitles, `${selectedPlatforms.toLocaleString("ko-KR")}개 플랫폼`],
+    ["상향 반영", Number(outcomeCounts.updated ?? 0), "기존 값보다 증가"],
+    ["변경 없음", Number(outcomeCounts.unchanged ?? 0), "기존 값 유지"],
+    ["오류", Number(outcomeCounts.error ?? 0), "원본 값 보존"]
+  ] : [
+    ["조회 작품", selectedTitles, `${selectedPlatforms.toLocaleString("ko-KR")}개 플랫폼`],
+    ["확인", Number(statusCounts.ok ?? 0), "ok"],
+    ["검색 결과 없음", Number(statusCounts.not_found ?? 0), "not_found"],
+    ["오류", Number(statusCounts.error ?? 0), "error"]
+  ];
+  return <>
+    <section className="platform-summary-grid">
+      {cards.map(([label, value, note]) => <article className="panel" key={String(label)}><span>{label}</span><strong>{formatNumber(Number(value))}</strong><small>{note}</small></article>)}
+    </section>
+    <section className="panel platform-progress-panel">
+      <div className="panel-title"><div><span className="eyebrow">PLATFORM PROGRESS</span><h2>수집 진행 근거</h2></div><span>경과 {formatDuration(elapsed)}{eta !== null && eta !== undefined ? ` · 예상 잔여 ${formatDuration(eta)}` : ""}</span></div>
+      <div className="platform-facts">
+        <span>인증 노벨피아 시도 <strong>{formatNumber(Number(result?.authenticated_novelpia_attempts ?? 0))}</strong></span>
+        <span>자동 재로그인 <strong>{formatNumber(Number(result?.authenticated_novelpia_relogins ?? 0))}</strong></span>
+        {Boolean(result?.schema_backup) && <span>DB backup <strong title={eventText(result?.schema_backup)}>{fileBasename(eventText(result?.schema_backup))}</strong></span>}
+      </div>
+      {events.length ? <div className="platform-event-list">{events.map((event, index) => {
+        const current = Number(event.completed_titles ?? event.completed ?? 0);
+        const total = Number(event.selected_titles ?? event.total ?? 0);
+        const percent = Number(event.percent ?? (total ? current / total * 100 : 0));
+        return <article key={`${event.recorded_at}-${event.phase}-${index}`}>
+          <time>{new Date(event.recorded_at).toLocaleTimeString("ko-KR")}</time>
+          <strong>{platformPhaseLabels[event.phase] ?? event.phase}</strong>
+          <div>{total > 0 && <><span>{formatNumber(current)}/{formatNumber(total)}</span><div className="progress"><i style={{ width: `${Math.min(100, percent)}%` }} /></div></>}</div>
+          {Boolean(event.error_message) && <small className="blocked">{eventText(event.error_message)}</small>}
+        </article>;
+      })}</div> : <div className="empty">아직 플랫폼 진행 이벤트가 없습니다.</div>}
+    </section>
+  </>;
+}
+
+const sheetPhaseLabels: Record<string, string> = {
+  validating: "실행 준비",
+  sheet_snapshot: "SQLite 읽기 전용 snapshot",
+  sheet_write_start: "임시 탭 쓰기 시작",
+  sheet_temp_tabs_created: "임시 탭 생성",
+  sheet_values_written: "값 쓰기 완료",
+  sheet_links_written: "하이퍼링크 쓰기 완료",
+  sheet_swap_completed: "공개 탭 교체 완료",
+  sheet_result: "동기화 검증 완료",
+  job_failed: "동기화 실패",
+  job_interrupted: "서버 중단 감지"
+};
+
+function SheetJobOutput({ events, result }: { events: JobEvent[]; result: Record<string, unknown> | null }) {
+  const resultEvent = [...events].reverse().find((event) => event.phase === "sheet_result");
+  return <>
+    <section className="sheet-summary-grid">
+      <article className="panel"><span>도서 목록</span><strong>{formatNumber(Number(result?.works_rows ?? 0))}</strong><small>작품 행</small></article>
+      <article className="panel"><span>수집 오류</span><strong>{formatNumber(Number(result?.error_rows ?? 0))}</strong><small>error 행</small></article>
+      <article className="panel"><span>방향</span><strong>단방향</strong><small>SQLite는 읽기 전용</small></article>
+      <article className="panel"><span>경과</span><strong>{formatDuration(resultEvent?.elapsed_seconds)}</strong><small>{eventText(result?.synced_at) || "동기화 시각 대기"}</small></article>
+    </section>
+    <section className="panel sheet-timeline-panel">
+      <div className="panel-title"><div><span className="eyebrow">SHEET TIMELINE</span><h2>안전 교체 단계</h2></div><span>기존 Spreadsheet 링크 유지</span></div>
+      <div className="sheet-timeline">{events.map((event, index) => <article key={`${event.recorded_at}-${event.phase}-${index}`}>
+        <i className={`folderling-dot folderling-dot-${eventText(event.status) || (event.phase === "job_failed" ? "failed" : "succeeded")}`} />
+        <div><strong>{sheetPhaseLabels[event.phase] ?? event.phase}</strong><small>{new Date(event.recorded_at).toLocaleTimeString("ko-KR")}</small></div>
+        {event.works_rows !== undefined && <span>도서 {formatNumber(Number(event.works_rows))}행</span>}
+        {event.error_rows !== undefined && <span>오류 {formatNumber(Number(event.error_rows))}행</span>}
+        {Boolean(event.error_message) && <p className="blocked">{eventText(event.error_message)}</p>}
+      </article>)}</div>
+    </section>
+  </>;
+}
+
+function JobDetail() {
+  const { jobId = "" } = useParams();
+  const [job, setJob] = useState<JobRecord>();
+  const [log, setLog] = useState("");
+  const [events, setEvents] = useState<JobEvent[]>([]);
+  const [filter, setFilter] = useState("");
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const load = () => {
+    Promise.all([
+      api<JobRecord>(`/api/jobs/${jobId}`),
+      api<{ job_id: string; text: string }>(`/api/jobs/${jobId}/log`),
+      api<{ job_id: string; items: JobEvent[] }>(`/api/jobs/${jobId}/events`)
+    ]).then(([record, logResult, eventResult]) => {
+      setJob(record);
+      setLog(logResult.text);
+      setEvents(eventResult.items);
+      setError("");
+    }).catch((reason) => setError(reason.message));
+  };
+  useEffect(() => {
+    load();
+  }, [jobId]);
+  useEffect(() => {
+    if (!job || ["succeeded", "failed", "needs_review", "interrupted"].includes(job.state)) return;
+    const id = window.setInterval(load, 1500);
+    return () => window.clearInterval(id);
+  }, [job?.state, jobId]);
+  if (error && !job) return <ErrorPanel message={error} retry={load} />;
+  if (!job) return <Loading />;
+  const percent = job.progress.total ? Math.round(job.progress.current / job.progress.total * 100) : 0;
+  const visibleLog = filter
+    ? log.split("\n").filter((line) => line.toLocaleLowerCase().includes(filter.toLocaleLowerCase())).join("\n")
+    : log;
+  const copy = async () => {
+    await navigator.clipboard.writeText(visibleLog);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
+  return <>
+    <PageHeader
+      eyebrow="JOB OUTPUT"
+      title={jobLabel(job.job_type)}
+      description={`작업 ID ${job.job_id}`}
+      action={<NavLink className="button secondary" to="/jobs">작업 이력</NavLink>}
+    />
+    {error && <div className="inline-error">{error}</div>}
+    <section className="job-detail-summary">
+      <article className="panel"><span>상태</span><strong className={`state-text state-text-${job.state}`}>{job.state}</strong><small>{job.message}</small></article>
+      <article className="panel"><span>현재 단계</span><strong>{job.stage}</strong><small>{job.updated_at ? new Date(job.updated_at).toLocaleString("ko-KR") : "-"}</small></article>
+      <article className="panel"><span>진행률</span><strong>{job.progress.total ? `${percent}%` : "대기"}</strong><small>{job.progress.current}/{job.progress.total}</small></article>
+    </section>
+    {job.progress.total > 0 && <div className="progress job-detail-progress"><i style={{ width: `${percent}%` }} /><small>{job.progress.current}/{job.progress.total}</small></div>}
+    {job.error && <section className="inline-error"><strong>{job.error.code}</strong><div>{job.error.message}</div></section>}
+    {job.job_type === "service_folderling" && <FolderlingJobOutput events={events} result={job.result} />}
+    {(job.job_type.startsWith("service_platform_") || job.job_type === "service_novelpia_auth_retry") && <PlatformJobOutput events={events} result={job.result} />}
+    {job.job_type === "service_google_sheet" && <SheetJobOutput events={events} result={job.result} />}
+    <details className="panel event-panel" open={job.job_type !== "service_folderling"}>
+      <summary className="panel-title"><div><span className="eyebrow">STRUCTURED EVENTS</span><h2>전체 구조화 이벤트</h2></div><span>{events.length}개 이벤트</span></summary>
+      {events.length ? <div className="event-list">{events.map((event, index) => <article key={`${event.recorded_at}-${index}`}>
+        <time>{new Date(event.recorded_at).toLocaleTimeString("ko-KR")}</time>
+        <strong>{String(event.phase ?? "event")}</strong>
+        <code>{JSON.stringify(event)}</code>
+      </article>)}</div> : <div className="empty">아직 구조화 이벤트가 없습니다.</div>}
+    </details>
+    {job.result && <section className="panel result-panel">
+      <div className="panel-title"><div><span className="eyebrow">RESULT</span><h2>완료 결과</h2></div></div>
+      <pre>{JSON.stringify(job.result, null, 2)}</pre>
+    </section>}
+    <section className="panel log-panel">
+      <div className="panel-title">
+        <div><span className="eyebrow">RAW LOG</span><h2>전체 원본 로그</h2></div>
+        <div className="log-actions">
+          <button className="button secondary" onClick={copy}>{copied ? "복사됨" : "복사"}</button>
+          <a className="button secondary" href={`/api/jobs/${job.job_id}/log/download`}>다운로드</a>
+        </div>
+      </div>
+      <input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="로그에서 검색" />
+      <pre>{visibleLog || "아직 로그가 없습니다."}</pre>
+    </section>
+  </>;
+}
+
 function JobList({ jobs, empty, detailed = false }: { jobs: JobRecord[]; empty: string; detailed?: boolean }) {
   if (!jobs.length) return <div className="empty">{empty}</div>;
   return <div className="job-list">{jobs.map((job) => {
     const percent = job.progress.total ? Math.round(job.progress.current / job.progress.total * 100) : 0;
-    return <article className="job" key={job.job_id}>
+    return <NavLink className="job job-link" to={`/jobs/${job.job_id}`} key={job.job_id}>
       <div className={`job-state state-${job.state}`}>{job.state}</div>
       <div className="job-main">
-        <strong>{job.job_type === "title_requeue" ? "제목 교정 재입고" : job.job_type === "volume_group_merge" ? "분권 묶기" : job.job_type}</strong>
+        <strong>{jobLabel(job.job_type)}</strong>
         <span>{job.message}</span>
         {job.progress.total > 0 && <div className="progress"><i style={{ width: `${percent}%` }} /><small>{job.progress.current}/{job.progress.total}</small></div>}
         {job.error && <div className="job-error">{job.error.message}</div>}
         {detailed && job.result && <div className="job-result">완료 결과가 저장되었습니다 · 작업 ID {job.job_id}</div>}
       </div>
       <time>{new Date(job.updated_at).toLocaleString("ko-KR")}</time>
-    </article>;
+    </NavLink>;
   })}</div>;
 }
 
