@@ -212,6 +212,11 @@ manifest, copy-verify-consume operation을 만든 뒤 `txt_temp/trash_bin/user_a
 `영구 삭제 실행`을 한 번 더 눌러야 하며, 자동 30일 삭제는 제공하지 않습니다. 삭제 후 파일 bytes는
 복구할 수 없지만 DB identity, fingerprint, 원래 격리 operation과 purge journal은 남습니다.
 
+상태 DB를 변경하는 작업은 실행 전 SQLite 백업을 만들며, `.dedup_state/backups`의 백업은 파일명이나
+작업 종류와 무관하게 최신 10개만 유지합니다. 승인·실행 중이거나 journal이 미완료인 작업이 참조하는
+백업은 개수 제한 밖에서도 보호합니다. 새 백업을 만들 때마다 같은 정책을 적용하므로 별도의 날짜 기반
+정리 작업은 필요하지 않습니다.
+
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
 읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로

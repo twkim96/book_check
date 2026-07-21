@@ -1389,6 +1389,71 @@ def transaction(conn: sqlite3.Connection, *, immediate: bool = True):
             raise
 
 
+STATE_BACKUP_RETENTION = 10
+
+
+def _is_state_backup(path: Path) -> bool:
+    """Return whether *path* is a managed SQLite backup file."""
+    return path.suffix == ".sqlite3"
+
+
+def protected_state_backup_paths(conn: sqlite3.Connection) -> set[str]:
+    """Return backups that are still required by an unfinished actual run."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT ar.backup_path
+        FROM actual_runs AS ar
+        WHERE ar.state IN ('approved', 'active')
+           OR EXISTS (
+               SELECT 1 FROM operations AS op
+               WHERE op.run_id = ar.run_id
+                 AND op.state IN ('planned', 'fs_done', 'db_done')
+           )
+        """
+    )
+    return {str(Path(row[0]).resolve()) for row in rows if row[0]}
+
+
+def prune_state_backups(
+    conn: sqlite3.Connection,
+    backup_dir: os.PathLike | str,
+    *,
+    keep_latest: int = STATE_BACKUP_RETENTION,
+) -> list[Path]:
+    """Keep a bounded global set of completed state DB backups.
+
+    Backups referenced by an unfinished actual run are retained even when that
+    exceeds ``keep_latest``. Symlinks and multiply-linked files are never removed.
+    """
+    if keep_latest < 1:
+        raise ValueError("keep_latest must be at least 1")
+
+    protected = protected_state_backup_paths(conn)
+    try:
+        entries = list(Path(backup_dir).iterdir())
+    except FileNotFoundError:
+        return []
+
+    candidates: list[tuple[int, Path]] = []
+    for path in entries:
+        if not _is_state_backup(path):
+            continue
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            continue
+        candidates.append((info.st_mtime_ns, path))
+
+    candidates.sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    retained = {str(path.resolve()) for _, path in candidates[:keep_latest]} | protected
+    removed: list[Path] = []
+    for _, path in candidates[keep_latest:]:
+        if str(path.resolve()) in retained:
+            continue
+        path.unlink()
+        removed.append(path)
+    return removed
+
+
 def backup_state_db(conn: sqlite3.Connection, backup_path: os.PathLike | str) -> Path:
     target = Path(backup_path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1410,6 +1475,8 @@ def backup_state_db(conn: sqlite3.Connection, backup_path: os.PathLike | str) ->
         raise
     else:
         destination.close()
+    if _is_state_backup(target) and target.parent.name == "backups":
+        prune_state_backups(conn, target.parent)
     return target
 
 

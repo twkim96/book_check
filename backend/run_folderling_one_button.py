@@ -3,7 +3,6 @@
 
 import argparse
 import sqlite3
-import stat
 import sys
 import uuid
 from datetime import datetime
@@ -17,7 +16,7 @@ from project_paths import PROJECT_ROOT, STATE_DB
 
 
 DEFAULT_STATE_DB = STATE_DB
-FOLDERLING_BACKUP_RETENTION = 10
+FOLDERLING_BACKUP_RETENTION = decision_store.STATE_BACKUP_RETENTION
 
 
 def build_parser():
@@ -59,50 +58,18 @@ def _schema_version(db_path):
 
 
 def _protected_backup_paths(conn):
-    rows = conn.execute(
-        """
-        SELECT DISTINCT ar.backup_path
-        FROM actual_runs AS ar
-        WHERE ar.state IN ('approved', 'active')
-           OR EXISTS (
-               SELECT 1 FROM operations AS op
-               WHERE op.run_id = ar.run_id
-                 AND op.state IN ('planned', 'fs_done', 'db_done')
-           )
-        """
-    )
-    return {str(Path(row[0]).resolve()) for row in rows if row[0]}
+    return decision_store.protected_state_backup_paths(conn)
 
 
 def _prune_folderling_backups(state_db_path, backup_dir, keep_latest=FOLDERLING_BACKUP_RETENTION):
-    """Bound completed-run backups without touching live recovery evidence."""
+    """Compatibility wrapper for the global managed-backup retention policy."""
     conn = decision_store.connect_state_db(state_db_path)
     try:
-        protected = _protected_backup_paths(conn)
+        return decision_store.prune_state_backups(
+            conn, backup_dir, keep_latest=keep_latest
+        )
     finally:
         conn.close()
-
-    candidates = []
-    try:
-        entries = list(Path(backup_dir).iterdir())
-    except FileNotFoundError:
-        return []
-    for path in entries:
-        if not path.name.startswith("before_folderling_") or path.suffix != ".sqlite3":
-            continue
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            continue
-        candidates.append((info.st_mtime_ns, path))
-    candidates.sort(reverse=True)
-    keep = {str(path.resolve()) for _, path in candidates[:keep_latest]} | protected
-    removed = []
-    for _, path in candidates[keep_latest:]:
-        if str(path.resolve()) in keep:
-            continue
-        path.unlink()
-        removed.append(path)
-    return removed
 
 
 def _close_unfinished_approval(state_db_path, reason):
