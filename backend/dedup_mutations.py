@@ -702,7 +702,8 @@ def user_quarantine(
     conn,
     *,
     source_file_id,
-    keep_file_id,
+    keep_file_id=None,
+    replacement_file_id=None,
     quarantine_dir,
     run_id,
     reason="user_approved_discard",
@@ -716,32 +717,60 @@ def user_quarantine(
     with mutation_lock(conn, f"user_quarantine:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
         source = _file_state(conn, source_file_id)
-        keep = _file_state(conn, keep_file_id)
-        if source_file_id == keep_file_id:
+        keep = _file_state(conn, keep_file_id) if keep_file_id else None
+        if keep_file_id and source_file_id == keep_file_id:
             raise ValueError("discard source and keep must differ")
-        if source["representative"]:
-            raise RuntimeError("representative file cannot be user-discarded")
-        if keep["source"] != "house":
+        if keep is not None and keep["source"] != "house":
             raise RuntimeError("user-discard keep file must already be in house")
+        replacement = _file_state(conn, replacement_file_id) if replacement_file_id else None
+        if source["representative"]:
+            if replacement is not None:
+                if (
+                    replacement["source"] != "house"
+                    or replacement["variant_id"] != source["variant_id"]
+                    or replacement_file_id == source_file_id
+                ):
+                    raise RuntimeError("replacement representative must be another active house file in the same variant")
+            else:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE variant_id = ? AND active = 1 AND file_id != ?",
+                    (source["variant_id"], source_file_id),
+                ).fetchone()[0]
+                if remaining:
+                    raise RuntimeError("representative replacement is required while the variant still has active files")
 
         source_root = "house_root" if source["source"] == "house" else "temp_root"
         decision_store.assert_actual_run_path(
             actual_run, source["canonical_path"], source_root
         )
-        decision_store.assert_actual_run_path(
-            actual_run, keep["canonical_path"], "house_root"
-        )
+        if keep is not None:
+            decision_store.assert_actual_run_path(
+                actual_run, keep["canonical_path"], "house_root"
+            )
+        if replacement is not None:
+            decision_store.assert_actual_run_path(
+                actual_run, replacement["canonical_path"], "house_root"
+            )
         decision_store.assert_actual_run_path(actual_run, quarantine_dir, "temp_root")
         source_path = _preflight(source)
-        keep_path = _preflight(keep)
+        keep_path = _preflight(keep) if keep is not None else None
+        replacement_path = _preflight(replacement) if replacement is not None else None
         source_evidence = inspect_regular_file(source_path)
-        keep_evidence = inspect_regular_file(keep_path)
+        keep_evidence = inspect_regular_file(keep_path) if keep_path is not None else None
+        replacement_evidence = (
+            inspect_regular_file(replacement_path) if replacement_path is not None else None
+        )
         decision_store.assert_manifest_source(
             actual_run, source_path, source_root, source_evidence
         )
-        decision_store.assert_manifest_source(
-            actual_run, keep_path, "house_root", keep_evidence
-        )
+        if keep_path is not None:
+            decision_store.assert_manifest_source(
+                actual_run, keep_path, "house_root", keep_evidence
+            )
+        if replacement_path is not None and replacement_path != keep_path:
+            decision_store.assert_manifest_source(
+                actual_run, replacement_path, "house_root", replacement_evidence
+            )
         destination = _unique_destination(quarantine_dir, source_path.name)
         with decision_store.transaction(conn):
             operation_id = decision_store.create_operation(
@@ -755,7 +784,9 @@ def user_quarantine(
                 expected_size=source["size"],
                 expected_mtime_ns=source["mtime_ns"],
                 expected_fingerprint_id=source["current_fingerprint_id"],
-                expected_keep_fingerprint_id=keep["current_fingerprint_id"],
+                expected_keep_fingerprint_id=(
+                    keep["current_fingerprint_id"] if keep is not None else None
+                ),
                 source_dev=source_evidence.dev,
                 source_ino=source_evidence.ino,
                 source_ctime_ns=source_evidence.ctime_ns,
@@ -765,13 +796,19 @@ def user_quarantine(
         def guard():
             decision_store.assert_active_actual_run(conn, run_id)
             current_source = _file_state(conn, source_file_id)
-            current_keep = _file_state(conn, keep_file_id)
+            current_keep = _file_state(conn, keep_file_id) if keep_file_id else None
             if current_source["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("user-discard source fingerprint changed")
-            if current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
+            if keep is not None and current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
                 raise RuntimeError("user-discard keep fingerprint changed")
-            if not evidence_matches(inspect_regular_file(keep_path), keep_evidence):
+            if keep_path is not None and not evidence_matches(inspect_regular_file(keep_path), keep_evidence):
                 raise RuntimeError("user-discard keep identity changed")
+            if replacement is not None:
+                current_replacement = _file_state(conn, replacement_file_id)
+                if current_replacement["current_fingerprint_id"] != replacement["current_fingerprint_id"]:
+                    raise RuntimeError("replacement representative fingerprint changed")
+                if not evidence_matches(inspect_regular_file(replacement_path), replacement_evidence):
+                    raise RuntimeError("replacement representative identity changed")
 
         destination_evidence = _copy_record_consume(
             conn,
@@ -782,6 +819,21 @@ def user_quarantine(
             guard=guard,
         )
         with decision_store.transaction(conn):
+            if source["representative"]:
+                if replacement is None:
+                    conn.execute(
+                        "DELETE FROM representatives WHERE variant_id = ? AND file_id = ?",
+                        (source["variant_id"], source_file_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE representatives SET file_id = ?, updated_at = CURRENT_TIMESTAMP WHERE variant_id = ? AND file_id = ?",
+                        (replacement_file_id, source["variant_id"], source_file_id),
+                    )
+                    conn.execute(
+                        "UPDATE files SET protected = 1 WHERE file_id = ?",
+                        (replacement_file_id,),
+                    )
             conn.execute(
                 """
                 UPDATE files SET canonical_path = ?, source = 'quarantine', active = 0,

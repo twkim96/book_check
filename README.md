@@ -74,7 +74,7 @@ python3 run_folderling_one_button.py --help
 1.2.8부터 `file_check`는 기존 컨트롤서버와 분리된 로컬 웹 서버를 제공합니다. 기본 주소는
 `http://127.0.0.1:9012`이며 외부망에 직접 노출하지 않습니다. 현재 화면에는 DB·index·입고
 대기 상태를 보여주는 대시보드, 플랫폼 `ok` 정보가 없는 파일의 수동 제목 교정, 분권 후보 검토,
-서비스 실행, 카탈로그·검토 큐, 작업 이력·보고서와 화면 설정이 있습니다.
+서비스 실행, 검토 큐를 흡수한 카탈로그, 작업 이력·보고서와 화면 설정이 있습니다.
 
 ## 동일 좌표 중복 재검사 (1.2.10)
 
@@ -99,6 +99,12 @@ Folderling은 현재 house 경로 집합, DB file identity, 저장된 제목 분
 경로를 사용하지 않고 기존 전체 Scanner로 자동 복귀합니다. doctor, backup, manifest, operation
 journal과 중복 판정 기준은 변경하지 않습니다. `NORMALIZER_VERSION`과 auditor cache 버전도
 제목 규칙 변경이 없으므로 유지해, 이전 실행에서 분석한 본문을 다시 읽지 않습니다.
+
+아직 입고하지 않을 묶음은 `txt_temp/hold` 아래에 보관합니다. Folderling, 중복 감사와 웹
+대시보드의 입고 대기 수는 `hold` 내부 전체를 제외하며, 밖으로 옮긴 항목만 다음 실행에서
+처리합니다. 기존 `___` 접두사 폴더·파일도 호환을 위해 같은 보류 규칙을 적용하지만, 새 보류는
+폴더명 규칙에 의존하지 않는 `hold` 사용을 권장합니다. house의 일반 `hold` 폴더에는 이 규칙을
+적용하지 않습니다.
 
 기존 분권 폴더와 같은 좌표의 파일이 temp에 남았지만 본문이 달라 중복으로 확정되지 않은
 경우에는 해당 파일만 `trash_bin/warning/volume_coordinate_conflicts`에 journaled hold합니다.
@@ -177,6 +183,33 @@ fingerprint가 갱신된 같은 파일쌍은 오래된 open review를 `supersede
 16,000개 이상 운영 규모를 위해 파일·작품 목록은 SQLite read model에서 페이지 단위로 읽습니다.
 폴더 목록은 DB projection을 짧게 캐시하고 사용자가 `실제 상태 갱신`을 눌렀을 때 명시적으로 새로
 계산합니다. 실제 폴더와 격리 파일 순회는 상세 확인 또는 격리 탭에서만 안전 상한을 두고 수행합니다.
+
+### 사람 관계 판정과 격리 관리 (1.3.2)
+
+파일 탐색기에서 두 파일을 선택하면 현재 fingerprint에 묶인 다음 관계를 저장할 수 있습니다.
+
+- `같은 내용`: 같은 variant로 연결
+- `같은 작품의 다른 판본·부속`: 같은 work의 별도 variant로 보존
+- `제목만 같은 다른 작품`: 서로 다른 work로 분리
+
+판정은 실행 전 두 파일의 현재 identity와 계획 SHA-256을 다시 확인하며, 판단 정정은 이전 decision을
+지우지 않고 supersedes 이력으로 남깁니다. 아직 다른 파일과 공유되지 않은 최초 관계는 UI에서 취소할
+수 있습니다.
+
+`사용자 승인 격리`는 자동 동일 파일 판정과 별개입니다. 불필요한 판본을 선택하면 DB backup, 선택 파일
+manifest, copy-verify-consume operation을 만든 뒤 `txt_temp/trash_bin/user_approved_discard`로 옮깁니다.
+대표 파일을 격리할 때 같은 variant의 다른 활성 파일이 있으면 그 파일을 새 대표로 지정하고, 마지막
+파일이면 활성 파일 유무로 variant/work 퇴역 영향을 표시합니다. 격리 후 index는 DB projection에서 다시
+동기화합니다.
+
+격리 탭의 `중복 아님 복원`은 원래 경로가 비어 있을 때만 동작합니다. 비교할 활성 파일과
+`same_work_distinct_variant` 또는 `distinct_work` 판단을 반드시 함께 저장하므로 같은 fingerprint 근거로
+즉시 다시 격리되지 않습니다. 목적지가 이미 있으면 자동 suffix나 덮어쓰기를 하지 않고 차단합니다.
+
+영구 삭제는 실제 bytes와 operation 소유권, quarantined fingerprint, keep 파일/decision을 다시 검증한
+선택 항목만 대상으로 합니다. 목록에서 대상을 선택한 뒤 모달에 표시되는 항목 수와 용량을 확인하고
+`영구 삭제 실행`을 한 번 더 눌러야 하며, 자동 30일 삭제는 제공하지 않습니다. 삭제 후 파일 bytes는
+복구할 수 없지만 DB identity, fingerprint, 원래 격리 operation과 purge journal은 남습니다.
 
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제

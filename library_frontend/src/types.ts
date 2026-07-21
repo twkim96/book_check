@@ -366,6 +366,7 @@ export interface ExplorerFile {
   raw_sha256: string | null;
   normalized_sha256: string | null;
   normalized_length: number | null;
+  open_review_count: number;
   retired_virtual_path: boolean;
 }
 
@@ -409,7 +410,7 @@ export interface ExplorerFileDetail {
   decisions: ExplorerHistoryItem[];
   operations: ExplorerHistoryItem[];
   same_coordinate: Array<{ file_id: string; canonical_path: string; size: number; source: string; active: number; author: string | null }>;
-  actions: { compare: boolean; title_correction: boolean; quarantine: false; move: false; blocked_reasons: string[]; future_version: string };
+  actions: { compare: boolean; title_correction: boolean; quarantine: boolean; move: false; blocked_reasons: string[]; quarantine_blocked_reasons: string[]; future_version: string };
   readonly: true;
 }
 
@@ -482,9 +483,13 @@ export interface ExplorerFolderDetail {
 
 export interface ExplorerQuarantineItem {
   operation_id: number | null;
+  file_id?: string | null;
+  keep_file_id?: string | null;
   action: string | null;
   source_path: string | null;
+  source_size: number | null;
   keep_path: string | null;
+  keep_size: number | null;
   name: string;
   path: string;
   category: string;
@@ -493,9 +498,84 @@ export interface ExplorerQuarantineItem {
   modified_at: number | null;
   age_days: number | null;
   tracked: boolean;
-  restore_available: false;
-  purge_available: false;
-  future_version: string;
+  restore_available: boolean;
+  purge_available: boolean;
+  future_version: string | null;
+  operation_state?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  related_files: Array<{
+    file_id: string;
+    name: string;
+    path: string;
+    size: number;
+    bases: string[];
+    confidence: "kept" | "confirmed" | "candidate";
+  }>;
+}
+
+export interface RelationshipPlan {
+  version: "1.3.2";
+  kind: "relationship";
+  item_count: number;
+  left: ExplorerFile & Record<string, unknown>;
+  right: ExplorerFile & Record<string, unknown>;
+  verdict: "same_content" | "same_work_distinct_variant" | "distinct_work";
+  variant_kind: string;
+  note: string;
+  existing_decision: (ExplorerHistoryItem & { decision_id: number; verdict: string }) | null;
+  mode: "new" | "correction";
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
+export interface QuarantinePlan {
+  version: "1.3.2";
+  kind: "user_quarantine";
+  item_count: 1;
+  source: ExplorerFile & Record<string, unknown>;
+  keep: (ExplorerFile & Record<string, unknown>) | null;
+  replacement_representative: (ExplorerFile & Record<string, unknown>) | null;
+  remaining_variant_files: number;
+  retired_variant: boolean;
+  retired_work: boolean;
+  destination_root: string;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
+export interface RestorePlan {
+  version: "1.3.2";
+  kind: "quarantine_restore";
+  item_count: 1;
+  operation_id: number;
+  source: ExplorerFile & Record<string, unknown>;
+  reference: (ExplorerFile & Record<string, unknown>) | null;
+  quarantine_path: string;
+  destination_path: string;
+  verdict: "same_work_distinct_variant" | "distinct_work";
+  note: string;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
+export interface PurgePlan {
+  version: "1.3.2";
+  kind: "quarantine_purge";
+  item_count: number;
+  total_size: number;
+  items: Array<{ operation_id: number; file_id: string; name: string; path: string; size: number; keep_path?: string | null; age_days: number | null; blocked_reasons: string[] }>;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  irreversible: true;
+  readonly: true;
 }
 
 export interface ExplorerQuarantineListing {

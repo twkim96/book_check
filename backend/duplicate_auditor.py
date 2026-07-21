@@ -29,8 +29,8 @@ from normalizer import (
     is_supported_file,
     normalize_filename,
     normalize_nfc,
-    should_exclude_dir,
-    should_exclude_file,
+    should_exclude_intake_dir,
+    should_exclude_intake_file,
     strip_trash_suffix,
 )
 from text_preview import (
@@ -315,12 +315,12 @@ def scan_temp_entries(temp_root, include_pass=False):
                 continue
             if directory.lower() == "pass" and include_pass:
                 kept_dirs.append(directory)
-            elif not should_exclude_dir(directory):
+            elif not should_exclude_intake_dir(directory):
                 kept_dirs.append(directory)
         dirs[:] = kept_dirs
 
         for filename in sorted(files):
-            if should_exclude_file(filename):
+            if should_exclude_intake_file(filename):
                 continue
             path = current_path / filename
             rel_path = normalize_nfc(str(path.relative_to(root)))

@@ -24,6 +24,12 @@ EXCLUDED_DIR_NAMES = {
     "__pycache__",
 }
 
+# ``txt_temp/hold`` is the explicit intake staging area. ``___`` remains a
+# compatibility marker for older batches. Both rules are temp/intake-only so
+# a legitimate house folder named ``hold`` is still indexed normally.
+INTAKE_HOLD_DIR_NAME = "hold"
+LEGACY_INTAKE_HOLD_PREFIX = "___"
+
 SUPPORTED_EXTENSIONS = {".txt", ".epub", ".pdf"}
 
 SOURCE_SITE_TAG_RE = re.compile(
@@ -300,6 +306,28 @@ def should_exclude_dir(name):
 def should_exclude_file(name):
     normalized = normalize_nfc(name).strip()
     return not normalized or normalized.startswith(".") or normalized == "Icon\r"
+
+
+def is_intake_hold_name(name):
+    """Return whether a temp item explicitly opts out of Folderling intake."""
+    normalized = normalize_nfc(name).strip()
+    return bool(normalized) and (
+        normalized.casefold() == INTAKE_HOLD_DIR_NAME
+        or normalized.startswith(LEGACY_INTAKE_HOLD_PREFIX)
+    )
+
+
+def should_exclude_intake_dir(name):
+    """Temp-only directory exclusion shared by intake, audit, and UI counts."""
+    return should_exclude_dir(name) or is_intake_hold_name(name)
+
+
+def should_exclude_intake_file(name):
+    """Exclude hidden files and legacy ``___``-prefixed held files in temp."""
+    normalized = normalize_nfc(name).strip()
+    return should_exclude_file(normalized) or normalized.startswith(
+        LEGACY_INTAKE_HOLD_PREFIX
+    )
 
 
 def is_supported_file(name):

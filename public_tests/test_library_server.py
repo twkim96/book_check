@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import decision_store
+from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_jobs import JobActiveError, JobRunner, JobStore
 from library_server import create_app
 
@@ -270,6 +271,52 @@ def test_readonly_explorer_routes_expose_file_folder_and_quarantine(tmp_path):
     assert client.get("/api/explorer/compare", query_string={"left": file_id}).status_code == 400
 
 
+def test_management_relationship_preview_and_apply_routes(tmp_path):
+    app, first_id = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    second_path = config.house_dir / "수동 교정 작품 extra.txt"
+    second_path.write_text("서로 다른 extra 본문", encoding="utf-8")
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        _ensure_intake_fingerprint(conn, _file_state(conn, first_id))
+        with decision_store.transaction(conn):
+            second = decision_store.reconcile_file_metadata(conn, second_path, source="house")
+        _ensure_intake_fingerprint(conn, _file_state(conn, second["file_id"]))
+    finally:
+        conn.close()
+
+    payload = {
+        "left_file_id": first_id,
+        "right_file_id": second["file_id"],
+        "verdict": "same_work_distinct_variant",
+        "variant_kind": "other",
+        "note": "API fixture",
+    }
+    client = app.test_client()
+    preview = client.post("/api/management/relationships/preview", json=payload)
+    assert preview.status_code == 200
+    plan = preview.get_json()["data"]
+    assert plan["apply_available"] is True
+
+    applied = client.post(
+        "/api/management/relationships/apply",
+        json={
+            **payload,
+            "confirm_count": plan["item_count"],
+            "confirm_plan_sha256": plan["plan_sha256"],
+        },
+    )
+    assert applied.status_code == 200
+    assert applied.get_json()["data"]["decision_id"]
+
+    quarantine = client.post(
+        "/api/management/quarantine/preview",
+        json={"source_file_id": first_id, "keep_file_id": second["file_id"]},
+    )
+    assert quarantine.status_code == 200
+    assert quarantine.get_json()["data"]["apply_available"] is True
+
+
 def test_readonly_review_queue_lists_managed_warning_files(tmp_path):
     app, _ = _server_fixture(tmp_path)
     config = app.config["library_server_config"]
@@ -304,6 +351,12 @@ def test_dashboard_pending_matches_folderling_intake_exclusions(tmp_path):
     nested.mkdir()
     (nested / "intake.epub").write_text("book", encoding="utf-8")
     (config.temp_dir / "direct.txt").write_text("book", encoding="utf-8")
+    held = config.temp_dir / "hold" / "20260701 완결"
+    held.mkdir(parents=True)
+    (held / "held.txt").write_text("book", encoding="utf-8")
+    legacy_held = config.temp_dir / "___기존 보류"
+    legacy_held.mkdir()
+    (legacy_held / "held.epub").write_text("book", encoding="utf-8")
 
     dashboard = app.test_client().get("/api/dashboard").get_json()["data"]
     assert dashboard["filesystem"]["folderling_pending"] == 2

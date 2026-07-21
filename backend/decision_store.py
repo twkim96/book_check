@@ -1006,7 +1006,7 @@ def _manifest_lookup_from_records(records):
     return lookup
 
 
-def prepare_actual_run(path, house_dir, temp_dir):
+def prepare_actual_run(path, house_dir, temp_dir, *, manifest_paths=None):
     """Consume one approval before any filesystem mutation and record its manifest."""
     ready, reason = verify_state_db_ready(path)
     if not ready:
@@ -1057,11 +1057,33 @@ def prepare_actual_run(path, house_dir, temp_dir):
     try:
         records = []
         manifest_keys = set()
-        for label, root_value in (("house", house_dir), ("temp", temp_dir)):
+        roots = (("house", house_dir), ("temp", temp_dir))
+        selected = None
+        if manifest_paths is not None:
+            selected = []
+            for value in manifest_paths:
+                item = Path(value).expanduser().resolve()
+                matched = None
+                for label, root_value in roots:
+                    root = Path(root_value).resolve()
+                    try:
+                        item.relative_to(root)
+                    except ValueError:
+                        continue
+                    matched = (label, root, item)
+                    break
+                if matched is None:
+                    raise RuntimeError(f"targeted manifest path is outside approved roots: {item}")
+                selected.append(matched)
+        for label, root_value in roots:
             root = Path(root_value).resolve()
             if not root.exists():
                 continue
-            for item in sorted(root.rglob("*")):
+            items = (
+                sorted(item for item_label, _, item in selected if item_label == label)
+                if selected is not None else sorted(root.rglob("*"))
+            )
+            for item in items:
                 if item.is_file() and not item.is_symlink():
                     item_stat = item.stat()
                     raw_rel_path = item.relative_to(root).as_posix()
@@ -2178,6 +2200,65 @@ def _recover_interrupted_purge_operation(conn: sqlite3.Connection, operation_id:
     return "failed"
 
 
+def _recover_interrupted_quarantine_restore(conn: sqlite3.Connection, operation_id: int) -> str:
+    row = conn.execute("SELECT * FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
+    if row is None:
+        raise KeyError(operation_id)
+    if row["action"] != "user_quarantine_restore":
+        raise ValueError("operation is not a quarantine restore")
+    if row["state"] not in {"planned", "fs_done", "db_done"}:
+        return row["state"]
+    source = Path(row["source_path"])
+    destination = Path(row["dest_path"])
+    actual_run = _actual_run_for_operation(conn, row["run_id"])
+    assert_actual_run_path(actual_run, source, "temp_root")
+    assert_actual_run_path(actual_run, destination, "house_root")
+    source_exists, destination_exists = source.exists(), destination.exists()
+    if row["state"] in {"planned", "fs_done"}:
+        if source_exists and not _owned_operation_path(row, source, "source"):
+            with transaction(conn):
+                transition_operation(conn, operation_id, "stale", error="restore source identity mismatch")
+            return "stale"
+        if destination_exists and not _owned_operation_path(row, destination, "destination"):
+            with transaction(conn):
+                transition_operation(conn, operation_id, "stale", error="restore destination identity mismatch")
+            return "stale"
+        if source_exists and destination_exists:
+            from mutation_io import unlink_owned
+            unlink_owned(destination, expected=_operation_evidence(row, "destination"))
+            with transaction(conn):
+                transition_operation(conn, operation_id, "rolled_back")
+            return "rolled_back"
+        if not source_exists and destination_exists:
+            _rollback_owned_destination(conn, row, destination, source, "quarantine")
+            with transaction(conn):
+                conn.execute("UPDATE files SET active = 0 WHERE file_id = ?", (row["file_id"],))
+            return "rolled_back"
+        if source_exists and not destination_exists:
+            _finalize_existing_source_rollback(conn, row, source, "quarantine")
+            with transaction(conn):
+                conn.execute("UPDATE files SET active = 0 WHERE file_id = ?", (row["file_id"],))
+            return "rolled_back"
+        with transaction(conn):
+            transition_operation(conn, operation_id, "failed", error="both restore paths missing")
+        return "failed"
+    file_row = conn.execute(
+        "SELECT canonical_path, source, active FROM files WHERE file_id = ?", (row["file_id"],)
+    ).fetchone()
+    if (
+        file_row is not None and file_row["canonical_path"] == str(destination)
+        and file_row["source"] == "house" and file_row["active"] == 1
+        and destination_exists and not source_exists
+        and _owned_operation_path(row, destination, "destination")
+    ):
+        with transaction(conn):
+            transition_operation(conn, operation_id, "committed")
+        return "committed"
+    with transaction(conn):
+        transition_operation(conn, operation_id, "failed", error="db_done restore state mismatch")
+    return "failed"
+
+
 def recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) -> str:
     from mutation_io import mutation_lock
     row = conn.execute(
@@ -2208,6 +2289,8 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
         return _recover_interrupted_queue_operation(conn, operation_id)
     if row["action"] == "quarantine_purge":
         return _recover_interrupted_purge_operation(conn, operation_id)
+    if row["action"] == "user_quarantine_restore":
+        return _recover_interrupted_quarantine_restore(conn, operation_id)
     raise ValueError(f"unsupported recovery action: {row['action']}")
 
 
@@ -3862,11 +3945,11 @@ def _managed_relationship_matches(conn, candidate, reference, verdict):
     return candidate_work != reference_work
 
 
-def _assert_no_active_actual_run(conn):
+def _assert_no_active_actual_run(conn, *, allowed_active_run_id=None):
     row = conn.execute(
         "SELECT run_id FROM actual_runs WHERE state = 'active' LIMIT 1"
     ).fetchone()
-    if row is not None:
+    if row is not None and row["run_id"] != allowed_active_run_id:
         raise RuntimeError(
             f"human decision state cannot change during active run: {row['run_id']}"
         )
@@ -3882,8 +3965,9 @@ def apply_decision(
     variant_kind: str = "other",
     note: Optional[str] = None,
     supersedes_decision_id: Optional[int] = None,
+    allowed_active_run_id: Optional[str] = None,
 ) -> int:
-    _assert_no_active_actual_run(conn)
+    _assert_no_active_actual_run(conn, allowed_active_run_id=allowed_active_run_id)
     if verdict not in FINAL_VERDICTS:
         raise ValueError(f"unknown final verdict: {verdict}")
     if variant_kind not in {"base", "revision", "adult", "translation", "other"}:

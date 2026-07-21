@@ -70,15 +70,15 @@ def _fixture(tmp_path):
             conn.execute(
                 """
                 INSERT INTO operations(
-                    run_id, action, source_path, quarantine_path, file_id,
+                    run_id, action, source_path, quarantine_path, file_id, keep_file_id,
                     expected_size, expected_mtime_ns, expected_fingerprint_id,
-                    state
-                ) VALUES ('fixture-run', 'user_quarantine', ?, ?, ?, ?, ?, ?, 'committed')
+                    expected_keep_fingerprint_id, state
+                ) VALUES ('fixture-run', 'user_quarantine', ?, ?, ?, ?, ?, ?, ?, ?, 'committed')
                 """,
                 (
                     str(house / "ㄱ" / "버린 판본.txt"), str(quarantined),
-                    qrow["file_id"], quarantined.stat().st_size,
-                    quarantined.stat().st_mtime_ns, qfp,
+                    qrow["file_id"], ids[0], quarantined.stat().st_size,
+                    quarantined.stat().st_mtime_ns, qfp, left_fp,
                 ),
             )
         return state_db, house, temp, ids, folder, quarantined, untracked
@@ -120,7 +120,7 @@ def test_file_explorer_detail_and_compare_are_readonly(tmp_path):
     detail = file_detail(state_db, ids[0])
     assert detail["file"]["core_title"] == "검사작품"
     assert detail["reviews"][0]["evidence"] == {"fixture": True}
-    assert detail["actions"]["quarantine"] is False
+    assert detail["actions"]["quarantine"] is True
     comparison = compare_files(state_db, ids[0], ids[1])
     assert comparison["comparison"]["same_raw_sha256"] is True
     assert comparison["latest_review"]["classification"] == "metadata_only"
@@ -156,12 +156,54 @@ def test_quarantine_explorer_shows_tracked_and_untracked_bytes(tmp_path):
     assert tracked["tracked"] is True
     assert tracked["physical_state"] == "present"
     assert tracked["source_path"].endswith("버린 판본.txt")
-    assert tracked["restore_available"] is False
+    assert tracked["source_size"] == quarantined.stat().st_size
+    assert tracked["keep_size"] == (house / "ㄱ" / "검사 작품" / "검사 작품 1권.txt").stat().st_size
+    assert tracked["related_files"][0]["file_id"]
+    assert tracked["related_files"][0]["bases"][0] == "keep"
+    assert tracked["restore_available"] is True
+    assert tracked["purge_available"] is True
     assert by_path[str(untracked.resolve())]["physical_state"] == "untracked"
     assert listing["summary"]["present"] == 1
     assert listing["summary"]["untracked"] == 1
 
     assert _snapshot(state_db, house, temp) == before
+
+
+def test_quarantine_explorer_lists_actionable_quarantine_before_review_queue(tmp_path):
+    state_db, _, temp, _, _, quarantined, _ = _fixture(tmp_path)
+    warning = temp / "trash_bin" / "warning" / "최신 검토 큐.txt"
+    warning.parent.mkdir(parents=True)
+    warning.write_text("검토 큐 본문", encoding="utf-8")
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            row = decision_store.reconcile_file_metadata(conn, warning, source="queue")
+        fingerprint = _ensure_intake_fingerprint(conn, _file_state(conn, row["file_id"]))
+        with decision_store.transaction(conn):
+            conn.execute(
+                """
+                INSERT INTO operations(
+                    run_id, action, source_path, dest_path, file_id, state,
+                    expected_size, expected_mtime_ns, expected_fingerprint_id,
+                    created_at, updated_at
+                ) VALUES ('newer-review-run', 'warning_move', ?, ?, ?, 'committed', ?, ?, ?,
+                          '2099-01-01 00:00:00', '2099-01-01 00:00:00')
+                """,
+                (
+                    str(temp / "최신 검토 큐.txt"), str(warning), row["file_id"],
+                    warning.stat().st_size, warning.stat().st_mtime_ns,
+                    fingerprint["current_fingerprint_id"],
+                ),
+            )
+    finally:
+        conn.close()
+
+    listing = quarantine_listing(state_db, temp)
+
+    assert listing["items"][0]["path"] == str(quarantined.resolve())
+    assert listing["items"][0]["purge_available"] is True
+    queued = next(item for item in listing["items"] if item["path"] == str(warning.resolve()))
+    assert queued["purge_available"] is False
 
 
 def test_file_explorer_marks_retired_virtual_paths_as_history_only(tmp_path):

@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useParams, useSearchParams } from "react-router-dom";
 
 import { ApiError, api, postJson } from "./api";
 import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
@@ -75,7 +75,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.1</small>
+            <small>file_check 1.3.2</small>
           </div>
         </div>
         <nav>
@@ -84,7 +84,6 @@ function Shell() {
           <NavLink to="/catalog">카탈로그</NavLink>
           <NavLink to="/review/titles">제목 교정</NavLink>
           <NavLink to="/review/volumes">분권 묶기</NavLink>
-          <NavLink to="/review/queue">검토 큐</NavLink>
           <NavLink to="/jobs">작업 이력</NavLink>
           <NavLink to="/reports/dedup">Folderling 보고서</NavLink>
           <NavLink to="/settings">설정</NavLink>
@@ -99,7 +98,7 @@ function Shell() {
           <Route path="/catalog" element={<Catalog />} />
           <Route path="/review/titles" element={<TitleReview />} />
           <Route path="/review/volumes" element={<VolumeReview />} />
-          <Route path="/review/queue" element={<ReviewQueue />} />
+          <Route path="/review/queue" element={<Navigate to="/catalog?tab=files&source=review" replace />} />
           <Route path="/jobs" element={<Jobs />} />
           <Route path="/jobs/:jobId" element={<JobDetail />} />
           <Route path="/reports/dedup" element={<DedupReports />} />
@@ -359,13 +358,13 @@ function ServiceRunButton({ service, source }: {
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const navigate = useNavigate();
+  const [jobNotice, setJobNotice] = useState<JobRecord>();
   const run = async () => {
     setBusy(true);
     setError("");
     try {
       const job = await postJson<JobRecord>(`/api/services/${service.id}/start`, { source });
-      navigate(`/jobs/${job.job_id}`);
+      setJobNotice(job);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "서비스를 시작하지 못했습니다.");
     } finally {
@@ -380,6 +379,7 @@ function ServiceRunButton({ service, source }: {
       onClick={run}
     >{busy ? "등록 중…" : "실행"}</button>
     {error && <small className="control-error">{error}</small>}
+    {jobNotice && <small className="control-success">작업 시작됨 · <NavLink to={`/jobs/${jobNotice.job_id}`}>이력 열기</NavLink></small>}
   </div>;
 }
 
@@ -484,7 +484,6 @@ function TitleReview() {
   const [planning, setPlanning] = useState(false);
   const [pendingJob, setPendingJob] = useState<PendingTitleJob>();
   const [jobNotice, setJobNotice] = useState<{ job_id: string; message: string }>();
-  const navigate = useNavigate();
 
   const load = (preservePosition = false) => {
     const params = new URLSearchParams({
@@ -559,7 +558,7 @@ function TitleReview() {
     }
   };
 
-  const applyPlan = async (moveToHistory: boolean) => {
+  const applyPlan = async () => {
     if (!plan) return;
     const appliedChanges = [...selectedChanges];
     setPlanning(true);
@@ -570,19 +569,15 @@ function TitleReview() {
         confirm_plan_sha256: plan.plan_sha256
       });
       setPlan(undefined);
-      if (moveToHistory) {
-        navigate(`/jobs/${job.job_id}`);
-      } else {
-        setJobNotice({ job_id: job.job_id, message: "제목 교정 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
-        setPendingJob({ job_id: job.job_id, file_ids: appliedChanges.map((change) => change.file_id) });
-        const appliedIds = new Set(appliedChanges.map((change) => change.file_id));
-        setDrafts((current) => Object.fromEntries(
-          Object.entries(current).map(([fileId, draft]) => [
-            fileId,
-            appliedIds.has(fileId) ? { ...draft, selected: false } : draft
-          ])
-        ));
-      }
+      setJobNotice({ job_id: job.job_id, message: "제목 교정 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
+      setPendingJob({ job_id: job.job_id, file_ids: appliedChanges.map((change) => change.file_id) });
+      const appliedIds = new Set(appliedChanges.map((change) => change.file_id));
+      setDrafts((current) => Object.fromEntries(
+        Object.entries(current).map(([fileId, draft]) => [
+          fileId,
+          appliedIds.has(fileId) ? { ...draft, selected: false } : draft
+        ])
+      ));
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === "confirmation_stale") {
         setError("파일이나 DB 상태가 바뀌었습니다. 계획을 다시 확인하세요.");
@@ -767,8 +762,7 @@ function TitleRow({ item, draft, pending, onChange }: { item: TitleCase; draft?:
   );
 }
 
-function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: boolean; onClose: () => void; onApply: (moveToHistory: boolean) => void }) {
-  const [moveToHistory, setMoveToHistory] = useState(false);
+function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: boolean; onClose: () => void; onApply: () => void }) {
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="plan-title">
@@ -783,13 +777,9 @@ function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: b
         <div className="plan-list">
           {plan.items.map((item) => <div key={item.file_id}><span>{item.current_name}</span><b>→</b><strong>{item.materialized_candidate_name}</strong></div>)}
         </div>
-        <label className="plan-history-option">
-          <input type="checkbox" checked={moveToHistory} onChange={(event) => setMoveToHistory(event.target.checked)} />
-          <span><strong>실행 후 작업 이력으로 이동</strong><small>체크하지 않으면 현재 검색·페이지·입력 위치를 유지합니다.</small></span>
-        </label>
         <footer>
           <button className="button secondary" disabled={busy} onClick={onClose}>취소</button>
-          <button className="button danger" disabled={busy || !plan.runnable} onClick={() => onApply(moveToHistory)}>{busy ? "등록 중…" : "확인하고 실행"}</button>
+          <button className="button danger" disabled={busy || !plan.runnable} onClick={onApply}>{busy ? "등록 중…" : "확인하고 실행"}</button>
         </footer>
       </section>
     </div>
@@ -848,7 +838,6 @@ function VolumeReview() {
   const [pendingJob, setPendingJob] = useState<PendingVolumeJob>();
   const [jobNotice, setJobNotice] = useState<{ job_id: string; message: string }>();
   const [error, setError] = useState("");
-  const navigate = useNavigate();
 
   const resetPage = () => {
     setCursor(null);
@@ -904,12 +893,8 @@ function VolumeReview() {
     };
   }, [pendingJob?.job_id, submittedSearch, classification, sort, direction, cursor]);
 
-  const handleJobStarted = (job: JobRecord, moveToHistory: boolean) => {
+  const handleJobStarted = (job: JobRecord) => {
     setActiveCase(undefined);
-    if (moveToHistory) {
-      navigate(`/jobs/${job.job_id}`);
-      return;
-    }
     setJobNotice({ job_id: job.job_id, message: "분권 묶기 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
     setPendingJob({ job_id: job.job_id });
   };
@@ -1005,14 +990,13 @@ function VolumeReview() {
   );
 }
 
-function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase; onClose: () => void; onStarted: (job: JobRecord, moveToHistory: boolean) => void }) {
+function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase; onClose: () => void; onStarted: (job: JobRecord) => void }) {
   const [selected, setSelected] = useState(() => new Set(value.items.map((item) => item.file_id)));
   const [folderName, setFolderName] = useState(value.target_folder_name);
   const [allowDuplicateCoordinates, setAllowDuplicateCoordinates] = useState(false);
   const [preview, setPreview] = useState<VolumePreview>();
   const [busy, setBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
-  const [moveToHistory, setMoveToHistory] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -1057,7 +1041,7 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
         confirm_count: preview.item_count,
         confirm_plan_sha256: preview.plan_sha256
       });
-      onStarted(job, moveToHistory);
+      onStarted(job);
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === "confirmation_stale") {
         setError("파일이나 DB 상태가 바뀌었습니다. 미리보기를 다시 확인하세요.");
@@ -1139,10 +1123,6 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
       {preview?.apply_available && <label className="volume-confirm">
         <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
         파일 {preview.item_count}개와 결과 폴더를 확인했습니다
-      </label>}
-      {preview?.apply_available && <label className="plan-history-option">
-        <input type="checkbox" checked={moveToHistory} onChange={(event) => setMoveToHistory(event.target.checked)} />
-        <span><strong>실행 후 작업 이력으로 이동</strong><small>체크하지 않으면 현재 검색·페이지 위치를 유지하고 완료 후 목록만 갱신합니다.</small></span>
       </label>}
     </section>
   </div>;

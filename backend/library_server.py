@@ -26,6 +26,17 @@ from library_explorer import (
     quarantine_listing,
 )
 from library_jobs import JobActiveError, JobRunner, JobStore
+from library_management import (
+    apply_purge,
+    apply_quarantine,
+    apply_relationship,
+    apply_restore,
+    cancel_relationship,
+    purge_preview,
+    quarantine_preview,
+    relationship_preview,
+    restore_preview,
+)
 from library_reports import (
     dedup_report_listing,
     dedup_report_path,
@@ -38,11 +49,11 @@ from library_review import (
     VolumeGroupProvider,
 )
 from library_services import LibraryServiceRegistry, ServiceBlocked
-from normalizer import should_exclude_dir, should_exclude_file
+from normalizer import should_exclude_intake_dir, should_exclude_intake_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.3.1"
+SERVER_VERSION = "1.3.2"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -82,12 +93,12 @@ def _count_supported(root: Path, *, intake_only: bool = False) -> int:
             directories[:] = [
                 name
                 for name in directories
-                if not should_exclude_dir(name)
+                if not should_exclude_intake_dir(name)
                 and not (Path(current) / name).is_symlink()
             ]
         for filename in filenames:
             path = Path(current) / filename
-            if intake_only and should_exclude_file(filename):
+            if intake_only and should_exclude_intake_file(filename):
                 continue
             if (
                 path.is_file()
@@ -183,8 +194,8 @@ def dashboard_snapshot(config: LibraryServerConfig, runner: JobRunner) -> dict:
         next_actions.append({
             "code": "review_queue",
             "label": f"검토 큐 {warning_files + pending_reviews:,}건",
-            "detail": "1.3.0에서는 근거를 읽기 전용으로 확인합니다.",
-            "href": "/review/queue",
+            "detail": "카탈로그 파일 탭에서 열린 관계 검토를 확인합니다.",
+            "href": "/catalog?tab=files&source=review",
             "severity": "warning",
         })
     if no_ok_titles:
@@ -307,6 +318,44 @@ def create_app(
 
     runner.register("volume_group_merge", apply_volume_job)
 
+    def apply_quarantine_job(payload, progress):
+        return apply_quarantine(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            index_path=config.index_path, source_file_id=payload["source_file_id"],
+            keep_file_id=payload.get("keep_file_id"),
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"사용자 승인 격리 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    def apply_restore_job(payload, progress):
+        return apply_restore(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            index_path=config.index_path, operation_id=payload["operation_id"],
+            reference_file_id=payload.get("reference_file_id"), verdict=payload["verdict"],
+            note=payload.get("note", ""), confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"격리 복원 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    def apply_purge_job(payload, progress):
+        return apply_purge(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            operation_ids=payload["operation_ids"], confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"격리 영구 삭제 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    runner.register("management_quarantine", apply_quarantine_job)
+    runner.register("management_restore", apply_restore_job)
+    runner.register("management_purge", apply_purge_job)
+
     services = LibraryServiceRegistry(
         state_db=config.state_db,
         house_dir=config.house_dir,
@@ -346,6 +395,10 @@ def create_app(
     @app.errorhandler(ValueError)
     def handle_value(exc):
         return jsonify({"ok": False, "error": {"code": "invalid_request", "message": str(exc)}}), 400
+
+    @app.errorhandler(RuntimeError)
+    def handle_runtime(exc):
+        return jsonify({"ok": False, "error": {"code": "operation_blocked", "message": str(exc)}}), 409
 
     @app.errorhandler(sqlite3.Error)
     def handle_sqlite(exc):
@@ -456,6 +509,103 @@ def create_app(
             limit=request.args.get("limit", 50, type=int),
             cursor=request.args.get("cursor") or None,
         )})
+
+    @app.post("/api/management/relationships/preview")
+    def management_relationship_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": relationship_preview(
+            config.state_db, left_file_id=str(body.get("left_file_id") or ""),
+            right_file_id=str(body.get("right_file_id") or ""),
+            verdict=str(body.get("verdict") or ""),
+            variant_kind=str(body.get("variant_kind") or "other"),
+            note=str(body.get("note") or ""),
+        )})
+
+    @app.post("/api/management/relationships/apply")
+    def management_relationship_apply():
+        body = _json_body()
+        result = apply_relationship(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            left_file_id=str(body.get("left_file_id") or ""),
+            right_file_id=str(body.get("right_file_id") or ""),
+            verdict=str(body.get("verdict") or ""),
+            variant_kind=str(body.get("variant_kind") or "other"),
+            note=str(body.get("note") or ""),
+            confirm_count=int(body.get("confirm_count", -1)),
+            confirm_plan_sha256=str(body.get("confirm_plan_sha256") or ""),
+        )
+        return jsonify({"ok": True, "data": result})
+
+    @app.post("/api/management/relationships/<int:decision_id>/cancel")
+    def management_relationship_cancel(decision_id):
+        return jsonify({"ok": True, "data": cancel_relationship(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            decision_id=decision_id,
+        )})
+
+    @app.post("/api/management/quarantine/preview")
+    def management_quarantine_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": quarantine_preview(
+            config.state_db, temp_dir=config.temp_dir,
+            source_file_id=str(body.get("source_file_id") or ""),
+            keep_file_id=(str(body["keep_file_id"]) if body.get("keep_file_id") else None),
+        )})
+
+    @app.post("/api/management/quarantine/apply")
+    def management_quarantine_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_quarantine", {
+            "source_file_id": str(body.get("source_file_id") or ""),
+            "keep_file_id": str(body["keep_file_id"]) if body.get("keep_file_id") else None,
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/quarantine/restore/preview")
+    def management_restore_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": restore_preview(
+            config.state_db, house_dir=config.house_dir,
+            operation_id=int(body.get("operation_id", -1)),
+            reference_file_id=(str(body["reference_file_id"]) if body.get("reference_file_id") else None),
+            verdict=str(body.get("verdict") or ""), note=str(body.get("note") or ""),
+        )})
+
+    @app.post("/api/management/quarantine/restore/apply")
+    def management_restore_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_restore", {
+            "operation_id": int(body.get("operation_id", -1)),
+            "reference_file_id": str(body["reference_file_id"]) if body.get("reference_file_id") else None,
+            "verdict": str(body.get("verdict") or ""), "note": str(body.get("note") or ""),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/quarantine/purge/preview")
+    def management_purge_preview():
+        body = _json_body()
+        values = body.get("operation_ids")
+        if not isinstance(values, list):
+            raise ValueError("operation_ids 배열이 필요합니다")
+        return jsonify({"ok": True, "data": purge_preview(
+            config.state_db, operation_ids=values,
+        )})
+
+    @app.post("/api/management/quarantine/purge/apply")
+    def management_purge_apply():
+        body = _json_body()
+        values = body.get("operation_ids")
+        if not isinstance(values, list):
+            raise ValueError("operation_ids 배열이 필요합니다")
+        record = runner.start_exclusive("management_purge", {
+            "operation_ids": values, "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
 
     @app.get("/api/settings/appearance")
     def appearance_settings():
@@ -744,7 +894,7 @@ def create_app(
         return (
             "<!doctype html><meta charset='utf-8'><title>file_check</title>"
             "<body style='font-family:system-ui;padding:32px'>"
-            "<h1>도서 관리 서버 1.3.1</h1>"
+            "<h1>도서 관리 서버 1.3.2</h1>"
             "<p>프런트 빌드가 없습니다. library_frontend에서 npm run build를 실행하세요.</p>"
             "</body>",
             503,

@@ -11,7 +11,7 @@ from normalizer import (
     get_chosung,
     materialize_title_markup,
     normalize_filename,
-    should_exclude_dir,
+    should_exclude_intake_dir,
     strip_pass_marker,
     strip_disambig_marker,
     strip_trash_suffix,
@@ -113,7 +113,8 @@ def parse_args(argv):
 
 
 def should_skip_source_item(item):
-    return should_exclude_dir(item)
+    # Check before normalize_filename turns underscores into spaces.
+    return should_exclude_intake_dir(item)
 
 
 def prune_empty_intake_tree(path):
@@ -377,8 +378,9 @@ def _process_items_authorized(
                 reason="legacy_pass_requires_pair_decision",
             )
 
-    # 1.2.1: ___ 폴더를 선행 평탄화하지 않는다. 내부 지원 파일은 감사 후
-    # journaled directory intake가 stable file_id/상대 경로를 보존하며 처리한다.
+    # ``hold``와 기존 ``___*`` 묶음은 dedup/auditor와 아래 intake 양쪽에서
+    # 제외한다. 보류 해제는 사용자가 해당 묶음을 temp 루트로 꺼내는 명시적
+    # 파일 작업이며, Folderling은 보류 폴더를 평탄화하거나 이름을 바꾸지 않는다.
 
     # ── 1단계: 중복 제거 + 검토 큐 격리 (house + temp 통합 스캔) ──
     print("=" * 60)

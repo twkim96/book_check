@@ -18,14 +18,147 @@ QUARANTINE_ACTIONS = frozenset({
     "suspected_move", "warning_move", "house_review_move",
     "volume_coordinate_hold",
 })
+MANAGEABLE_QUARANTINE_ACTIONS = frozenset({
+    "exact_quarantine", "human_quarantine", "user_quarantine",
+})
 MAX_FOLDER_INVENTORY = 5_000
 MAX_QUARANTINE_INVENTORY = 10_000
+MAX_QUARANTINE_RELATED_FILES = 100
 _FOLDER_CACHE: dict[str, tuple[tuple[int, ...], float, list[dict[str, Any]]]] = {}
 _FOLDER_CACHE_TTL = 15.0
 
 
 def _bounded_limit(value: int, maximum: int = 100) -> int:
     return max(1, min(int(value), maximum))
+
+
+def _quarantine_related_files(conn, operations) -> dict[str, list[dict[str, Any]]]:
+    """Project active house files related to each quarantined/queued file.
+
+    A direct keep is strongest.  Active decision/review pairs follow, then
+    same-core files.  We expose the basis rather than claiming that title
+    equality alone proves duplicate content.
+    """
+    source_ids = sorted({str(row["file_id"]) for row in operations if row["file_id"]})
+    if not source_ids:
+        return {}
+    placeholders = ",".join("?" for _ in source_ids)
+    related: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+
+    def add(source_id, file_id, path, size, basis, priority, confidence):
+        if not source_id or not file_id or source_id == file_id or not path:
+            return
+        bucket = related[str(source_id)]
+        item = bucket.get(str(file_id))
+        if item is None:
+            path = str(path)
+            item = {
+                "file_id": str(file_id), "name": Path(path).name,
+                "path": path, "size": int(size or 0), "bases": [],
+                "priority": int(priority), "confidence": confidence,
+            }
+            bucket[str(file_id)] = item
+        item["priority"] = min(item["priority"], int(priority))
+        confidence_rank = {"candidate": 0, "confirmed": 1, "kept": 2}
+        if confidence_rank[confidence] > confidence_rank[item["confidence"]]:
+            item["confidence"] = confidence
+        if basis not in item["bases"]:
+            item["bases"].append(basis)
+
+    for row in operations:
+        if (
+            row["keep_file_id"] and row["keep_active"]
+            and row["keep_source"] == "house"
+        ):
+            add(
+                row["file_id"], row["keep_file_id"], row["keep_path"],
+                row["keep_size"], "keep", 0, "kept",
+            )
+
+    review_rows = conn.execute(
+        f"""
+        WITH relations(source_file_id, related_file_id, detail) AS (
+            SELECT candidate_file_id, reference_file_id, classification
+            FROM review_items
+            WHERE state IN ('pending', 'deferred')
+              AND candidate_file_id IN ({placeholders})
+            UNION ALL
+            SELECT reference_file_id, candidate_file_id, classification
+            FROM review_items
+            WHERE state IN ('pending', 'deferred')
+              AND reference_file_id IN ({placeholders})
+        )
+        SELECT r.source_file_id, r.related_file_id, r.detail,
+               f.canonical_path, f.size
+        FROM relations AS r JOIN files AS f ON f.file_id = r.related_file_id
+        WHERE f.active = 1 AND f.source = 'house'
+        """,
+        (*source_ids, *source_ids),
+    ).fetchall()
+    for row in review_rows:
+        add(
+            row["source_file_id"], row["related_file_id"], row["canonical_path"],
+            row["size"], f"review:{row['detail']}", 2, "candidate",
+        )
+
+    decision_rows = conn.execute(
+        f"""
+        WITH relations(source_file_id, related_file_id, detail) AS (
+            SELECT left_file_id, right_file_id, verdict
+            FROM decisions WHERE active = 1 AND left_file_id IN ({placeholders})
+            UNION ALL
+            SELECT right_file_id, left_file_id, verdict
+            FROM decisions WHERE active = 1 AND right_file_id IN ({placeholders})
+        )
+        SELECT r.source_file_id, r.related_file_id, r.detail,
+               f.canonical_path, f.size
+        FROM relations AS r JOIN files AS f ON f.file_id = r.related_file_id
+        WHERE f.active = 1 AND f.source = 'house'
+        """,
+        (*source_ids, *source_ids),
+    ).fetchall()
+    for row in decision_rows:
+        verdict = str(row["detail"])
+        add(
+            row["source_file_id"], row["related_file_id"], row["canonical_path"],
+            row["size"], f"decision:{verdict}",
+            1 if verdict == "same_content" else 3,
+            "confirmed" if verdict == "same_content" else "candidate",
+        )
+
+    core_rows = conn.execute(
+        f"""
+        SELECT source.file_id AS source_file_id, related.file_id AS related_file_id,
+               related.canonical_path, related.size
+        FROM file_analysis AS source_analysis
+        JOIN files AS source ON source.file_id = source_analysis.file_id
+        JOIN file_analysis AS related_analysis
+          ON related_analysis.core_title = source_analysis.core_title
+        JOIN files AS related ON related.file_id = related_analysis.file_id
+        WHERE source.file_id IN ({placeholders})
+          AND source_analysis.core_title != ''
+          AND related.file_id != source.file_id
+          AND related.active = 1 AND related.source = 'house'
+        """,
+        source_ids,
+    ).fetchall()
+    for row in core_rows:
+        add(
+            row["source_file_id"], row["related_file_id"], row["canonical_path"],
+            row["size"], "same_core_title", 4, "candidate",
+        )
+
+    output = {}
+    for source_id, values in related.items():
+        ordered = sorted(
+            values.values(),
+            key=lambda item: (item["priority"], -item["size"], item["name"].casefold()),
+        )[:MAX_QUARANTINE_RELATED_FILES]
+        output[source_id] = [
+            {key: value for key, value in item.items() if key != "priority"}
+            for item in ordered
+        ]
+    return output
 
 
 def _offset(cursor: str | None) -> int:
@@ -79,7 +212,7 @@ def file_listing(
     limit: int = 50,
     cursor: str | None = None,
 ) -> dict:
-    if source not in {"active", "house", "temp", "queue", "quarantine", "inactive", "all"}:
+    if source not in {"active", "review", "house", "temp", "queue", "quarantine", "inactive", "all"}:
         raise ValueError("unknown file source filter")
     if extension not in {"all", "txt", "epub", "pdf"}:
         raise ValueError("unknown extension filter")
@@ -93,6 +226,19 @@ def file_listing(
     parameters: list[Any] = []
     if source == "active":
         clauses.append("f.active = 1")
+    elif source == "review":
+        clauses.append("f.active = 1")
+        clauses.append(
+            "EXISTS ("
+            "SELECT 1 FROM review_items AS open_review "
+            "JOIN files AS candidate ON candidate.file_id = open_review.candidate_file_id "
+            "JOIN files AS reference ON reference.file_id = open_review.reference_file_id "
+            "WHERE open_review.state IN ('pending', 'deferred') "
+            "AND open_review.queue_path IS NULL "
+            "AND candidate.source != 'queue' AND reference.source != 'queue' "
+            "AND (open_review.candidate_file_id = f.file_id "
+            "OR open_review.reference_file_id = f.file_id))"
+        )
     elif source == "inactive":
         clauses.append("f.active = 0")
     elif source != "all":
@@ -146,7 +292,11 @@ def file_listing(
                    v.work_bucket_id, v.variant_kind, v.label AS variant_label,
                    CASE WHEN r.file_id IS NULL THEN 0 ELSE 1 END AS representative,
                    fp.fingerprint_id, fp.status AS fingerprint_status,
-                   fp.raw_sha256, fp.normalized_sha256, fp.normalized_length
+                   fp.raw_sha256, fp.normalized_sha256, fp.normalized_length,
+                   (SELECT COUNT(*) FROM review_items AS open_review
+                    WHERE open_review.state IN ('pending', 'deferred')
+                      AND (open_review.candidate_file_id = f.file_id
+                           OR open_review.reference_file_id = f.file_id)) AS open_review_count
             {base}
             ORDER BY {order} {direction_sql}, f.file_id {direction_sql}
             LIMIT ? OFFSET ?
@@ -289,15 +439,19 @@ def file_detail(state_db: os.PathLike | str, file_id: str) -> dict:
                 """,
                 (file_id, row["core_title"], *values),
             )]
-        blockers = []
+        common_blockers = []
         if not item["active"]:
-            blockers.append("inactive_file")
+            common_blockers.append("inactive_file")
         if item["source"] != "house":
-            blockers.append("outside_active_house")
+            common_blockers.append("outside_active_house")
+        quarantine_blockers = list(common_blockers)
+        if item.get("fingerprint_id") is None:
+            quarantine_blockers.append("missing_fingerprint")
+        title_blockers = list(common_blockers)
         if item["protected"] or item["representative"]:
-            blockers.append("protected_relationship")
+            title_blockers.append("protected_relationship")
         if item["assignment_state"] == "managed":
-            blockers.append("managed_relationship")
+            title_blockers.append("managed_relationship")
         return {
             "file": item,
             "reviews": reviews,
@@ -306,11 +460,12 @@ def file_detail(state_db: os.PathLike | str, file_id: str) -> dict:
             "same_coordinate": same_coordinate,
             "actions": {
                 "compare": item["active"],
-                "title_correction": item["active"] and item["source"] == "house" and not blockers,
-                "quarantine": False,
+                "title_correction": not title_blockers,
+                "quarantine": not quarantine_blockers,
                 "move": False,
-                "blocked_reasons": blockers,
-                "future_version": "1.3.2~1.3.3",
+                "blocked_reasons": title_blockers,
+                "quarantine_blocked_reasons": quarantine_blockers,
+                "future_version": "1.3.3",
             },
             "readonly": True,
         }
@@ -614,8 +769,10 @@ def quarantine_listing(
             SELECT o.operation_id, o.run_id, o.action, o.source_path, o.dest_path,
                    o.quarantine_path, o.file_id, o.keep_file_id, o.state AS operation_state,
                    o.purged_at, o.created_at, o.updated_at,
+                   o.expected_size AS source_size,
                    f.active AS file_active, f.source AS file_source,
-                   keep.canonical_path AS keep_path
+                   keep.canonical_path AS keep_path, keep.size AS keep_size,
+                   keep.active AS keep_active, keep.source AS keep_source
             FROM operations AS o
             LEFT JOIN files AS f ON f.file_id = o.file_id
             LEFT JOIN files AS keep ON keep.file_id = o.keep_file_id
@@ -624,6 +781,7 @@ def quarantine_listing(
             """.format(",".join("?" for _ in QUARANTINE_ACTIONS)),
             sorted(QUARANTINE_ACTIONS),
         ).fetchall()
+        related_by_source = _quarantine_related_files(conn, operations)
     finally:
         conn.close()
     items = []
@@ -651,10 +809,11 @@ def quarantine_listing(
             "size": stat.st_size if stat else None,
             "modified_at": stat.st_mtime if stat else None,
             "age_days": max(0, int((time.time() - stat.st_mtime) // 86400)) if stat else None,
+            "related_files": related_by_source.get(str(row["file_id"]), []),
             "tracked": True,
-            "restore_available": False,
-            "purge_available": False,
-            "future_version": "1.3.2",
+            "restore_available": item_state == "present" and row["action"] in MANAGEABLE_QUARANTINE_ACTIONS,
+            "purge_available": item_state == "present" and row["action"] in MANAGEABLE_QUARANTINE_ACTIONS,
+            "future_version": None,
         })
     if trash.is_dir():
         scanned = 0
@@ -672,7 +831,9 @@ def quarantine_listing(
                 "operation_id": None,
                 "action": None,
                 "source_path": None,
+                "source_size": None,
                 "keep_path": None,
+                "keep_size": None,
                 "name": path.name,
                 "path": resolved,
                 "category": str(path.parent.relative_to(trash)),
@@ -680,6 +841,7 @@ def quarantine_listing(
                 "size": stat.st_size,
                 "modified_at": stat.st_mtime,
                 "age_days": max(0, int((time.time() - stat.st_mtime) // 86400)),
+                "related_files": [],
                 "tracked": False,
                 "restore_available": False,
                 "purge_available": False,
@@ -695,7 +857,18 @@ def quarantine_listing(
     )}
     if state != "all":
         items = [item for item in items if item["physical_state"] == state]
-    items.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item["path"])), reverse=True)
+    # Put entries that can actually be managed by the 1.3.2 UI first.  The
+    # trash tree also contains older warning/house review queue files; sorting
+    # only by recency made an entire first screen look disabled even though
+    # user/exact quarantine entries were available further down the list.
+    items.sort(
+        key=lambda item: (
+            bool(item.get("purge_available") or item.get("restore_available")),
+            str(item.get("updated_at") or ""),
+            str(item["path"]),
+        ),
+        reverse=True,
+    )
     return _page(
         items,
         offset=_offset(cursor),
