@@ -159,10 +159,15 @@ def dedup_report_listing(
     search: str = "",
     kind: str = "all",
     limit: int = 200,
+    cursor: str | int | None = None,
 ) -> dict:
     if kind not in {"all", "dedup", "strong_candidates"}:
         raise ValueError("지원하지 않는 dedup 보고서 종류입니다")
     limit = max(1, min(int(limit), 500))
+    try:
+        offset = max(0, int(cursor or 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("지원하지 않는 보고서 페이지 위치입니다") from exc
     needle = str(search or "").strip().casefold()
     root = _report_root(temp_dir)
     grouped: dict[str, dict[str, Path]] = {}
@@ -189,10 +194,14 @@ def dedup_report_listing(
             continue
         items.append(item)
     items.sort(key=lambda item: (item["created_at"], item["report_id"]), reverse=True)
+    page = items[offset:offset + limit]
+    next_offset = offset + len(page)
     return {
-        "items": items[:limit],
+        "items": page,
         "total": len(items),
         "limit": limit,
+        "cursor": str(offset) if offset else None,
+        "next_cursor": str(next_offset) if next_offset < len(items) else None,
         "search": search,
         "kind": kind,
         "readonly": True,

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections import defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -713,6 +715,120 @@ def folder_listing(
     )
 
 
+def file_destination_candidates(
+    state_db: os.PathLike | str,
+    house_dir: os.PathLike | str,
+    file_id: str,
+    *,
+    search: str = "",
+    limit: int = 24,
+) -> dict:
+    """Rank existing house folders without changing the relocation contract."""
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        source = conn.execute(
+            """
+            SELECT f.file_id, f.canonical_path, a.core_title, a.readable_title,
+                   v.work_bucket_id
+            FROM files f
+            LEFT JOIN file_analysis a ON a.file_id = f.file_id
+            LEFT JOIN variants v ON v.variant_id = f.variant_id
+            WHERE f.file_id = ? AND f.active = 1 AND f.source = 'house'
+            """,
+            (str(file_id),),
+        ).fetchone()
+        if source is None:
+            raise KeyError(file_id)
+    finally:
+        conn.close()
+
+    current_parent = str(Path(source["canonical_path"]).parent)
+    source_core = str(source["core_title"] or "")
+    source_readable = str(source["readable_title"] or Path(source["canonical_path"]).stem)
+    source_work = int(source["work_bucket_id"]) if source["work_bucket_id"] is not None else None
+    needle = str(search or "").strip().casefold()
+
+    def key(value: str) -> str:
+        return re.sub(r"[^0-9a-z가-힣]+", "", str(value).casefold())
+
+    source_keys = [value for value in {key(source_core), key(source_readable)} if value]
+    candidates = []
+    for folder in _folder_snapshot(state_db, house_dir):
+        haystack = " ".join([
+            folder["name"], folder["relative_path"],
+            folder.get("managed_work_title") or "",
+            *folder["core_titles"], *folder["sample_files"],
+        ]).casefold()
+        if needle and needle not in haystack:
+            continue
+        folder_keys = [
+            value for value in {
+                key(folder["name"]),
+                *(key(value) for value in folder["core_titles"]),
+            } if value
+        ]
+        similarity = max(
+            (SequenceMatcher(None, left, right).ratio()
+             for left in source_keys for right in folder_keys),
+            default=0.0,
+        )
+        exact_core = bool(source_core and source_core in folder["core_titles"])
+        same_work = bool(source_work is not None and source_work in folder["work_bucket_ids"])
+        current = folder["path"] == current_parent
+        grouped_destination = bool(folder["depth"] > 1 or folder.get("managed_folder_id") is not None)
+        if not needle and not current and not grouped_destination:
+            continue
+        if not needle and not (current or same_work or exact_core or similarity >= 0.48):
+            continue
+        score = similarity * 70.0
+        reasons = []
+        if same_work:
+            score += 120
+            reasons.append("같은 작품 관계")
+        if exact_core:
+            score += 100
+            reasons.append("core title 일치")
+        elif similarity >= 0.72:
+            reasons.append("제목 매우 유사")
+        elif similarity >= 0.5:
+            reasons.append("제목 유사")
+        if folder.get("managed_folder_id") is not None:
+            score += 8
+            reasons.append("관리 폴더")
+        if needle:
+            score += 35
+            reasons.append("검색 일치")
+        if current:
+            score += 20 if grouped_destination else -100
+            reasons.append("현재 위치")
+        candidates.append({
+            "path": folder["path"], "name": folder["name"],
+            "relative_path": folder["relative_path"],
+            "file_count": folder["file_count"], "total_size": folder["total_size"],
+            "core_titles": folder["core_titles"][:4],
+            "work_bucket_ids": folder["work_bucket_ids"],
+            "managed_folder_id": folder.get("managed_folder_id"),
+            "managed_role": folder.get("managed_role"),
+            "similarity": round(similarity, 4), "score": round(score, 3),
+            "reasons": reasons or (["검색 일치"] if needle else ["제목 일부 유사"]),
+            "grouped_destination": grouped_destination, "current": current,
+        })
+    candidates.sort(
+        key=lambda item: (item["score"], item["file_count"], item["name"].casefold()),
+        reverse=True,
+    )
+    limit = _bounded_limit(limit, 50)
+    return {
+        "source": {
+            "file_id": source["file_id"], "path": source["canonical_path"],
+            "core_title": source_core, "readable_title": source_readable,
+            "work_bucket_id": source_work, "current_parent": current_parent,
+        },
+        "items": candidates[:limit], "search": search, "limit": limit,
+        "readonly": True,
+    }
+
+
 def folder_detail(
     state_db: os.PathLike | str,
     house_dir: os.PathLike | str,
@@ -793,8 +909,8 @@ def folder_detail(
         "actions": {
             "rename": managed is not None,
             "move": managed is not None,
-            "quarantine": False,
-            "future_version": None if managed else "1.3.3",
+            "quarantine": registered > 0 and not truncated,
+            "future_version": None,
         },
         "readonly": True,
     }

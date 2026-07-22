@@ -76,7 +76,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.4</small>
+            <small>file_check 1.3.5</small>
           </div>
         </div>
         <nav>
@@ -271,7 +271,7 @@ function WorksCatalog() {
   };
   if (error && !listing) return <ErrorPanel message={error} retry={load} />;
   return <>
-    <PageHeader eyebrow="WORK CATALOG · 1.3.4" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 찾고, DB work가 있는 작품은 병합·분리·별칭·입고 경로를 관리합니다." />
+    <PageHeader eyebrow="WORK CATALOG · 1.3.5" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 찾고, DB work가 있는 작품은 병합·분리·별칭·입고 경로를 관리합니다." />
     <CatalogTabs active="works" />
     {error && <div className="inline-error">{error}</div>}
     {jobNotice && <div className="inline-notice"><span>작품 관계 작업을 시작했습니다. 현재 화면에서 계속 확인할 수 있습니다.</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
@@ -1162,14 +1162,16 @@ function DedupReports() {
   const [search, setSearch] = useState("");
   const [submittedSearch, setSubmittedSearch] = useState("");
   const [kind, setKind] = useState<"all" | "dedup" | "strong_candidates">("all");
+  const [cursor, setCursor] = useState("");
   const [error, setError] = useState("");
   const load = () => {
-    const query = new URLSearchParams({ search: submittedSearch, kind, limit: "500" });
+    const query = new URLSearchParams({ search: submittedSearch, kind, limit: "20" });
+    if (cursor) query.set("cursor", cursor);
     api<DedupReportListing>(`/api/reports/dedup?${query}`)
       .then((result) => { setData(result); setError(""); })
       .catch((reason) => setError(reason.message));
   };
-  useEffect(load, [submittedSearch, kind]);
+  useEffect(load, [submittedSearch, kind, cursor]);
   return <>
     <PageHeader
       eyebrow="HISTORICAL REPORTS"
@@ -1178,11 +1180,11 @@ function DedupReports() {
       action={<button className="button secondary" onClick={load}>새로고침</button>}
     />
     <section className="toolbar">
-      <form className="search-form" onSubmit={(event) => { event.preventDefault(); setSubmittedSearch(search.trim()); }}>
+      <form className="search-form" onSubmit={(event) => { event.preventDefault(); setCursor(""); setSubmittedSearch(search.trim()); }}>
         <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="날짜·요약 내용 검색" />
         <button className="button secondary">검색</button>
       </form>
-      <select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}>
+      <select value={kind} onChange={(event) => { setCursor(""); setKind(event.target.value as typeof kind); }}>
         <option value="all">전체 보고서</option>
         <option value="dedup">Folderling 중복 정리</option>
         <option value="strong_candidates">강력 후보 감사</option>
@@ -1204,6 +1206,10 @@ function DedupReports() {
           <span>{formatBytes(item.size)}</span>
         </NavLink>)}
       </div> : <div className="empty">조건에 맞는 보고서가 없습니다.</div>}
+      {data && <div className="pagination">
+        <button className="button secondary" disabled={!cursor} onClick={() => { const previous = Math.max(0, Number(cursor || 0) - data.limit); setCursor(previous ? String(previous) : ""); }}>이전</button>
+        <button className="button secondary" disabled={!data.next_cursor} onClick={() => data.next_cursor && setCursor(data.next_cursor)}>다음</button>
+      </div>}
       {data && <small className="report-root">읽기 전용 경로 · {data.root}</small>}
     </section>
   </>;

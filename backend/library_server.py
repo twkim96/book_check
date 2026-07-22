@@ -22,6 +22,7 @@ from library_appearance import read_appearance, reset_appearance, write_appearan
 from library_explorer import (
     compare_files,
     file_detail,
+    file_destination_candidates,
     file_listing,
     folder_detail,
     folder_listing,
@@ -29,11 +30,13 @@ from library_explorer import (
 )
 from library_jobs import JobActiveError, JobRunner, JobStore
 from library_organize import (
+    apply_folder_quarantine,
     apply_file_relocate,
     apply_managed_folder_create,
     apply_managed_folder_adopt,
     apply_managed_folder_relocate,
     file_relocate_preview,
+    folder_quarantine_preview,
     managed_folder_preview,
     managed_folder_adopt_preview,
     managed_folder_relocate_preview,
@@ -71,6 +74,7 @@ from library_work_management import (
     apply_work_split,
     representative_preview,
     work_detail,
+    work_search,
     work_merge_preview,
     work_split_preview,
 )
@@ -79,7 +83,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.3.4"
+SERVER_VERSION = "1.3.5"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -494,6 +498,17 @@ def create_app(
             ),
         )
 
+    def apply_folder_quarantine_job(payload, progress):
+        return apply_folder_quarantine(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            index_path=config.index_path, folder_path=payload["folder_path"],
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"폴더 전체 격리 {current:,}/{total:,}: {name}"
+            ),
+        )
+
     def apply_work_merge_job(payload, progress):
         progress(0, 1, "작품 병합 관계 확인")
         result = apply_work_merge(
@@ -576,6 +591,7 @@ def create_app(
     runner.register("management_folder_create", apply_managed_folder_create_job)
     runner.register("management_folder_relocate", apply_managed_folder_relocate_job)
     runner.register("management_folder_adopt", apply_managed_folder_adopt_job)
+    runner.register("management_folder_quarantine", apply_folder_quarantine_job)
     runner.register("management_work_merge", apply_work_merge_job)
     runner.register("management_work_split", apply_work_split_job)
     runner.register("management_work_alias", apply_work_alias_job)
@@ -693,6 +709,14 @@ def create_app(
     @app.get("/api/explorer/files/<file_id>")
     def explorer_file(file_id):
         return jsonify({"ok": True, "data": file_detail(config.state_db, file_id)})
+
+    @app.get("/api/explorer/files/<file_id>/destinations")
+    def explorer_file_destinations(file_id):
+        return jsonify({"ok": True, "data": file_destination_candidates(
+            config.state_db, config.house_dir, file_id,
+            search=request.args.get("search", ""),
+            limit=request.args.get("limit", 24, type=int),
+        )})
 
     @app.get("/api/explorer/compare")
     def explorer_compare():
@@ -927,11 +951,40 @@ def create_app(
         })
         return jsonify({"ok": True, "data": record}), 202
 
+    @app.post("/api/management/folders/quarantine/preview")
+    def management_folder_quarantine_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": folder_quarantine_preview(
+            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
+            folder_path=str(body.get("folder_path") or ""),
+        )})
+
+    @app.post("/api/management/folders/quarantine/apply")
+    def management_folder_quarantine_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_folder_quarantine", {
+            "folder_path": str(body.get("folder_path") or ""),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
     @app.get("/api/management/works/<int:work_bucket_id>")
     def management_work_detail(work_bucket_id):
         return jsonify({
             "ok": True,
             "data": work_detail(config.state_db, work_bucket_id),
+        })
+
+    @app.get("/api/management/works")
+    def management_work_search():
+        return jsonify({
+            "ok": True,
+            "data": work_search(
+                config.state_db,
+                search=request.args.get("search", ""),
+                limit=int(request.args.get("limit", 20)),
+            ),
         })
 
     @app.post("/api/management/works/merge/preview")
@@ -1258,6 +1311,7 @@ def create_app(
                 search=request.args.get("search", ""),
                 kind=request.args.get("kind", "all"),
                 limit=request.args.get("limit", 200, type=int),
+                cursor=request.args.get("cursor"),
             ),
         })
 

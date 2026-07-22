@@ -129,7 +129,6 @@ function buildCssVariables(settings: AppearanceSettings): Record<string, string>
     "--accent-on": luminance(accent) > 0.5 ? "#0a0c10" : "#ffffff",
     "--accent-soft": `rgba(${accent.r}, ${accent.g}, ${accent.b}, .18)`,
     "--accent-shadow": `rgba(${accent.r}, ${accent.g}, ${accent.b}, .26)`,
-    "--bg-glow": rgbToHex(mix(background, accent, 0.2)),
     "--sidebar": `rgba(${background.r}, ${background.g}, ${background.b}, .94)`,
     "--panel-alpha": `rgba(${mix(background, surfaceTarget, 0.055).r}, ${mix(background, surfaceTarget, 0.055).g}, ${mix(background, surfaceTarget, 0.055).b}, .94)`
   };

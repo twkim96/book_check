@@ -6,6 +6,7 @@ from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_explorer import (
     compare_files,
     file_detail,
+    file_destination_candidates,
     file_listing,
     folder_detail,
     folder_listing,
@@ -108,6 +109,35 @@ def _snapshot(state_db, house, temp):
         if path.is_file()
     )
     return counts, active, tree
+
+
+def test_destination_candidates_rank_same_core_folder_before_current(tmp_path):
+    state_db, house, temp, ids, folder, _, _ = _fixture(tmp_path)
+    target = house / "ㄱ" / "검사 작품 전권"
+    target.mkdir()
+    target_file = target / "검사 작품 2권.txt"
+    target_file.write_text("다음 권 합성 본문", encoding="utf-8")
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            row = decision_store.reconcile_file_metadata(conn, target_file, source="house")
+            decision_store.upsert_file_analysis(conn, row["file_id"], target_file)
+    finally:
+        conn.close()
+    before = _snapshot(state_db, house, temp)
+    listing = file_destination_candidates(
+        state_db, house, ids[0], search="", limit=10
+    )
+    assert listing["source"]["core_title"] == "검사작품"
+    assert listing["items"][0]["path"] == str(folder)
+    assert listing["items"][0]["current"] is True
+    assert listing["items"][1]["path"] == str(target)
+    assert "core title 일치" in listing["items"][1]["reasons"]
+    searched = file_destination_candidates(
+        state_db, house, ids[0], search="전권", limit=10
+    )
+    assert [item["path"] for item in searched["items"]] == [str(target)]
+    assert _snapshot(state_db, house, temp) == before
 
 
 def test_file_explorer_detail_and_compare_are_readonly(tmp_path):

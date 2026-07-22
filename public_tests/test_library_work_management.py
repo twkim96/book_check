@@ -14,6 +14,7 @@ from library_work_management import (
     resolve_work_route,
     work_merge_preview,
     work_split_preview,
+    work_search,
 )
 
 
@@ -74,6 +75,29 @@ def _folder(conn, path: Path, work_id: int, role="primary"):
             """,
             (work_id, str(path), role, info.st_dev, info.st_ino, info.st_ctime_ns),
         ).lastrowid)
+
+
+def test_work_search_finds_title_id_and_alias(tmp_path):
+    state_db, house, _ = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            work_id = _work(conn, "Re 제로부터 시작하는 이세계 생활")
+            conn.execute(
+                "INSERT INTO work_aliases(alias_kind, alias_key, alias_display, work_bucket_id, origin) "
+                "VALUES ('folder_name', '리제로', '리제로', ?, 'human_decision')",
+                (work_id,),
+            )
+        _folder(conn, house / "영어" / "Re 제로", work_id)
+    finally:
+        conn.close()
+    by_title = work_search(state_db, search="제로부터", limit=10)
+    by_alias = work_search(state_db, search="리제로", limit=10)
+    by_id = work_search(state_db, search=str(work_id), limit=10)
+    assert [item["work_bucket_id"] for item in by_title["items"]] == [work_id]
+    assert [item["work_bucket_id"] for item in by_alias["items"]] == [work_id]
+    assert by_id["items"][0]["work_bucket_id"] == work_id
+    assert by_id["items"][0]["active_folder_count"] == 1
 
 
 def test_alias_route_and_explicit_replacement(tmp_path):
@@ -333,6 +357,42 @@ def test_work_split_moves_selected_variant_folder_and_alias(tmp_path):
         assert first_folder != second_folder
     finally:
         conn.close()
+
+
+def test_work_split_blocks_variant_left_inside_source_managed_folder(tmp_path):
+    state_db, house, _temp = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            source_work = _work(conn, "혼합 폴더 작품")
+            first_variant = _variant(conn, source_work, "base")
+            second_variant = _variant(conn, source_work, "revision")
+        folder = _folder(conn, house / "ㅎ" / "혼합 폴더 작품", source_work)
+        _managed_file(conn, house / "ㅎ" / "혼합 폴더 작품" / "1권.epub", first_variant)
+        _managed_file(conn, house / "ㅎ" / "혼합 폴더 작품" / "2권.epub", second_variant)
+    finally:
+        conn.close()
+
+    without_folder = work_split_preview(
+        state_db,
+        source_work_id=source_work,
+        variant_ids=[first_variant],
+        display_title="분리 작품",
+    )
+    assert without_folder["apply_available"] is False
+    assert f"selected_variants_require_folder:{folder}" in without_folder["blocked_reasons"]
+    assert f"folder_contains_unselected_variants:{folder}" in without_folder["blocked_reasons"]
+
+    with_mixed_folder = work_split_preview(
+        state_db,
+        source_work_id=source_work,
+        variant_ids=[first_variant],
+        display_title="분리 작품",
+        folder_ids=[folder],
+    )
+    assert with_mixed_folder["apply_available"] is False
+    assert f"selected_variants_require_folder:{folder}" not in with_mixed_folder["blocked_reasons"]
+    assert f"folder_contains_unselected_variants:{folder}" in with_mixed_folder["blocked_reasons"]
 
 
 def test_representative_replacement_keeps_variant_relationship(tmp_path):

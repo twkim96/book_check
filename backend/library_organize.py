@@ -1,4 +1,4 @@
-"""Safe 1.3.3 file rename and relocation workflows."""
+"""Safe file/folder organization and folder quarantine workflows."""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ MANAGED_FOLDER_CREATE_ACTION = "managed_folder_create"
 MANAGED_FOLDER_ADOPT_ACTION = "managed_folder_adopt"
 MANAGED_FOLDER_RELOCATE_ACTION = "managed_folder_relocate"
 MANAGED_FOLDER_ITEM_ACTION = "managed_folder_relocate_item"
+FOLDER_QUARANTINE_ACTION = "user_folder_quarantine"
+FOLDER_QUARANTINE_ITEM_ACTION = "user_quarantine"
 FOLDER_ROLES = frozenset({"primary", "edition", "auxiliary"})
 MAX_FOLDER_ITEMS = 5_000
 ANALYSIS_FIELDS = (
@@ -697,7 +699,9 @@ def _rename_directory_no_clobber(source: Path, destination: Path) -> None:
     os.rename(source, destination)
 
 
-def _folder_inventory(conn, source: Path) -> tuple[list[dict], list[str]]:
+def _folder_inventory(
+    conn, source: Path, *, require_fingerprint: bool = True
+) -> tuple[list[dict], list[str]]:
     db_rows = conn.execute(
         """
         SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns, f.dev, f.ino,
@@ -746,7 +750,7 @@ def _folder_inventory(conn, source: Path) -> tuple[list[dict], list[str]]:
                 )
                 if expected != actual:
                     raise RuntimeError(f"registered file snapshot is stale: {path}")
-                if row["current_fingerprint_id"] is None:
+                if require_fingerprint and row["current_fingerprint_id"] is None:
                     raise RuntimeError(f"registered file fingerprint is missing: {path}")
             items.append({
                 "relative_path": str(path.relative_to(source)),
@@ -1234,7 +1238,404 @@ def recover_operation_group(conn, group_id: int) -> str:
                 conn, group_id, target, error="managed folder adopt recovery mismatch"
             )
         return target
+    if group["action"] == FOLDER_QUARANTINE_ACTION:
+        return recover_folder_quarantine_group(conn, group_id)
     raise ValueError(f"unsupported operation group action: {group['action']}")
+
+
+def folder_quarantine_preview(
+    state_db: Path,
+    *,
+    house_dir: Path,
+    temp_dir: Path,
+    folder_path: str,
+) -> dict:
+    house = Path(house_dir).resolve()
+    source = Path(folder_path).expanduser().resolve()
+    try:
+        relative = source.relative_to(house)
+    except ValueError as exc:
+        raise ValueError("격리 폴더가 house 밖에 있습니다") from exc
+    if not relative.parts:
+        raise ValueError("house 루트는 격리할 수 없습니다")
+    current_identity = _directory_identity(source)
+    destination = (
+        Path(temp_dir).resolve() / "trash_bin" /
+        "user_approved_folder_discard" / relative
+    )
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        blockers: list[str] = []
+        if destination.exists() or destination.is_symlink():
+            blockers.append("quarantine_destination_occupied")
+        try:
+            items, directories = _folder_inventory(
+                conn, source, require_fingerprint=False
+            )
+        except RuntimeError as exc:
+            items, directories = [], []
+            blockers.append(f"inventory_blocked:{exc}")
+        registered = [item for item in items if item["registered"]]
+        if not registered:
+            blockers.append("folder_has_no_registered_books")
+        managed_folders = [dict(row) for row in conn.execute(
+            """
+            SELECT folder_id, work_bucket_id, canonical_path, role
+            FROM work_folders
+            WHERE state = 'active' AND (canonical_path = ? OR canonical_path LIKE ? ESCAPE '\\')
+            ORDER BY canonical_path
+            """,
+            (str(source), _descendant_pattern(source)),
+        )]
+        work_ids = sorted({int(row[0]) for row in conn.execute(
+            """
+            SELECT DISTINCT v.work_bucket_id
+            FROM files f JOIN variants v ON v.variant_id = f.variant_id
+            WHERE f.active = 1 AND f.source = 'house'
+              AND f.canonical_path LIKE ? ESCAPE '\\'
+            """,
+            (_descendant_pattern(source),),
+        )})
+        related_folders: list[dict] = []
+        if work_ids:
+            placeholders = ",".join("?" for _ in work_ids)
+            rows = conn.execute(
+                f"""
+                SELECT wf.folder_id, wf.work_bucket_id, wf.canonical_path, wf.role,
+                       w.display_title
+                FROM work_folders wf JOIN works w ON w.work_bucket_id = wf.work_bucket_id
+                WHERE wf.state = 'active' AND wf.work_bucket_id IN ({placeholders})
+                  AND NOT (wf.canonical_path = ? OR wf.canonical_path LIKE ? ESCAPE '\\')
+                ORDER BY wf.role, wf.canonical_path
+                """,
+                [*work_ids, str(source), _descendant_pattern(source)],
+            ).fetchall()
+            related_folders = [dict(row) for row in rows]
+        confirmation_items = [
+            {key: item[key] for key in (
+                "relative_path", "source_path", "size", "mtime_ns", "dev", "ino",
+                "ctime_ns", "registered", "file_id",
+            )}
+            for item in items
+        ]
+        payload = {
+            "source_path": str(source),
+            "source_identity": current_identity,
+            "destination_path": str(destination),
+            "items": confirmation_items,
+            "directories": directories,
+            "managed_folder_ids": [row["folder_id"] for row in managed_folders],
+        }
+        return {
+            "version": "1.3.5",
+            "kind": "user_folder_quarantine",
+            "item_count": len(items),
+            "source_path": str(source),
+            "source_identity": current_identity,
+            "destination_path": str(destination),
+            "registered_count": len(registered),
+            "auxiliary_count": len(items) - len(registered),
+            "directory_count": len(directories),
+            "total_size": sum(int(item["size"]) for item in items),
+            "work_bucket_ids": work_ids,
+            "managed_folders": managed_folders,
+            "related_folders": related_folders,
+            "items": items,
+            "directories": directories,
+            "blocked_reasons": blockers,
+            "apply_available": not blockers,
+            "plan_sha256": _hash(payload),
+            "readonly": True,
+        }
+    finally:
+        conn.close()
+
+
+def recover_folder_quarantine_group(conn, group_id: int) -> str:
+    group = _group_row(conn, group_id)
+    if group["action"] != FOLDER_QUARANTINE_ACTION:
+        raise ValueError("operation group is not a folder quarantine")
+    if group["state"] not in {"planned", "fs_done", "db_done"}:
+        return group["state"]
+    source = Path(group["source_path"])
+    destination = Path(group["dest_path"])
+    expected_inode = (group["source_dev"], group["source_ino"])
+
+    def matches(path: Path) -> bool:
+        try:
+            return _directory_identity(path)[:2] == expected_inode
+        except (FileNotFoundError, OSError, RuntimeError):
+            return False
+
+    if group["state"] in {"planned", "fs_done"}:
+        if matches(source) and not destination.exists():
+            pass
+        elif matches(destination) and not source.exists():
+            ensure_directory_nofollow(source.parent)
+            _rename_directory_no_clobber(destination, source)
+        else:
+            target = "stale" if group["state"] == "planned" else "failed"
+            with decision_store.transaction(conn):
+                decision_store.transition_operation_group(
+                    conn, group_id, target, error="folder quarantine recovery identity mismatch"
+                )
+            return target
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE operations SET state = 'rolled_back', updated_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = ? AND action = ? AND state IN ('planned','fs_done','db_done')",
+                (group["run_id"], FOLDER_QUARANTINE_ITEM_ACTION),
+            )
+            decision_store.transition_operation_group(conn, group_id, "rolled_back")
+        return "rolled_back"
+
+    active = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE active = 1 AND source = 'house' "
+        "AND canonical_path LIKE ? ESCAPE '\\'",
+        (_descendant_pattern(source),),
+    ).fetchone()[0]
+    quarantined = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE active = 0 AND source = 'quarantine' "
+        "AND canonical_path LIKE ? ESCAPE '\\'",
+        (_descendant_pattern(destination),),
+    ).fetchone()[0]
+    if matches(destination) and not source.exists() and active == 0 and quarantined > 0:
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE operations SET state = 'committed', updated_at = CURRENT_TIMESTAMP "
+                "WHERE run_id = ? AND action = ? AND state = 'db_done'",
+                (group["run_id"], FOLDER_QUARANTINE_ITEM_ACTION),
+            )
+            decision_store.transition_operation_group(conn, group_id, "committed")
+        return "committed"
+    with decision_store.transaction(conn):
+        decision_store.transition_operation_group(
+            conn, group_id, "failed", error="folder quarantine db_done recovery mismatch"
+        )
+    return "failed"
+
+
+def _quarantine_folder(conn, *, plan: Mapping[str, object], run_id: str, manifest_path: str) -> dict:
+    actual_run = decision_store.assert_active_actual_run(conn, run_id)
+    source = Path(str(plan["source_path"]))
+    destination = Path(str(plan["destination_path"]))
+    decision_store.assert_actual_run_path(actual_run, source, "house_root")
+    decision_store.assert_actual_run_path(actual_run, destination, "temp_root")
+    current_identity = _directory_identity(source)
+    expected_identity = tuple(plan["source_identity"])
+    if current_identity != expected_identity:
+        raise RuntimeError("folder identity changed before quarantine")
+    ensure_directory_nofollow(destination.parent)
+    manifest_json = json.dumps(
+        {"items": plan["items"], "directories": plan["directories"]},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    operation_ids: list[int] = []
+    with decision_store.transaction(conn):
+        group_id = decision_store.create_operation_group(
+            conn, run_id=run_id, action=FOLDER_QUARANTINE_ACTION,
+            plan_sha256=str(plan["plan_sha256"]), source_path=str(source),
+            dest_path=str(destination), item_count=int(plan["item_count"]),
+            manifest_path=manifest_path, source_manifest_json=manifest_json,
+        )
+        conn.execute(
+            "UPDATE operation_groups SET source_dev = ?, source_ino = ?, source_ctime_ns = ? "
+            "WHERE group_id = ?", (*current_identity, group_id)
+        )
+        for item in plan["items"]:
+            if not item["registered"]:
+                continue
+            operation_ids.append(decision_store.create_operation(
+                conn, run_id=run_id, action=FOLDER_QUARANTINE_ITEM_ACTION,
+                source_path=item["source_path"],
+                quarantine_path=str(destination / item["relative_path"]),
+                file_id=item["file_id"], expected_size=item["size"],
+                expected_mtime_ns=item["mtime_ns"],
+                expected_fingerprint_id=item["fingerprint_id"],
+                source_dev=item["dev"], source_ino=item["ino"],
+                source_ctime_ns=item["ctime_ns"],
+            ))
+    recovered_after_error = None
+    try:
+        _rename_directory_no_clobber(source, destination)
+        destination_identity = _directory_identity(destination)
+        if destination_identity[:2] != current_identity[:2]:
+            raise RuntimeError("folder inode changed during quarantine")
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE operation_groups SET destination_dev = ?, destination_ino = ?, "
+                "destination_ctime_ns = ?, updated_at = CURRENT_TIMESTAMP WHERE group_id = ?",
+                (*destination_identity, group_id),
+            )
+            for operation_id in operation_ids:
+                operation = conn.execute(
+                    "SELECT quarantine_path FROM operations WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                evidence = inspect_regular_file(operation["quarantine_path"])
+                decision_store.record_operation_destination(conn, operation_id, evidence)
+                decision_store.transition_operation(conn, operation_id, "fs_done")
+            decision_store.transition_operation_group(conn, group_id, "fs_done")
+
+        with decision_store.transaction(conn):
+            selected_ids = [item["file_id"] for item in plan["items"] if item["registered"]]
+            selected_set = set(selected_ids)
+            representatives = conn.execute(
+                "SELECT variant_id, file_id FROM representatives WHERE file_id IN ({})".format(
+                    ",".join("?" for _ in selected_ids)
+                ), selected_ids,
+            ).fetchall() if selected_ids else []
+            for representative in representatives:
+                replacement = conn.execute(
+                    "SELECT file_id FROM files WHERE variant_id = ? AND active = 1 AND source = 'house' "
+                    "ORDER BY protected DESC, canonical_path",
+                    (representative["variant_id"],),
+                ).fetchall()
+                replacement_id = next(
+                    (row["file_id"] for row in replacement if row["file_id"] not in selected_set),
+                    None,
+                )
+                if replacement_id:
+                    conn.execute(
+                        "UPDATE representatives SET file_id = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE variant_id = ?", (replacement_id, representative["variant_id"]),
+                    )
+                    conn.execute("UPDATE files SET protected = 1 WHERE file_id = ?", (replacement_id,))
+                else:
+                    conn.execute("DELETE FROM representatives WHERE variant_id = ?", (representative["variant_id"],))
+            for item in plan["items"]:
+                if not item["registered"]:
+                    continue
+                new_path = destination / item["relative_path"]
+                evidence = inspect_regular_file(new_path)
+                conn.execute(
+                    """
+                    UPDATE files SET canonical_path = ?, source = 'quarantine', active = 0,
+                        protected = 0, dev = ?, ino = ?, ctime_ns = ?, size = ?, mtime_ns = ?
+                    WHERE file_id = ? AND active = 1 AND source = 'house'
+                    """,
+                    (str(new_path), evidence.dev, evidence.ino, evidence.ctime_ns,
+                     evidence.size, evidence.mtime_ns, item["file_id"]),
+                )
+                decision_store.supersede_open_reviews_for_file(
+                    conn, item["file_id"], reason="user_approved_folder_discard"
+                )
+            conn.execute(
+                "UPDATE work_folders SET state = 'retired', updated_at = CURRENT_TIMESTAMP "
+                "WHERE state = 'active' AND (canonical_path = ? OR canonical_path LIKE ? ESCAPE '\\')",
+                (str(source), _descendant_pattern(source)),
+            )
+            for operation_id in operation_ids:
+                decision_store.transition_operation(conn, operation_id, "db_done")
+            decision_store.transition_operation_group(conn, group_id, "db_done")
+        with decision_store.transaction(conn):
+            for operation_id in operation_ids:
+                decision_store.transition_operation(conn, operation_id, "committed")
+            decision_store.transition_operation_group(conn, group_id, "committed")
+    except BaseException as exc:
+        group = _group_row(conn, group_id)
+        if group["state"] in {"planned", "fs_done", "db_done"}:
+            outcome = recover_folder_quarantine_group(conn, group_id)
+            if outcome == "committed":
+                recovered_after_error = str(exc)
+            else:
+                raise
+        else:
+            raise
+    return {
+        "group_id": group_id, "operation_ids": operation_ids,
+        "source_path": str(source), "destination_path": str(destination),
+        "registered_count": int(plan["registered_count"]),
+        "auxiliary_count": int(plan["auxiliary_count"]),
+        "recovered_after_error": recovered_after_error,
+    }
+
+
+def apply_folder_quarantine(
+    state_db: Path, *, house_dir: Path, temp_dir: Path, index_path: Path,
+    folder_path: str, confirm_count: int, confirm_plan_sha256: str, progress=None,
+) -> dict:
+    from library_review import _refresh_review_index
+    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.3.5"):
+        plan = folder_quarantine_preview(
+            state_db, house_dir=house_dir, temp_dir=temp_dir, folder_path=folder_path
+        )
+        if not plan["apply_available"]:
+            raise RuntimeError("folder quarantine is blocked: " + ",".join(plan["blocked_reasons"]))
+        if confirm_count != plan["item_count"] or confirm_plan_sha256 != plan["plan_sha256"]:
+            raise RuntimeError("folder quarantine confirmation is stale")
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            issues = decision_store.doctor_issues(conn)
+            if issues:
+                raise RuntimeError(f"doctor failed before folder quarantine: {issues[0]['kind']}")
+            backup = decision_store.backup_state_db(conn, _backup_path(state_db, "folder_quarantine"))
+            from dedup_mutations import _ensure_intake_fingerprint, _file_state
+            for item in plan["items"]:
+                if item["registered"] and item["fingerprint_id"] is None:
+                    source_row = _file_state(conn, item["file_id"])
+                    evidence = inspect_regular_file(source_row["canonical_path"])
+                    existing = conn.execute(
+                        """
+                        SELECT fingerprint_id, raw_sha256
+                        FROM fingerprints
+                        WHERE file_id = ? AND canonical_path = ? AND size = ? AND mtime_ns = ?
+                          AND raw_sha256 IS NOT NULL
+                        ORDER BY fingerprint_id DESC
+                        """,
+                        (source_row["file_id"], source_row["canonical_path"],
+                         source_row["size"], source_row["mtime_ns"]),
+                    ).fetchall()
+                    reusable = next(
+                        (row for row in existing if row["raw_sha256"] == evidence.sha256),
+                        None,
+                    )
+                    if reusable is not None:
+                        with decision_store.transaction(conn):
+                            conn.execute(
+                                "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ? "
+                                "AND current_fingerprint_id IS NULL",
+                                (reusable["fingerprint_id"], source_row["file_id"]),
+                            )
+                        fingerprinted = _file_state(conn, item["file_id"])
+                    else:
+                        fingerprinted = _ensure_intake_fingerprint(conn, source_row)
+                    item["fingerprint_id"] = fingerprinted["current_fingerprint_id"]
+            decision_store.issue_actual_run_token(conn, str(backup), house_dir=house_dir, temp_dir=temp_dir)
+        finally:
+            conn.close()
+        run_id, manifest_path = decision_store.prepare_actual_run(
+            state_db, house_dir, temp_dir,
+            manifest_paths=[item["source_path"] for item in plan["items"]],
+        )
+        try:
+            conn = decision_store.connect_state_db(state_db)
+            try:
+                result = _quarantine_folder(conn, plan=plan, run_id=run_id, manifest_path=manifest_path)
+                result["doctor_issues"] = decision_store.doctor_issues(conn, allowed_active_run_id=run_id)
+                decision_store.finish_actual_run(conn, run_id, success=True)
+            finally:
+                conn.close()
+        except BaseException as exc:
+            conn = decision_store.connect_state_db(state_db)
+            try:
+                decision_store.finish_actual_run(conn, run_id, success=False, error=str(exc))
+            finally:
+                conn.close()
+            raise
+        if progress:
+            progress(plan["item_count"], plan["item_count"], Path(folder_path).name)
+        try:
+            index = _refresh_review_index(state_db=state_db, house_dir=house_dir, index_path=index_path)
+        except Exception as exc:
+            index = {"index_updated": False, "house_index_synced": False,
+                     "warning": f"폴더 격리는 완료됐지만 index 갱신에 실패했습니다: {exc}"}
+        output = {**result, "run_id": run_id, "manifest_path": manifest_path,
+                  "backup_path": str(backup), **index}
+        if result["doctor_issues"]:
+            output["_job_state"] = "needs_review"
+            output["_job_message"] = "폴더 격리는 완료됐지만 Doctor 검토가 필요합니다"
+        return output
 
 
 def _relocate_managed_folder(

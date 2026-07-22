@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import decision_store
-from dedup_mutations import user_quarantine
+from dedup_mutations import _ensure_intake_fingerprint, _file_state, user_quarantine
 from mutation_io import (
     ensure_directory_nofollow,
     evidence_matches,
@@ -86,16 +86,47 @@ def _public_file(row) -> dict:
     }
 
 
-def _require_current_file(row, *, source: str = "house") -> None:
+def _require_current_file(
+    row, *, source: str = "house", require_fingerprint: bool = True,
+) -> None:
     if not row["active"] or row["source"] != source:
         raise RuntimeError(f"file must be an active {source} file: {row['file_id']}")
-    if row["current_fingerprint_id"] is None:
+    if require_fingerprint and row["current_fingerprint_id"] is None:
         raise RuntimeError(f"current fingerprint is missing: {row['file_id']}")
     evidence = inspect_regular_file(row["canonical_path"])
     expected = (row["dev"], row["ino"], row["ctime_ns"], row["size"], row["mtime_ns"])
     actual = (evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size, evidence.mtime_ns)
     if expected != actual:
         raise RuntimeError(f"file snapshot is stale: {row['file_id']}")
+
+
+def _prepare_current_fingerprint(conn, file_id: str):
+    """Attach a current raw fingerprint after backup, reusing immutable evidence."""
+    source = _file_state(conn, file_id)
+    if source["current_fingerprint_id"] is not None:
+        return source
+    _require_current_file(_file_row(conn, file_id, active=True), require_fingerprint=False)
+    evidence = inspect_regular_file(source["canonical_path"])
+    existing = conn.execute(
+        """
+        SELECT fingerprint_id, raw_sha256
+        FROM fingerprints
+        WHERE file_id = ? AND canonical_path = ? AND size = ? AND mtime_ns = ?
+          AND raw_sha256 IS NOT NULL
+        ORDER BY fingerprint_id DESC
+        """,
+        (source["file_id"], source["canonical_path"], source["size"], source["mtime_ns"]),
+    ).fetchall()
+    reusable = next((row for row in existing if row["raw_sha256"] == evidence.sha256), None)
+    if reusable is not None:
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ? "
+                "AND current_fingerprint_id IS NULL",
+                (reusable["fingerprint_id"], source["file_id"]),
+            )
+        return _file_state(conn, file_id)
+    return _ensure_intake_fingerprint(conn, source)
 
 
 def relationship_preview(
@@ -245,7 +276,7 @@ def quarantine_preview(
         source = _file_row(conn, source_file_id, active=True)
         blockers = []
         try:
-            _require_current_file(source)
+            _require_current_file(source, require_fingerprint=False)
         except RuntimeError as exc:
             blockers.append(str(exc))
         keep = None
@@ -255,7 +286,7 @@ def quarantine_preview(
             else:
                 try:
                     keep = _file_row(conn, keep_file_id, active=True)
-                    _require_current_file(keep)
+                    _require_current_file(keep, require_fingerprint=False)
                 except (KeyError, RuntimeError) as exc:
                     blockers.append(f"invalid_keep:{exc}")
         replacement = None
@@ -274,6 +305,10 @@ def quarantine_preview(
             remaining_variant_files = len(candidates)
             if candidates:
                 replacement = _file_row(conn, candidates[0]["file_id"], active=True)
+                try:
+                    _require_current_file(replacement, require_fingerprint=False)
+                except RuntimeError as exc:
+                    blockers.append(f"invalid_replacement:{exc}")
             else:
                 retired_variant = True
                 if source["work_bucket_id"] is not None:
@@ -293,12 +328,17 @@ def quarantine_preview(
             "replacement_file_id": replacement["file_id"] if replacement else None,
             "destination_root": str(destination_root),
         }
+        preparation_ids = {
+            row["file_id"] for row in (source, keep, replacement)
+            if row is not None and row["current_fingerprint_id"] is None
+        }
         return {
             "version": "1.3.2", "kind": "user_quarantine", "item_count": 1,
             "source": _public_file(source), "keep": _public_file(keep) if keep else None,
             "replacement_representative": _public_file(replacement) if replacement else None,
             "remaining_variant_files": remaining_variant_files,
             "retired_variant": retired_variant, "retired_work": retired_work,
+            "fingerprint_preparation_count": len(preparation_ids),
             "destination_root": str(destination_root),
             "blocked_reasons": blockers, "apply_available": not blockers,
             "plan_sha256": _hash(payload), "readonly": True,
@@ -328,6 +368,13 @@ def apply_quarantine(
             if issues:
                 raise RuntimeError(f"doctor failed before quarantine: {issues[0]['kind']}")
             backup = decision_store.backup_state_db(conn, _backup_path(state_db, "user_quarantine"))
+            preparation_ids = [source_file_id]
+            for key in ("keep", "replacement_representative"):
+                item = plan[key]
+                if item and item["file_id"] not in preparation_ids:
+                    preparation_ids.append(item["file_id"])
+            for file_id in preparation_ids:
+                _prepare_current_fingerprint(conn, file_id)
             decision_store.issue_actual_run_token(conn, str(backup), house_dir=house_dir, temp_dir=temp_dir)
         finally:
             conn.close()

@@ -76,6 +76,12 @@ python3 run_folderling_one_button.py --help
 대기 상태를 보여주는 대시보드, 플랫폼 `ok` 정보가 없는 파일의 수동 제목 교정, 분권 후보 검토,
 서비스 실행, 검토 큐를 흡수한 카탈로그, 작업 이력·보고서와 화면 설정이 있습니다.
 
+로컬 Chrome 확장 코드는 공개 Git에서 제외된 `extension/`에만 둡니다. 해당 폴더의
+`normalizer.js`는 Python `backend/normalizer.py`와 같은 `NORMALIZER_VERSION` 및
+`core_title` 결과를 유지하며, `extension/check_normalizer_parity.py`로 양쪽 결과를 대조합니다.
+`[[제목]]`·`{{구조}}`는 게시글 사이트나 번들 index가 생성하는 문법은 아니지만 계약 차이를
+남기지 않기 위해 확장에서도 호환 처리합니다.
+
 ## 동일 좌표 중복 재검사 (1.2.10)
 
 Folderling은 같은 `core_title`과 권/회차 좌표를 가진 TXT·EPUB 쌍을 필수 후보로
@@ -261,6 +267,47 @@ house-ingest transaction에 묶여 관계 저장이 실패하면 기존 operatio
 
 1.3.4는 합성 API·Folderling fixture와 전체 회귀, production build까지만 수행합니다. 운영 DB 최종
 migration, Re:제로 read-only 병합 preview, 실제 alias 입고·중단 복구와 UI 조정은 1.3.5에서 진행합니다.
+
+### 운영 전환과 관계 안전성 보강 (1.3.5)
+
+운영 도서 서버를 재시작해 schema v12 DB를 v13으로 전환했습니다. 서버는 migration 전에
+`before_library_server_schema_*.sqlite3` 백업을 만들고 SQLite 무결성 및 SHA-256을 확인했으며,
+전환 뒤 Doctor, active run, unfinished operation/group을 다시 검사했습니다. 운영 DB·index·house의
+활성 지원 파일은 모두 16,679개로 유지됐습니다.
+
+첫 운영 관계는 파일을 움직이지 않는 `궁귀검신` work #3의 primary 관리 폴더 등록과 core title alias로
+검증했습니다. 폴더 등록과 alias 저장은 각각 전용 backup·manifest·관리 event를 남겼고, alias는
+`/txt_house/ㄱ/궁귀검신`으로 정상 해석됩니다. 실제 `Re 제로…` 데이터는 두 work가 아니라 work #1과
+미연결 폴더의 조합이므로 잘못된 병합을 실행하지 않았습니다.
+
+운영 split preview에서 같은 관리 폴더의 판본 하나만 다른 work로 옮기면 파일 경로와 폴더 관계가
+엇갈릴 수 있는 경우를 발견해 차단했습니다. 분리 대상 파일이 관리 폴더 안에 있으면 그 폴더도 반드시
+선택해야 하고, 같은 폴더에 선택하지 않은 variant가 남으면 먼저 물리 폴더를 나눠야 합니다. 화면은
+내부 blocker 코드 대신 이 이유를 한국어로 표시하고 실행 버튼을 비활성화합니다.
+
+관리 폴더 생성·현재 폴더 등록 화면은 숫자 ID를 직접 입력하지 않습니다. 작품명, core title, 별칭 또는
+작품 번호로 검색한 결과에서 파일 수와 현재 관리 폴더 수를 확인한 뒤 작품을 선택합니다. 파일 이동
+화면은 같은 작품 관계, 동일 core title, 유사 core title 순으로 기존 house 폴더를 카드형 추천합니다.
+각 카드에서 추천 근거, 상대 경로, 보유 파일 수·용량과 관리 폴더 여부를 확인하고 클릭해 선택하며,
+폴더명·core title·보유 파일명 검색도 같은 화면에서 수행합니다. 초성 루트는 추천 노이즈에서 제외하고,
+작품 폴더 안에 이미 있는 파일은 현재 위치를 우선 표시합니다. 직접 경로 입력은 접힌 고급 항목으로
+유지합니다.
+
+폴더 상세는 내부 DB 도서마다 `빠른 제목 교정`, `이름·이동`, `사용자 승인 격리`를 바로 실행합니다.
+빠른 제목 교정은 별도 페이지로 이동하지 않고 기존 `TitleCorrectionProvider`의 preview/plan/apply를
+그대로 호출하는 1파일 모달이므로 교정 규칙이나 temp 재입고 로직을 복제하지 않습니다.
+
+`폴더 전체 격리`는 DB 도서와 JPG·ZIP 같은 부속 파일, 빈 하위 폴더를
+`user_folder_quarantine` operation group으로 묶어
+`txt_temp/trash_bin/user_approved_folder_discard/<기존 house 상대 경로>`로 이동합니다. 실행 전 DB backup,
+전체 파일 manifest, 폴더 inode, 목적지 no-clobber를 확인하고 파일별 `user_quarantine` 이력도 남깁니다.
+중간 DB 실패 시 폴더 전체를 원위치로 되돌리며, DB에 아직 fingerprint가 없는 미배정 파일은 실행
+직전 백업 이후 fingerprint만 보강한 뒤 같은 확인 계획으로 처리합니다. symlink, stale identity,
+기존 격리 목적지 충돌은 실행 전에 차단합니다.
+
+1.3.5 전체 회귀는 `585 passed`, TypeScript/Vite production build와 운영 Doctor 0건을 확인했습니다.
+실제 동일 작품 두 work의 merge 적용과 alias에 맞는 다음 정상 신규 파일의 Folderling 입고는 인위적인
+테스트 파일을 서재에 남기지 않고, 해당 실사용 사례가 생길 때 계획 확인부터 검증합니다.
 
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제

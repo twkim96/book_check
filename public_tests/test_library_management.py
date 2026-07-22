@@ -155,6 +155,63 @@ def test_user_quarantine_retires_representative_and_restore_records_distinct_dec
         conn.close()
 
 
+def test_user_quarantine_prepares_missing_fingerprint_after_backup(tmp_path):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    source = house / "ㄱ" / "지문 없는 신규 도서.txt"
+    source.parent.mkdir(parents=True)
+    temp.mkdir()
+    source.write_text("아직 감사되지 않은 실제 도서 본문", encoding="utf-8")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            row = decision_store.reconcile_file_metadata(conn, source, source="house")
+        file_id = row["file_id"]
+        assert conn.execute(
+            "SELECT current_fingerprint_id FROM files WHERE file_id = ?", (file_id,)
+        ).fetchone()[0] is None
+    finally:
+        conn.close()
+
+    plan = quarantine_preview(state_db, temp_dir=temp, source_file_id=file_id)
+    assert plan["apply_available"] is True
+    assert plan["fingerprint_preparation_count"] == 1
+    assert plan["source"]["current_fingerprint_id"] is None
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT current_fingerprint_id FROM files WHERE file_id = ?", (file_id,)
+        ).fetchone()[0] is None
+    finally:
+        conn.close()
+
+    result = apply_quarantine(
+        state_db, house_dir=house, temp_dir=temp, index_path=tmp_path / "file_index.json",
+        source_file_id=file_id, keep_file_id=None, confirm_count=1,
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    assert not source.exists()
+    assert Path(result["dest_path"]).is_file()
+    assert Path(result["backup_path"]).is_file()
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        stored = conn.execute(
+            """
+            SELECT f.current_fingerprint_id, fp.status
+            FROM files f JOIN fingerprints fp
+              ON fp.fingerprint_id = f.current_fingerprint_id
+            WHERE f.file_id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+        assert stored["current_fingerprint_id"] is not None
+        assert stored["status"] == "raw_only"
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+
 def test_selected_quarantine_purge_confirms_plan_and_releases_only_selected_bytes(tmp_path):
     state_db, house, temp, index, paths, ids = _fixture(tmp_path)
     plan = quarantine_preview(

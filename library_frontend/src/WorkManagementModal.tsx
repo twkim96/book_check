@@ -129,7 +129,7 @@ export function WorkManagementModal({
 
   const invalidateSplit = () => setSplitPlan(undefined);
   return <Modal close={close}>
-    <Top eyebrow="WORK RELATIONSHIP · 1.3.4" title={`작품 #${workId} 관리`} close={close}/>
+    <Top eyebrow="WORK RELATIONSHIP · 1.3.5" title={`작품 #${workId} 관리`} close={close}/>
     {error && <div className="inline-error">{error}</div>}
     {!detail ? !error && <div className="loading"><span/>작품 관계를 확인하고 있습니다.</div> : <>
       <div className="management-impact">
@@ -147,7 +147,7 @@ export function WorkManagementModal({
         <div className="management-form">
           <label>별칭 종류<select value={aliasKind} onChange={(event) => { setAliasKind(event.target.value as WorkAliasPlan["alias_kind"]); setAliasPlan(undefined); }}><option value="core_title">core title</option><option value="readable_title">읽기 제목</option><option value="folder_name">폴더명</option></select></label>
           <label>입고 폴더<select value={aliasFolderId} onChange={(event) => { setAliasFolderId(event.target.value); setAliasPlan(undefined); }}><option value="">대표 폴더 자동 선택</option>{detail.folders.filter((item) => item.state === "active").map((folder) => <option value={folder.folder_id} key={folder.folder_id}>#{folder.folder_id} {folder.role} · {folder.canonical_path}</option>)}</select></label>
-          <label className="management-wide">별칭<input value={aliasValue} onChange={(event) => { setAliasValue(event.target.value); setAliasPlan(undefined); }} placeholder="Re 제로부터 시작하는 이세계 생활"/></label>
+          <label className="management-wide">별칭<input value={aliasValue} onChange={(event) => { setAliasValue(event.target.value); setAliasPlan(undefined); }} placeholder={detail.work.display_title ?? "작품 별칭"}/></label>
           <label>교체할 alias ID<input type="number" min="1" value={replaceAliasId} onChange={(event) => { setReplaceAliasId(event.target.value); setAliasPlan(undefined); }} placeholder="충돌 시에만"/></label>
         </div>
         {aliasPlan && <><div className="management-paths"><small>저장 key: {aliasPlan.alias_key}</small>{aliasPlan.existing_alias && <small>현재 alias #{aliasPlan.existing_alias.alias_id} · work {aliasPlan.existing_alias.work_bucket_id}</small>}</div><PlanCheck sha={aliasPlan.plan_sha256} blockers={aliasPlan.blocked_reasons}/></>}

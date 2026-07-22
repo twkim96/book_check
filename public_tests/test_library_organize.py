@@ -6,11 +6,13 @@ import decision_store
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 import library_organize
 from library_organize import (
+    apply_folder_quarantine,
     apply_file_relocate,
     apply_managed_folder_create,
     apply_managed_folder_adopt,
     apply_managed_folder_relocate,
     file_relocate_preview,
+    folder_quarantine_preview,
     managed_folder_preview,
     managed_folder_adopt_preview,
     managed_folder_relocate_preview,
@@ -524,6 +526,87 @@ def test_existing_folder_can_be_adopted_without_moving_files(tmp_path):
             "SELECT action, state FROM operation_groups WHERE group_id = ?",
             (result["group_id"],),
         ).fetchone()[:] == ("managed_folder_adopt", "committed")
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+
+def test_folder_quarantine_moves_registered_and_auxiliary_as_one_group(tmp_path):
+    state_db, house, temp, index, source, _, file_id = _fixture(tmp_path)
+    folder = source.parent
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET current_fingerprint_id = NULL WHERE file_id = ?",
+                (file_id,),
+            )
+    finally:
+        conn.close()
+    (folder / "cover.jpg").write_bytes(b"cover")
+    (folder / "extras").mkdir()
+    (folder / "extras" / "map.zip").write_bytes(b"zip")
+    plan = folder_quarantine_preview(
+        state_db, house_dir=house, temp_dir=temp, folder_path=str(folder)
+    )
+    assert plan["apply_available"] is True
+    assert plan["registered_count"] == 1
+    assert plan["auxiliary_count"] == 2
+    assert next(item for item in plan["items"] if item["registered"])["fingerprint_id"] is None
+    result = apply_folder_quarantine(
+        state_db, house_dir=house, temp_dir=temp, index_path=index,
+        folder_path=str(folder), confirm_count=plan["item_count"],
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    destination = Path(result["destination_path"])
+    assert not folder.exists()
+    assert (destination / source.name).read_bytes() == b"synthetic epub bytes"
+    assert (destination / "cover.jpg").read_bytes() == b"cover"
+    assert (destination / "extras" / "map.zip").read_bytes() == b"zip"
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        file_row = conn.execute(
+            "SELECT active, source, canonical_path FROM files WHERE file_id = ?", (file_id,)
+        ).fetchone()
+        assert file_row[0:2] == (0, "quarantine")
+        assert file_row[2] == str(destination / source.name)
+        assert conn.execute(
+            "SELECT action, state FROM operation_groups WHERE group_id = ?",
+            (result["group_id"],),
+        ).fetchone()[:] == ("user_folder_quarantine", "committed")
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+
+def test_folder_quarantine_db_failure_rolls_tree_back(tmp_path, monkeypatch):
+    state_db, house, temp, index, source, _, _ = _fixture(tmp_path)
+    folder = source.parent
+    plan = folder_quarantine_preview(
+        state_db, house_dir=house, temp_dir=temp, folder_path=str(folder)
+    )
+    original = decision_store.transition_operation_group
+
+    def fail_db_done(conn, group_id, new_state, **kwargs):
+        if new_state == "db_done":
+            raise RuntimeError("injected quarantine db failure")
+        return original(conn, group_id, new_state, **kwargs)
+
+    monkeypatch.setattr(decision_store, "transition_operation_group", fail_db_done)
+    with pytest.raises(RuntimeError, match="injected quarantine db failure"):
+        apply_folder_quarantine(
+            state_db, house_dir=house, temp_dir=temp, index_path=index,
+            folder_path=str(folder), confirm_count=plan["item_count"],
+            confirm_plan_sha256=plan["plan_sha256"],
+        )
+    assert folder.is_dir() and source.is_file()
+    assert not Path(plan["destination_path"]).exists()
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT state FROM operation_groups WHERE action = 'user_folder_quarantine' "
+            "ORDER BY group_id DESC LIMIT 1"
+        ).fetchone()[0] == "rolled_back"
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()

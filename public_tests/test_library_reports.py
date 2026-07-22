@@ -83,6 +83,29 @@ def test_dedup_report_listing_groups_legacy_pairs_and_json_only_reports(tmp_path
     assert "정확 중복 quarantine 1개" in old["summary"]
 
 
+def test_dedup_report_listing_pages_twenty_reports_at_a_time(tmp_path):
+    root = tmp_path / "dedup_logs"
+    root.mkdir()
+    for index in range(25):
+        (root / f"dedup_20260721_{index:06d}.txt").write_text(
+            f"모드: page fixture {index}", encoding="utf-8"
+        )
+
+    first = dedup_report_listing(tmp_path, limit=20)
+    assert first["total"] == 25
+    assert len(first["items"]) == 20
+    assert first["cursor"] is None
+    assert first["next_cursor"] == "20"
+
+    second = dedup_report_listing(tmp_path, limit=20, cursor=first["next_cursor"])
+    assert len(second["items"]) == 5
+    assert second["cursor"] == "20"
+    assert second["next_cursor"] is None
+    assert {item["report_id"] for item in first["items"]}.isdisjoint(
+        item["report_id"] for item in second["items"]
+    )
+
+
 def test_json_only_detail_renders_text_and_exports_without_creating_txt(tmp_path):
     temp, _old, _paired, current, _strong = _reports(tmp_path)
 

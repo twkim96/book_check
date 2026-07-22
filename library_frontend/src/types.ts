@@ -204,6 +204,8 @@ export interface DedupReportListing {
   items: DedupReportItem[];
   total: number;
   limit: number;
+  cursor: string | null;
+  next_cursor: string | null;
   search: string;
   kind: "all" | "dedup" | "strong_candidates";
   readonly: true;
@@ -372,7 +374,7 @@ export interface WorkManagementDetail {
 }
 
 export interface WorkMergePlan {
-  version: "1.3.4";
+  version: "1.3.5";
   kind: "work_merge";
   item_count: number;
   source: WorkManagementDetail;
@@ -384,7 +386,7 @@ export interface WorkMergePlan {
 }
 
 export interface WorkSplitPlan {
-  version: "1.3.4";
+  version: "1.3.5";
   kind: "work_split";
   item_count: number;
   source: WorkManagementDetail;
@@ -399,7 +401,7 @@ export interface WorkSplitPlan {
 }
 
 export interface WorkAliasPlan {
-  version: "1.3.4";
+  version: "1.3.5";
   kind: "work_alias_upsert";
   item_count: number;
   alias_kind: "core_title" | "readable_title" | "folder_name";
@@ -415,7 +417,7 @@ export interface WorkAliasPlan {
 }
 
 export interface WorkAliasRetirePlan {
-  version: "1.3.4";
+  version: "1.3.5";
   kind: "work_alias_retire";
   item_count: number;
   alias: WorkManagementDetail["aliases"][number];
@@ -425,7 +427,7 @@ export interface WorkAliasRetirePlan {
 }
 
 export interface RepresentativePlan {
-  version: "1.3.4";
+  version: "1.3.5";
   kind: "representative_replace";
   item_count: number;
   variant: WorkManagementDetail["variants"][number] & { work_bucket_id: number };
@@ -525,7 +527,7 @@ export interface ExplorerFileDetail {
 }
 
 export interface FileRelocatePlan {
-  version: "1.3.3";
+  version: "1.3.5";
   kind: "file_relocate";
   item_count: number;
   source: ExplorerFile & Record<string, unknown>;
@@ -548,7 +550,7 @@ export interface FileRelocatePlan {
 }
 
 export interface ManagedFolderPlan {
-  version: "1.3.3";
+  version: "1.3.5";
   kind: "managed_folder_create";
   item_count: number;
   work: { work_bucket_id: number; display_title: string | null };
@@ -563,7 +565,7 @@ export interface ManagedFolderPlan {
 }
 
 export interface ManagedFolderRelocatePlan {
-  version: "1.3.3";
+  version: "1.3.5";
   kind: "managed_folder_relocate";
   item_count: number;
   folder: { folder_id: number; work_bucket_id: number; role: string; display_title: string | null };
@@ -584,7 +586,7 @@ export interface ManagedFolderRelocatePlan {
 }
 
 export interface ManagedFolderAdoptPlan {
-  version: "1.3.3";
+  version: "1.3.5";
   kind: "managed_folder_adopt";
   item_count: number;
   folder_path: string;
@@ -597,6 +599,51 @@ export interface ManagedFolderAdoptPlan {
   blocked_reasons: string[];
   apply_available: boolean;
   plan_sha256: string;
+  readonly: true;
+}
+
+export interface WorkSearchItem {
+  work_bucket_id: number;
+  display_title: string | null;
+  active_file_count: number;
+  active_folder_count: number;
+}
+
+export interface WorkSearchListing {
+  items: WorkSearchItem[];
+  search: string;
+  limit: number;
+  readonly: true;
+}
+
+export interface FileDestinationCandidate {
+  path: string;
+  name: string;
+  relative_path: string;
+  file_count: number;
+  total_size: number;
+  core_titles: string[];
+  work_bucket_ids: number[];
+  managed_folder_id: number | null;
+  managed_role: string | null;
+  similarity: number;
+  score: number;
+  reasons: string[];
+  current: boolean;
+}
+
+export interface FileDestinationListing {
+  source: {
+    file_id: string;
+    path: string;
+    core_title: string;
+    readable_title: string;
+    work_bucket_id: number | null;
+    current_parent: string;
+  };
+  items: FileDestinationCandidate[];
+  search: string;
+  limit: number;
   readonly: true;
 }
 
@@ -660,14 +707,45 @@ export interface ExplorerFolderDetail {
     extension: string;
     registered: boolean;
     symlink: boolean;
-    file: Record<string, unknown> | null;
+    file: {
+      file_id: string;
+      canonical_path: string;
+      size: number;
+      source: string;
+      active: number;
+      assignment_state: string;
+      variant_id: number | null;
+      core_title: string | null;
+      author: string | null;
+      work_bucket_id: number | null;
+    } | null;
   }>;
   registered_count: number;
   unregistered_count: number;
   total_size: number;
   truncated: boolean;
   managed_folder: { folder_id: number; work_bucket_id: number; role: string; state: string; work_title: string | null } | null;
-  actions: { rename: boolean; move: boolean; quarantine: false; future_version: string | null };
+  actions: { rename: boolean; move: boolean; quarantine: boolean; future_version: string | null };
+  readonly: true;
+}
+
+export interface FolderQuarantinePlan {
+  version: "1.3.5";
+  kind: "user_folder_quarantine";
+  item_count: number;
+  source_path: string;
+  destination_path: string;
+  registered_count: number;
+  auxiliary_count: number;
+  directory_count: number;
+  total_size: number;
+  work_bucket_ids: number[];
+  managed_folders: Array<{ folder_id: number; work_bucket_id: number; canonical_path: string; role: string }>;
+  related_folders: Array<{ folder_id: number; work_bucket_id: number; canonical_path: string; role: string; display_title: string | null }>;
+  items: Array<{ relative_path: string; source_path: string; size: number; registered: boolean; file_id: string | null }>;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
   readonly: true;
 }
 
@@ -731,6 +809,7 @@ export interface QuarantinePlan {
   remaining_variant_files: number;
   retired_variant: boolean;
   retired_work: boolean;
+  fingerprint_preparation_count: number;
   destination_root: string;
   blocked_reasons: string[];
   apply_available: boolean;

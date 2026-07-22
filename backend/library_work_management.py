@@ -1,4 +1,4 @@
-"""Human-approved work, variant, alias, and routing management for v1.3.4."""
+"""Human-approved work, variant, alias, and routing management for v1.3.5."""
 
 from __future__ import annotations
 
@@ -140,6 +140,63 @@ def work_detail(state_db: Path, work_bucket_id: int) -> dict:
         conn.close()
 
 
+def work_search(state_db: Path, *, search: str = "", limit: int = 20) -> dict:
+    """Small searchable projection used by folder-management pickers."""
+    needle = str(search or "").strip()
+    limit = max(1, min(int(limit), 50))
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        parameters: list[object] = []
+        where = "w.status = 'active'"
+        if needle:
+            escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            where += """
+                AND (
+                    CAST(w.work_bucket_id AS TEXT) = ?
+                    OR w.display_title LIKE ? ESCAPE '\\' COLLATE NOCASE
+                    OR EXISTS (
+                        SELECT 1 FROM variants sv
+                        JOIN files sf ON sf.variant_id = sv.variant_id
+                        LEFT JOIN file_analysis sa ON sa.file_id = sf.file_id
+                        WHERE sv.work_bucket_id = w.work_bucket_id AND sf.active = 1
+                          AND (sa.core_title LIKE ? ESCAPE '\\' COLLATE NOCASE
+                               OR sa.readable_title LIKE ? ESCAPE '\\' COLLATE NOCASE)
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM work_aliases wa
+                        WHERE wa.work_bucket_id = w.work_bucket_id AND wa.active = 1
+                          AND wa.alias_display LIKE ? ESCAPE '\\' COLLATE NOCASE
+                    )
+                )
+            """
+            parameters.extend([needle, pattern, pattern, pattern, pattern])
+        rows = conn.execute(
+            f"""
+            SELECT w.work_bucket_id, w.display_title,
+                   COUNT(DISTINCT CASE WHEN f.active = 1 AND f.source = 'house' THEN f.file_id END)
+                       AS active_file_count,
+                   COUNT(DISTINCT CASE WHEN wf.state = 'active' THEN wf.folder_id END)
+                       AS active_folder_count
+            FROM works w
+            LEFT JOIN variants v ON v.work_bucket_id = w.work_bucket_id
+            LEFT JOIN files f ON f.variant_id = v.variant_id
+            LEFT JOIN work_folders wf ON wf.work_bucket_id = w.work_bucket_id
+            WHERE {where}
+            GROUP BY w.work_bucket_id, w.display_title
+            ORDER BY
+                CASE WHEN CAST(w.work_bucket_id AS TEXT) = ? THEN 0 ELSE 1 END,
+                CASE WHEN w.display_title = ? COLLATE NOCASE THEN 0 ELSE 1 END,
+                active_file_count DESC, w.display_title COLLATE NOCASE, w.work_bucket_id
+            LIMIT ?
+            """,
+            [*parameters, needle, needle, limit],
+        ).fetchall()
+        return {"items": [dict(row) for row in rows], "search": needle, "limit": limit, "readonly": True}
+    finally:
+        conn.close()
+
+
 def alias_preview(
     state_db: Path,
     *,
@@ -190,7 +247,7 @@ def alias_preview(
             "replace_alias_id": replace_alias_id,
         }
         return {
-            "version": "1.3.4",
+            "version": "1.3.5",
             "kind": "work_alias_upsert",
             "item_count": 1,
             "alias_kind": alias_kind,
@@ -247,7 +304,7 @@ def apply_alias(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-1.3.4"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-1.3.5"):
         plan = alias_preview(
             state_db,
             alias_kind=alias_kind,
@@ -332,7 +389,7 @@ def alias_retire_preview(state_db: Path, *, alias_id: int) -> dict:
         blockers = [] if alias["active"] else ["alias_already_inactive"]
         payload = {"alias": dict(alias), "action": "retire"}
         return {
-            "version": "1.3.4",
+            "version": "1.3.5",
             "kind": "work_alias_retire",
             "item_count": 1,
             "alias": dict(alias),
@@ -354,7 +411,7 @@ def apply_alias_retire(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-retire-1.3.4"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-retire-1.3.5"):
         plan = alias_retire_preview(state_db, alias_id=alias_id)
         if not plan["apply_available"]:
             raise RuntimeError(
@@ -576,7 +633,7 @@ def work_merge_preview(
             "demoted_folder_ids": demoted_folder_ids,
         }
         return {
-            "version": "1.3.4",
+            "version": "1.3.5",
             "kind": "work_merge",
             "item_count": len(active_variants),
             "source": source,
@@ -601,7 +658,7 @@ def apply_work_merge(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-merge-1.3.4"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-merge-1.3.5"):
         plan = work_merge_preview(
             state_db, source_work_id=source_work_id, target_work_id=target_work_id
         )
@@ -705,13 +762,11 @@ def work_split_preview(
         }
         if not set(selected_folders).issubset(source_folder_ids):
             blockers.append("folder_not_in_source_work")
-        for folder_id in selected_folders:
-            folder = next(
-                (row for row in source["folders"] if int(row["folder_id"]) == folder_id),
-                None,
-            )
-            if folder is None:
+        selected_variant_set = set(selected_variants)
+        for folder in source["folders"]:
+            if folder["state"] != "active":
                 continue
+            folder_id = int(folder["folder_id"])
             contained_variants = {
                 int(row[0])
                 for row in conn.execute(
@@ -723,7 +778,11 @@ def work_split_preview(
                     (_descendant_pattern(folder["canonical_path"]),),
                 )
             }
-            if not contained_variants.issubset(set(selected_variants)):
+            if not contained_variants.intersection(selected_variant_set):
+                continue
+            if folder_id not in selected_folders:
+                blockers.append(f"selected_variants_require_folder:{folder_id}")
+            if not contained_variants.issubset(selected_variant_set):
                 blockers.append(f"folder_contains_unselected_variants:{folder_id}")
         source_alias_ids = {
             int(row["alias_id"]) for row in source["aliases"] if row["active"]
@@ -756,7 +815,7 @@ def work_split_preview(
             "cleared_alias_routes": cleared_alias_routes,
         }
         return {
-            "version": "1.3.4",
+            "version": "1.3.5",
             "kind": "work_split",
             "item_count": len(selected_variants),
             "source": source,
@@ -787,7 +846,7 @@ def apply_work_split(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-split-1.3.4"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-split-1.3.5"):
         plan = work_split_preview(
             state_db,
             source_work_id=source_work_id,
@@ -905,7 +964,7 @@ def representative_preview(state_db: Path, *, variant_id: int, file_id: str) -> 
             "current_file_id": current["file_id"] if current else None,
         }
         return {
-            "version": "1.3.4",
+            "version": "1.3.5",
             "kind": "representative_replace",
             "item_count": 1,
             "variant": dict(variant),
@@ -930,7 +989,7 @@ def apply_representative(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "representative-replace-1.3.4"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "representative-replace-1.3.5"):
         plan = representative_preview(state_db, variant_id=variant_id, file_id=file_id)
         if not plan["apply_available"]:
             raise RuntimeError(
