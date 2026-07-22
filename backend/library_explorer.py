@@ -447,8 +447,6 @@ def file_detail(state_db: os.PathLike | str, file_id: str) -> dict:
         if item["source"] != "house":
             common_blockers.append("outside_active_house")
         quarantine_blockers = list(common_blockers)
-        if item.get("fingerprint_id") is None:
-            quarantine_blockers.append("missing_fingerprint")
         title_blockers = list(common_blockers)
         if item["protected"] or item["representative"]:
             title_blockers.append("protected_relationship")

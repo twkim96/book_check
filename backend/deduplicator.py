@@ -167,9 +167,11 @@ def ensure_index(house_dir, index_path, rescan=False, state_db_path=None):
     output_dir = os.path.dirname(index_path)
     file_list_path = os.path.join(output_dir, "file_list.json")
     print("ℹ️ 파일 인덱스를 갱신합니다...")
-    generate_file_list(
+    generated = generate_file_list(
         [house_dir], file_list_path, index_path, state_db_path=state_db_path
     )
+    if not generated or not os.path.isfile(index_path):
+        raise RuntimeError("file index generation failed")
 
 
 def load_index_entries(
@@ -186,12 +188,12 @@ def load_index_entries(
         with open(index_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
     except Exception as e:
-        print(f"❌ file_index.json 읽기 실패: {e}")
-        return []
+        raise RuntimeError(f"file_index.json 읽기 실패: {e}") from e
 
     if payload.get("version") != 2 or not isinstance(payload.get("entries"), list):
-        print("❌ file_index.json 형식이 v2 인덱스가 아닙니다. scanner.py로 다시 생성하세요.")
-        return []
+        raise RuntimeError(
+            "file_index.json 형식이 v2 인덱스가 아닙니다. scanner.py로 다시 생성하세요."
+        )
 
     index_norm_version = payload.get("normalizer_version")
     if index_norm_version != NORMALIZER_VERSION:
@@ -425,7 +427,7 @@ def choose_keep_exact(entries):
     protected = [e for e in entries if e.get("protected")]
     representatives = [e for e in entries if e.get("representative")]
     house = [e for e in entries if e.get("source") == "house"]
-    pool = protected or representatives or house or entries
+    pool = representatives or protected or house or entries
     return choose_keep(pool)
 
 
@@ -675,8 +677,7 @@ def _apply_disambig(entry, num, dry_run):
 def find_exact_duplicates(entries):
     size_groups = defaultdict(list)
     for entry in entries:
-        if entry["size"] > 0:
-            size_groups[entry["size"]].append(entry)
+        size_groups[entry["size"]].append(entry)
 
     exact_groups = []
     for paths in size_groups.values():
@@ -924,7 +925,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.2.10"
+        duplicate_auditor.AUDITOR_VERSION == "1.3.6"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )

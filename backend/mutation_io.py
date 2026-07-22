@@ -369,7 +369,16 @@ def inspect_normalized_text(path):
         raw_sha = _hash_fd(fd)
         normalized_sha = None
         decode_errors = []
-        for encoding in ("utf-8-sig", "utf-8", "cp949"):
+        prefix = os.pread(fd, 4, 0)
+        if prefix.startswith(codecs.BOM_UTF16_LE):
+            encodings = ("utf-16-le",)
+        elif prefix.startswith(codecs.BOM_UTF16_BE):
+            encodings = ("utf-16-be",)
+        elif prefix.startswith(codecs.BOM_UTF8):
+            encodings = ("utf-8-sig",)
+        else:
+            encodings = ("utf-8", "cp949")
+        for encoding in encodings:
             os.lseek(fd, 0, os.SEEK_SET)
             decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
             digest = hashlib.sha256()

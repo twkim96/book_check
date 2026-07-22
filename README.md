@@ -320,6 +320,46 @@ loopback Host와 same-origin 요청만 허용하며 서버 자체도 loopback �
 결합하지 않습니다. 현재 중복 순회는 느릴 수 있지만 판정 계약을 유지하며, snapshot 자료형과 cache
 무효화 계약을 별도 성능 패치로 설계한 뒤 적용합니다.
 
+### 코드 리뷰 경계 안정화 (1.3.6)
+
+1.3.6은 1.2.7 이후 전체 코드 리뷰에서 실제 재현된 파일 유실·경로 이탈·관계 오염 경계를 우선
+보강합니다. `unpack` 정리는 지원 파일 검사와 삭제 inventory를 별도로 만들지 않고 한 번의 no-follow
+inventory에서 지원 파일과 비지원 부속 파일을 함께 확정합니다. inventory에 지원 TXT·EPUB·PDF가 하나라도
+있으면 아무것도 지우지 않으며, inventory 뒤에 도착한 파일은 삭제 목록에 없으므로 그대로 보존됩니다.
+JPG·ZIP 같은 비지원 부속 파일을 정상 입고 뒤 삭제하는 기존 계약은 유지하며 추가 본문 hash는 수행하지
+않습니다.
+
+폴더 전체 격리는 사용자가 지정한 원시 경로의 house 상대 위치를 먼저 확인하고, 최종 경로 또는 중간
+구성요소가 symlink이면 `resolve()`한 실제 대상을 건드리기 전에 차단합니다. 작품 분리는 선택 폴더가
+선택 variant를 실제로 포함하는지 양방향으로 검사합니다. 병합·분리로 현재 관계와 모순된 활성
+`distinct_work`·`same_work_distinct_variant` 판정은 history를 삭제하지 않고 `active=0`으로 퇴역시키며,
+Doctor도 남은 활성 판정 모순을 `active_decision_relation_conflict`로 보고합니다.
+
+손상되거나 크기 제한을 넘은 EPUB 후보는 `epub_analysis_error`로 auditor를 불완전 종료해 Folderling
+입고를 중단합니다. 새 압축 원본 제한이 이전 분석 cache에 가려지지 않도록 fingerprint generation을
+4, auditor version을 1.3.6으로 올렸습니다. mutation 재검증도 auditor와 같은 UTF-16 BOM 규칙을 사용합니다.
+
+인덱스 생성·로드 실패는 빈 정상 인덱스로 바꾸지 않고 즉시 실패합니다. house와 로컬 확장 인덱스 배포는
+동일 디렉터리의 임시 정규 파일을 SHA-256으로 확인한 뒤 `os.replace()`하며, 기존 목적지가 symlink이면
+외부 대상을 따라가지 않고 중단합니다. 사용자 지정 `--state-db`도 actual 승인부터 dedup·입고·index까지
+같은 경로를 유지합니다.
+
+대표 변경은 새 대표를 `protected=1`로 만들고, 대표 격리 시 대체 후보는 활성 managed 파일로 제한합니다.
+파일 탐색기는 fingerprint가 없어도 백업 이후 자동 준비하는 격리 API를 그대로 사용할 수 있습니다.
+exact keep은 protected 비대표보다 대표를 우선하며 0바이트 동일 파일도 exact 판정에 포함합니다. Folderling
+결과는 검토 큐·report-only·legacy pass·실제 skipped 입력을 `review_required_count`로 합쳐 UI에서 단순
+성공과 구분합니다. 예상된 관리 폴더 제외 항목은 별도 `excluded_count`로만 기록합니다.
+
+이번 버전에는 디렉터리 입고 전체를 하나의 operation group으로 resume하는 재설계, 두 index surface를
+한 generation manifest로 묶는 변경, 후보 그래프 조기 cap, strong-component 자료구조 변경, Doctor·hash·
+snapshot 공유, Scanner 관찰 transaction 분리는 포함하지 않습니다. 디렉터리 입고는 현재 파일별 journal로
+원본·입고 파일을 보존하지만 중간 실패 후 같은 목적 폴더가 남으면 수동 확인이 필요합니다. 나머지는
+판정 결과와 cache invalidation 범위를 함께 바꾸는 성능 작업이므로 별도 버전에서 fixture와 운영 측정을
+준비한 뒤 적용합니다.
+
+1.3.6 검증은 `602 passed`, Python compileall, TypeScript/Vite production build와 `git diff --check`를
+통과했습니다. 테스트는 임시 fixture만 사용했으며 운영 house·temp·DB에는 변경을 수행하지 않았습니다.
+
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
 읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로

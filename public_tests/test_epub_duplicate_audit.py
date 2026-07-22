@@ -147,3 +147,26 @@ def test_epub_file_limit_is_checked_before_raw_hash(tmp_path, monkeypatch):
         mutation_io.inspect_epub_content(
             path, max_file_bytes=path.stat().st_size - 1
         )
+
+
+def test_corrupt_epub_candidate_makes_audit_incomplete(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["손상 작품 [작가A].epub", "손상 작품 [작가B].epub"]
+    for name in names:
+        (house / name).write_bytes(b"not a zip archive")
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+
+    report = duplicate_auditor.run_audit(_args(index, house, temp))
+
+    assert report.completed is False
+    assert "epub_analysis_error" in report.stop_reasons
+    assert report.stats["classification_counts"] == {"metadata_only": 1}
+
+
+def test_epub_limit_semantics_use_new_cache_generation():
+    assert duplicate_auditor.FINGERPRINT_VERSION == "4"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.3.6"

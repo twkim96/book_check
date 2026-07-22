@@ -77,6 +77,36 @@ def _folder(conn, path: Path, work_id: int, role="primary"):
         ).lastrowid)
 
 
+def _decision(conn, left_file, left_variant, right_file, right_variant, verdict):
+    records = sorted(((left_file, left_variant), (right_file, right_variant)))
+    (left_file, left_variant), (right_file, right_variant) = records
+    left_fp = conn.execute(
+        "SELECT current_fingerprint_id FROM files WHERE file_id = ?", (left_file,)
+    ).fetchone()[0]
+    right_fp = conn.execute(
+        "SELECT current_fingerprint_id FROM files WHERE file_id = ?", (right_file,)
+    ).fetchone()[0]
+    left_work = conn.execute(
+        "SELECT work_bucket_id FROM variants WHERE variant_id = ?", (left_variant,)
+    ).fetchone()[0]
+    right_work = conn.execute(
+        "SELECT work_bucket_id FROM variants WHERE variant_id = ?", (right_variant,)
+    ).fetchone()[0]
+    return int(conn.execute(
+        """
+        INSERT INTO decisions(
+            left_work_id, left_variant_id, right_work_id, right_variant_id,
+            left_file_id, right_file_id, left_fingerprint_id, right_fingerprint_id,
+            verdict
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            left_work, left_variant, right_work, right_variant,
+            left_file, right_file, left_fp, right_fp, verdict,
+        ),
+    ).lastrowid)
+
+
 def test_work_search_finds_title_id_and_alias(tmp_path):
     state_db, house, _ = _fixture(tmp_path)
     conn = decision_store.connect_state_db(state_db)
@@ -216,8 +246,17 @@ def test_work_merge_moves_relations_and_demotes_second_primary(tmp_path):
             target_variant = _variant(conn, target_work)
         source_folder = _folder(conn, house / "ㄹ" / "Re 제로", source_work)
         target_folder = _folder(conn, house / "ㄹ" / "Re:제로", target_work)
-        _managed_file(conn, house / "ㄹ" / "Re 제로" / "Re 제로 1권.epub", source_variant)
-        _managed_file(conn, house / "ㄹ" / "Re:제로" / "Re:제로 2권.epub", target_variant)
+        source_file = _managed_file(
+            conn, house / "ㄹ" / "Re 제로" / "Re 제로 1권.epub", source_variant
+        )
+        target_file = _managed_file(
+            conn, house / "ㄹ" / "Re:제로" / "Re:제로 2권.epub", target_variant
+        )
+        with decision_store.transaction(conn):
+            decision_id = _decision(
+                conn, source_file, source_variant, target_file, target_variant,
+                "distinct_work",
+            )
     finally:
         conn.close()
     alias = alias_preview(
@@ -271,6 +310,10 @@ def test_work_merge_moves_relations_and_demotes_second_primary(tmp_path):
             "SELECT action FROM work_management_events WHERE event_id = ?",
             (result["event_id"],),
         ).fetchone()[0] == "work_merge"
+        assert conn.execute(
+            "SELECT active FROM decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()[0] == 0
+        assert decision_id in result["retired_decision_ids"]
         assert decision_store.doctor_issues(conn) == []
         assert target_folder != source_folder
     finally:
@@ -289,12 +332,19 @@ def test_work_split_moves_selected_variant_folder_and_alias(tmp_path):
         second_folder = _folder(
             conn, house / "ㄱ" / "갈라진 작품 개정판", source_work, role="edition"
         )
-        _managed_file(conn, house / "ㄱ" / "갈라진 작품" / "갈라진 작품 1권.epub", first_variant)
-        _managed_file(
+        first_file = _managed_file(
+            conn, house / "ㄱ" / "갈라진 작품" / "갈라진 작품 1권.epub", first_variant
+        )
+        second_file = _managed_file(
             conn,
             house / "ㄱ" / "갈라진 작품 개정판" / "갈라진 작품 개정판 1권.epub",
             second_variant,
         )
+        with decision_store.transaction(conn):
+            decision_id = _decision(
+                conn, first_file, first_variant, second_file, second_variant,
+                "same_work_distinct_variant",
+            )
     finally:
         conn.close()
     alias = alias_preview(
@@ -353,6 +403,10 @@ def test_work_split_moves_selected_variant_folder_and_alias(tmp_path):
             "SELECT work_bucket_id, preferred_folder_id FROM work_aliases WHERE alias_id = ?",
             (alias_result["alias_id"],),
         ).fetchone()[:] == (result["new_work_id"], second_folder)
+        assert conn.execute(
+            "SELECT active FROM decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()[0] == 0
+        assert decision_id in result["retired_decision_ids"]
         assert decision_store.doctor_issues(conn) == []
         assert first_folder != second_folder
     finally:
@@ -409,6 +463,8 @@ def test_representative_replacement_keeps_variant_relationship(tmp_path):
             variant_id,
             representative=False,
         )
+        with decision_store.transaction(conn):
+            conn.execute("UPDATE files SET protected = 0 WHERE file_id = ?", (second,))
     finally:
         conn.close()
     plan = representative_preview(state_db, variant_id=variant_id, file_id=second)
@@ -426,6 +482,9 @@ def test_representative_replacement_keeps_variant_relationship(tmp_path):
         assert conn.execute(
             "SELECT file_id FROM representatives WHERE variant_id = ?", (variant_id,)
         ).fetchone()[0] == second
+        assert conn.execute(
+            "SELECT protected FROM files WHERE file_id = ?", (second,)
+        ).fetchone()[0] == 1
         assert result["file_id"] != first
         assert decision_store.doctor_issues(conn) == []
     finally:
@@ -495,3 +554,32 @@ def test_resolve_work_route_blocks_aliases_pointing_to_different_works(tmp_path)
     assert route["status"] == "route_conflict"
     assert route["matched"] is False
     assert route["work_bucket_ids"] == sorted([core_work, readable_work])
+
+
+def test_work_split_rejects_selected_folder_without_selected_variant(tmp_path):
+    state_db, house, _ = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            work_id = _work(conn, "분리 폴더 검증")
+            selected_variant = _variant(conn, work_id, "base")
+            unselected_variant = _variant(conn, work_id, "revision")
+        selected_folder = _folder(conn, house / "ㅂ" / "선택 판본", work_id)
+        unrelated_folder = _folder(conn, house / "ㅂ" / "미선택 판본", work_id, "edition")
+        _managed_file(conn, house / "ㅂ" / "선택 판본" / "1권.epub", selected_variant)
+        _managed_file(conn, house / "ㅂ" / "미선택 판본" / "2권.epub", unselected_variant)
+    finally:
+        conn.close()
+
+    plan = work_split_preview(
+        state_db,
+        source_work_id=work_id,
+        variant_ids=[selected_variant],
+        display_title="새 작품",
+        folder_ids=[selected_folder, unrelated_folder],
+    )
+    assert plan["apply_available"] is False
+    assert (
+        f"selected_folder_has_no_selected_variants:{unrelated_folder}"
+        in plan["blocked_reasons"]
+    )

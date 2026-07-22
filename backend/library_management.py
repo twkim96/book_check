@@ -297,7 +297,8 @@ def quarantine_preview(
             candidates = conn.execute(
                 """
                 SELECT f.file_id FROM files AS f
-                WHERE f.variant_id = ? AND f.active = 1 AND f.source = 'house' AND f.file_id != ?
+                WHERE f.variant_id = ? AND f.active = 1 AND f.source = 'house'
+                  AND f.assignment_state = 'managed' AND f.file_id != ?
                 ORDER BY CASE WHEN f.file_id = ? THEN 0 ELSE 1 END, f.protected DESC, f.canonical_path
                 """,
                 (source["variant_id"], source_file_id, keep_file_id or ""),

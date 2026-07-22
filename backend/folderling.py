@@ -2,6 +2,7 @@ import errno
 import os
 import shutil
 import sys
+import tempfile
 from datetime import datetime
 
 from tqdm import tqdm
@@ -188,16 +189,10 @@ def _tree_file_stats(root):
     return count, size
 
 
-def _cleanup_unpack_tree_owned(root, *, reusable):
-    """Delete only entries observed in one no-follow snapshot.
-
-    A file arriving after the snapshot is never passed to unlink.  It instead
-    keeps a directory non-empty (or leaves the reusable inbox non-empty), so the
-    caller reports cleanup_failed and preserves the late arrival.
-    """
-    root = os.path.abspath(root)
+def _snapshot_unpack_tree(root):
     files = []
     directories = []
+    supported = []
     for current, child_dirs, filenames in os.walk(root, topdown=True, followlinks=False):
         for name in child_dirs:
             path = os.path.join(current, name)
@@ -210,11 +205,24 @@ def _cleanup_unpack_tree_owned(root, *, reusable):
             info = os.lstat(path)
             if not os.path.isfile(path) or os.path.islink(path):
                 raise OSError(f"unpack file is not owned safely: {path}")
-            files.append((
+            record = (
                 path, info.st_dev, info.st_ino, info.st_ctime_ns,
                 info.st_size, info.st_mtime_ns,
-            ))
+            )
+            files.append(record)
+            if is_supported_file(name):
+                supported.append(path)
+    return files, directories, supported
 
+
+def _cleanup_unpack_tree_owned(root, *, reusable, files, directories):
+    """Delete only entries observed in one no-follow snapshot.
+
+    A file arriving after the snapshot is never passed to unlink.  It instead
+    keeps a directory non-empty (or leaves the reusable inbox non-empty), so the
+    caller reports cleanup_failed and preserves the late arrival.
+    """
+    root = os.path.abspath(root)
     removed_files = 0
     removed_bytes = 0
     for path, dev, ino, ctime_ns, size, mtime_ns in files:
@@ -255,7 +263,19 @@ def cleanup_unpack_sources(src_dir):
     """
     results = []
     for name, root, reusable in _unpack_roots(src_dir):
-        remaining = iter_unpack_supported_files(root)
+        try:
+            files, directories, remaining = _snapshot_unpack_tree(root)
+        except OSError as exc:
+            results.append({
+                "name": name,
+                "path": root,
+                "status": "snapshot_blocked",
+                "remaining_supported": 0,
+                "discarded_files": 0,
+                "discarded_bytes": 0,
+                "error": str(exc),
+            })
+            continue
         if remaining:
             results.append({
                 "name": name,
@@ -266,19 +286,12 @@ def cleanup_unpack_sources(src_dir):
                 "discarded_bytes": 0,
             })
             continue
-        if _tree_has_symlink(root):
-            results.append({
-                "name": name,
-                "path": root,
-                "status": "symlink_blocked",
-                "remaining_supported": 0,
-                "discarded_files": 0,
-                "discarded_bytes": 0,
-            })
-            continue
         try:
             discarded_files, discarded_bytes = _cleanup_unpack_tree_owned(
-                root, reusable=reusable
+                root,
+                reusable=reusable,
+                files=files,
+                directories=directories,
             )
             status = "cleaned"
         except OSError as exc:
@@ -337,6 +350,45 @@ def directory_has_files(path):
     return False
 
 
+def _atomic_publish_file(source, destination):
+    """Publish one regular file without following a destination symlink."""
+    from mutation_io import ensure_directory_nofollow, inspect_regular_file
+
+    source_evidence = inspect_regular_file(source)
+    destination = os.path.abspath(destination)
+    parent = os.path.dirname(destination)
+    ensure_directory_nofollow(parent)
+    if os.path.islink(destination):
+        raise RuntimeError(f"index destination is a symlink: {destination}")
+    if os.path.lexists(destination) and not os.path.isfile(destination):
+        raise RuntimeError(f"index destination is not a regular file: {destination}")
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=parent, prefix=f".{os.path.basename(destination)}.",
+            suffix=".tmp", delete=False,
+        ) as output, open(source, "rb") as input_file:
+            temporary = output.name
+            shutil.copyfileobj(input_file, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_evidence = inspect_regular_file(temporary)
+        if temporary_evidence.sha256 != source_evidence.sha256:
+            raise RuntimeError("index source changed during atomic publish")
+        os.replace(temporary, destination)
+        temporary = None
+        published = inspect_regular_file(destination)
+        if published.sha256 != source_evidence.sha256:
+            raise RuntimeError("published index SHA-256 mismatch")
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def sync_extension_index(file_index_json, script_dir):
     extension_index_json = os.path.join(script_dir, EXTENSION_INDEX_PATH)
     extension_dir = os.path.dirname(extension_index_json)
@@ -345,7 +397,7 @@ def sync_extension_index(file_index_json, script_dir):
         print("⚠️ 확장 폴더를 찾을 수 없어 브라우저 확장용 인덱스 복사를 건너뜁니다.")
         return False
 
-    shutil.copy2(file_index_json, extension_index_json)
+    _atomic_publish_file(file_index_json, extension_index_json)
     print(f"✨ 브라우저 확장용 인덱스 동기화 완료: {extension_index_json}")
     return True
 
@@ -356,7 +408,7 @@ def sync_house_index(file_index_json, dst_dir):
         print(f"✨ txt_house 인덱스 최신 상태: {house_index_json}")
         return True
 
-    shutil.copy2(file_index_json, house_index_json)
+    _atomic_publish_file(file_index_json, house_index_json)
     print(f"✨ txt_house 인덱스 동기화 완료: {house_index_json}")
     return True
 
@@ -572,6 +624,7 @@ def _process_items_authorized(
     actual_run_id,
     manifest_path,
     *,
+    state_db_path=None,
     event_callback=None,
 ):
     recent_dir = os.path.join(dst_dir, "_최근")
@@ -580,7 +633,9 @@ def _process_items_authorized(
     file_list_json = os.path.join(script_dir, "file_list.json")
     file_index_json = os.path.join(script_dir, "file_index.json")
     pass_dir = os.path.join(src_dir, PASS_DIR_NAME)
-    state_db_path = os.path.join(script_dir, ".dedup_state", "dedup_decisions.sqlite3")
+    state_db_path = state_db_path or os.path.join(
+        script_dir, ".dedup_state", "dedup_decisions.sqlite3"
+    )
 
     intake_run_id = actual_run_id
     print(f"🔐 일회성 actual 승인 소비: {actual_run_id}")
@@ -597,6 +652,7 @@ def _process_items_authorized(
     from mutation_io import ensure_directory_nofollow
     ensure_directory_nofollow(dst_dir)
 
+    legacy_pass_count = 0
     if os.path.isdir(pass_dir):
         legacy_pass_count = len(os.listdir(pass_dir))
         if legacy_pass_count:
@@ -690,6 +746,8 @@ def _process_items_authorized(
     print("=" * 60)
     move_count = 0
     pass_count = 0
+    skipped_count = 0
+    excluded_count = 0
     failure_count = 0
     empty_dir_cleanup_count = 0
     volume_conflict_hold_count = 0
@@ -714,6 +772,7 @@ def _process_items_authorized(
             tqdm(items, desc="분류 및 이동 중"), start=1
         ):
             if not is_pass and should_skip_source_item(item):
+                excluded_count += 1
                 emit_folderling_event(
                     event_callback,
                     "file_result",
@@ -768,6 +827,7 @@ def _process_items_authorized(
                 ext = os.path.splitext(clean_name)[1].lower()
 
                 if is_file and ext not in SUPPORTED_EXTENSIONS:
+                    skipped_count += 1
                     emit_folderling_event(
                         event_callback,
                         "file_result",
@@ -782,6 +842,7 @@ def _process_items_authorized(
                     )
                     continue
                 if not is_dir and not is_file:
+                    skipped_count += 1
                     emit_folderling_event(
                         event_callback,
                         "file_result",
@@ -982,6 +1043,8 @@ def _process_items_authorized(
             total=item_total,
             move_count=move_count,
             pass_count=pass_count,
+            skipped_count=skipped_count,
+            excluded_count=excluded_count,
             failure_count=failure_count,
             volume_conflict_hold_count=volume_conflict_hold_count,
             empty_dir_cleanup_count=empty_dir_cleanup_count,
@@ -1118,6 +1181,9 @@ def _process_items_authorized(
         "dedup_summary": dedup_summary,
         "move_count": move_count,
         "pass_count": pass_count,
+        "skipped_count": skipped_count,
+        "excluded_count": excluded_count,
+        "legacy_pass_count": legacy_pass_count,
         "empty_dir_cleanup_count": empty_dir_cleanup_count,
         "failure_count": failure_count,
         "volume_conflict_hold_count": volume_conflict_hold_count,
@@ -1130,12 +1196,20 @@ def _process_items_authorized(
         "index_mode": index_mode,
         "index_fallback_reason": index_fallback_reason,
     }
+    result["review_required_count"] = (
+        int(dedup_summary.get("review_queue_move_count", 0))
+        + int(dedup_summary.get("managed_report_only_count", 0))
+        + volume_conflict_hold_count
+        + unpack_cleanup_issue_count
+        + legacy_pass_count
+        + skipped_count
+    )
     emit_folderling_event(
         event_callback,
         "folderling_summary",
         status=(
             "needs_review"
-            if failure_count or volume_conflict_hold_count or unpack_cleanup_issue_count
+            if failure_count or result["review_required_count"]
             else "succeeded"
         ),
         **result,
@@ -1203,6 +1277,7 @@ def _process_items_with_lock_held(
             script_dir,
             actual_run_id,
             manifest_path,
+            state_db_path=state_db_path,
             event_callback=event_callback,
         )
         result["review_action_summary"] = action_summary

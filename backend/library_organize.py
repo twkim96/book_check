@@ -108,6 +108,26 @@ def _safe_existing_house_directory(house_dir: Path, value: str) -> Path:
     return resolved
 
 
+def _safe_house_source_directory(house_dir: Path, value: str) -> tuple[Path, Path]:
+    house = Path(house_dir).expanduser().resolve(strict=True)
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = house / candidate
+    absolute = Path(os.path.abspath(candidate))
+    try:
+        relative = absolute.relative_to(house)
+    except ValueError as exc:
+        raise ValueError("격리 폴더가 house 밖에 있습니다") from exc
+    if not relative.parts:
+        raise ValueError("house 루트는 격리할 수 없습니다")
+    resolved = absolute.resolve(strict=True)
+    if resolved != absolute:
+        raise ValueError("심볼릭 링크가 포함된 격리 폴더는 사용할 수 없습니다")
+    if not resolved.is_dir():
+        raise ValueError("격리 폴더가 존재하지 않습니다")
+    return resolved, relative
+
+
 def _projection_diff(
     row,
     before_analysis: Mapping[str, object],
@@ -1299,14 +1319,7 @@ def folder_quarantine_preview(
     temp_dir: Path,
     folder_path: str,
 ) -> dict:
-    house = Path(house_dir).resolve()
-    source = Path(folder_path).expanduser().resolve()
-    try:
-        relative = source.relative_to(house)
-    except ValueError as exc:
-        raise ValueError("격리 폴더가 house 밖에 있습니다") from exc
-    if not relative.parts:
-        raise ValueError("house 루트는 격리할 수 없습니다")
+    source, relative = _safe_house_source_directory(house_dir, folder_path)
     current_identity = _directory_identity(source)
     destination = (
         Path(temp_dir).resolve() / "trash_bin" /
@@ -1376,7 +1389,7 @@ def folder_quarantine_preview(
             "managed_folder_ids": [row["folder_id"] for row in managed_folders],
         }
         return {
-            "version": "1.3.5",
+            "version": "1.3.6",
             "kind": "user_folder_quarantine",
             "item_count": len(items),
             "source_path": str(source),
@@ -1608,7 +1621,7 @@ def apply_folder_quarantine(
     folder_path: str, confirm_count: int, confirm_plan_sha256: str, progress=None,
 ) -> dict:
     from library_review import _refresh_review_index
-    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.3.5"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.3.6"):
         plan = folder_quarantine_preview(
             state_db, house_dir=house_dir, temp_dir=temp_dir, folder_path=folder_path
         )

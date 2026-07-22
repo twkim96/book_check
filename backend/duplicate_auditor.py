@@ -59,8 +59,8 @@ from review_noise import (
 MAX_ESTIMATED_READ_PASSES = 5
 # v2: BOM UTF-16 LE/BE strict 판독을 fingerprint 의미에 포함한다.
 # 판독 규칙이 바뀌면 기존 decode_lossy 결과를 재사용하지 않도록 반드시 올린다.
-FINGERPRINT_VERSION = "3"
-AUDITOR_VERSION = "1.2.10"
+FINGERPRINT_VERSION = "4"
+AUDITOR_VERSION = "1.3.6"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 
@@ -1196,6 +1196,7 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
             stop_reasons.append("stale_input")
             break
         except (RuntimeError, zipfile.BadZipFile) as exc:
+            stop_reasons.append("epub_analysis_error")
             analyses[path] = TextAnalysis(
                 path=path,
                 size=entry.size,

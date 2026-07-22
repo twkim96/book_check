@@ -135,3 +135,52 @@ def test_folderling_journals_unpacked_book_then_discards_wrapper_assets(tmp_path
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()
+
+
+def test_folderling_keeps_custom_state_db_through_authorized_workflow(tmp_path):
+    script_dir = tmp_path / "project"
+    custom_state_db = tmp_path / "custom" / "state.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    script_dir.mkdir()
+    house.mkdir()
+    temp.mkdir()
+    (script_dir / "extension").mkdir()
+    incoming = temp / "사용자 DB 경로 작품 1-3 완.txt"
+    incoming.write_text("custom state db body", encoding="utf-8")
+
+    conn = decision_store.initialize_state_db(custom_state_db)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, incoming, source="temp")
+    finally:
+        conn.close()
+    assert generate_file_list(
+        [str(house)],
+        str(script_dir / "file_list.json"),
+        str(script_dir / "file_index.json"),
+        state_db_path=str(custom_state_db),
+    )
+    conn = decision_store.connect_state_db(custom_state_db)
+    try:
+        backup = decision_store.backup_state_db(
+            conn, custom_state_db.parent / "backups" / "before-custom.sqlite3"
+        )
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+
+    result = folderling._process_items_with_lock_held(
+        str(temp), str(house), str(script_dir), state_db_path=str(custom_state_db)
+    )
+
+    assert result["failure_count"] == 0
+    assert result["move_count"] == 1
+    assert not (script_dir / ".dedup_state" / "dedup_decisions.sqlite3").exists()
+    conn = decision_store.connect_state_db_readonly(custom_state_db)
+    try:
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()

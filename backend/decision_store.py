@@ -2930,6 +2930,32 @@ def doctor_issues(
             "kind": "retired_work_has_active_relations",
             "work_bucket_id": row["work_bucket_id"],
         })
+    for row in conn.execute(
+        """
+        SELECT d.decision_id, d.verdict,
+               lv.variant_id AS left_variant_id, lv.work_bucket_id AS left_work_id,
+               rv.variant_id AS right_variant_id, rv.work_bucket_id AS right_work_id
+        FROM decisions AS d
+        JOIN variants AS lv ON lv.variant_id = d.left_variant_id
+        JOIN variants AS rv ON rv.variant_id = d.right_variant_id
+        WHERE d.active = 1
+        """
+    ):
+        if row["verdict"] == "same_content":
+            valid = row["left_variant_id"] == row["right_variant_id"]
+        elif row["verdict"] == "same_work_distinct_variant":
+            valid = (
+                row["left_work_id"] == row["right_work_id"]
+                and row["left_variant_id"] != row["right_variant_id"]
+            )
+        else:
+            valid = row["left_work_id"] != row["right_work_id"]
+        if not valid:
+            issues.append({
+                "kind": "active_decision_relation_conflict",
+                "decision_id": row["decision_id"],
+                "verdict": row["verdict"],
+            })
     return issues
 
 

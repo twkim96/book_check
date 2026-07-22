@@ -1,4 +1,4 @@
-"""Human-approved work, variant, alias, and routing management for v1.3.5."""
+"""Human-approved work, variant, alias, and routing management for v1.3.6."""
 
 from __future__ import annotations
 
@@ -247,7 +247,7 @@ def alias_preview(
             "replace_alias_id": replace_alias_id,
         }
         return {
-            "version": "1.3.5",
+            "version": "1.3.6",
             "kind": "work_alias_upsert",
             "item_count": 1,
             "alias_kind": alias_kind,
@@ -304,7 +304,7 @@ def apply_alias(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-1.3.5"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-1.3.6"):
         plan = alias_preview(
             state_db,
             alias_kind=alias_kind,
@@ -389,7 +389,7 @@ def alias_retire_preview(state_db: Path, *, alias_id: int) -> dict:
         blockers = [] if alias["active"] else ["alias_already_inactive"]
         payload = {"alias": dict(alias), "action": "retire"}
         return {
-            "version": "1.3.5",
+            "version": "1.3.6",
             "kind": "work_alias_retire",
             "item_count": 1,
             "alias": dict(alias),
@@ -411,7 +411,7 @@ def apply_alias_retire(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-retire-1.3.5"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-retire-1.3.6"):
         plan = alias_retire_preview(state_db, alias_id=alias_id)
         if not plan["apply_available"]:
             raise RuntimeError(
@@ -649,7 +649,7 @@ def work_merge_preview(
             "demoted_folder_ids": demoted_folder_ids,
         }
         return {
-            "version": "1.3.5",
+            "version": "1.3.6",
             "kind": "work_merge",
             "item_count": len(active_variants),
             "source": source,
@@ -664,6 +664,39 @@ def work_merge_preview(
         conn.close()
 
 
+def _retire_contradictory_decisions(conn) -> list[int]:
+    retired = []
+    for row in conn.execute(
+        """
+        SELECT d.decision_id, d.verdict,
+               lv.variant_id AS left_variant_id, lv.work_bucket_id AS left_work_id,
+               rv.variant_id AS right_variant_id, rv.work_bucket_id AS right_work_id
+        FROM decisions AS d
+        JOIN variants AS lv ON lv.variant_id = d.left_variant_id
+        JOIN variants AS rv ON rv.variant_id = d.right_variant_id
+        WHERE d.active = 1
+        """
+    ):
+        if row["verdict"] == "same_content":
+            valid = row["left_variant_id"] == row["right_variant_id"]
+        elif row["verdict"] == "same_work_distinct_variant":
+            valid = (
+                row["left_work_id"] == row["right_work_id"]
+                and row["left_variant_id"] != row["right_variant_id"]
+            )
+        else:
+            valid = row["left_work_id"] != row["right_work_id"]
+        if not valid:
+            retired.append(int(row["decision_id"]))
+    if retired:
+        marks = ",".join("?" for _ in retired)
+        conn.execute(
+            f"UPDATE decisions SET active = 0 WHERE decision_id IN ({marks})",
+            retired,
+        )
+    return retired
+
+
 def apply_work_merge(
     state_db: Path,
     *,
@@ -674,7 +707,7 @@ def apply_work_merge(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-merge-1.3.5"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-merge-1.3.6"):
         plan = work_merge_preview(
             state_db, source_work_id=source_work_id, target_work_id=target_work_id
         )
@@ -717,6 +750,7 @@ def apply_work_merge(
                     "WHERE work_bucket_id = ?",
                     (int(source_work_id),),
                 )
+                retired_decision_ids = _retire_contradictory_decisions(conn)
                 event_id = _record_event(
                     conn,
                     action="work_merge",
@@ -725,6 +759,7 @@ def apply_work_merge(
                         "source_before": plan["source"],
                         "target_before": plan["target"],
                         "demoted_folder_ids": plan["demoted_folder_ids"],
+                        "retired_decision_ids": retired_decision_ids,
                     },
                     source_work_id=int(source_work_id),
                     target_work_id=int(target_work_id),
@@ -738,6 +773,7 @@ def apply_work_merge(
                 "event_id": event_id,
                 "source_work_id": int(source_work_id),
                 "target_work_id": int(target_work_id),
+                "retired_decision_ids": retired_decision_ids,
                 "backup_path": str(backup),
                 "plan_sha256": plan["plan_sha256"],
             }
@@ -795,6 +831,8 @@ def work_split_preview(
                 )
             }
             if not contained_variants.intersection(selected_variant_set):
+                if folder_id in selected_folders:
+                    blockers.append(f"selected_folder_has_no_selected_variants:{folder_id}")
                 continue
             if folder_id not in selected_folders:
                 blockers.append(f"selected_variants_require_folder:{folder_id}")
@@ -831,7 +869,7 @@ def work_split_preview(
             "cleared_alias_routes": cleared_alias_routes,
         }
         return {
-            "version": "1.3.5",
+            "version": "1.3.6",
             "kind": "work_split",
             "item_count": len(selected_variants),
             "source": source,
@@ -862,7 +900,7 @@ def apply_work_split(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-split-1.3.5"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-split-1.3.6"):
         plan = work_split_preview(
             state_db,
             source_work_id=source_work_id,
@@ -914,6 +952,7 @@ def apply_work_split(
                         "updated_at = CURRENT_TIMESTAMP WHERE alias_id = ?",
                         (int(alias_id),),
                     )
+                retired_decision_ids = _retire_contradictory_decisions(conn)
                 event_id = _record_event(
                     conn,
                     action="work_split",
@@ -925,6 +964,7 @@ def apply_work_split(
                         "alias_ids": plan["alias_ids"],
                         "cleared_alias_routes": plan["cleared_alias_routes"],
                         "display_title": plan["display_title"],
+                        "retired_decision_ids": retired_decision_ids,
                     },
                     source_work_id=int(source_work_id),
                     target_work_id=new_work_id,
@@ -938,6 +978,7 @@ def apply_work_split(
                 "event_id": event_id,
                 "source_work_id": int(source_work_id),
                 "new_work_id": new_work_id,
+                "retired_decision_ids": retired_decision_ids,
                 "backup_path": str(backup),
                 "plan_sha256": plan["plan_sha256"],
             }
@@ -980,7 +1021,7 @@ def representative_preview(state_db: Path, *, variant_id: int, file_id: str) -> 
             "current_file_id": current["file_id"] if current else None,
         }
         return {
-            "version": "1.3.5",
+            "version": "1.3.6",
             "kind": "representative_replace",
             "item_count": 1,
             "variant": dict(variant),
@@ -1005,7 +1046,7 @@ def apply_representative(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "representative-replace-1.3.5"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "representative-replace-1.3.6"):
         plan = representative_preview(state_db, variant_id=variant_id, file_id=file_id)
         if not plan["apply_available"]:
             raise RuntimeError(
@@ -1035,6 +1076,11 @@ def apply_representative(
                         "WHERE variant_id = ?",
                         (str(file_id), int(variant_id)),
                     )
+                conn.execute(
+                    "UPDATE files SET protected = 1 WHERE file_id = ? "
+                    "AND active = 1 AND assignment_state = 'managed'",
+                    (str(file_id),),
+                )
                 event_id = _record_event(
                     conn,
                     action="representative_replace",

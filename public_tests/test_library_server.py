@@ -471,7 +471,7 @@ def test_readonly_explorer_routes_expose_file_folder_and_quarantine(tmp_path):
 
     detail = client.get(f"/api/explorer/files/{file_id}").get_json()["data"]
     assert detail["file"]["name"] == "수동 교정 작품 146.txt"
-    assert detail["actions"]["quarantine"] is False
+    assert detail["actions"]["quarantine"] is True
 
     folders = client.get("/api/explorer/folders?search=house&refresh=1").get_json()["data"]
     assert folders["readonly"] is True

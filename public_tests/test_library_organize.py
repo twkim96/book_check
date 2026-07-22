@@ -724,3 +724,19 @@ def test_folder_quarantine_rejects_file_changed_after_actual_manifest(
         )
     assert folder.is_dir()
     assert not Path(plan["destination_path"]).exists()
+
+
+def test_folder_quarantine_rejects_symlink_source_without_moving_target(tmp_path):
+    state_db, house, temp, _, source, _, _ = _fixture(tmp_path)
+    target = source.parent
+    link = house / "ㄱ" / "격리 링크"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="심볼릭 링크"):
+        folder_quarantine_preview(
+            state_db, house_dir=house, temp_dir=temp, folder_path=str(link)
+        )
+
+    assert link.is_symlink()
+    assert target.is_dir()
+    assert source.is_file()

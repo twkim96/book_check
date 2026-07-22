@@ -657,8 +657,7 @@ class LibraryServiceRegistry:
                 )
         if (
             result.get("failure_count")
-            or result.get("volume_conflict_hold_count")
-            or result.get("unpack_cleanup_issue_count")
+            or result.get("review_required_count")
         ):
             result["_job_state"] = "needs_review"
             result["_job_message"] = "Folderling 완료 · 검토할 결과 있음"
