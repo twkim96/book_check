@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -20,6 +21,8 @@ from normalizer import (
 from project_paths import FILE_INDEX, FILE_LIST, HOUSE_DIR, STATE_DB
 
 DEFAULT_STATE_DB = str(STATE_DB)
+INDEX_GENERATION_FILENAME = "index_generation.json"
+INDEX_GENERATION_SCHEMA = 1
 
 # ==========================================
 # [설정] 소설 파일들이 있는 폴더 경로들을 리스트로 입력하세요.
@@ -144,6 +147,140 @@ def _atomic_json_write(path, payload):
                 pass
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_copy_replace(source, destination):
+    destination = Path(destination)
+    source = Path(source)
+    source_sha256 = _sha256_file(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise RuntimeError(f"index destination is a symlink: {destination}")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=destination.parent, prefix=f".{destination.name}.",
+            suffix=".tmp", delete=False,
+        ) as output, open(source, "rb") as input_file:
+            temporary = Path(output.name)
+            shutil.copyfileobj(input_file, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+        if _sha256_file(destination) != source_sha256:
+            raise RuntimeError(f"published index SHA-256 mismatch: {destination}")
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _publish_generation_transaction(staged_destinations):
+    """Publish several files and restore the previous generation on failure."""
+    backups = {}
+    published = []
+    preserve_backups = False
+    try:
+        for destination, _source in staged_destinations:
+            destination = Path(destination)
+            if destination.is_symlink():
+                raise RuntimeError(f"index destination is a symlink: {destination}")
+            if destination.exists():
+                backup = destination.parent / (
+                    f".{destination.name}.generation-backup-{uuid.uuid4().hex}"
+                )
+                _atomic_copy_replace(destination, backup)
+                backups[destination] = backup
+            else:
+                backups[destination] = None
+        for destination, source in staged_destinations:
+            _atomic_copy_replace(source, destination)
+            published.append(Path(destination))
+    except BaseException:
+        restore_errors = []
+        for destination, backup in backups.items():
+            try:
+                if backup is None:
+                    if destination.exists() and not destination.is_symlink():
+                        destination.unlink()
+                else:
+                    _atomic_copy_replace(backup, destination)
+            except Exception as exc:  # preserve the original publish failure
+                restore_errors.append(f"{destination}: {exc}")
+        if restore_errors:
+            preserve_backups = True
+            raise RuntimeError(
+                "index generation publish failed and rollback was incomplete: "
+                + "; ".join(restore_errors)
+                + "; backups="
+                + ",".join(str(path) for path in backups.values() if path is not None)
+            )
+        raise
+    finally:
+        if not preserve_backups:
+            for backup in backups.values():
+                if backup is not None:
+                    try:
+                        backup.unlink()
+                    except FileNotFoundError:
+                        pass
+
+
+def _generation_manifest_path(index_path):
+    return Path(index_path).parent / INDEX_GENERATION_FILENAME
+
+
+def validate_index_generation(index_path, file_list_path=None):
+    """Validate an optional 1.3.7 generation manifest fail-closed when present."""
+    index_path = Path(index_path)
+    manifest_path = _generation_manifest_path(index_path)
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if manifest.get("schema_version") != INDEX_GENERATION_SCHEMA:
+        raise IndexSnapshotStale("unsupported index generation manifest")
+    if manifest.get("normalizer_version") != NORMALIZER_VERSION:
+        raise IndexSnapshotStale("index generation normalizer version changed")
+    surfaces = manifest.get("surfaces") or {}
+    expected_index = surfaces.get("file_index") or {}
+    if _sha256_file(index_path) != expected_index.get("sha256"):
+        raise IndexSnapshotStale("file_index.json generation hash mismatch")
+    if file_list_path is None:
+        file_list_path = index_path.parent / "file_list.json"
+    file_list_path = Path(file_list_path)
+    expected_list = surfaces.get("file_list") or {}
+    if not file_list_path.exists() or _sha256_file(file_list_path) != expected_list.get("sha256"):
+        raise IndexSnapshotStale("file_list.json generation hash mismatch")
+    with open(index_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("generation_id") != manifest.get("generation_id"):
+        raise IndexSnapshotStale("index generation id mismatch")
+    return manifest
+
+
+def _prune_generation_staging(parent, *, keep=3):
+    root = Path(parent) / ".index_generations"
+    if not root.is_dir():
+        return
+    generations = sorted(
+        (path for path in root.iterdir() if path.is_dir() and not path.is_symlink()),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for stale in generations[keep:]:
+        shutil.rmtree(stale)
+
+
 def _write_index_surfaces(
     entries,
     output_path,
@@ -152,19 +289,78 @@ def _write_index_surfaces(
     index_mode="full_scan",
     inventory_revision=None,
 ):
+    generation_started_at = time.perf_counter()
     files = sorted({entry["name"] for entry in entries})
+    generation_id = uuid.uuid4().hex
+    generated_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     payload = {
         "version": 2,
         "normalizer_version": NORMALIZER_VERSION,
-        "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "generation_id": generation_id,
+        "generated_at": generated_at,
         "entries": entries,
     }
     if index_mode:
         payload["index_mode"] = index_mode
     if inventory_revision:
         payload["inventory_revision"] = inventory_revision
-    _atomic_json_write(output_path, files)
-    _atomic_json_write(index_output_path, payload)
+    output_path = Path(output_path)
+    index_output_path = Path(index_output_path)
+    if output_path.parent.resolve() != index_output_path.parent.resolve():
+        raise RuntimeError("index generation surfaces must share one publication directory")
+    staging_dir = output_path.parent / ".index_generations" / generation_id
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    staged_list = staging_dir / output_path.name
+    staged_index = staging_dir / index_output_path.name
+    staged_manifest = staging_dir / INDEX_GENERATION_FILENAME
+    _atomic_json_write(staged_list, files)
+    _atomic_json_write(staged_index, payload)
+    with open(staged_list, "r", encoding="utf-8") as handle:
+        staged_files = json.load(handle)
+    with open(staged_index, "r", encoding="utf-8") as handle:
+        staged_payload = json.load(handle)
+    if not isinstance(staged_files, list):
+        raise RuntimeError("staged file_list.json is not an array")
+    if (
+        staged_payload.get("version") != 2
+        or staged_payload.get("generation_id") != generation_id
+        or not isinstance(staged_payload.get("entries"), list)
+    ):
+        raise RuntimeError("staged file_index.json generation validation failed")
+    staged_file_count = sum(
+        entry.get("type") == "file" for entry in staged_payload["entries"]
+    )
+    if staged_file_count != sum(entry["type"] == "file" for entry in entries):
+        raise RuntimeError("staged file_index.json file count mismatch")
+    manifest = {
+        "schema_version": INDEX_GENERATION_SCHEMA,
+        "generation_id": generation_id,
+        "inventory_revision": inventory_revision,
+        "normalizer_version": NORMALIZER_VERSION,
+        "file_count": staged_file_count,
+        "entry_count": len(entries),
+        "generated_at": generated_at,
+        "surfaces": {
+            "file_list": {
+                "name": output_path.name,
+                "sha256": _sha256_file(staged_list),
+            },
+            "file_index": {
+                "name": index_output_path.name,
+                "sha256": _sha256_file(staged_index),
+            },
+        },
+    }
+    _atomic_json_write(staged_manifest, manifest)
+    manifest_path = output_path.parent / INDEX_GENERATION_FILENAME
+    _publish_generation_transaction([
+        (output_path, staged_list),
+        (index_output_path, staged_index),
+        (manifest_path, staged_manifest),
+    ])
+    validate_index_generation(index_output_path, output_path)
+    _prune_generation_staging(output_path.parent)
+    generation_seconds = round(time.perf_counter() - generation_started_at, 6)
     return {
         "ok": True,
         "index_mode": index_mode,
@@ -172,6 +368,11 @@ def _write_index_surfaces(
         "file_entry_count": sum(entry["type"] == "file" for entry in entries),
         "entry_count": len(entries),
         "inventory_revision": inventory_revision,
+        "generation_id": generation_id,
+        "generation_manifest": str(manifest_path),
+        "generation_seconds": generation_seconds,
+        "surface_bytes": staged_list.stat().st_size + staged_index.stat().st_size,
+        "surface_hash_count": 2,
     }
 
 
@@ -369,6 +570,7 @@ def validate_index_snapshot(
 ):
     """Return a reusable projected snapshot or a fail-closed fallback reason."""
     try:
+        validate_index_generation(index_path)
         with open(index_path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if payload.get("version") != 2 or not isinstance(payload.get("entries"), list):
@@ -397,7 +599,7 @@ def validate_index_snapshot(
         }
 
 
-def generate_file_list_from_state_db(
+def _generate_file_list_from_state_db_unlocked(
     house_dir,
     output_path,
     index_output_path,
@@ -425,6 +627,31 @@ def generate_file_list_from_state_db(
     print(f"👉 {output_path}")
     print(f"👉 {index_output_path}")
     return result
+
+
+def generate_file_list_from_state_db(
+    house_dir,
+    output_path,
+    index_output_path,
+    state_db_path,
+    *,
+    allowed_active_run_id=None,
+    temp_root=None,
+):
+    """Project and publish while participating in the shared roots lock."""
+    from mutation_io import mutation_lock_for_roots
+    from project_paths import TEMP_DIR
+
+    with mutation_lock_for_roots(
+        house_dir, temp_root or TEMP_DIR, "scanner-state-db-projection"
+    ):
+        return _generate_file_list_from_state_db_unlocked(
+            house_dir,
+            output_path,
+            index_output_path,
+            state_db_path,
+            allowed_active_run_id=allowed_active_run_id,
+        )
 
 
 def get_file_entries(
@@ -587,7 +814,7 @@ def get_file_list(directory_list, state_db_path=None):
     return sorted({entry["name"] for entry in entries})
 
 
-def generate_file_list(
+def _generate_file_list_unlocked(
     directory_list,
     output_path,
     index_output_path=None,
@@ -619,6 +846,32 @@ def generate_file_list(
     except Exception as e:
         print(f"\n❌ 오류 발생: {e}")
         return False
+
+
+def generate_file_list(
+    directory_list,
+    output_path,
+    index_output_path=None,
+    state_db_path=None,
+    *,
+    temp_root=None,
+):
+    """Scan and publish while participating in the shared roots lock."""
+    from mutation_io import mutation_lock_for_roots
+    from project_paths import TEMP_DIR
+
+    directory_list = list(directory_list)
+    if not directory_list:
+        raise ValueError("at least one scanner directory is required")
+    with mutation_lock_for_roots(
+        directory_list[0], temp_root or TEMP_DIR, "scanner-full-scan"
+    ):
+        return _generate_file_list_unlocked(
+            directory_list,
+            output_path,
+            index_output_path,
+            state_db_path,
+        )
 
 
 if __name__ == "__main__":

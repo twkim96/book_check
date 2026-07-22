@@ -1,4 +1,4 @@
-"""Human-approved work, variant, alias, and routing management for v1.3.6."""
+"""Human-approved work, variant, alias, and routing management for v1.3.7."""
 
 from __future__ import annotations
 
@@ -247,7 +247,7 @@ def alias_preview(
             "replace_alias_id": replace_alias_id,
         }
         return {
-            "version": "1.3.6",
+            "version": "1.3.7",
             "kind": "work_alias_upsert",
             "item_count": 1,
             "alias_kind": alias_kind,
@@ -304,7 +304,7 @@ def apply_alias(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-1.3.6"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-1.3.7"):
         plan = alias_preview(
             state_db,
             alias_kind=alias_kind,
@@ -389,7 +389,7 @@ def alias_retire_preview(state_db: Path, *, alias_id: int) -> dict:
         blockers = [] if alias["active"] else ["alias_already_inactive"]
         payload = {"alias": dict(alias), "action": "retire"}
         return {
-            "version": "1.3.6",
+            "version": "1.3.7",
             "kind": "work_alias_retire",
             "item_count": 1,
             "alias": dict(alias),
@@ -411,7 +411,7 @@ def apply_alias_retire(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-retire-1.3.6"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-alias-retire-1.3.7"):
         plan = alias_retire_preview(state_db, alias_id=alias_id)
         if not plan["apply_available"]:
             raise RuntimeError(
@@ -643,18 +643,27 @@ def work_merge_preview(
         demoted_folder_ids = [
             int(row["folder_id"]) for row in source_primary
         ] if target_primary else []
+        prospective_decisions = _prospective_contradictory_decisions(
+            conn,
+            {
+                int(row["variant_id"]): int(target_work_id)
+                for row in source["variants"]
+            },
+        )
         payload = {
             "source": source,
             "target": target,
             "demoted_folder_ids": demoted_folder_ids,
+            "retired_decisions": prospective_decisions,
         }
         return {
-            "version": "1.3.6",
+            "version": "1.3.7",
             "kind": "work_merge",
             "item_count": len(active_variants),
             "source": source,
             "target": target,
             "demoted_folder_ids": demoted_folder_ids,
+            "retired_decisions": prospective_decisions,
             "blocked_reasons": blockers,
             "apply_available": not blockers,
             "plan_sha256": _hash(payload),
@@ -664,7 +673,8 @@ def work_merge_preview(
         conn.close()
 
 
-def _retire_contradictory_decisions(conn) -> list[int]:
+def _prospective_contradictory_decisions(conn, work_overrides=None) -> list[dict]:
+    work_overrides = work_overrides or {}
     retired = []
     for row in conn.execute(
         """
@@ -675,19 +685,42 @@ def _retire_contradictory_decisions(conn) -> list[int]:
         JOIN variants AS lv ON lv.variant_id = d.left_variant_id
         JOIN variants AS rv ON rv.variant_id = d.right_variant_id
         WHERE d.active = 1
+        ORDER BY d.decision_id
         """
     ):
+        left_work_id = work_overrides.get(
+            int(row["left_variant_id"]), int(row["left_work_id"])
+        )
+        right_work_id = work_overrides.get(
+            int(row["right_variant_id"]), int(row["right_work_id"])
+        )
         if row["verdict"] == "same_content":
             valid = row["left_variant_id"] == row["right_variant_id"]
         elif row["verdict"] == "same_work_distinct_variant":
             valid = (
-                row["left_work_id"] == row["right_work_id"]
+                left_work_id == right_work_id
                 and row["left_variant_id"] != row["right_variant_id"]
             )
         else:
-            valid = row["left_work_id"] != row["right_work_id"]
+            valid = left_work_id != right_work_id
         if not valid:
-            retired.append(int(row["decision_id"]))
+            retired.append({
+                "decision_id": int(row["decision_id"]),
+                "verdict": row["verdict"],
+                "left_variant_id": int(row["left_variant_id"]),
+                "right_variant_id": int(row["right_variant_id"]),
+                "reason": "relation_would_contradict_result",
+            })
+    return retired
+
+
+def _retire_contradictory_decisions(conn, *, expected_ids=None) -> list[int]:
+    retired = [
+        int(row["decision_id"])
+        for row in _prospective_contradictory_decisions(conn)
+    ]
+    if expected_ids is not None and retired != sorted(int(value) for value in expected_ids):
+        raise RuntimeError("contradictory decision set changed after preview")
     if retired:
         marks = ",".join("?" for _ in retired)
         conn.execute(
@@ -707,7 +740,7 @@ def apply_work_merge(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-merge-1.3.6"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-merge-1.3.7"):
         plan = work_merge_preview(
             state_db, source_work_id=source_work_id, target_work_id=target_work_id
         )
@@ -750,7 +783,12 @@ def apply_work_merge(
                     "WHERE work_bucket_id = ?",
                     (int(source_work_id),),
                 )
-                retired_decision_ids = _retire_contradictory_decisions(conn)
+                retired_decision_ids = _retire_contradictory_decisions(
+                    conn,
+                    expected_ids=[
+                        row["decision_id"] for row in plan["retired_decisions"]
+                    ],
+                )
                 event_id = _record_event(
                     conn,
                     action="work_merge",
@@ -867,9 +905,13 @@ def work_split_preview(
             "alias_ids": selected_aliases,
             "display_title": title,
             "cleared_alias_routes": cleared_alias_routes,
+            "retired_decisions": _prospective_contradictory_decisions(
+                conn,
+                {int(variant_id): "new_work" for variant_id in selected_variants},
+            ),
         }
         return {
-            "version": "1.3.6",
+            "version": "1.3.7",
             "kind": "work_split",
             "item_count": len(selected_variants),
             "source": source,
@@ -878,6 +920,7 @@ def work_split_preview(
             "alias_ids": selected_aliases,
             "display_title": title,
             "cleared_alias_routes": cleared_alias_routes,
+            "retired_decisions": payload["retired_decisions"],
             "blocked_reasons": blockers,
             "apply_available": not blockers,
             "plan_sha256": _hash(payload),
@@ -900,7 +943,7 @@ def apply_work_split(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "work-split-1.3.6"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "work-split-1.3.7"):
         plan = work_split_preview(
             state_db,
             source_work_id=source_work_id,
@@ -952,7 +995,12 @@ def apply_work_split(
                         "updated_at = CURRENT_TIMESTAMP WHERE alias_id = ?",
                         (int(alias_id),),
                     )
-                retired_decision_ids = _retire_contradictory_decisions(conn)
+                retired_decision_ids = _retire_contradictory_decisions(
+                    conn,
+                    expected_ids=[
+                        row["decision_id"] for row in plan["retired_decisions"]
+                    ],
+                )
                 event_id = _record_event(
                     conn,
                     action="work_split",
@@ -1021,7 +1069,7 @@ def representative_preview(state_db: Path, *, variant_id: int, file_id: str) -> 
             "current_file_id": current["file_id"] if current else None,
         }
         return {
-            "version": "1.3.6",
+            "version": "1.3.7",
             "kind": "representative_replace",
             "item_count": 1,
             "variant": dict(variant),
@@ -1046,7 +1094,7 @@ def apply_representative(
     confirm_count: int,
     confirm_plan_sha256: str,
 ) -> dict:
-    with mutation_lock_for_roots(house_dir, temp_dir, "representative-replace-1.3.6"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "representative-replace-1.3.7"):
         plan = representative_preview(state_db, variant_id=variant_id, file_id=file_id)
         if not plan["apply_available"]:
             raise RuntimeError(

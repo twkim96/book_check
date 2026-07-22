@@ -294,6 +294,11 @@ def quarantine_preview(
         retired_variant = False
         retired_work = False
         if source["representative"] and source["variant_id"] is not None:
+            remaining_variant_files = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE variant_id = ? AND active = 1 "
+                "AND source = 'house' AND file_id != ?",
+                (source["variant_id"], source_file_id),
+            ).fetchone()[0]
             candidates = conn.execute(
                 """
                 SELECT f.file_id FROM files AS f
@@ -303,13 +308,14 @@ def quarantine_preview(
                 """,
                 (source["variant_id"], source_file_id, keep_file_id or ""),
             ).fetchall()
-            remaining_variant_files = len(candidates)
             if candidates:
                 replacement = _file_row(conn, candidates[0]["file_id"], active=True)
                 try:
                     _require_current_file(replacement, require_fingerprint=False)
                 except RuntimeError as exc:
                     blockers.append(f"invalid_replacement:{exc}")
+            elif remaining_variant_files:
+                blockers.append("variant_has_no_managed_replacement")
             else:
                 retired_variant = True
                 if source["work_bucket_id"] is not None:
@@ -408,7 +414,10 @@ def apply_quarantine(
         if progress:
             progress(1, 1, plan["source"]["name"])
         try:
-            index = _refresh_review_index(state_db=state_db, house_dir=house_dir, index_path=index_path)
+            index = _refresh_review_index(
+                state_db=state_db, house_dir=house_dir, index_path=index_path,
+                temp_dir=temp_dir,
+            )
         except Exception as exc:
             index = {"index_updated": False, "house_index_synced": False,
                      "warning": f"격리는 완료됐지만 index 갱신에 실패했습니다: {exc}"}
@@ -655,7 +664,10 @@ def apply_restore(
         if progress:
             progress(1, 1, plan["source"]["name"])
         try:
-            index = _refresh_review_index(state_db=state_db, house_dir=house_dir, index_path=index_path)
+            index = _refresh_review_index(
+                state_db=state_db, house_dir=house_dir, index_path=index_path,
+                temp_dir=temp_dir,
+            )
         except Exception as exc:
             index = {"index_updated": False, "house_index_synced": False,
                      "warning": f"복원은 완료됐지만 index 갱신에 실패했습니다: {exc}"}

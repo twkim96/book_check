@@ -1,8 +1,11 @@
 import errno
+import hashlib
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime
 
 from tqdm import tqdm
@@ -22,10 +25,12 @@ from normalizer import (
     SUPPORTED_EXTENSIONS,
 )
 from scanner import (
+    INDEX_GENERATION_FILENAME,
     IndexSnapshotStale,
     generate_file_list,
     generate_file_list_from_state_db,
     validate_index_snapshot,
+    validate_index_generation,
 )
 from deduplicator import clean_duplicates, unique_path
 from project_paths import HOUSE_DIR, PROJECT_ROOT, TEMP_DIR
@@ -215,6 +220,30 @@ def _snapshot_unpack_tree(root):
     return files, directories, supported
 
 
+class UnpackCleanupError(OSError):
+    def __init__(self, message, *, removed_files=0, removed_bytes=0):
+        super().__init__(message)
+        self.removed_files = int(removed_files)
+        self.removed_bytes = int(removed_bytes)
+
+
+def _open_relative_directory(root_fd, parts):
+    fd = os.dup(root_fd)
+    flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        for part in parts:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _cleanup_unpack_tree_owned(root, *, reusable, files, directories):
     """Delete only entries observed in one no-follow snapshot.
 
@@ -225,31 +254,75 @@ def _cleanup_unpack_tree_owned(root, *, reusable, files, directories):
     root = os.path.abspath(root)
     removed_files = 0
     removed_bytes = 0
-    for path, dev, ino, ctime_ns, size, mtime_ns in files:
-        current = os.lstat(path)
-        if (
-            current.st_dev, current.st_ino, current.st_ctime_ns,
-            current.st_size, current.st_mtime_ns,
-        ) != (dev, ino, ctime_ns, size, mtime_ns):
-            raise OSError(f"unpack file changed during cleanup: {path}")
-        os.unlink(path)
-        removed_files += 1
-        removed_bytes += size
+    root_fd = None
+    parent_fd = None
+    try:
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        root_identity = os.fstat(root_fd)
+        for path, dev, ino, ctime_ns, size, mtime_ns in files:
+            relative = os.path.relpath(path, root)
+            parts = relative.split(os.sep)
+            directory_fd = _open_relative_directory(root_fd, parts[:-1])
+            try:
+                current = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    current.st_dev, current.st_ino, current.st_ctime_ns,
+                    current.st_size, current.st_mtime_ns,
+                ) != (dev, ino, ctime_ns, size, mtime_ns):
+                    raise OSError(f"unpack file changed during cleanup: {path}")
+                os.unlink(parts[-1], dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
+            removed_files += 1
+            removed_bytes += size
 
-    for path, dev, ino in sorted(
-        directories, key=lambda item: len(item[0].split(os.sep)), reverse=True
-    ):
-        current = os.lstat(path)
-        if (current.st_dev, current.st_ino) != (dev, ino):
-            raise OSError(f"unpack directory changed during cleanup: {path}")
-        os.rmdir(path)
+        for path, dev, ino in sorted(
+            directories,
+            key=lambda item: len(os.path.relpath(item[0], root).split(os.sep)),
+            reverse=True,
+        ):
+            relative = os.path.relpath(path, root)
+            parts = relative.split(os.sep)
+            directory_fd = _open_relative_directory(root_fd, parts[:-1])
+            try:
+                current = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (dev, ino):
+                    raise OSError(f"unpack directory changed during cleanup: {path}")
+                os.rmdir(parts[-1], dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
 
-    if reusable:
-        if os.listdir(root):
-            raise OSError("unpack inbox changed during cleanup")
-    else:
-        os.rmdir(root)
-    return removed_files, removed_bytes
+        if reusable:
+            if os.listdir(root_fd):
+                raise OSError("unpack inbox changed during cleanup")
+        else:
+            parent = os.path.dirname(root)
+            leaf = os.path.basename(root)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            current_root = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if (current_root.st_dev, current_root.st_ino) != (
+                root_identity.st_dev, root_identity.st_ino,
+            ):
+                raise OSError("unpack wrapper changed during cleanup")
+            os.rmdir(leaf, dir_fd=parent_fd)
+        return removed_files, removed_bytes
+    except OSError as exc:
+        raise UnpackCleanupError(
+            str(exc), removed_files=removed_files, removed_bytes=removed_bytes
+        ) from exc
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def cleanup_unpack_sources(src_dir):
@@ -271,8 +344,8 @@ def cleanup_unpack_sources(src_dir):
                 "path": root,
                 "status": "snapshot_blocked",
                 "remaining_supported": 0,
-                "discarded_files": 0,
-                "discarded_bytes": 0,
+                "discarded_files": int(getattr(exc, "removed_files", 0)),
+                "discarded_bytes": int(getattr(exc, "removed_bytes", 0)),
                 "error": str(exc),
             })
             continue
@@ -301,8 +374,8 @@ def cleanup_unpack_sources(src_dir):
                 "path": root,
                 "status": status,
                 "remaining_supported": 0,
-                "discarded_files": 0,
-                "discarded_bytes": 0,
+                "discarded_files": int(getattr(exc, "removed_files", 0)),
+                "discarded_bytes": int(getattr(exc, "removed_bytes", 0)),
                 "error": str(exc),
             })
             continue
@@ -352,41 +425,448 @@ def directory_has_files(path):
 
 def _atomic_publish_file(source, destination):
     """Publish one regular file without following a destination symlink."""
-    from mutation_io import ensure_directory_nofollow, inspect_regular_file
+    from mutation_io import atomic_publish_regular_file
 
-    source_evidence = inspect_regular_file(source)
-    destination = os.path.abspath(destination)
-    parent = os.path.dirname(destination)
-    ensure_directory_nofollow(parent)
-    if os.path.islink(destination):
-        raise RuntimeError(f"index destination is a symlink: {destination}")
-    if os.path.lexists(destination) and not os.path.isfile(destination):
-        raise RuntimeError(f"index destination is not a regular file: {destination}")
+    return atomic_publish_regular_file(source, destination)
 
-    temporary = None
+
+DIRECTORY_INTAKE_ACTION = "directory_house_ingest"
+
+
+def _directory_source_inventory(source_root, destination_root):
+    """Capture one immutable, no-follow directory intake manifest."""
+    from mutation_io import inspect_regular_file
+
+    source_root = os.path.abspath(source_root)
+    destination_root = os.path.abspath(destination_root)
+    if os.path.islink(source_root):
+        raise RuntimeError(f"directory intake source is a symlink: {source_root}")
+    items = []
+    normalized_paths = set()
+    for root, dirs, files in os.walk(source_root, followlinks=False):
+        for dirname in dirs:
+            directory = os.path.join(root, dirname)
+            if os.path.islink(directory):
+                raise RuntimeError(f"directory intake contains a symlink: {directory}")
+        for filename in files:
+            source = os.path.join(root, filename)
+            if os.path.islink(source):
+                raise RuntimeError(f"directory intake contains a symlink: {source}")
+            relative = os.path.relpath(source, source_root)
+            normalized_relative = normalize_nfc(relative)
+            if normalized_relative in normalized_paths:
+                raise RuntimeError(
+                    "directory intake normalized path collision: "
+                    f"{normalized_relative}"
+                )
+            normalized_paths.add(normalized_relative)
+            evidence = inspect_regular_file(source)
+            items.append({
+                "rel_path": relative,
+                "normalized_rel_path": normalized_relative,
+                "destination_rel_path": relative,
+                "dev": evidence.dev,
+                "ino": evidence.ino,
+                "ctime_ns": evidence.ctime_ns,
+                "size": evidence.size,
+                "mtime_ns": evidence.mtime_ns,
+                "sha256": evidence.sha256,
+            })
+    items.sort(key=lambda item: item["normalized_rel_path"])
+    plan_payload = {
+        "version": 1,
+        "source_root": normalize_nfc(source_root),
+        "destination_root": normalize_nfc(destination_root),
+        "items": [
+            {
+                "rel_path": item["normalized_rel_path"],
+                "destination_rel_path": normalize_nfc(item["destination_rel_path"]),
+                "size": item["size"],
+                "sha256": item["sha256"],
+            }
+            for item in items
+        ],
+    }
+    plan_sha256 = hashlib.sha256(
+        json.dumps(
+            plan_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        **plan_payload,
+        "items": items,
+        "plan_sha256": plan_sha256,
+    }
+
+
+def _load_resumable_directory_manifest(conn, source_root, destination_root=None):
+    import decision_store
+
+    source_key = decision_store.canonicalize_path(source_root)
+    rows = conn.execute(
+        """
+        SELECT * FROM operation_groups
+        WHERE action = ? AND state = 'failed'
+        ORDER BY group_id DESC
+        """,
+        (DIRECTORY_INTAKE_ACTION,),
+    ).fetchall()
+    for row in rows:
+        if not row["source_path"]:
+            continue
+        if decision_store.canonicalize_path(row["source_path"]) != source_key:
+            continue
+        if destination_root is not None and decision_store.canonicalize_path(
+            row["dest_path"]
+        ) != decision_store.canonicalize_path(destination_root):
+            continue
+        try:
+            manifest = json.loads(row["source_manifest_json"] or "")
+        except (TypeError, ValueError):
+            continue
+        if (
+            isinstance(manifest, dict)
+            and isinstance(manifest.get("items"), list)
+            and manifest.get("plan_sha256") == row["plan_sha256"]
+        ):
+            return row, manifest
+    return None, None
+
+
+def has_resumable_directory_intake(state_db_path, source_root):
+    if not state_db_path:
+        return False
+    import decision_store
+
+    conn = decision_store.connect_state_db(state_db_path)
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb", dir=parent, prefix=f".{os.path.basename(destination)}.",
-            suffix=".tmp", delete=False,
-        ) as output, open(source, "rb") as input_file:
-            temporary = output.name
-            shutil.copyfileobj(input_file, output, length=1024 * 1024)
-            output.flush()
-            os.fsync(output.fileno())
-        temporary_evidence = inspect_regular_file(temporary)
-        if temporary_evidence.sha256 != source_evidence.sha256:
-            raise RuntimeError("index source changed during atomic publish")
-        os.replace(temporary, destination)
-        temporary = None
-        published = inspect_regular_file(destination)
-        if published.sha256 != source_evidence.sha256:
-            raise RuntimeError("published index SHA-256 mismatch")
+        row, _ = _load_resumable_directory_manifest(conn, source_root)
+        return row is not None
     finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+        conn.close()
+
+
+def _validate_directory_resume_sources(source_root, manifest):
+    current = _directory_source_inventory(source_root, manifest["destination_root"])
+    expected = {
+        item["normalized_rel_path"]: item for item in manifest["items"]
+    }
+    for item in current["items"]:
+        expected_item = expected.get(item["normalized_rel_path"])
+        if expected_item is None:
+            raise RuntimeError(
+                "directory intake source gained an unapproved file after failure: "
+                f"{item['rel_path']}"
+            )
+        if (
+            item["dev"] != expected_item["dev"]
+            or item["ino"] != expected_item["ino"]
+            or item["ctime_ns"] != expected_item["ctime_ns"]
+            or item["size"] != expected_item["size"]
+            or item["mtime_ns"] != expected_item["mtime_ns"]
+            or item["sha256"] != expected_item["sha256"]
+        ):
+            raise RuntimeError(
+                "directory intake source changed after approval: "
+                f"{item['rel_path']}"
+            )
+    return current
+
+
+def _committed_directory_item(conn, manifest, item, destination):
+    """Return whether an earlier group owns this exact committed destination."""
+    import decision_store
+    from mutation_io import inspect_regular_file
+
+    canonical_destination = decision_store.canonicalize_path(destination)
+    row = conn.execute(
+        """
+        SELECT o.operation_id, o.file_id,
+               o.destination_dev, o.destination_ino, o.destination_ctime_ns,
+               o.destination_size, o.destination_mtime_ns, o.destination_sha256
+        FROM operations AS o
+        JOIN operation_groups AS og ON og.group_id = o.operation_group_id
+        WHERE og.action = ? AND og.plan_sha256 = ?
+          AND o.action = 'house_ingest' AND o.state = 'committed'
+          AND o.dest_path = ?
+        ORDER BY o.operation_id DESC LIMIT 1
+        """,
+        (DIRECTORY_INTAKE_ACTION, manifest["plan_sha256"], canonical_destination),
+    ).fetchone()
+    if row is None or not os.path.lexists(destination):
+        return False
+    evidence = inspect_regular_file(destination)
+    operation_identity = (
+        row["destination_dev"], row["destination_ino"], row["destination_ctime_ns"],
+        row["destination_size"], row["destination_mtime_ns"],
+        row["destination_sha256"],
+    )
+    current_identity = (
+        evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size,
+        evidence.mtime_ns, evidence.sha256,
+    )
+    if (
+        current_identity != operation_identity
+        or evidence.sha256 != item["sha256"]
+    ):
+        raise RuntimeError(
+            "directory intake committed destination changed: "
+            f"{item['destination_rel_path']}"
+        )
+    file_row = conn.execute(
+        "SELECT canonical_path, source, active, dev, ino, ctime_ns, size, mtime_ns "
+        "FROM files WHERE file_id = ?",
+        (row["file_id"],),
+    ).fetchone()
+    if (
+        file_row is None
+        or not file_row["active"]
+        or file_row["source"] != "house"
+        or file_row["canonical_path"] != canonical_destination
+        or (
+            file_row["dev"], file_row["ino"], file_row["ctime_ns"],
+            file_row["size"], file_row["mtime_ns"],
+        ) != current_identity[:5]
+    ):
+        raise RuntimeError(
+            "directory intake committed destination is not aligned with DB: "
+            f"{item['destination_rel_path']}"
+        )
+    return True
+
+
+def _ingest_directory_group(conn, source_root, destination_root, run_id):
+    """Resume-safe directory intake built on the existing per-file journal."""
+    import decision_store
+    from dedup_mutations import ingest_to_house
+
+    source_root = os.path.abspath(source_root)
+    destination_root = os.path.abspath(destination_root)
+    prior_group, manifest = _load_resumable_directory_manifest(
+        conn, source_root, destination_root
+    )
+    if manifest is None:
+        if os.path.lexists(destination_root):
+            raise RuntimeError(
+                "directory intake destination exists without a resumable operation group: "
+                f"{destination_root}"
+            )
+        manifest = _directory_source_inventory(source_root, destination_root)
+    else:
+        _validate_directory_resume_sources(source_root, manifest)
+
+    source_stat = os.lstat(source_root)
+    manifest_json = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    with decision_store.transaction(conn):
+        group_id = decision_store.create_operation_group(
+            conn,
+            run_id=run_id,
+            action=DIRECTORY_INTAKE_ACTION,
+            plan_sha256=manifest["plan_sha256"],
+            source_path=decision_store.canonicalize_path(source_root),
+            dest_path=decision_store.canonicalize_path(destination_root),
+            item_count=len(manifest["items"]),
+            source_manifest_json=manifest_json,
+        )
+        conn.execute(
+            """
+            UPDATE operation_groups
+            SET source_dev = ?, source_ino = ?, source_ctime_ns = ?
+            WHERE group_id = ?
+            """,
+            (source_stat.st_dev, source_stat.st_ino, source_stat.st_ctime_ns, group_id),
+        )
+
+    try:
+        for item in manifest["items"]:
+            source = os.path.join(source_root, item["rel_path"])
+            destination = os.path.join(
+                destination_root, item["destination_rel_path"]
+            )
+            source_exists = os.path.lexists(source)
+            destination_exists = os.path.lexists(destination)
+            if destination_exists and _committed_directory_item(
+                conn, manifest, item, destination
+            ):
+                if source_exists:
+                    raise RuntimeError(
+                        "directory intake source and committed destination both exist: "
+                        f"{item['rel_path']}"
+                    )
+                continue
+            if destination_exists:
+                raise RuntimeError(
+                    "directory intake destination conflict: "
+                    f"{item['destination_rel_path']}"
+                )
+            if not source_exists:
+                raise RuntimeError(
+                    "directory intake item is missing from source and destination: "
+                    f"{item['rel_path']}"
+                )
+            canonical_source = decision_store.canonicalize_path(source)
+            row = conn.execute(
+                "SELECT file_id FROM files WHERE canonical_path = ? AND active = 1",
+                (canonical_source,),
+            ).fetchone()
+            if row is None:
+                with decision_store.transaction(conn):
+                    row = decision_store.reconcile_file_metadata(
+                        conn, source, source="temp"
+                    )
+            ingest_to_house(
+                conn,
+                source_file_id=row["file_id"],
+                destination=destination,
+                run_id=run_id,
+                operation_group_id=group_id,
+            )
+
+        for item in manifest["items"]:
+            destination = os.path.join(
+                destination_root, item["destination_rel_path"]
+            )
+            if not _committed_directory_item(conn, manifest, item, destination):
+                raise RuntimeError(
+                    "directory intake group is incomplete after ingest: "
+                    f"{item['destination_rel_path']}"
+                )
+        destination_stat = os.lstat(destination_root)
+        with decision_store.transaction(conn):
+            conn.execute(
+                """
+                UPDATE operation_groups
+                SET destination_dev = ?, destination_ino = ?, destination_ctime_ns = ?
+                WHERE group_id = ?
+                """,
+                (
+                    destination_stat.st_dev,
+                    destination_stat.st_ino,
+                    destination_stat.st_ctime_ns,
+                    group_id,
+                ),
+            )
+            decision_store.transition_operation_group(conn, group_id, "fs_done")
+            decision_store.transition_operation_group(conn, group_id, "db_done")
+            decision_store.transition_operation_group(conn, group_id, "committed")
+        return {
+            "group_id": group_id,
+            "resumed_from_group_id": prior_group["group_id"] if prior_group else None,
+            "item_count": len(manifest["items"]),
+        }
+    except BaseException as exc:
+        with decision_store.transaction(conn):
+            row = conn.execute(
+                "SELECT state FROM operation_groups WHERE group_id = ?", (group_id,)
+            ).fetchone()
+            if row is not None and row["state"] in {"planned", "fs_done", "db_done"}:
+                decision_store.transition_operation_group(
+                    conn, group_id, "failed", error=str(exc)
+                )
+        raise
+
+
+def recover_directory_intake_group(conn, group_id):
+    """Resolve a crash-left directory group after recovering its child journals."""
+    import decision_store
+
+    group = conn.execute(
+        "SELECT * FROM operation_groups WHERE group_id = ?", (int(group_id),)
+    ).fetchone()
+    if group is None:
+        raise KeyError(group_id)
+    if group["action"] != DIRECTORY_INTAKE_ACTION:
+        raise ValueError("operation group is not a directory house intake")
+    if group["state"] not in {"planned", "fs_done", "db_done"}:
+        return group["state"]
+
+    children = conn.execute(
+        "SELECT operation_id, state FROM operations "
+        "WHERE operation_group_id = ? ORDER BY operation_id",
+        (int(group_id),),
+    ).fetchall()
+    for child in children:
+        if child["state"] in {"planned", "fs_done", "db_done"}:
+            decision_store.recover_interrupted_operation(
+                conn, int(child["operation_id"])
+            )
+
+    try:
+        manifest = json.loads(group["source_manifest_json"] or "")
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("plan_sha256") != group["plan_sha256"]
+            or not isinstance(manifest.get("items"), list)
+        ):
+            raise RuntimeError("directory intake recovery manifest is invalid")
+        source_root = group["source_path"]
+        destination_root = group["dest_path"]
+        complete = True
+        conflict = False
+        for item in manifest["items"]:
+            source = os.path.join(source_root, item["rel_path"])
+            destination = os.path.join(
+                destination_root, item["destination_rel_path"]
+            )
+            if _committed_directory_item(conn, manifest, item, destination):
+                if os.path.lexists(source):
+                    conflict = True
+                continue
+            complete = False
+            source_exists = os.path.lexists(source)
+            destination_exists = os.path.lexists(destination)
+            if destination_exists or not source_exists:
+                conflict = True
+        child_states = {
+            row[0] for row in conn.execute(
+                "SELECT state FROM operations WHERE operation_group_id = ?",
+                (int(group_id),),
+            )
+        }
+        if child_states & {"planned", "fs_done", "db_done"}:
+            raise RuntimeError("directory intake child recovery is incomplete")
+        if complete and not conflict:
+            with decision_store.transaction(conn):
+                current = conn.execute(
+                    "SELECT state FROM operation_groups WHERE group_id = ?",
+                    (int(group_id),),
+                ).fetchone()[0]
+                if current == "planned":
+                    decision_store.transition_operation_group(conn, group_id, "fs_done")
+                    current = "fs_done"
+                if current == "fs_done":
+                    decision_store.transition_operation_group(conn, group_id, "db_done")
+                    current = "db_done"
+                if current == "db_done":
+                    decision_store.transition_operation_group(conn, group_id, "committed")
+            return "committed"
+        target = "stale" if conflict and group["state"] == "planned" else "failed"
+        with decision_store.transaction(conn):
+            decision_store.transition_operation_group(
+                conn,
+                group_id,
+                target,
+                error=(
+                    "directory intake recovery found conflicting paths"
+                    if conflict else "directory intake recovered children; resume required"
+                ),
+            )
+        return target
+    except Exception as exc:
+        with decision_store.transaction(conn):
+            current = conn.execute(
+                "SELECT state FROM operation_groups WHERE group_id = ?",
+                (int(group_id),),
+            ).fetchone()[0]
+            if current in {"planned", "fs_done", "db_done"}:
+                target = "stale" if current == "planned" else "failed"
+                decision_store.transition_operation_group(
+                    conn, group_id, target, error=str(exc)
+                )
+                return target
+        raise
 
 
 def sync_extension_index(file_index_json, script_dir):
@@ -411,6 +891,176 @@ def sync_house_index(file_index_json, dst_dir):
     _atomic_publish_file(file_index_json, house_index_json)
     print(f"✨ txt_house 인덱스 동기화 완료: {house_index_json}")
     return True
+
+
+def _capture_index_deployment(paths, backup_parent):
+    """Save the currently visible multi-surface generation before publication."""
+    backup_root = tempfile.mkdtemp(prefix="index-deploy-", dir=backup_parent)
+    records = []
+    try:
+        for index, raw_path in enumerate(paths):
+            path = os.path.abspath(raw_path)
+            if os.path.islink(path):
+                raise RuntimeError(f"index deployment destination is a symlink: {path}")
+            if os.path.lexists(path) and not os.path.isfile(path):
+                raise RuntimeError(
+                    f"index deployment destination is not a regular file: {path}"
+                )
+            backup = None
+            original_sha256 = None
+            if os.path.isfile(path):
+                from mutation_io import inspect_regular_file
+
+                original_sha256 = inspect_regular_file(path).sha256
+                backup = os.path.join(backup_root, f"{index}.backup")
+                _atomic_publish_file(path, backup)
+            records.append({
+                "path": path,
+                "backup": backup,
+                "original_sha256": original_sha256,
+                "expected_current_sha256": None,
+            })
+        snapshot = {"root": backup_root, "records": records}
+        _write_index_deployment_journal(snapshot)
+        return snapshot
+    except BaseException:
+        shutil.rmtree(backup_root, ignore_errors=True)
+        raise
+
+
+def _write_index_deployment_journal(snapshot):
+    journal = os.path.join(snapshot["root"], "deployment.json")
+    temporary = journal + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle, ensure_ascii=False, sort_keys=True, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, journal)
+
+
+def _authorize_index_deployment(snapshot, expected_by_path):
+    for record in snapshot["records"]:
+        expected = expected_by_path.get(os.path.abspath(record["path"]))
+        if expected is not None:
+            record["expected_current_sha256"] = expected
+    _write_index_deployment_journal(snapshot)
+
+
+def _restore_index_deployment(snapshot):
+    from mutation_io import inspect_regular_file
+
+    errors = []
+    for record in snapshot["records"]:
+        path = record["path"]
+        backup = record["backup"]
+        try:
+            current_sha256 = None
+            if os.path.lexists(path):
+                if os.path.islink(path) or not os.path.isfile(path):
+                    raise RuntimeError(
+                        f"refusing to replace changed index destination: {path}"
+                    )
+                current_sha256 = inspect_regular_file(path).sha256
+            allowed = {
+                value for value in (
+                    record.get("original_sha256"),
+                    record.get("expected_current_sha256"),
+                ) if value is not None
+            }
+            if current_sha256 is not None and current_sha256 not in allowed:
+                raise RuntimeError(
+                    f"index destination changed outside this deployment: {path}"
+                )
+            if backup is not None:
+                _atomic_publish_file(backup, path)
+            elif os.path.lexists(path):
+                if record.get("expected_current_sha256") is None:
+                    raise RuntimeError(
+                        f"refusing to remove an unowned new index destination: {path}"
+                    )
+                os.unlink(path)
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise RuntimeError(
+            "index deployment rollback incomplete; backups preserved: "
+            + "; ".join(errors)
+        )
+    shutil.rmtree(snapshot["root"], ignore_errors=True)
+
+
+def _discard_index_deployment_snapshot(snapshot):
+    shutil.rmtree(snapshot["root"], ignore_errors=True)
+
+
+def recover_pending_index_deployments(
+    backup_parent, *, file_list_path, file_index_path, house_index_path,
+    extension_index_path,
+):
+    """Finish a crash-left validated generation or preserve its recovery data."""
+    backup_parent = os.path.abspath(backup_parent)
+    expected_paths = {
+        os.path.abspath(file_list_path),
+        os.path.abspath(file_index_path),
+        os.path.abspath(os.path.join(backup_parent, INDEX_GENERATION_FILENAME)),
+        os.path.abspath(house_index_path),
+        os.path.abspath(extension_index_path),
+    }
+    outcomes = []
+    for name in sorted(os.listdir(backup_parent)):
+        if not name.startswith("index-deploy-"):
+            continue
+        root = os.path.join(backup_parent, name)
+        journal = os.path.join(root, "deployment.json")
+        if not os.path.isfile(journal) or os.path.islink(journal):
+            continue
+        with open(journal, "r", encoding="utf-8") as handle:
+            snapshot = json.load(handle)
+        snapshot["root"] = root
+        record_paths = {
+            os.path.abspath(record["path"]) for record in snapshot.get("records", [])
+        }
+        if record_paths != expected_paths:
+            raise RuntimeError(
+                f"pending index deployment journal has unexpected paths: {journal}"
+            )
+        for record in snapshot["records"]:
+            backup = record.get("backup")
+            if backup is not None and os.path.commonpath(
+                (root, os.path.abspath(backup))
+            ) != root:
+                raise RuntimeError(
+                    f"pending index deployment backup escaped journal root: {backup}"
+                )
+        try:
+            validate_index_generation(file_index_path, file_list_path)
+        except Exception as exc:
+            outcomes.append({
+                "journal": journal,
+                "status": "needs_review",
+                "error": str(exc),
+            })
+            continue
+        from mutation_io import inspect_regular_file
+
+        list_sha256 = inspect_regular_file(file_list_path).sha256
+        index_sha256 = inspect_regular_file(file_index_path).sha256
+        manifest_path = os.path.join(backup_parent, INDEX_GENERATION_FILENAME)
+        manifest_sha256 = inspect_regular_file(manifest_path).sha256
+        _authorize_index_deployment(snapshot, {
+            os.path.abspath(file_list_path): list_sha256,
+            os.path.abspath(file_index_path): index_sha256,
+            os.path.abspath(manifest_path): manifest_sha256,
+            os.path.abspath(house_index_path): index_sha256,
+            os.path.abspath(extension_index_path): index_sha256,
+        })
+        _atomic_publish_file(file_index_path, house_index_path)
+        extension_parent = os.path.dirname(os.path.abspath(extension_index_path))
+        if os.path.isdir(extension_parent):
+            _atomic_publish_file(file_index_path, extension_index_path)
+        _discard_index_deployment_snapshot(snapshot)
+        outcomes.append({"journal": journal, "status": "committed"})
+    return outcomes
 
 
 def move_to_house(
@@ -495,10 +1145,28 @@ def move_to_house(
                 f"manual variant review required: {candidate_path}"
             )
         if os.path.isdir(src_path):
-            raise FileExistsError(
-                f"directory intake destination already exists; manual review required: {candidate_path}"
-            )
-        dst_path = unique_path(target_folder, final_name_candidate, conflict_suffix)
+            if not state_db_path:
+                raise FileExistsError(
+                    "directory intake destination already exists; "
+                    f"manual review required: {candidate_path}"
+                )
+            import decision_store
+
+            resume_conn = decision_store.connect_state_db(state_db_path)
+            try:
+                resume_group, _ = _load_resumable_directory_manifest(
+                    resume_conn, src_path, candidate_path
+                )
+            finally:
+                resume_conn.close()
+            if resume_group is None:
+                raise FileExistsError(
+                    "directory intake destination already exists without a matching "
+                    f"failed group; manual review required: {candidate_path}"
+                )
+            dst_path = candidate_path
+        else:
+            dst_path = unique_path(target_folder, final_name_candidate, conflict_suffix)
     else:
         dst_path = candidate_path
     final_name = os.path.basename(dst_path)
@@ -554,35 +1222,15 @@ def move_to_house(
             conn.close()
     elif state_db_path and os.path.isdir(src_path):
         import decision_store
-        from dedup_mutations import ingest_to_house
 
         conn = decision_store.connect_state_db(state_db_path)
         try:
-            source_files = []
-            for root, _, files in os.walk(src_path):
-                for filename in files:
-                    source_files.append(os.path.join(root, filename))
-            for source_file in sorted(source_files):
-                relative = os.path.relpath(source_file, src_path)
-                destination_file = os.path.join(dst_path, relative)
-                canonical_source = decision_store.canonicalize_path(source_file)
-                row = conn.execute(
-                    "SELECT file_id FROM files WHERE canonical_path = ? AND active = 1",
-                    (canonical_source,),
-                ).fetchone()
-                if row is None:
-                    # 표지 등 scanner 비대상 파일도 직접 shutil.move하지 않는다.
-                    # stable ID와 raw fingerprint를 만든 뒤 같은 journal sink로 입고한다.
-                    with decision_store.transaction(conn):
-                        row = decision_store.reconcile_file_metadata(
-                            conn, source_file, source="temp"
-                        )
-                ingest_to_house(
-                    conn,
-                    source_file_id=row["file_id"],
-                    destination=destination_file,
-                    run_id=run_id or f"folderling-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
-                )
+            _ingest_directory_group(
+                conn,
+                src_path,
+                dst_path,
+                run_id or f"folderling-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+            )
         finally:
             conn.close()
     else:
@@ -627,6 +1275,8 @@ def _process_items_authorized(
     state_db_path=None,
     event_callback=None,
 ):
+    workflow_started_at = time.perf_counter()
+    performance_metrics = {}
     recent_dir = os.path.join(dst_dir, "_최근")
     success_log = os.path.join(script_dir, "success.log")
     fail_log = os.path.join(script_dir, "fail.log")
@@ -651,6 +1301,20 @@ def _process_items_authorized(
 
     from mutation_io import ensure_directory_nofollow
     ensure_directory_nofollow(dst_dir)
+    pending_deployments = recover_pending_index_deployments(
+        script_dir,
+        file_list_path=file_list_json,
+        file_index_path=file_index_json,
+        house_index_path=os.path.join(dst_dir, HOUSE_INDEX_FILENAME),
+        extension_index_path=os.path.join(script_dir, EXTENSION_INDEX_PATH),
+    )
+    pending_review = [
+        item for item in pending_deployments if item["status"] == "needs_review"
+    ]
+    if pending_review:
+        raise RuntimeError(
+            "pending index deployment needs review: " + pending_review[0]["error"]
+        )
 
     legacy_pass_count = 0
     if os.path.isdir(pass_dir):
@@ -683,11 +1347,15 @@ def _process_items_authorized(
         source_root=os.path.abspath(src_dir),
         house_root=os.path.abspath(dst_dir),
     )
+    stage_started_at = time.perf_counter()
     snapshot = validate_index_snapshot(
         dst_dir,
         file_index_json,
         state_db_path,
         allowed_active_run_id=actual_run_id,
+    )
+    performance_metrics["snapshot_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
     )
     pre_index_mode = "verified_snapshot" if snapshot["valid"] else "full_scan_fallback"
     emit_folderling_event(
@@ -708,6 +1376,7 @@ def _process_items_authorized(
             "🔄 house 전체 Scanner fallback: "
             f"{snapshot['reason']}"
         )
+    stage_started_at = time.perf_counter()
     dedup_summary = clean_duplicates(
         house_dir=dst_dir,
         temp_dir=src_dir,
@@ -723,6 +1392,10 @@ def _process_items_authorized(
         require_state_db=True,
         authorized_run_id=actual_run_id,
         event_callback=event_callback,
+        verified_index_entries=(snapshot["entries"] if snapshot["valid"] else None),
+    )
+    performance_metrics["dedup_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
     )
     emit_folderling_event(
         event_callback,
@@ -756,6 +1429,7 @@ def _process_items_authorized(
     unpack_discarded_file_count = 0
     unpack_discarded_bytes = 0
 
+    stage_started_at = time.perf_counter()
     with open(success_log, "w", encoding="utf-8") as s_log, \
          open(fail_log, "w", encoding="utf-8") as f_log:
 
@@ -855,7 +1529,11 @@ def _process_items_authorized(
                         total=item_total,
                     )
                     continue
-                if is_dir and not directory_has_files(src_path):
+                resumable_directory = bool(
+                    is_dir
+                    and has_resumable_directory_intake(state_db_path, src_path)
+                )
+                if is_dir and not directory_has_files(src_path) and not resumable_directory:
                     removed = prune_empty_intake_tree(src_path)
                     empty_dir_cleanup_count += removed
                     s_log.write(
@@ -1052,6 +1730,9 @@ def _process_items_authorized(
             unpack_discarded_file_count=unpack_discarded_file_count,
             unpack_discarded_bytes=unpack_discarded_bytes,
         )
+    performance_metrics["intake_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
+    )
 
     cleanup_recent_links(recent_dir, max_days=30)
 
@@ -1087,52 +1768,119 @@ def _process_items_authorized(
     index_ready = False
     index_error = None
     index_deployment_error = None
+    stage_started_at = time.perf_counter()
+    extension_index_json = os.path.join(script_dir, EXTENSION_INDEX_PATH)
+    deployment_snapshot = None
     try:
-        projection = generate_file_list_from_state_db(
-            dst_dir,
-            file_list_json,
-            file_index_json,
-            state_db_path,
-            allowed_active_run_id=actual_run_id,
-        )
-        if not projection["ok"]:
-            raise RuntimeError("DB snapshot index generation returned failure")
-        index_ready = True
-        print("✨ file_list.json / file_index.json 증분 projection 완료")
-    except IndexSnapshotStale as exc:
-        index_mode = "full_scan_fallback"
-        index_fallback_reason = str(exc)
-        print(f"🔄 DB snapshot 검증 실패, 전체 Scanner fallback: {exc}")
-        try:
-            index_ok = generate_file_list(
-                [dst_dir],
+        deployment_snapshot = _capture_index_deployment(
+            [
                 file_list_json,
                 file_index_json,
-                state_db_path=state_db_path,
-            )
-            if not index_ok:
-                raise RuntimeError("scanner index generation returned failure")
-            index_ready = True
-            print("✨ file_list.json / file_index.json 전체 갱신 완료")
-        except Exception as fallback_exc:
-            failure_count += 1
-            index_error = str(fallback_exc)
-            print(f"⚠️ 파일 인덱스 fallback 중 에러가 발생했습니다: {fallback_exc}")
-    except Exception as e:
+                os.path.join(script_dir, INDEX_GENERATION_FILENAME),
+                os.path.join(dst_dir, HOUSE_INDEX_FILENAME),
+                extension_index_json,
+            ],
+            script_dir,
+        )
+    except Exception as snapshot_exc:
         failure_count += 1
-        index_error = str(e)
-        print(f"⚠️ 파일 인덱스 업데이트 중 에러가 발생했습니다: {e}")
+        index_error = str(snapshot_exc)
+        print(f"⚠️ 기존 인덱스 generation 보존 준비 실패: {snapshot_exc}")
 
+    if deployment_snapshot is not None:
+        try:
+            projection = generate_file_list_from_state_db(
+                dst_dir,
+                file_list_json,
+                file_index_json,
+                state_db_path,
+                allowed_active_run_id=actual_run_id,
+                temp_root=src_dir,
+            )
+            if not projection["ok"]:
+                raise RuntimeError("DB snapshot index generation returned failure")
+            index_ready = True
+            print("✨ file_list.json / file_index.json 증분 projection 완료")
+        except IndexSnapshotStale as exc:
+            index_mode = "full_scan_fallback"
+            index_fallback_reason = str(exc)
+            print(f"🔄 DB snapshot 검증 실패, 전체 Scanner fallback: {exc}")
+            try:
+                index_ok = generate_file_list(
+                    [dst_dir],
+                    file_list_json,
+                    file_index_json,
+                    state_db_path=state_db_path,
+                    temp_root=src_dir,
+                )
+                if not index_ok:
+                    raise RuntimeError("scanner index generation returned failure")
+                index_ready = True
+                print("✨ file_list.json / file_index.json 전체 갱신 완료")
+            except Exception as fallback_exc:
+                failure_count += 1
+                index_error = str(fallback_exc)
+                print(f"⚠️ 파일 인덱스 fallback 중 에러가 발생했습니다: {fallback_exc}")
+        except Exception as e:
+            failure_count += 1
+            index_error = str(e)
+            print(f"⚠️ 파일 인덱스 업데이트 중 에러가 발생했습니다: {e}")
+    performance_metrics["index_generation_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
+    )
+
+    stage_started_at = time.perf_counter()
     if index_ready:
         try:
+            from mutation_io import inspect_regular_file
+
+            list_sha256 = inspect_regular_file(file_list_json).sha256
+            index_sha256 = inspect_regular_file(file_index_json).sha256
+            manifest_sha256 = inspect_regular_file(
+                os.path.join(script_dir, INDEX_GENERATION_FILENAME)
+            ).sha256
+            _authorize_index_deployment(
+                deployment_snapshot,
+                {
+                    os.path.abspath(file_list_json): list_sha256,
+                    os.path.abspath(file_index_json): index_sha256,
+                    os.path.abspath(
+                        os.path.join(script_dir, INDEX_GENERATION_FILENAME)
+                    ): manifest_sha256,
+                    os.path.abspath(
+                        os.path.join(dst_dir, HOUSE_INDEX_FILENAME)
+                    ): index_sha256,
+                    os.path.abspath(extension_index_json): index_sha256,
+                },
+            )
             if not sync_house_index(file_index_json, dst_dir):
                 raise RuntimeError("house index sync failed")
-            if not sync_extension_index(file_index_json, script_dir):
-                raise RuntimeError("extension index sync failed")
+            extension_dir = os.path.dirname(extension_index_json)
+            if os.path.isdir(extension_dir):
+                if not sync_extension_index(file_index_json, script_dir):
+                    raise RuntimeError("extension index sync failed")
+            else:
+                print("⚠️ 로컬 확장 폴더 없음: extension surface 배포를 건너뜁니다.")
         except Exception as e:
             failure_count += 1
             index_deployment_error = str(e)
             print(f"⚠️ 파일 인덱스 배포 중 에러가 발생했습니다: {e}")
+    if deployment_snapshot is not None:
+        if index_ready and not index_deployment_error:
+            _discard_index_deployment_snapshot(deployment_snapshot)
+        else:
+            try:
+                _restore_index_deployment(deployment_snapshot)
+                print("↩️ 인덱스 배포 실패: 이전 generation을 모든 surface에 복원했습니다.")
+            except Exception as rollback_exc:
+                failure_count += 1
+                index_deployment_error = (
+                    f"{index_deployment_error or index_error}; rollback={rollback_exc}"
+                )
+                print(f"❌ 인덱스 generation 복원 실패: {rollback_exc}")
+    performance_metrics["index_deployment_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
+    )
     emit_folderling_event(
         event_callback,
         "index_result",
@@ -1195,6 +1943,7 @@ def _process_items_authorized(
         "pre_index_fallback_reason": snapshot["reason"],
         "index_mode": index_mode,
         "index_fallback_reason": index_fallback_reason,
+        "performance_metrics": performance_metrics,
     }
     result["review_required_count"] = (
         int(dedup_summary.get("review_queue_move_count", 0))
@@ -1203,6 +1952,22 @@ def _process_items_authorized(
         + unpack_cleanup_issue_count
         + legacy_pass_count
         + skipped_count
+    )
+    performance_metrics["authorized_total_seconds"] = round(
+        time.perf_counter() - workflow_started_at, 6
+    )
+    print(
+        "⏱️ 단계별 시간: "
+        + ", ".join(
+            f"{name}={seconds:.2f}s"
+            for name, seconds in performance_metrics.items()
+        )
+    )
+    emit_folderling_event(
+        event_callback,
+        "authorized_performance_metrics",
+        status="succeeded",
+        **performance_metrics,
     )
     emit_folderling_event(
         event_callback,
@@ -1299,6 +2064,7 @@ def _process_items_with_lock_held(
             conn.close()
         raise
     failure_count = int(result.get("failure_count", 0))
+    doctor_started_at = time.perf_counter()
     conn = decision_store.connect_state_db(state_db_path)
     try:
         final_issues = decision_store.doctor_issues(
@@ -1324,6 +2090,15 @@ def _process_items_with_lock_held(
         )
     finally:
         conn.close()
+    result.setdefault("performance_metrics", {})["final_doctor_seconds"] = round(
+        time.perf_counter() - doctor_started_at, 6
+    )
+    emit_folderling_event(
+        event_callback,
+        "performance_metrics",
+        status="succeeded" if failure_count == 0 else "needs_review",
+        **result["performance_metrics"],
+    )
     emit_folderling_event(
         event_callback,
         "actual_run_finished",

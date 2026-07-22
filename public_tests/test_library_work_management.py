@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import decision_store
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_work_management import (
@@ -318,6 +320,56 @@ def test_work_merge_moves_relations_and_demotes_second_primary(tmp_path):
         assert target_folder != source_folder
     finally:
         conn.close()
+
+
+def test_work_merge_confirmation_includes_decisions_retired_by_merge(tmp_path):
+    state_db, house, temp = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            source_work = _work(conn, "병합 원본")
+            target_work = _work(conn, "병합 대상")
+            source_variant = _variant(conn, source_work)
+            target_variant = _variant(conn, target_work)
+        source_file = _managed_file(
+            conn, house / "ㅂ" / "병합 원본 1.txt", source_variant
+        )
+        target_file = _managed_file(
+            conn, house / "ㅂ" / "병합 대상 1.txt", target_variant
+        )
+    finally:
+        conn.close()
+    plan = work_merge_preview(
+        state_db, source_work_id=source_work, target_work_id=target_work
+    )
+    assert plan["retired_decisions"] == []
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            decision_id = _decision(
+                conn, source_file, source_variant, target_file, target_variant,
+                "distinct_work",
+            )
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="confirmation is stale"):
+        apply_work_merge(
+            state_db,
+            house_dir=house,
+            temp_dir=temp,
+            source_work_id=source_work,
+            target_work_id=target_work,
+            confirm_count=plan["item_count"],
+            confirm_plan_sha256=plan["plan_sha256"],
+        )
+    refreshed = work_merge_preview(
+        state_db, source_work_id=source_work, target_work_id=target_work
+    )
+    assert [item["decision_id"] for item in refreshed["retired_decisions"]] == [
+        decision_id
+    ]
 
 
 def test_work_split_moves_selected_variant_folder_and_alias(tmp_path):

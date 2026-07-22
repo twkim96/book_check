@@ -394,7 +394,8 @@ def apply_file_relocate(
             progress(1, 1, plan["target_name"])
         try:
             index = _refresh_review_index(
-                state_db=state_db, house_dir=house_dir, index_path=index_path
+                state_db=state_db, house_dir=house_dir, index_path=index_path,
+                temp_dir=temp_dir,
             )
         except Exception as exc:
             index = {
@@ -1282,6 +1283,13 @@ def _recover_managed_folder_create_group(conn, group_id: int) -> str:
 
 def recover_operation_group(conn, group_id: int) -> str:
     group = _group_row(conn, group_id)
+    from folderling import (
+        DIRECTORY_INTAKE_ACTION,
+        recover_directory_intake_group,
+    )
+
+    if group["action"] == DIRECTORY_INTAKE_ACTION:
+        return recover_directory_intake_group(conn, group_id)
     if group["action"] == MANAGED_FOLDER_CREATE_ACTION:
         return _recover_managed_folder_create_group(conn, group_id)
     if group["action"] == MANAGED_FOLDER_RELOCATE_ACTION:
@@ -1389,7 +1397,7 @@ def folder_quarantine_preview(
             "managed_folder_ids": [row["folder_id"] for row in managed_folders],
         }
         return {
-            "version": "1.3.6",
+            "version": "1.3.7",
             "kind": "user_folder_quarantine",
             "item_count": len(items),
             "source_path": str(source),
@@ -1553,6 +1561,7 @@ def _quarantine_folder(conn, *, plan: Mapping[str, object], run_id: str, manifes
             for representative in representatives:
                 replacement = conn.execute(
                     "SELECT file_id FROM files WHERE variant_id = ? AND active = 1 AND source = 'house' "
+                    "AND assignment_state = 'managed' "
                     "ORDER BY protected DESC, canonical_path",
                     (representative["variant_id"],),
                 ).fetchall()
@@ -1621,7 +1630,7 @@ def apply_folder_quarantine(
     folder_path: str, confirm_count: int, confirm_plan_sha256: str, progress=None,
 ) -> dict:
     from library_review import _refresh_review_index
-    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.3.6"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.3.7"):
         plan = folder_quarantine_preview(
             state_db, house_dir=house_dir, temp_dir=temp_dir, folder_path=folder_path
         )
@@ -1691,7 +1700,10 @@ def apply_folder_quarantine(
         if progress:
             progress(plan["item_count"], plan["item_count"], Path(folder_path).name)
         try:
-            index = _refresh_review_index(state_db=state_db, house_dir=house_dir, index_path=index_path)
+            index = _refresh_review_index(
+                state_db=state_db, house_dir=house_dir, index_path=index_path,
+                temp_dir=temp_dir,
+            )
         except Exception as exc:
             index = {"index_updated": False, "house_index_synced": False,
                      "warning": f"폴더 격리는 완료됐지만 index 갱신에 실패했습니다: {exc}"}
@@ -1934,7 +1946,8 @@ def apply_managed_folder_relocate(
             progress(1, 1, plan["target_name"])
         try:
             index = _refresh_review_index(
-                state_db=state_db, house_dir=house_dir, index_path=index_path
+                state_db=state_db, house_dir=house_dir, index_path=index_path,
+                temp_dir=temp_dir,
             )
         except Exception as exc:
             index = {

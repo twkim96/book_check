@@ -404,7 +404,10 @@ def house_review_move(
         return {"operation_id": operation_id, "destination": str(destination)}
 
 
-def ingest_to_house(conn, *, source_file_id, destination, run_id, routing=None):
+def ingest_to_house(
+    conn, *, source_file_id, destination, run_id, routing=None,
+    operation_group_id=None,
+):
     with mutation_lock(conn, f"house_ingest:{run_id}", run_id=run_id):
         return _ingest_to_house(
             conn,
@@ -412,10 +415,14 @@ def ingest_to_house(conn, *, source_file_id, destination, run_id, routing=None):
             destination=destination,
             run_id=run_id,
             routing=routing,
+            operation_group_id=operation_group_id,
         )
 
 
-def _ingest_to_house(conn, *, source_file_id, destination, run_id, routing=None):
+def _ingest_to_house(
+    conn, *, source_file_id, destination, run_id, routing=None,
+    operation_group_id=None,
+):
     """Journal a temp-to-house intake while preserving the stable file_id."""
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     source = _file_state(conn, source_file_id)
@@ -447,6 +454,7 @@ def _ingest_to_house(conn, *, source_file_id, destination, run_id, routing=None)
             expected_size=source["size"],
             expected_mtime_ns=source["mtime_ns"],
             expected_fingerprint_id=source["current_fingerprint_id"],
+            operation_group_id=operation_group_id,
             source_dev=source_evidence.dev,
             source_ino=source_evidence.ino,
             source_ctime_ns=source_evidence.ctime_ns,

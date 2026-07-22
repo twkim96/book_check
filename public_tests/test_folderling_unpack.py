@@ -1,3 +1,5 @@
+import os
+
 import decision_store
 import folderling
 from folderling import cleanup_unpack_sources, iter_process_items
@@ -68,9 +70,9 @@ def test_unpack_cleanup_preserves_supported_file_arriving_during_cleanup(
     cover.write_bytes(b"cover")
     original_unlink = folderling.os.unlink
 
-    def unlink_then_arrive(path):
-        original_unlink(path)
-        if str(path) == str(cover):
+    def unlink_then_arrive(path, *args, **kwargs):
+        original_unlink(path, *args, **kwargs)
+        if os.fspath(path) in {str(cover), cover.name}:
             late.write_text("late book", encoding="utf-8")
 
     monkeypatch.setattr(folderling.os, "unlink", unlink_then_arrive)

@@ -360,6 +360,59 @@ snapshot 공유, Scanner 관찰 transaction 분리는 포함하지 않습니다.
 1.3.6 검증은 `602 passed`, Python compileall, TypeScript/Vite production build와 `git diff --check`를
 통과했습니다. 테스트는 임시 fixture만 사용했으며 운영 house·temp·DB에는 변경을 수행하지 않았습니다.
 
+### 재실행 가능한 폴더 입고와 index generation (1.3.7)
+
+1.3.7은 분권 폴더 입고가 일부 파일에서 중단돼도 같은 폴더를 다시 넣어 이어서 완료할 수 있게 합니다.
+입고 전에 모든 파일을 symlink를 따라가지 않고 inventory하고, 상대 경로·파일 identity·크기·mtime·
+SHA-256·목적 경로를 `directory_house_ingest` operation group에 저장합니다. 개별 파일 입고 journal은
+`operation_group_id`로 이 계획에 연결됩니다. 실패한 group을 재실행하면 이전 group이 실제로 committed한
+목적 파일과 현재 DB canonical path가 모두 일치하는 항목만 재사용하고 나머지만 입고합니다. 승인 뒤
+추가된 파일, 변경된 source, 변조된 destination, symlink 또는 같은 이름의 다른 bytes는 자동 합치거나
+덮어쓰지 않고 실패로 남깁니다. schema는 14이며 기존 DB migration은 종전과 같이 검증된 backup을 소유한
+진입점에서만 수행합니다.
+
+Scanner는 레거시 배열 형식의 `file_list.json`을 유지하면서 `file_index.json`에 `generation_id`를 넣고,
+두 파일의 SHA-256·inventory revision·normalizer version·파일 수를 `index_generation.json`에 기록합니다.
+두 JSON은 generation staging에서 먼저 다시 읽어 검증하며, 프로젝트 surface는 manifest를 마지막에
+게시합니다. 게시 중 실패하면 이전 세 파일을 복원하고 실패 staging은 진단용으로 남깁니다. Folderling은
+프로젝트·house·설치된 로컬 확장 surface를 배포하기 전에 이전 generation을 함께 snapshot하며, house나
+확장 복사 실패 시 프로젝트까지 이전 세대로 되돌립니다. 확장 폴더가 공개 저장소나 설치 환경에 없으면
+선택 surface로 간주해 건너뜁니다. deduplicator·auditor·플랫폼 수집기는 manifest가 존재할 때 generation
+ID와 두 hash가 맞지 않으면 stale index로 중단합니다.
+
+리뷰 후속 보강으로 Scanner의 UI·CLI 진입점도 Folderling과 같은 house/temp root lock에 참여합니다.
+따라서 다른 서버 프로세스나 복구 명령과 Scanner가 겹쳐 DB reconciliation 또는 index 게시를 동시에
+진행하지 않습니다. 디렉터리 입고가 `planned` 상태에서 강제 종료돼도 recovery가 자식 operation을 먼저
+정리한 뒤 manifest·source·destination·DB를 비교해 완료된 group은 확정하고 나머지는 재실행 가능한 실패
+상태로 전환합니다. unpack 부속 파일 정리는 고정한 directory FD와 `O_NOFOLLOW`를 사용하며, 일부 삭제 뒤
+오류가 나면 실제 삭제한 파일 수와 bytes를 결과에 남깁니다.
+
+프로젝트·house·로컬 확장 배포에는 지속 deployment journal을 남깁니다. 재시작 시 검증된 프로젝트
+generation을 미완료 surface에 다시 게시하고 journal을 제거하며, snapshot 뒤 다른 프로세스가 만든 파일이나
+바꾼 surface는 소유권을 증명할 수 없으므로 삭제하거나 이전 backup으로 덮지 않습니다. Scanner 자체 게시의
+rollback도 복원 실패 시 backup을 보존합니다. standalone deduplicator의 확장 index 게시 역시 임시 정규
+파일과 no-follow 원자 교체를 사용합니다.
+
+사람 관계 작업은 병합·분리 preview 시 퇴역 예정 decision ID·판정·사유를 plan SHA에 포함해 확인 뒤 생긴
+판정을 조용히 퇴역시키지 않습니다. 대표 파일 격리·폴더 전체 격리는 활성 구성원과 `managed` 대체 대표를
+구분하며, 적격 대표가 없으면 variant를 잘못 퇴역시키거나 미관리 파일을 대표로 승격하지 않습니다. exact
+그룹도 대표가 아닌 keep 후보는 복사 전에 report-only로 전환합니다.
+
+파일이 하나도 없는 하위 디렉터리는 도서 의미 데이터가 아닌 컨테이너로 취급해 목적지에 복제하지 않습니다.
+파일이 들어 있는 경로 구조만 재생성하며, 빈 source shell은 모든 승인 파일이 정상 입고된 뒤 정리합니다.
+
+Folderling 결과와 구조화 event에는 snapshot·dedup·intake·index 생성·배포·final Doctor의 단계별 시간을
+기록합니다. auditor의 후보 수, 실제 read bytes, fingerprint/pair cache hit·miss도 dedup summary에 포함합니다.
+검증된 snapshot entry는 deduplicator 첫 입력으로 직접 전달해 같은 `file_index.json`을 한 번 더 parse하는
+작은 중복 I/O를 제거했습니다. 후보 graph 조기 cap, Scanner transaction 재설계, final Doctor 축소와
+mutation 직전 SHA 재검증 제거는 판정·안전 gate 영향에 비해 운영 병목 근거가 부족해 이번 버전에서
+적용하지 않았습니다.
+
+재개·generation·강제 종료·동시 실행·symlink 경계 테스트는 임시 fixture만 사용합니다. 운영 적용 후에는 작은 신규 분권 폴더 한 건을
+입고해 operation group committed, unfinished operation/group 0, final Doctor 0과 세 surface generation ID를
+확인한 뒤 버전을 닫습니다. 리뷰 후속 코드 검증은 `624 passed`, Python compileall, TypeScript/Vite production
+build와 `git diff --check`를 통과했습니다.
+
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
 읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로

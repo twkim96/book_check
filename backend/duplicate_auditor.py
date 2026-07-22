@@ -256,9 +256,12 @@ def _entry_from_stat(
 
 
 def load_house_entries(index_path, house_root, include_pass=False):
+    from scanner import validate_index_generation
+
     invalid = []
     entries = []
     root = Path(house_root).expanduser().resolve()
+    validate_index_generation(index_path)
     with open(index_path, "r", encoding="utf-8") as stream:
         payload = json.load(stream)
     if payload.get("version") != 2 or not isinstance(payload.get("entries"), list):

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -517,6 +517,7 @@ CREATE TABLE operations (
     expected_fingerprint_id INTEGER NOT NULL REFERENCES fingerprints(fingerprint_id) ON DELETE RESTRICT,
     expected_keep_fingerprint_id INTEGER REFERENCES fingerprints(fingerprint_id) ON DELETE RESTRICT,
     parent_operation_id INTEGER REFERENCES operations(operation_id) ON DELETE RESTRICT,
+    operation_group_id INTEGER REFERENCES operation_groups(group_id) ON DELETE RESTRICT,
     source_dev INTEGER,
     source_ino INTEGER,
     source_ctime_ns INTEGER,
@@ -533,6 +534,9 @@ CREATE TABLE operations (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX operations_group_state
+ON operations(operation_group_id, state);
 
 {FILE_ANALYSIS_SCHEMA_SQL}
 
@@ -997,6 +1001,35 @@ def initialize_state_db(
         )
         conn.commit()
         version = 13
+    if version == 13:
+        operation_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(operations)")
+        }
+        if "operation_group_id" not in operation_columns:
+            conn.execute(
+                "ALTER TABLE operations ADD COLUMN operation_group_id INTEGER "
+                "REFERENCES operation_groups(group_id) ON DELETE RESTRICT"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS operations_group_state "
+            "ON operations(operation_group_id, state)"
+        )
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v14 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute("DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')")
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 14")
+        conn.commit()
+        version = 14
     validate_schema(conn)
     return conn
 
@@ -1032,6 +1065,11 @@ def validate_schema(
             "source_ctime_ns", "destination_dev", "destination_ino",
             "destination_ctime_ns", "error",
         },
+        "operations": {
+            "operation_id", "run_id", "action", "source_path", "dest_path",
+            "file_id", "expected_fingerprint_id", "parent_operation_id",
+            "operation_group_id", "state",
+        },
         "work_folders": {
             "folder_id", "work_bucket_id", "canonical_path", "role", "state",
             "operation_group_id", "dev", "ino", "ctime_ns",
@@ -1066,6 +1104,7 @@ def validate_schema(
         "work_aliases_one_active_key",
         "work_aliases_work_active",
         "work_management_events_work",
+        "operations_group_state",
     }
     missing_indexes = required_indexes - indexes
     if missing_indexes:
@@ -1108,7 +1147,10 @@ def verify_state_db_ready(path: os.PathLike | str) -> Tuple[bool, str]:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(f"PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_MS}")
-            validate_schema(conn)
+            # Readiness ends with the full Doctor, which performs the integrity
+            # check.  Keep this first pass structural only so an approved run
+            # does not execute the same full SQLite integrity scan twice.
+            validate_schema(conn, check_integrity=False)
             enabled = conn.execute(
                 "SELECT value FROM settings WHERE key = 'actual_mutation_enabled'"
             ).fetchone()
@@ -1905,6 +1947,7 @@ def create_operation(
     keep_file_id: Optional[str] = None,
     expected_keep_fingerprint_id: Optional[int] = None,
     parent_operation_id: Optional[int] = None,
+    operation_group_id: Optional[int] = None,
     source_dev: Optional[int] = None,
     source_ino: Optional[int] = None,
     source_ctime_ns: Optional[int] = None,
@@ -1927,8 +1970,9 @@ def create_operation(
             run_id, action, source_path, dest_path, quarantine_path, file_id,
             keep_file_id, expected_size, expected_mtime_ns, expected_fingerprint_id,
             expected_keep_fingerprint_id, parent_operation_id,
-            source_dev, source_ino, source_ctime_ns, source_sha256, state
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned')
+            operation_group_id, source_dev, source_ino, source_ctime_ns,
+            source_sha256, state
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned')
         """,
         (
             run_id,
@@ -1943,6 +1987,7 @@ def create_operation(
             expected_fingerprint_id,
             expected_keep_fingerprint_id,
             parent_operation_id,
+            operation_group_id,
             source_dev,
             source_ino,
             source_ctime_ns,

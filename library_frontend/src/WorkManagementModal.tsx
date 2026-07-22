@@ -129,7 +129,7 @@ export function WorkManagementModal({
 
   const invalidateSplit = () => setSplitPlan(undefined);
   return <Modal close={close}>
-    <Top eyebrow="WORK RELATIONSHIP · 1.3.6" title={`작품 #${workId} 관리`} close={close}/>
+    <Top eyebrow="WORK RELATIONSHIP · 1.3.7" title={`작품 #${workId} 관리`} close={close}/>
     {error && <div className="inline-error">{error}</div>}
     {!detail ? !error && <div className="loading"><span/>작품 관계를 확인하고 있습니다.</div> : <>
       <div className="management-impact">

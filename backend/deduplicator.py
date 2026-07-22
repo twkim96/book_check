@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections import Counter, defaultdict
 from datetime import datetime
 
@@ -22,7 +23,7 @@ from normalizer import (
     strip_trash_suffix,
     units_comparable,
 )
-from scanner import generate_file_list
+from scanner import generate_file_list, validate_index_generation
 from text_preview import count_text_chars, preview_similarity, read_text_edges
 from project_paths import EXTENSION_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
@@ -38,10 +39,12 @@ def _sync_extension_index(index_path):
     if not os.path.isdir(ext_dir):
         return False
     try:
-        shutil.copy2(index_path, ext_index)
+        from mutation_io import atomic_publish_regular_file
+
+        atomic_publish_regular_file(index_path, ext_index)
         print(f"✨ 브라우저 확장용 인덱스 동기화 완료: {ext_index}")
         return True
-    except OSError as e:
+    except (OSError, RuntimeError) as e:
         print(f"⚠️ 확장 인덱스 동기화 실패: {e}")
         return False
 
@@ -175,20 +178,31 @@ def ensure_index(house_dir, index_path, rescan=False, state_db_path=None):
 
 
 def load_index_entries(
-    house_dir, index_path, rescan=False, state_db_path=None, allow_write=True
+    house_dir, index_path, rescan=False, state_db_path=None, allow_write=True,
+    verified_entries=None,
 ):
-    if allow_write:
+    if verified_entries is not None and rescan:
+        raise RuntimeError("verified index entries cannot be combined with rescan")
+    if verified_entries is None and allow_write:
         ensure_index(
             house_dir, index_path, rescan=rescan, state_db_path=state_db_path
         )
-    elif rescan:
+    elif verified_entries is None and rescan:
         raise RuntimeError("--pure-plan cannot rescan or write an index")
 
-    try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception as e:
-        raise RuntimeError(f"file_index.json 읽기 실패: {e}") from e
+    if verified_entries is None:
+        try:
+            validate_index_generation(index_path)
+            with open(index_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"file_index.json 읽기 실패: {e}") from e
+    else:
+        payload = {
+            "version": 2,
+            "normalizer_version": NORMALIZER_VERSION,
+            "entries": verified_entries,
+        }
 
     if payload.get("version") != 2 or not isinstance(payload.get("entries"), list):
         raise RuntimeError(
@@ -1335,6 +1349,7 @@ def _managed_exact_records(exact_groups, state_db_path, temp_dir, dry_run, actua
                 if (
                     not keep.get("file_id")
                     or keep.get("assignment_state") != "managed"
+                    or not keep.get("representative")
                     or not entry.get("file_id")
                     or entry.get("protected")
                     or entry.get("representative")
@@ -1736,7 +1751,9 @@ def _clean_duplicates_impl(
     actual_run_id=None,
     pure_plan=False,
     event_callback=None,
+    verified_index_entries=None,
 ):
+    performance_metrics = {}
     script_dir = str(PROJECT_ROOT)
     index_path = index_path or os.path.join(script_dir, "file_index.json")
 
@@ -1771,12 +1788,17 @@ def _clean_duplicates_impl(
         print("❌ 대상 폴더(house_dir)가 존재하지 않습니다.")
         return None
 
+    stage_started_at = time.perf_counter()
     entries = load_index_entries(
         house_dir,
         index_path,
         rescan=rescan,
         state_db_path=state_db_path if managed_mode and not pure_plan else None,
         allow_write=not pure_plan,
+        verified_entries=verified_index_entries,
+    )
+    performance_metrics["index_load_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
     )
     print(f"🔍 house 인덱스 로드 완료: {len(entries)}개")
 
@@ -1789,6 +1811,7 @@ def _clean_duplicates_impl(
 
     if audit_suspects:
         print("🔎 cross/near-core 본문 감사 시작 (완료된 결과만 검토 큐에 반영)")
+        stage_started_at = time.perf_counter()
         auditor_report = auditor_report or run_auditor_queue_report(
             index_path,
             house_dir,
@@ -1811,6 +1834,9 @@ def _clean_duplicates_impl(
         )
         if managed_mode:
             enrich_entries_from_state_db(entries, state_db_path, read_only=pure_plan)
+        performance_metrics["auditor_seconds"] = round(
+            time.perf_counter() - stage_started_at, 6
+        )
 
     # scanner/auditor reconcile이 DB 상태를 바꾼 뒤, 첫 mutation 직전에 다시 검사한다.
     if not dry_run and managed_mode:
@@ -1836,7 +1862,11 @@ def _clean_duplicates_impl(
                 f"{len(issues)} ({issues[0]['kind']})"
             )
 
+    stage_started_at = time.perf_counter()
     exact_groups = find_exact_duplicates(entries)
+    performance_metrics["exact_grouping_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
+    )
     multi_representative_paths = set()
     if managed_mode:
         multi_representative_paths = find_multi_representative_candidates(
@@ -1971,6 +2001,23 @@ def _clean_duplicates_impl(
         "include_temp": include_temp,
         "managed_mode": managed_mode,
         "audit_suspects": audit_suspects,
+        "index_input_mode": (
+            "verified_snapshot_entries"
+            if verified_index_entries is not None else "file_index_json"
+        ),
+        "performance_metrics": performance_metrics,
+        "auditor_metrics": (
+            {
+                key: getattr(auditor_report, "stats", {}).get(key, 0)
+                for key in (
+                    "candidate_pairs", "managed_representative_pairs",
+                    "result_pairs", "actual_read_bytes",
+                    "fingerprint_cache_hits", "fingerprint_cache_misses",
+                    "pair_cache_hits", "pair_cache_misses",
+                )
+            }
+            if auditor_report is not None else {}
+        ),
         "unsafe_legacy_bridge": bool(audit_suspects and not managed_mode),
         "auditor_group_count": len(auditor_groups),
         "auditor_report_relation_count": len(auditor_relations),
@@ -2069,6 +2116,7 @@ def clean_duplicates(
     authorized_run_id=None,
     pure_plan=False,
     event_callback=None,
+    verified_index_entries=None,
 ):
     """Public entry point; actual managed runs require a DB-backed active capability."""
     if not dry_run and not require_state_db:
@@ -2092,6 +2140,7 @@ def clean_duplicates(
         require_state_db=require_state_db,
         pure_plan=pure_plan,
         event_callback=event_callback,
+        verified_index_entries=verified_index_entries,
     )
     if dry_run or not require_state_db:
         return _clean_duplicates_impl(**kwargs, actual_run_id=None)

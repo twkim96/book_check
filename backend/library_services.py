@@ -664,24 +664,95 @@ class LibraryServiceRegistry:
         return result
 
     def _run_scanner(self, payload, progress) -> dict:
-        from folderling import sync_house_index
-        from scanner import generate_file_list
+        from mutation_io import mutation_lock_for_roots
+
+        with mutation_lock_for_roots(
+            self.house_dir, self.temp_dir, "library-service-scanner"
+        ):
+            return self._run_scanner_locked(payload, progress)
+
+    def _run_scanner_locked(self, payload, progress) -> dict:
+        from folderling import (
+            _authorize_index_deployment,
+            _capture_index_deployment,
+            _discard_index_deployment_snapshot,
+            _restore_index_deployment,
+            recover_pending_index_deployments,
+            sync_extension_index,
+            sync_house_index,
+        )
+        from scanner import (
+            INDEX_GENERATION_FILENAME,
+            generate_file_list,
+            validate_index_generation,
+        )
 
         total = _count_supported(self.house_dir)
         progress(0, total, "house 전체 Scanner 시작", stage="running", event={
             "phase": "scanner_start", "selected_files": total
         })
         file_list = self.index_path.with_name("file_list.json")
-        ok = generate_file_list(
-            [str(self.house_dir)],
-            str(file_list),
-            str(self.index_path),
-            state_db_path=str(self.state_db),
+        extension_index = self.project_root / "extension" / "file_index.json"
+        pending = recover_pending_index_deployments(
+            self.project_root,
+            file_list_path=file_list,
+            file_index_path=self.index_path,
+            house_index_path=self.house_dir / "file_index.json",
+            extension_index_path=extension_index,
         )
-        if not ok:
-            raise RuntimeError("Scanner index generation failed")
-        if not sync_house_index(str(self.index_path), str(self.house_dir)):
-            raise RuntimeError("house index sync failed")
+        needs_review = [item for item in pending if item["status"] == "needs_review"]
+        if needs_review:
+            raise RuntimeError(
+                "pending index deployment needs review: " + needs_review[0]["error"]
+            )
+        deployment_snapshot = _capture_index_deployment(
+            [
+                file_list,
+                self.index_path,
+                self.index_path.with_name(INDEX_GENERATION_FILENAME),
+                self.house_dir / "file_index.json",
+                extension_index,
+            ],
+            self.project_root,
+        )
+        try:
+            ok = generate_file_list(
+                [str(self.house_dir)],
+                str(file_list),
+                str(self.index_path),
+                state_db_path=str(self.state_db),
+                temp_root=str(self.temp_dir),
+            )
+            if not ok:
+                raise RuntimeError("Scanner index generation failed")
+            validate_index_generation(self.index_path, file_list)
+            from mutation_io import inspect_regular_file
+
+            list_sha256 = inspect_regular_file(file_list).sha256
+            index_sha256 = inspect_regular_file(self.index_path).sha256
+            manifest_path = self.index_path.with_name(INDEX_GENERATION_FILENAME)
+            manifest_sha256 = inspect_regular_file(manifest_path).sha256
+            _authorize_index_deployment(
+                deployment_snapshot,
+                {
+                    str(file_list.resolve()): list_sha256,
+                    str(self.index_path.resolve()): index_sha256,
+                    str(manifest_path.resolve()): manifest_sha256,
+                    str((self.house_dir / "file_index.json").resolve()): index_sha256,
+                    str(extension_index.resolve()): index_sha256,
+                },
+            )
+            if not sync_house_index(str(self.index_path), str(self.house_dir)):
+                raise RuntimeError("house index sync failed")
+            if extension_index.parent.is_dir() and not sync_extension_index(
+                str(self.index_path), str(self.project_root)
+            ):
+                raise RuntimeError("extension index sync failed")
+        except BaseException:
+            _restore_index_deployment(deployment_snapshot)
+            raise
+        else:
+            _discard_index_deployment_snapshot(deployment_snapshot)
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))
         files = sum(item.get("type") == "file" for item in payload.get("entries", []))
         directories = sum(item.get("type") == "dir" for item in payload.get("entries", []))

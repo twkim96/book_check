@@ -21,7 +21,9 @@ from volume_review import (
 )
 
 
-def _refresh_review_index(*, state_db: Path, house_dir: Path, index_path: Path) -> dict:
+def _refresh_review_index(
+    *, state_db: Path, house_dir: Path, index_path: Path, temp_dir: Path | None = None
+) -> dict:
     """Refresh review mutation surfaces from DB, with a safe full-scan fallback."""
     from folderling import sync_house_index
     from scanner import (
@@ -39,6 +41,7 @@ def _refresh_review_index(*, state_db: Path, house_dir: Path, index_path: Path) 
             str(file_list_path),
             str(index_path),
             str(state_db),
+            temp_root=str(temp_dir) if temp_dir is not None else None,
         )
         updated = bool(result["ok"])
     except IndexSnapshotStale as exc:
@@ -50,6 +53,7 @@ def _refresh_review_index(*, state_db: Path, house_dir: Path, index_path: Path) 
                 str(file_list_path),
                 str(index_path),
                 state_db_path=str(state_db),
+                temp_root=str(temp_dir) if temp_dir is not None else None,
             )
         )
     return {
@@ -193,6 +197,7 @@ class TitleCorrectionProvider:
                     state_db=self.state_db,
                     house_dir=self.house_dir,
                     index_path=self.index_path,
+                    temp_dir=self.temp_dir,
                 )
             )
             if not result["index_updated"]:
@@ -281,6 +286,7 @@ class VolumeGroupProvider:
                     state_db=self.state_db,
                     house_dir=self.house_dir,
                     index_path=self.index_path,
+                    temp_dir=self.temp_dir,
                 )
             )
             if not result["index_updated"]:

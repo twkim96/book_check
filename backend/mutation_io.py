@@ -533,6 +533,46 @@ def evidence_matches(left: FileEvidence, right: FileEvidence) -> bool:
     )
 
 
+def atomic_publish_regular_file(source, destination):
+    """Publish one verified regular file without following destination links."""
+    source = Path(source)
+    destination = Path(destination)
+    source_evidence = inspect_regular_file(source)
+    ensure_directory_nofollow(destination.parent)
+    if destination.is_symlink():
+        raise RuntimeError(f"publish destination is a symlink: {destination}")
+    if destination.exists() and not destination.is_file():
+        raise RuntimeError(f"publish destination is not a regular file: {destination}")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=destination.parent,
+            prefix=f".{destination.name}.", suffix=".tmp", delete=False,
+        ) as output, open(source, "rb") as input_file:
+            temporary = Path(output.name)
+            while True:
+                chunk = input_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_evidence = inspect_regular_file(temporary)
+        if temporary_evidence.sha256 != source_evidence.sha256:
+            raise RuntimeError("publish source changed during copy")
+        os.replace(temporary, destination)
+        temporary = None
+        if inspect_regular_file(destination).sha256 != source_evidence.sha256:
+            raise RuntimeError("published file SHA-256 mismatch")
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    return source_evidence
+
+
 def copy_no_clobber(source, destination, *, expected: FileEvidence | None = None):
     """Exclusively copy and verify a destination while leaving source intact."""
     source = Path(source)

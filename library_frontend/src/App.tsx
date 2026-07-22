@@ -76,7 +76,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.6</small>
+            <small>file_check 1.3.7</small>
           </div>
         </div>
         <nav>
@@ -271,7 +271,7 @@ function WorksCatalog() {
   };
   if (error && !listing) return <ErrorPanel message={error} retry={load} />;
   return <>
-    <PageHeader eyebrow="WORK CATALOG · 1.3.6" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 찾고, DB work가 있는 작품은 병합·분리·별칭·입고 경로를 관리합니다." />
+    <PageHeader eyebrow="WORK CATALOG · 1.3.7" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 찾고, DB work가 있는 작품은 병합·분리·별칭·입고 경로를 관리합니다." />
     <CatalogTabs active="works" />
     {error && <div className="inline-error">{error}</div>}
     {jobNotice && <div className="inline-notice"><span>작품 관계 작업을 시작했습니다. 현재 화면에서 계속 확인할 수 있습니다.</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}

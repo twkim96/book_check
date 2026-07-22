@@ -16,6 +16,10 @@ library_frontend/*.tsbuildinfo
 # 로컬 산출물 (scanner/folderling/dedup이 생성)
 file_list.json
 file_index.json
+index_generation.json
+.index_generations/
+index-deploy-*/
+.*.generation-backup-*
 success.log
 fail.log
 warning.log

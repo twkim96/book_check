@@ -291,6 +291,9 @@ def _indexed_file_paths(state_db_path: str):
         return None
     if not FILE_INDEX.is_file():
         raise RuntimeError("file_index.json is missing; run Scanner first")
+    from scanner import validate_index_generation
+
+    validate_index_generation(FILE_INDEX)
     payload = json.loads(FILE_INDEX.read_text(encoding="utf-8"))
     entries = payload.get("entries")
     if not isinstance(entries, list):
