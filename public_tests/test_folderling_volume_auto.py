@@ -3,6 +3,7 @@ from pathlib import Path
 
 import decision_store
 from folderling import move_to_house
+from library_work_management import alias_preview, apply_alias
 from volume_group_mutations import (
     ensure_volume_fingerprints,
     link_volume_relationships,
@@ -86,6 +87,84 @@ def test_folderling_auto_adds_non_overlapping_volume_to_existing_group(tmp_path)
     assert Path(destination).parent == house / "ㅂ" / "별빛 연대기"
     assert "volume-auto" in log.getvalue()
     assert all(row["file_id"] for row in existing + [incoming])
+
+
+def test_human_alias_route_precedes_volume_and_links_incoming_file(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    target = house / "ㄹ" / "Re 제로 통합"
+    target.mkdir(parents=True)
+    incoming_path = temp / "Re 제로부터 시작하는 이세계 생활 11권.epub"
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        incoming = _add(conn, incoming_path, "temp")
+        with decision_store.transaction(conn):
+            decision_store.upsert_file_analysis(conn, incoming["file_id"], incoming_path)
+            work_id = int(conn.execute(
+                "INSERT INTO works(display_title) VALUES ('Re 제로 통합')"
+            ).lastrowid)
+            info = target.stat()
+            folder_id = int(conn.execute(
+                """
+                INSERT INTO work_folders(
+                    work_bucket_id, canonical_path, role, state, dev, ino, ctime_ns
+                ) VALUES (?, ?, 'primary', 'active', ?, ?, ?)
+                """,
+                (work_id, str(target), info.st_dev, info.st_ino, info.st_ctime_ns),
+            ).lastrowid)
+    finally:
+        conn.close()
+    plan = alias_preview(
+        state_db,
+        alias_kind="core_title",
+        alias_value="Re 제로부터 시작하는 이세계 생활",
+        work_bucket_id=work_id,
+        preferred_folder_id=folder_id,
+    )
+    apply_alias(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        alias_kind="core_title",
+        alias_value="Re 제로부터 시작하는 이세계 생활",
+        work_bucket_id=work_id,
+        preferred_folder_id=folder_id,
+        replace_alias_id=None,
+        confirm_count=1,
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    run_id = _approve(state_db, house, temp)
+    log = StringIO()
+    destination = move_to_house(
+        str(incoming_path),
+        str(house),
+        str(house / "_최근"),
+        incoming_path.name,
+        log,
+        "",
+        state_db_path=str(state_db),
+        run_id=run_id,
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        row = conn.execute(
+            """
+            SELECT f.assignment_state, f.assignment_origin, v.work_bucket_id
+            FROM files AS f JOIN variants AS v ON v.variant_id = f.variant_id
+            WHERE f.file_id = ?
+            """,
+            (incoming["file_id"],),
+        ).fetchone()
+        assert row[:] == ("managed", "human_decision", work_id)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert Path(destination).parent == target
+    assert "work-route" in log.getvalue()
 
 
 def test_folderling_auto_fills_gap_and_appends_latest_to_existing_group(tmp_path):

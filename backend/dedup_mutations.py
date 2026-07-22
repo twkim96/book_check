@@ -404,14 +404,18 @@ def house_review_move(
         return {"operation_id": operation_id, "destination": str(destination)}
 
 
-def ingest_to_house(conn, *, source_file_id, destination, run_id):
+def ingest_to_house(conn, *, source_file_id, destination, run_id, routing=None):
     with mutation_lock(conn, f"house_ingest:{run_id}", run_id=run_id):
         return _ingest_to_house(
-            conn, source_file_id=source_file_id, destination=destination, run_id=run_id
+            conn,
+            source_file_id=source_file_id,
+            destination=destination,
+            run_id=run_id,
+            routing=routing,
         )
 
 
-def _ingest_to_house(conn, *, source_file_id, destination, run_id):
+def _ingest_to_house(conn, *, source_file_id, destination, run_id, routing=None):
     """Journal a temp-to-house intake while preserving the stable file_id."""
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     source = _file_state(conn, source_file_id)
@@ -431,6 +435,7 @@ def _ingest_to_house(conn, *, source_file_id, destination, run_id):
     decision_store.assert_manifest_source(
         actual_run, source_path, "temp_root", source_evidence
     )
+    routing_result = None
     with decision_store.transaction(conn):
         operation_id = decision_store.create_operation(
             conn,
@@ -487,10 +492,24 @@ def _ingest_to_house(conn, *, source_file_id, destination, run_id):
             destination,
             stat_result=moved_stat,
         )
+        if routing is not None:
+            from library_work_management import attach_routed_file
+
+            routing_result = attach_routed_file(
+                conn,
+                file_id=source_file_id,
+                work_bucket_id=int(routing["work_bucket_id"]),
+                alias_id=int(routing["alias_id"]),
+            )
         decision_store.transition_operation(conn, operation_id, "db_done")
     with decision_store.transaction(conn):
         decision_store.transition_operation(conn, operation_id, "committed")
-    return {"operation_id": operation_id, "file_id": source_file_id, "dest_path": str(destination)}
+    return {
+        "operation_id": operation_id,
+        "file_id": source_file_id,
+        "dest_path": str(destination),
+        "routing": routing_result,
+    }
 
 
 def _unique_destination(directory, filename):

@@ -240,6 +240,28 @@ index를 다시 동기화합니다. 운영 DB는 서버를 재시작할 때 migr
 1.3.3은 합성·전체 회귀와 production build까지 완료했지만 운영 DB migration과 실제 UI 왕복 테스트는
 후속 1.3.5 안정화 단계로 이월했습니다.
 
+### 작품 병합·분리와 입고 라우팅 (1.3.4)
+
+schema v13은 `works.status`, `variants.status`, `work_aliases`, `work_management_events`를 추가합니다.
+작품 관리 화면에서 기존 work를 다른 work로 병합하거나 선택 variant를 새 work로 분리할 수 있으며,
+대표 파일도 같은 variant의 활성 파일 중에서 다시 지정할 수 있습니다. 병합은 파일 bytes를 움직이지
+않고 variant·관리 폴더·활성 alias 관계만 옮기며, source work는 삭제하지 않고 `retired` 이력으로 남깁니다.
+두 작품에 primary 폴더가 각각 있으면 유지 work의 primary를 보존하고 source primary는 edition으로
+전환합니다.
+
+`core_title`, 읽기 제목, 폴더명 alias는 한 시점에 하나의 활성 work만 가리킵니다. alias에는 특정 관리
+폴더를 입고 목적지로 지정하거나 work의 primary 폴더를 자동 사용하게 할 수 있습니다. 충돌 alias는 현재
+alias ID를 명시해야 교체할 수 있고, 교체·해제 이력은 이전 행과 관리 event를 보존합니다.
+
+Folderling은 신규 파일의 현재 DB 분석값을 활성 alias와 정확히 비교합니다. 사람이 지정한 alias가 맞으면
+기존 자동 분권 추정보다 우선해 관리 폴더로 입고하고, 파일마다 별도 variant와 representative를 만들어
+같은 권수의 다른 판본도 동일 내용으로 합치지 않습니다. alias 목적지에 같은 파일명이 이미 있으면
+`_dup_N`을 만들거나 덮어쓰지 않고 수동 검토 대상으로 차단합니다. 파일 이동과 관계 저장은 같은
+house-ingest transaction에 묶여 관계 저장이 실패하면 기존 operation recovery로 원위치할 수 있습니다.
+
+1.3.4는 합성 API·Folderling fixture와 전체 회귀, production build까지만 수행합니다. 운영 DB 최종
+migration, Re:제로 read-only 병합 preview, 실제 alias 입고·중단 복구와 UI 조정은 1.3.5에서 진행합니다.
+
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
 읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로

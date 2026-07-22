@@ -3,7 +3,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { postJson } from "./api";
 import type { FileRelocatePlan, JobRecord, ManagedFolderAdoptPlan, ManagedFolderPlan, ManagedFolderRelocatePlan, PurgePlan, QuarantinePlan, RelationshipPlan, RestorePlan } from "./types";
 
-function Modal({ close, children, danger = false }: { close: () => void; children: ReactNode; danger?: boolean }) {
+export function Modal({ close, children, danger = false }: { close: () => void; children: ReactNode; danger?: boolean }) {
   useEffect(() => {
     const escape = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
     window.addEventListener("keydown", escape);
@@ -12,11 +12,11 @@ function Modal({ close, children, danger = false }: { close: () => void; childre
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}><section className={`modal management-modal${danger ? " management-modal-danger" : ""}`}>{children}</section></div>;
 }
 
-function Top({ eyebrow, title, close }: { eyebrow: string; title: string; close: () => void }) {
+export function Top({ eyebrow, title, close }: { eyebrow: string; title: string; close: () => void }) {
   return <div className="management-modal-top"><div><span className="eyebrow">{eyebrow}</span><h2>{title}</h2></div><button className="button secondary" onClick={close}>닫기</button></div>;
 }
 
-function PlanCheck({ sha, blockers }: { sha: string; blockers: string[] }) {
+export function PlanCheck({ sha, blockers }: { sha: string; blockers: string[] }) {
   return <div className={blockers.length ? "management-plan blocked" : "management-plan ready"}><strong>{blockers.length ? "실행 차단" : "현재 계획 실행 가능"}</strong><code>{sha}</code>{blockers.map((value) => <span key={value}>{value}</span>)}</div>;
 }
 

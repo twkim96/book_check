@@ -4,6 +4,7 @@ import { NavLink, Navigate, Route, Routes, useParams, useSearchParams } from "re
 import { ApiError, api, postJson } from "./api";
 import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
 import { SettingsPage } from "./Settings";
+import { WorkManagementModal } from "./WorkManagementModal";
 import type {
   CatalogItem,
   CatalogListing,
@@ -75,7 +76,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.3</small>
+            <small>file_check 1.3.4</small>
           </div>
         </div>
         <nav>
@@ -246,6 +247,9 @@ function WorksCatalog() {
   const [error, setError] = useState("");
   const [draft, setDraft] = useState(params.get("search") ?? "");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [manageWorkId, setManageWorkId] = useState<number>();
+  const [jobNotice, setJobNotice] = useState<JobRecord>();
+  const [workIdDraft, setWorkIdDraft] = useState("");
   const search = params.get("search") ?? "";
   const status = params.get("status") ?? "all";
   const cursor = params.get("cursor") ?? "";
@@ -267,9 +271,10 @@ function WorksCatalog() {
   };
   if (error && !listing) return <ErrorPanel message={error} retry={load} />;
   return <>
-    <PageHeader eyebrow="READ-ONLY CATALOG" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 한 화면에서 찾습니다. 모든 탐색 기능은 읽기 전용입니다." action={<span className="readonly-pill">READ ONLY</span>} />
+    <PageHeader eyebrow="WORK CATALOG · 1.3.4" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 찾고, DB work가 있는 작품은 병합·분리·별칭·입고 경로를 관리합니다." />
     <CatalogTabs active="works" />
     {error && <div className="inline-error">{error}</div>}
+    {jobNotice && <div className="inline-notice"><span>작품 관계 작업을 시작했습니다. 현재 화면에서 계속 확인할 수 있습니다.</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
     <div className="toolbar catalog-toolbar">
       <form className="search-form" onSubmit={submit}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="원본 제목·core title·작가 검색" /><button className="button secondary">검색</button></form>
       <select value={status} onChange={(event) => update({ status: event.target.value })}>
@@ -279,6 +284,7 @@ function WorksCatalog() {
         <option value="not_found">모두 검색 결과 없음</option>
         <option value="error">오류 포함</option>
       </select>
+      <form className="search-form" onSubmit={(event) => { event.preventDefault(); if (Number(workIdDraft) > 0) setManageWorkId(Number(workIdDraft)); }}><input type="number" min="1" value={workIdDraft} onChange={(event) => setWorkIdDraft(event.target.value)} placeholder="work ID 직접 열기"/><button className="button secondary" disabled={!workIdDraft}>작품 관리</button></form>
     </div>
     <section className="table-panel catalog-panel">
       <div className="table-summary"><span>현재 조건 <strong>{formatNumber(listing?.total ?? 0)}</strong>작품</span><span>행을 열면 실제 보유 파일과 마지막 수집 시각을 확인합니다.</span></div>
@@ -291,10 +297,10 @@ function WorksCatalog() {
               <td><strong>{item.display_title}</strong><code className="core">{item.title_key}</code>{item.author && <small>{item.author}</small>}{item.work_bucket_ids.length > 0 && <small>work {item.work_bucket_ids.join(", ")} · 판본 {item.variant_ids.length}</small>}</td>
               <td><b>{item.file_count}개</b><small>{item.effective_max ? `~${formatNumber(item.effective_max)}${item.unit}${item.complete ? " 완" : ""}` : "범위 미상"}</small><small>{item.folders.length > 1 ? `${item.folders.length}개 폴더 분산` : "한 폴더"}</small></td>
               {(["series", "kakao", "novelpia"] as const).map((platform) => <td key={platform}><StatusBadge status={item.platforms[platform].status} /><span>{catalogMetric(item, platform)}</span>{item.platforms[platform].remote_url && <a href={item.platforms[platform].remote_url ?? undefined} target="_blank" rel="noreferrer">원문 ↗</a>}</td>)}
-              <td><button className="button ghost" onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(item.title_key)) next.delete(item.title_key); else next.add(item.title_key); return next; })}>{isOpen ? "접기" : "파일 보기"}</button></td>
+              <td><button className="button ghost" onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(item.title_key)) next.delete(item.title_key); else next.add(item.title_key); return next; })}>{isOpen ? "접기" : "파일 보기"}</button>{item.work_bucket_ids.length === 1 && <button className="button secondary" onClick={() => setManageWorkId(item.work_bucket_ids[0])}>작품 관리</button>}</td>
             </tr>
             {isOpen && <tr className="catalog-detail-row"><td colSpan={6}><div className="catalog-detail-grid">
-              <section><strong>보유 파일 {item.files.length}개 · 판본 {item.variant_ids.length}개</strong>{item.folders.length > 1 && <div className="catalog-relation-note"><b>여러 폴더에 분산</b>{item.folders.map((folder) => <small key={folder}>{folder}</small>)}</div>}{item.files.map((file) => <NavLink className="catalog-file" to={`/catalog?tab=files&search=${encodeURIComponent(file.file_id)}`} key={file.file_id}><b>{file.name}{item.representative_file_ids.includes(file.file_id) ? " · 대표" : ""}</b><small title={file.path}>{file.path}</small></NavLink>)}</section>
+              <section><strong>보유 파일 {item.files.length}개 · 판본 {item.variant_ids.length}개</strong>{item.work_bucket_ids.length > 1 && <div className="catalog-relation-note"><b>여러 work가 같은 제목 행에 표시됨</b>{item.work_bucket_ids.map((workId) => <button className="button secondary" key={workId} onClick={() => setManageWorkId(workId)}>work #{workId} 관리</button>)}</div>}{item.folders.length > 1 && <div className="catalog-relation-note"><b>여러 폴더에 분산</b>{item.folders.map((folder) => <small key={folder}>{folder}</small>)}</div>}{item.files.map((file) => <NavLink className="catalog-file" to={`/catalog?tab=files&search=${encodeURIComponent(file.file_id)}`} key={file.file_id}><b>{file.name}{item.representative_file_ids.includes(file.file_id) ? " · 대표" : ""}</b><small title={file.path}>{file.path}</small></NavLink>)}</section>
               <section><strong>플랫폼 수집 근거</strong>{(["series", "kakao", "novelpia"] as const).map((platform) => { const value = item.platforms[platform]; return <div className="catalog-platform-detail" key={platform}><b>{platformLabels[platform]} · {statusLabel(value.status)}</b><small>{value.remote_title ?? "원문 제목 없음"}</small><small>마지막 시도 {value.last_attempt_at ? new Date(value.last_attempt_at).toLocaleString("ko-KR") : "없음"}</small>{value.error_message && <small className="blocked">{value.error_message}</small>}</div>; })}</section>
             </div></td></tr>}
           </Fragment>;
@@ -302,6 +308,7 @@ function WorksCatalog() {
       </table></div> : <div className="empty">조건에 맞는 보유 작품이 없습니다.</div>}
       {listing && <div className="pagination"><button className="button secondary" disabled={!cursor} onClick={() => { const value = new URLSearchParams(params); const previous = Math.max(0, Number(cursor || 0) - listing.limit); if (previous) value.set("cursor", String(previous)); else value.delete("cursor"); setParams(value); }}>이전</button><button className="button secondary" disabled={!listing.next_cursor} onClick={() => { const value = new URLSearchParams(params); if (listing.next_cursor) value.set("cursor", listing.next_cursor); setParams(value); }}>다음</button></div>}
     </section>
+    {manageWorkId !== undefined && <WorkManagementModal workId={manageWorkId} close={() => setManageWorkId(undefined)} started={setJobNotice}/>}
   </>;
 }
 

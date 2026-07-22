@@ -61,12 +61,25 @@ from library_review import (
     VolumeGroupProvider,
 )
 from library_services import LibraryServiceRegistry, ServiceBlocked
+from library_work_management import (
+    alias_preview,
+    alias_retire_preview,
+    apply_alias,
+    apply_alias_retire,
+    apply_representative,
+    apply_work_merge,
+    apply_work_split,
+    representative_preview,
+    work_detail,
+    work_merge_preview,
+    work_split_preview,
+)
 from mutation_io import mutation_lock_for_roots
 from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.3.3"
+SERVER_VERSION = "1.3.4"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -481,6 +494,81 @@ def create_app(
             ),
         )
 
+    def apply_work_merge_job(payload, progress):
+        progress(0, 1, "작품 병합 관계 확인")
+        result = apply_work_merge(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            source_work_id=payload["source_work_id"],
+            target_work_id=payload["target_work_id"],
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+        )
+        progress(1, 1, "작품 병합 완료")
+        return result
+
+    def apply_work_split_job(payload, progress):
+        progress(0, 1, "작품 분리 관계 확인")
+        result = apply_work_split(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            source_work_id=payload["source_work_id"],
+            variant_ids=payload["variant_ids"],
+            display_title=payload["display_title"],
+            folder_ids=payload.get("folder_ids", []),
+            alias_ids=payload.get("alias_ids", []),
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+        )
+        progress(1, 1, "작품 분리 완료")
+        return result
+
+    def apply_work_alias_job(payload, progress):
+        progress(0, 1, "작품 별칭 확인")
+        result = apply_alias(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            alias_kind=payload["alias_kind"],
+            alias_value=payload["alias_value"],
+            work_bucket_id=payload["work_bucket_id"],
+            preferred_folder_id=payload.get("preferred_folder_id"),
+            replace_alias_id=payload.get("replace_alias_id"),
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+        )
+        progress(1, 1, "작품 별칭 저장 완료")
+        return result
+
+    def apply_work_alias_retire_job(payload, progress):
+        progress(0, 1, "작품 별칭 해제 확인")
+        result = apply_alias_retire(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            alias_id=payload["alias_id"],
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+        )
+        progress(1, 1, "작품 별칭 해제 완료")
+        return result
+
+    def apply_representative_job(payload, progress):
+        progress(0, 1, "대표 파일 확인")
+        result = apply_representative(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            variant_id=payload["variant_id"],
+            file_id=payload["file_id"],
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+        )
+        progress(1, 1, "대표 파일 변경 완료")
+        return result
+
     runner.register("management_quarantine", apply_quarantine_job)
     runner.register("management_restore", apply_restore_job)
     runner.register("management_purge", apply_purge_job)
@@ -488,6 +576,11 @@ def create_app(
     runner.register("management_folder_create", apply_managed_folder_create_job)
     runner.register("management_folder_relocate", apply_managed_folder_relocate_job)
     runner.register("management_folder_adopt", apply_managed_folder_adopt_job)
+    runner.register("management_work_merge", apply_work_merge_job)
+    runner.register("management_work_split", apply_work_split_job)
+    runner.register("management_work_alias", apply_work_alias_job)
+    runner.register("management_work_alias_retire", apply_work_alias_retire_job)
+    runner.register("management_representative", apply_representative_job)
 
     services = LibraryServiceRegistry(
         state_db=config.state_db,
@@ -829,6 +922,135 @@ def create_app(
             "folder_path": str(body.get("folder_path") or ""),
             "work_bucket_id": int(body.get("work_bucket_id", -1)),
             "role": str(body.get("role") or ""),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.get("/api/management/works/<int:work_bucket_id>")
+    def management_work_detail(work_bucket_id):
+        return jsonify({
+            "ok": True,
+            "data": work_detail(config.state_db, work_bucket_id),
+        })
+
+    @app.post("/api/management/works/merge/preview")
+    def management_work_merge_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": work_merge_preview(
+            config.state_db,
+            source_work_id=int(body.get("source_work_id", -1)),
+            target_work_id=int(body.get("target_work_id", -1)),
+        )})
+
+    @app.post("/api/management/works/merge/apply")
+    def management_work_merge_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_work_merge", {
+            "source_work_id": int(body.get("source_work_id", -1)),
+            "target_work_id": int(body.get("target_work_id", -1)),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/works/split/preview")
+    def management_work_split_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": work_split_preview(
+            config.state_db,
+            source_work_id=int(body.get("source_work_id", -1)),
+            variant_ids=[int(value) for value in body.get("variant_ids", [])],
+            display_title=str(body.get("display_title") or ""),
+            folder_ids=[int(value) for value in body.get("folder_ids", [])],
+            alias_ids=[int(value) for value in body.get("alias_ids", [])],
+        )})
+
+    @app.post("/api/management/works/split/apply")
+    def management_work_split_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_work_split", {
+            "source_work_id": int(body.get("source_work_id", -1)),
+            "variant_ids": [int(value) for value in body.get("variant_ids", [])],
+            "display_title": str(body.get("display_title") or ""),
+            "folder_ids": [int(value) for value in body.get("folder_ids", [])],
+            "alias_ids": [int(value) for value in body.get("alias_ids", [])],
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/works/aliases/preview")
+    def management_work_alias_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": alias_preview(
+            config.state_db,
+            alias_kind=str(body.get("alias_kind") or ""),
+            alias_value=str(body.get("alias_value") or ""),
+            work_bucket_id=int(body.get("work_bucket_id", -1)),
+            preferred_folder_id=(
+                int(body["preferred_folder_id"])
+                if body.get("preferred_folder_id") is not None else None
+            ),
+            replace_alias_id=(
+                int(body["replace_alias_id"])
+                if body.get("replace_alias_id") is not None else None
+            ),
+        )})
+
+    @app.post("/api/management/works/aliases/apply")
+    def management_work_alias_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_work_alias", {
+            "alias_kind": str(body.get("alias_kind") or ""),
+            "alias_value": str(body.get("alias_value") or ""),
+            "work_bucket_id": int(body.get("work_bucket_id", -1)),
+            "preferred_folder_id": (
+                int(body["preferred_folder_id"])
+                if body.get("preferred_folder_id") is not None else None
+            ),
+            "replace_alias_id": (
+                int(body["replace_alias_id"])
+                if body.get("replace_alias_id") is not None else None
+            ),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/works/aliases/retire/preview")
+    def management_work_alias_retire_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": alias_retire_preview(
+            config.state_db,
+            alias_id=int(body.get("alias_id", -1)),
+        )})
+
+    @app.post("/api/management/works/aliases/retire/apply")
+    def management_work_alias_retire_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_work_alias_retire", {
+            "alias_id": int(body.get("alias_id", -1)),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/variants/representative/preview")
+    def management_representative_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": representative_preview(
+            config.state_db,
+            variant_id=int(body.get("variant_id", -1)),
+            file_id=str(body.get("file_id") or ""),
+        )})
+
+    @app.post("/api/management/variants/representative/apply")
+    def management_representative_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_representative", {
+            "variant_id": int(body.get("variant_id", -1)),
+            "file_id": str(body.get("file_id") or ""),
             "confirm_count": int(body.get("confirm_count", -1)),
             "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
         })

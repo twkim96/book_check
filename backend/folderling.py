@@ -331,26 +331,48 @@ def move_to_house(
 
     target_folder = os.path.join(dst_dir, folder_name)
     auto_volume = None
+    explicit_route = None
     if state_db_path and os.path.isfile(src_path) and not is_pass:
         import decision_store
+        from library_work_management import resolve_work_route
         from volume_group_mutations import classify_folderling_volume_target
 
         conn = decision_store.connect_state_db(state_db_path)
         try:
             source_row = conn.execute(
-                "SELECT file_id FROM files WHERE canonical_path = ? AND active = 1",
+                """
+                SELECT f.file_id, fa.core_title, fa.readable_title
+                FROM files AS f
+                LEFT JOIN file_analysis AS fa ON fa.file_id = f.file_id
+                WHERE f.canonical_path = ? AND f.active = 1
+                """,
                 (decision_store.canonicalize_path(src_path),),
             ).fetchone()
             if source_row is not None:
-                volume_decision = classify_folderling_volume_target(
+                explicit_route = resolve_work_route(
                     conn,
-                    source_file_id=source_row["file_id"],
-                    house_root=dst_dir,
+                    core_title=source_row["core_title"],
+                    readable_title=source_row["readable_title"],
+                    folder_name=os.path.basename(os.path.dirname(src_path)),
                 )
-                if volume_decision["status"] == "coordinate_conflict":
-                    raise VolumeCoordinateConflict(volume_decision)
-                if volume_decision["status"] == "target":
-                    auto_volume = volume_decision
+                if explicit_route["status"] == "target":
+                    target_folder = explicit_route["target_folder"]
+                elif explicit_route.get("matched"):
+                    raise RuntimeError(
+                        "사람 지정 작품 alias는 있지만 활성 목적 폴더가 없습니다: "
+                        f"work={explicit_route.get('work_bucket_id')}"
+                    )
+                else:
+                    explicit_route = None
+                    volume_decision = classify_folderling_volume_target(
+                        conn,
+                        source_file_id=source_row["file_id"],
+                        house_root=dst_dir,
+                    )
+                    if volume_decision["status"] == "coordinate_conflict":
+                        raise VolumeCoordinateConflict(volume_decision)
+                    if volume_decision["status"] == "target":
+                        auto_volume = volume_decision
         finally:
             conn.close()
         if auto_volume is not None:
@@ -361,6 +383,11 @@ def move_to_house(
                 target_folder = auto_volume["target_folder"]
     candidate_path = os.path.join(target_folder, final_name_candidate)
     if os.path.exists(candidate_path):
+        if explicit_route is not None:
+            raise FileExistsError(
+                "explicit work route destination already exists; "
+                f"manual variant review required: {candidate_path}"
+            )
         if os.path.isdir(src_path):
             raise FileExistsError(
                 f"directory intake destination already exists; manual review required: {candidate_path}"
@@ -390,13 +417,20 @@ def move_to_house(
             ).fetchone()
             if row is None:
                 raise RuntimeError("temp file is not reconciled in the decision DB")
-            ingest_to_house(
+            ingest_result = ingest_to_house(
                 conn,
                 source_file_id=row["file_id"],
                 destination=dst_path,
                 run_id=run_id or f"folderling-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+                routing=explicit_route,
             )
-            if auto_volume is not None:
+            if explicit_route is not None:
+                relationship = ingest_result["routing"]
+                source_label += (
+                    f"[work-route work={relationship['work_bucket_id']} "
+                    f"alias={relationship['alias_id']}] "
+                )
+            elif auto_volume is not None:
                 volume_file_ids = auto_volume["existing_file_ids"] + [row["file_id"]]
                 ensure_volume_fingerprints(conn, volume_file_ids)
                 with decision_store.transaction(conn):

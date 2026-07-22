@@ -326,6 +326,116 @@ export interface CatalogListing {
   readonly: true;
 }
 
+export interface WorkManagementDetail {
+  work: {
+    work_bucket_id: number;
+    display_title: string | null;
+    status: "active" | "retired";
+  };
+  variants: Array<{
+    variant_id: number;
+    variant_kind: string;
+    label: string | null;
+    status: "active" | "retired";
+    active_file_count: number;
+    representative_file_id: string | null;
+  }>;
+  folders: Array<{
+    folder_id: number;
+    canonical_path: string;
+    role: "primary" | "edition" | "auxiliary";
+    state: string;
+  }>;
+  aliases: Array<{
+    alias_id: number;
+    alias_kind: "core_title" | "readable_title" | "folder_name";
+    alias_key: string;
+    alias_display: string;
+    work_bucket_id: number;
+    preferred_folder_id: number | null;
+    origin: string;
+    active: number;
+  }>;
+  files: Array<{
+    file_id: string;
+    canonical_path: string;
+    variant_id: number;
+    active: number;
+    source: string;
+    size: number;
+    coordinate_kind: string | null;
+    coordinate_raw: string | null;
+    representative: number;
+  }>;
+  events: Array<Record<string, unknown>>;
+  readonly: true;
+}
+
+export interface WorkMergePlan {
+  version: "1.3.4";
+  kind: "work_merge";
+  item_count: number;
+  source: WorkManagementDetail;
+  target: WorkManagementDetail;
+  demoted_folder_ids: number[];
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+}
+
+export interface WorkSplitPlan {
+  version: "1.3.4";
+  kind: "work_split";
+  item_count: number;
+  source: WorkManagementDetail;
+  variant_ids: number[];
+  folder_ids: number[];
+  alias_ids: number[];
+  display_title: string;
+  cleared_alias_routes: number[];
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+}
+
+export interface WorkAliasPlan {
+  version: "1.3.4";
+  kind: "work_alias_upsert";
+  item_count: number;
+  alias_kind: "core_title" | "readable_title" | "folder_name";
+  alias_key: string;
+  alias_display: string;
+  work: WorkManagementDetail["work"];
+  preferred_folder: WorkManagementDetail["folders"][number] | null;
+  existing_alias: WorkManagementDetail["aliases"][number] | null;
+  replace_alias_id: number | null;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+}
+
+export interface WorkAliasRetirePlan {
+  version: "1.3.4";
+  kind: "work_alias_retire";
+  item_count: number;
+  alias: WorkManagementDetail["aliases"][number];
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+}
+
+export interface RepresentativePlan {
+  version: "1.3.4";
+  kind: "representative_replace";
+  item_count: number;
+  variant: WorkManagementDetail["variants"][number] & { work_bucket_id: number };
+  file: WorkManagementDetail["files"][number] | null;
+  current_file_id: string | null;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+}
+
 export interface ExplorerFile {
   file_id: string;
   canonical_path: string;

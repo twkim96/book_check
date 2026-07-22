@@ -135,7 +135,10 @@ def test_library_server_migrates_v11_with_owned_backup(tmp_path):
     assert app.test_client().get("/health").status_code == 200
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert (
+            conn.execute("PRAGMA user_version").fetchone()[0]
+            == decision_store.SCHEMA_VERSION
+        )
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
             "AND name IN ('operation_groups', 'work_folders')"
@@ -207,6 +210,76 @@ def test_managed_folder_create_api_appears_in_folder_catalog(tmp_path):
     )
     assert relocate.status_code == 200
     assert relocate.get_json()["data"]["apply_available"] is True
+
+
+def test_work_merge_management_api_runs_as_exclusive_job(tmp_path):
+    app, file_id = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        _ensure_intake_fingerprint(conn, _file_state(conn, file_id))
+        with decision_store.transaction(conn):
+            source_work = int(conn.execute(
+                "INSERT INTO works(display_title) VALUES ('합칠 작품')"
+            ).lastrowid)
+            target_work = int(conn.execute(
+                "INSERT INTO works(display_title) VALUES ('유지 작품')"
+            ).lastrowid)
+            source_variant = int(conn.execute(
+                "INSERT INTO variants(work_bucket_id, variant_kind) VALUES (?, 'base')",
+                (source_work,),
+            ).lastrowid)
+            conn.execute(
+                "UPDATE files SET variant_id = ?, assignment_state = 'managed', "
+                "assignment_origin = 'human_decision', protected = 1 WHERE file_id = ?",
+                (source_variant, file_id),
+            )
+            conn.execute(
+                "INSERT INTO representatives(variant_id, file_id) VALUES (?, ?)",
+                (source_variant, file_id),
+            )
+    finally:
+        conn.close()
+    client = app.test_client()
+    detail = client.get(f"/api/management/works/{source_work}")
+    assert detail.status_code == 200
+    assert detail.get_json()["data"]["work"]["status"] == "active"
+    preview = client.post(
+        "/api/management/works/merge/preview",
+        json={"source_work_id": source_work, "target_work_id": target_work},
+    )
+    assert preview.status_code == 200
+    plan = preview.get_json()["data"]
+    assert plan["apply_available"] is True
+    started = client.post(
+        "/api/management/works/merge/apply",
+        json={
+            "source_work_id": source_work,
+            "target_work_id": target_work,
+            "confirm_count": plan["item_count"],
+            "confirm_plan_sha256": plan["plan_sha256"],
+        },
+    )
+    assert started.status_code == 202
+    job_id = started.get_json()["data"]["job_id"]
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["data"]
+        if job["state"] in {"succeeded", "failed", "needs_review", "interrupted"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "succeeded", job
+    conn = decision_store.connect_state_db_readonly(config.state_db)
+    try:
+        assert conn.execute(
+            "SELECT status FROM works WHERE work_bucket_id = ?", (source_work,)
+        ).fetchone()[0] == "retired"
+        assert conn.execute(
+            "SELECT work_bucket_id FROM variants WHERE variant_id = ?", (source_variant,)
+        ).fetchone()[0] == target_work
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
 
 
 def test_health_dashboard_and_title_review_api(tmp_path):

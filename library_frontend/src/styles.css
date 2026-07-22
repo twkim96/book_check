@@ -334,6 +334,13 @@ input:focus, select:focus { border-color: var(--blue-2); box-shadow: 0 0 0 3px v
 .management-purge-list { display: grid; gap: 5px; max-height: 220px; margin-top: 12px; overflow: auto; }
 .management-purge-list > span { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-low); }
 .management-purge-list small { color: var(--muted); }
+.management-work-section { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-low); }
+.management-work-section > summary { cursor: pointer; color: var(--text); font-size: 13px; font-weight: 800; }
+.management-work-section > footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.management-choice-list { display: grid; gap: 6px; margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.management-choice-list > strong { color: #b9c3d2; font-size: 11px; }
+.management-choice-list label { display: flex; align-items: flex-start; gap: 8px; color: var(--muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.management-choice-list input { margin-top: 2px; }
 .review-queue-list { display: grid; gap: 7px; padding: 12px; max-height: calc(100vh - 320px); overflow: auto; }
 .review-queue-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-bottom: 12px; }
 .review-queue-summary button { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border: 1px solid #303947; border-radius: 9px; color: #aeb8c7; background: #11161d; }

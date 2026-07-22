@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -72,6 +72,8 @@ REQUIRED_TABLES = frozenset({
     "operation_groups",
     "operations",
     "work_folders",
+    "work_aliases",
+    "work_management_events",
     "file_analysis",
     "catalog_titles",
     "catalog_platform_stats",
@@ -204,6 +206,7 @@ CREATE TABLE settings (
 CREATE TABLE works (
     work_bucket_id INTEGER PRIMARY KEY,
     display_title TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -214,6 +217,7 @@ CREATE TABLE variants (
     variant_kind TEXT NOT NULL DEFAULT 'base'
         CHECK (variant_kind IN ('base', 'revision', 'adult', 'translation', 'other')),
     label TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -458,6 +462,46 @@ ON work_folders(work_bucket_id, state, role);
 CREATE UNIQUE INDEX work_folders_one_primary
 ON work_folders(work_bucket_id)
 WHERE state = 'active' AND role = 'primary';
+
+CREATE TABLE work_aliases (
+    alias_id INTEGER PRIMARY KEY,
+    alias_kind TEXT NOT NULL CHECK (
+        alias_kind IN ('core_title', 'readable_title', 'folder_name')
+    ),
+    alias_key TEXT NOT NULL,
+    alias_display TEXT NOT NULL,
+    work_bucket_id INTEGER NOT NULL REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+    preferred_folder_id INTEGER REFERENCES work_folders(folder_id) ON DELETE RESTRICT,
+    origin TEXT NOT NULL DEFAULT 'human_decision'
+        CHECK (origin IN ('human_decision', 'strong_match')),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    supersedes_alias_id INTEGER REFERENCES work_aliases(alias_id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX work_aliases_one_active_key
+ON work_aliases(alias_kind, alias_key) WHERE active = 1;
+
+CREATE INDEX work_aliases_work_active
+ON work_aliases(work_bucket_id, active, alias_kind);
+
+CREATE TABLE work_management_events (
+    event_id INTEGER PRIMARY KEY,
+    action TEXT NOT NULL,
+    source_work_id INTEGER REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+    target_work_id INTEGER REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+    plan_sha256 TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT 'local_user',
+    supersedes_event_id INTEGER
+        REFERENCES work_management_events(event_id) ON DELETE RESTRICT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX work_management_events_work
+ON work_management_events(source_work_id, target_work_id, created_at);
 
 CREATE TABLE operations (
     operation_id INTEGER PRIMARY KEY,
@@ -884,6 +928,75 @@ def initialize_state_db(
         )
         conn.commit()
         version = 12
+    if version == 12:
+        work_columns = {row[1] for row in conn.execute("PRAGMA table_info(works)")}
+        if "status" not in work_columns:
+            conn.execute(
+                "ALTER TABLE works ADD COLUMN status TEXT NOT NULL DEFAULT 'active' "
+                "CHECK (status IN ('active', 'retired'))"
+            )
+        variant_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(variants)")
+        }
+        if "status" not in variant_columns:
+            conn.execute(
+                "ALTER TABLE variants ADD COLUMN status TEXT NOT NULL DEFAULT 'active' "
+                "CHECK (status IN ('active', 'retired'))"
+            )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS work_aliases (
+                alias_id INTEGER PRIMARY KEY,
+                alias_kind TEXT NOT NULL CHECK (
+                    alias_kind IN ('core_title', 'readable_title', 'folder_name')
+                ),
+                alias_key TEXT NOT NULL,
+                alias_display TEXT NOT NULL,
+                work_bucket_id INTEGER NOT NULL
+                    REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+                preferred_folder_id INTEGER
+                    REFERENCES work_folders(folder_id) ON DELETE RESTRICT,
+                origin TEXT NOT NULL DEFAULT 'human_decision'
+                    CHECK (origin IN ('human_decision', 'strong_match')),
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                supersedes_alias_id INTEGER
+                    REFERENCES work_aliases(alias_id) ON DELETE RESTRICT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS work_aliases_one_active_key
+            ON work_aliases(alias_kind, alias_key) WHERE active = 1;
+            CREATE INDEX IF NOT EXISTS work_aliases_work_active
+            ON work_aliases(work_bucket_id, active, alias_kind);
+            CREATE TABLE IF NOT EXISTS work_management_events (
+                event_id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                source_work_id INTEGER
+                    REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+                target_work_id INTEGER
+                    REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+                plan_sha256 TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'local_user',
+                supersedes_event_id INTEGER
+                    REFERENCES work_management_events(event_id) ON DELETE RESTRICT,
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS work_management_events_work
+            ON work_management_events(source_work_id, target_work_id, created_at);
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v13 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active');
+            DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup');
+            UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP
+            WHERE key = 'actual_mutation_enabled';
+            PRAGMA user_version = 13;
+            """
+        )
+        conn.commit()
+        version = 13
     validate_schema(conn)
     return conn
 
@@ -923,6 +1036,16 @@ def validate_schema(
             "folder_id", "work_bucket_id", "canonical_path", "role", "state",
             "operation_group_id", "dev", "ino", "ctime_ns",
         },
+        "work_aliases": {
+            "alias_id", "alias_kind", "alias_key", "alias_display",
+            "work_bucket_id", "preferred_folder_id", "origin", "active",
+            "supersedes_alias_id",
+        },
+        "work_management_events": {
+            "event_id", "action", "source_work_id", "target_work_id",
+            "plan_sha256", "payload_json", "actor", "supersedes_event_id",
+            "active",
+        },
     }
     for table, expected in required_columns.items():
         actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -940,6 +1063,9 @@ def validate_schema(
         "operation_groups_run_state",
         "work_folders_work_state",
         "work_folders_one_primary",
+        "work_aliases_one_active_key",
+        "work_aliases_work_active",
+        "work_management_events_work",
     }
     missing_indexes = required_indexes - indexes
     if missing_indexes:
@@ -958,6 +1084,10 @@ def validate_schema(
     }
     if "title_override_json" not in analysis_columns:
         raise RuntimeError("file_analysis.title_override_json is missing")
+    for table in ("works", "variants"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "status" not in columns:
+            raise RuntimeError(f"{table}.status is missing")
 
     if check_integrity:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -2720,16 +2850,86 @@ def doctor_issues(
                 })
     for row in conn.execute(
         """
-        SELECT r.variant_id, r.file_id, f.protected, f.active, f.assignment_state
-        FROM representatives AS r JOIN files AS f ON f.file_id = r.file_id
+        SELECT r.variant_id, r.file_id, f.protected, f.active, f.assignment_state,
+               v.status AS variant_status, w.status AS work_status
+        FROM representatives AS r
+        JOIN files AS f ON f.file_id = r.file_id
+        JOIN variants AS v ON v.variant_id = r.variant_id
+        JOIN works AS w ON w.work_bucket_id = v.work_bucket_id
         """
     ):
-        if not row["protected"] or not row["active"] or row["assignment_state"] != "managed":
+        if (
+            not row["protected"] or not row["active"]
+            or row["assignment_state"] != "managed"
+            or row["variant_status"] != "active"
+            or row["work_status"] != "active"
+        ):
             issues.append({
                 "kind": "invalid_representative",
                 "variant_id": row["variant_id"],
                 "file_id": row["file_id"],
             })
+    for row in conn.execute(
+        """
+        SELECT f.file_id, f.variant_id, v.status AS variant_status,
+               w.work_bucket_id, w.status AS work_status
+        FROM files AS f
+        JOIN variants AS v ON v.variant_id = f.variant_id
+        JOIN works AS w ON w.work_bucket_id = v.work_bucket_id
+        WHERE f.active = 1 AND f.assignment_state = 'managed'
+          AND (v.status != 'active' OR w.status != 'active')
+        """
+    ):
+        issues.append({
+            "kind": "managed_file_in_retired_relation",
+            "file_id": row["file_id"],
+            "variant_id": row["variant_id"],
+            "work_bucket_id": row["work_bucket_id"],
+        })
+    for row in conn.execute(
+        """
+        SELECT wa.alias_id, wa.work_bucket_id, wa.preferred_folder_id,
+               w.status AS work_status, wf.work_bucket_id AS folder_work_id,
+               wf.state AS folder_state
+        FROM work_aliases AS wa
+        JOIN works AS w ON w.work_bucket_id = wa.work_bucket_id
+        LEFT JOIN work_folders AS wf ON wf.folder_id = wa.preferred_folder_id
+        WHERE wa.active = 1
+        """
+    ):
+        if row["work_status"] != "active":
+            issues.append({
+                "kind": "active_alias_on_retired_work",
+                "alias_id": row["alias_id"],
+                "work_bucket_id": row["work_bucket_id"],
+            })
+        if row["preferred_folder_id"] is not None and (
+            row["folder_state"] != "active"
+            or row["folder_work_id"] != row["work_bucket_id"]
+        ):
+            issues.append({
+                "kind": "alias_route_invalid",
+                "alias_id": row["alias_id"],
+                "folder_id": row["preferred_folder_id"],
+            })
+    for row in conn.execute(
+        """
+        SELECT w.work_bucket_id
+        FROM works AS w
+        WHERE w.status = 'retired' AND (
+            EXISTS (SELECT 1 FROM variants AS v
+                    WHERE v.work_bucket_id = w.work_bucket_id AND v.status = 'active')
+            OR EXISTS (SELECT 1 FROM work_folders AS wf
+                       WHERE wf.work_bucket_id = w.work_bucket_id AND wf.state = 'active')
+            OR EXISTS (SELECT 1 FROM work_aliases AS wa
+                       WHERE wa.work_bucket_id = w.work_bucket_id AND wa.active = 1)
+        )
+        """
+    ):
+        issues.append({
+            "kind": "retired_work_has_active_relations",
+            "work_bucket_id": row["work_bucket_id"],
+        })
     return issues
 
 
