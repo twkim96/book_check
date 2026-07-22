@@ -7,7 +7,9 @@ import json
 import os
 import sqlite3
 import sys
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Sequence
@@ -26,6 +28,16 @@ from library_explorer import (
     quarantine_listing,
 )
 from library_jobs import JobActiveError, JobRunner, JobStore
+from library_organize import (
+    apply_file_relocate,
+    apply_managed_folder_create,
+    apply_managed_folder_adopt,
+    apply_managed_folder_relocate,
+    file_relocate_preview,
+    managed_folder_preview,
+    managed_folder_adopt_preview,
+    managed_folder_relocate_preview,
+)
 from library_management import (
     apply_purge,
     apply_quarantine,
@@ -49,11 +61,12 @@ from library_review import (
     VolumeGroupProvider,
 )
 from library_services import LibraryServiceRegistry, ServiceBlocked
+from mutation_io import mutation_lock_for_roots
 from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.3.2"
+SERVER_VERSION = "1.3.3"
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -68,6 +81,58 @@ class LibraryServerConfig:
     runtime_dir: Path
     frontend_dist: Path
     project_root: Path
+
+
+def _ensure_server_schema(config: LibraryServerConfig) -> Path | None:
+    """Own a verified backup before migrating the local management server DB."""
+    if not config.state_db.is_file():
+        return None
+    probe = sqlite3.connect(str(config.state_db))
+    try:
+        probe.execute("PRAGMA query_only = ON")
+        version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+    finally:
+        probe.close()
+    if version == decision_store.SCHEMA_VERSION:
+        return None
+
+    with mutation_lock_for_roots(
+        config.house_dir, config.temp_dir, "library-server-schema-migration"
+    ):
+        conn = decision_store.connect_state_db(config.state_db)
+        try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version == decision_store.SCHEMA_VERSION:
+                return None
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "actual_runs" in tables and conn.execute(
+                "SELECT 1 FROM actual_runs WHERE state IN ('approved', 'active') LIMIT 1"
+            ).fetchone():
+                raise RuntimeError("schema migration requires no active actual run")
+            if "operations" in tables and conn.execute(
+                "SELECT 1 FROM operations WHERE state IN ('planned', 'fs_done', 'db_done') LIMIT 1"
+            ).fetchone():
+                raise RuntimeError("schema migration requires operation recovery first")
+            if "operation_groups" in tables and conn.execute(
+                "SELECT 1 FROM operation_groups "
+                "WHERE state IN ('planned', 'fs_done', 'db_done') LIMIT 1"
+            ).fetchone():
+                raise RuntimeError("schema migration requires operation-group recovery first")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            backup = decision_store.backup_state_db(
+                conn,
+                config.state_db.parent / "backups" /
+                f"before_library_server_schema_{stamp}_{uuid.uuid4().hex[:8]}.sqlite3",
+            )
+        finally:
+            conn.close()
+        migrated = decision_store.initialize_state_db(config.state_db, migrate=True)
+        migrated.close()
+        return backup
 
 
 def _open_state_db_readonly_keeper(state_db: Path):
@@ -271,6 +336,7 @@ def create_app(
         frontend_dist=Path(frontend_dist).expanduser().resolve(),
         project_root=Path(project_root).expanduser().resolve(),
     )
+    _ensure_server_schema(config)
     readonly_keeper = (
         _open_state_db_readonly_keeper(config.state_db)
         if config.state_db.is_file() else None
@@ -352,9 +418,76 @@ def create_app(
             ),
         )
 
+    def apply_file_relocate_job(payload, progress):
+        return apply_file_relocate(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            index_path=config.index_path,
+            file_id=payload["file_id"],
+            target_directory=payload["target_directory"],
+            new_name=payload.get("new_name"),
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"파일 정리 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    def apply_managed_folder_create_job(payload, progress):
+        return apply_managed_folder_create(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            work_bucket_id=payload["work_bucket_id"],
+            parent_directory=payload["parent_directory"],
+            folder_name=payload["folder_name"],
+            role=payload["role"],
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"관리 폴더 생성 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    def apply_managed_folder_relocate_job(payload, progress):
+        return apply_managed_folder_relocate(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            index_path=config.index_path,
+            folder_id=payload["folder_id"],
+            target_parent=payload["target_parent"],
+            new_name=payload.get("new_name"),
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"관리 폴더 정리 {current:,}/{total:,}: {name}"
+            ),
+        )
+
+    def apply_managed_folder_adopt_job(payload, progress):
+        return apply_managed_folder_adopt(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            folder_path=payload["folder_path"],
+            work_bucket_id=payload["work_bucket_id"],
+            role=payload["role"],
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+            progress=lambda current, total, name: progress(
+                current, total, f"기존 폴더 관리 등록 {current:,}/{total:,}: {name}"
+            ),
+        )
+
     runner.register("management_quarantine", apply_quarantine_job)
     runner.register("management_restore", apply_restore_job)
     runner.register("management_purge", apply_purge_job)
+    runner.register("management_file_relocate", apply_file_relocate_job)
+    runner.register("management_folder_create", apply_managed_folder_create_job)
+    runner.register("management_folder_relocate", apply_managed_folder_relocate_job)
+    runner.register("management_folder_adopt", apply_managed_folder_adopt_job)
 
     services = LibraryServiceRegistry(
         state_db=config.state_db,
@@ -603,6 +736,100 @@ def create_app(
             raise ValueError("operation_ids 배열이 필요합니다")
         record = runner.start_exclusive("management_purge", {
             "operation_ids": values, "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/files/relocate/preview")
+    def management_file_relocate_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": file_relocate_preview(
+            config.state_db,
+            house_dir=config.house_dir,
+            file_id=str(body.get("file_id") or ""),
+            target_directory=str(body.get("target_directory") or ""),
+            new_name=(str(body["new_name"]) if body.get("new_name") else None),
+        )})
+
+    @app.post("/api/management/files/relocate/apply")
+    def management_file_relocate_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_file_relocate", {
+            "file_id": str(body.get("file_id") or ""),
+            "target_directory": str(body.get("target_directory") or ""),
+            "new_name": str(body["new_name"]) if body.get("new_name") else None,
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/folders/create/preview")
+    def management_folder_create_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": managed_folder_preview(
+            config.state_db,
+            house_dir=config.house_dir,
+            work_bucket_id=int(body.get("work_bucket_id", -1)),
+            parent_directory=str(body.get("parent_directory") or ""),
+            folder_name=str(body.get("folder_name") or ""),
+            role=str(body.get("role") or ""),
+        )})
+
+    @app.post("/api/management/folders/create/apply")
+    def management_folder_create_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_folder_create", {
+            "work_bucket_id": int(body.get("work_bucket_id", -1)),
+            "parent_directory": str(body.get("parent_directory") or ""),
+            "folder_name": str(body.get("folder_name") or ""),
+            "role": str(body.get("role") or ""),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/folders/relocate/preview")
+    def management_folder_relocate_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": managed_folder_relocate_preview(
+            config.state_db,
+            house_dir=config.house_dir,
+            folder_id=int(body.get("folder_id", -1)),
+            target_parent=str(body.get("target_parent") or ""),
+            new_name=(str(body["new_name"]) if body.get("new_name") else None),
+        )})
+
+    @app.post("/api/management/folders/relocate/apply")
+    def management_folder_relocate_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_folder_relocate", {
+            "folder_id": int(body.get("folder_id", -1)),
+            "target_parent": str(body.get("target_parent") or ""),
+            "new_name": str(body["new_name"]) if body.get("new_name") else None,
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
+
+    @app.post("/api/management/folders/adopt/preview")
+    def management_folder_adopt_preview():
+        body = _json_body()
+        return jsonify({"ok": True, "data": managed_folder_adopt_preview(
+            config.state_db,
+            house_dir=config.house_dir,
+            folder_path=str(body.get("folder_path") or ""),
+            work_bucket_id=int(body.get("work_bucket_id", -1)),
+            role=str(body.get("role") or ""),
+        )})
+
+    @app.post("/api/management/folders/adopt/apply")
+    def management_folder_adopt_apply():
+        body = _json_body()
+        record = runner.start_exclusive("management_folder_adopt", {
+            "folder_path": str(body.get("folder_path") or ""),
+            "work_bucket_id": int(body.get("work_bucket_id", -1)),
+            "role": str(body.get("role") or ""),
+            "confirm_count": int(body.get("confirm_count", -1)),
             "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
         })
         return jsonify({"ok": True, "data": record}), 202
@@ -894,7 +1121,7 @@ def create_app(
         return (
             "<!doctype html><meta charset='utf-8'><title>file_check</title>"
             "<body style='font-family:system-ui;padding:32px'>"
-            "<h1>도서 관리 서버 1.3.2</h1>"
+            f"<h1>도서 관리 서버 {SERVER_VERSION}</h1>"
             "<p>프런트 빌드가 없습니다. library_frontend에서 npm run build를 실행하세요.</p>"
             "</body>",
             503,

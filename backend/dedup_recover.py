@@ -29,6 +29,7 @@ def build_parser():
     backup.add_argument("--run", action="store_true")
     recover = sub.add_parser("recover")
     recover.add_argument("--operation-id", type=int)
+    recover.add_argument("--group-id", type=int)
     recover.add_argument("--run", action="store_true")
     enable = sub.add_parser("enable")
     enable.add_argument("--backup", required=True)
@@ -365,20 +366,47 @@ def run(args):
             _json({"dry_run": False, "output": str(output), "integrity_check": "ok"})
             return 0
         if args.command == "recover":
-            if args.operation_id is None:
-                operation_ids = [row[0] for row in conn.execute(
-                    "SELECT operation_id FROM operations WHERE state IN ('planned', 'fs_done', 'db_done') ORDER BY operation_id"
-                )]
+            if args.operation_id is not None and args.group_id is not None:
+                raise RuntimeError("--operation-id and --group-id cannot be combined")
+            if args.group_id is None:
+                group_ids = [row[0] for row in conn.execute(
+                    "SELECT group_id FROM operation_groups "
+                    "WHERE state IN ('planned', 'fs_done', 'db_done') ORDER BY group_id"
+                )] if args.operation_id is None else []
             else:
+                group_ids = [args.group_id]
+            if args.operation_id is None and args.group_id is None:
+                operation_ids = [row[0] for row in conn.execute(
+                    "SELECT operation_id FROM operations WHERE state IN ('planned', 'fs_done', 'db_done') "
+                    "AND action != 'managed_folder_relocate_item' ORDER BY operation_id"
+                )]
+            elif args.operation_id is not None:
                 operation_ids = [args.operation_id]
+            else:
+                operation_ids = []
             if not args.run:
-                _json({"dry_run": True, "operation_ids": operation_ids})
+                _json({
+                    "dry_run": True,
+                    "operation_group_ids": group_ids,
+                    "operation_ids": operation_ids,
+                })
                 return 0
+            from library_organize import recover_operation_group
+            group_outcomes = {
+                group_id: recover_operation_group(conn, group_id)
+                for group_id in group_ids
+            }
             outcomes = {
                 operation_id: decision_store.recover_interrupted_operation(conn, operation_id)
                 for operation_id in operation_ids
             }
-            _json({"dry_run": False, "outcomes": outcomes})
+            _json({
+                "dry_run": False,
+                "operation_group_outcomes": group_outcomes,
+                "operation_outcomes": outcomes,
+                # Keep the pre-v1.3.3 response field for existing callers.
+                "outcomes": outcomes,
+            })
             return 0
         if args.command == "enable":
             issues = decision_store.doctor_issues(conn)

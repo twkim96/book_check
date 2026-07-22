@@ -1028,7 +1028,10 @@ def test_v10_migration_adds_title_override_column_only_with_explicit_permission(
             row[1] for row in migrated.execute("PRAGMA table_info(file_analysis)")
         }
         assert "title_override_json" in columns
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert (
+            migrated.execute("PRAGMA user_version").fetchone()[0]
+            == decision_store.SCHEMA_VERSION
+        )
     finally:
         migrated.close()
 

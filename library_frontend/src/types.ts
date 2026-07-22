@@ -414,6 +414,82 @@ export interface ExplorerFileDetail {
   readonly: true;
 }
 
+export interface FileRelocatePlan {
+  version: "1.3.3";
+  kind: "file_relocate";
+  item_count: number;
+  source: ExplorerFile & Record<string, unknown>;
+  target_directory: string;
+  target_name: string;
+  destination_path: string;
+  rename: boolean;
+  move: boolean;
+  projection_same: boolean;
+  projection_diff: {
+    analysis: Record<string, { before: unknown; after: unknown }>;
+    coordinate: Record<string, { before: unknown; after: unknown }>;
+  };
+  route: "journaled_relocate" | "title_correction";
+  title_correction_search: string;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
+export interface ManagedFolderPlan {
+  version: "1.3.3";
+  kind: "managed_folder_create";
+  item_count: number;
+  work: { work_bucket_id: number; display_title: string | null };
+  parent_directory: string;
+  folder_name: string;
+  destination_path: string;
+  role: "primary" | "edition" | "auxiliary";
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
+export interface ManagedFolderRelocatePlan {
+  version: "1.3.3";
+  kind: "managed_folder_relocate";
+  item_count: number;
+  folder: { folder_id: number; work_bucket_id: number; role: string; display_title: string | null };
+  source_path: string;
+  target_parent: string;
+  target_name: string;
+  destination_path: string;
+  rename: boolean;
+  move: boolean;
+  registered_count: number;
+  auxiliary_count: number;
+  directory_count: number;
+  total_size: number;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
+export interface ManagedFolderAdoptPlan {
+  version: "1.3.3";
+  kind: "managed_folder_adopt";
+  item_count: number;
+  folder_path: string;
+  work: { work_bucket_id: number; display_title: string | null };
+  role: "primary" | "edition" | "auxiliary";
+  found_work_ids: number[];
+  registered_count: number;
+  auxiliary_count: number;
+  directory_count: number;
+  blocked_reasons: string[];
+  apply_available: boolean;
+  plan_sha256: string;
+  readonly: true;
+}
+
 export interface ExplorerComparison {
   left: ExplorerFile & Record<string, unknown>;
   right: ExplorerFile & Record<string, unknown>;
@@ -445,6 +521,9 @@ export interface ExplorerFolder {
   mixed_core: boolean;
   mixed_work: boolean;
   depth: number;
+  managed_folder_id: number | null;
+  managed_role: "primary" | "edition" | "auxiliary" | null;
+  managed_work_title: string | null;
 }
 
 export interface ExplorerFolderListing {
@@ -477,7 +556,8 @@ export interface ExplorerFolderDetail {
   unregistered_count: number;
   total_size: number;
   truncated: boolean;
-  actions: { rename: false; move: false; quarantine: false; future_version: string };
+  managed_folder: { folder_id: number; work_bucket_id: number; role: string; state: string; work_title: string | null } | null;
+  actions: { rename: boolean; move: boolean; quarantine: false; future_version: string | null };
   readonly: true;
 }
 

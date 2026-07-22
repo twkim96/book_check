@@ -65,6 +65,150 @@ def _server_fixture(tmp_path):
     return app, row["file_id"]
 
 
+def test_file_relocate_preview_and_apply_api(tmp_path):
+    app, file_id = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        _ensure_intake_fingerprint(conn, _file_state(conn, file_id))
+    finally:
+        conn.close()
+    target = config.house_dir / "정리된 작품"
+    target.mkdir()
+    client = app.test_client()
+    payload = {
+        "file_id": file_id,
+        "target_directory": str(target),
+        "new_name": "수동 교정 작품 146.txt",
+    }
+    response = client.post("/api/management/files/relocate/preview", json=payload)
+    assert response.status_code == 200
+    plan = response.get_json()["data"]
+    assert plan["apply_available"] is True
+    assert plan["move"] is True and plan["rename"] is False
+
+    started = client.post(
+        "/api/management/files/relocate/apply",
+        json={
+            **payload,
+            "confirm_count": plan["item_count"],
+            "confirm_plan_sha256": plan["plan_sha256"],
+        },
+    )
+    assert started.status_code == 202
+    job_id = started.get_json()["data"]["job_id"]
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["data"]
+        if job["state"] in {"succeeded", "failed", "needs_review", "interrupted"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "succeeded"
+    assert (target / payload["new_name"]).is_file()
+
+
+def test_library_server_migrates_v11_with_owned_backup(tmp_path):
+    state_db = tmp_path / ".dedup_state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        conn.execute("DROP TABLE work_folders")
+        conn.execute("DROP TABLE operation_groups")
+        conn.execute("PRAGMA user_version = 11")
+        conn.commit()
+    finally:
+        conn.close()
+    house, temp, runtime, frontend = (
+        tmp_path / "house", tmp_path / "temp", tmp_path / "runtime", tmp_path / "dist"
+    )
+    for path in (house, temp, frontend):
+        path.mkdir()
+    (frontend / "index.html").write_text("ok", encoding="utf-8")
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+    )
+    assert app.test_client().get("/health").status_code == 200
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('operation_groups', 'work_folders')"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
+    backups = list((state_db.parent / "backups").glob("before_library_server_schema_*.sqlite3"))
+    assert len(backups) == 1
+
+
+def test_managed_folder_create_api_appears_in_folder_catalog(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        with decision_store.transaction(conn):
+            work_id = int(conn.execute(
+                "INSERT INTO works(display_title) VALUES ('API 관리 작품')"
+            ).lastrowid)
+    finally:
+        conn.close()
+    parent = config.house_dir / "ㄱ"
+    parent.mkdir()
+    client = app.test_client()
+    payload = {
+        "work_bucket_id": work_id,
+        "parent_directory": str(parent),
+        "folder_name": "API 관리 작품",
+        "role": "primary",
+    }
+    preview = client.post(
+        "/api/management/folders/create/preview", json=payload
+    )
+    assert preview.status_code == 200
+    plan = preview.get_json()["data"]
+    assert plan["apply_available"] is True
+    started = client.post(
+        "/api/management/folders/create/apply",
+        json={
+            **payload,
+            "confirm_count": plan["item_count"],
+            "confirm_plan_sha256": plan["plan_sha256"],
+        },
+    )
+    assert started.status_code == 202
+    job_id = started.get_json()["data"]["job_id"]
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["data"]
+        if job["state"] in {"succeeded", "failed", "needs_review", "interrupted"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "succeeded"
+    listing = client.get(
+        "/api/explorer/folders?state=managed&refresh=1"
+    ).get_json()["data"]
+    assert listing["total"] == 1
+    assert listing["items"][0]["managed_role"] == "primary"
+    assert listing["items"][0]["file_count"] == 0
+    target_parent = config.house_dir / "ㄴ"
+    target_parent.mkdir()
+    relocate = client.post(
+        "/api/management/folders/relocate/preview",
+        json={
+            "folder_id": listing["items"][0]["managed_folder_id"],
+            "target_parent": str(target_parent),
+            "new_name": "API 이동 작품",
+        },
+    )
+    assert relocate.status_code == 200
+    assert relocate.get_json()["data"]["apply_available"] is True
+
+
 def test_health_dashboard_and_title_review_api(tmp_path):
     app, file_id = _server_fixture(tmp_path)
     client = app.test_client()

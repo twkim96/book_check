@@ -217,6 +217,29 @@ manifest, copy-verify-consume operation을 만든 뒤 `txt_temp/trash_bin/user_a
 백업은 개수 제한 밖에서도 보호합니다. 새 백업을 만들 때마다 같은 정책을 적용하므로 별도의 날짜 기반
 정리 작업은 필요하지 않습니다.
 
+### 도서·폴더 정리 작업공간 (1.3.3)
+
+파일 상세의 `이름·위치 정리`는 활성 house 파일을 기존 house 폴더로 옮기거나 불필요한 꼬리표만
+정리합니다. 새 파일명을 다시 분석한 core title, 읽기 제목, 플랫폼 검색 제목, 작가와 권·부·외전 좌표가
+기존 DB projection과 모두 같을 때만 file ID·work·variant 관계를 유지한 journaled 이동을 허용합니다.
+분석 결과가 달라지는 이름은 이 화면에서 실행하지 않고 기존 제목 교정으로 보내 Folderling 판정을 다시
+받습니다. 작품 관계 변경도 위치 이동과 섞지 않고 파일 비교의 사람 관계 판정에서 별도로 승인합니다.
+
+폴더 탐색기에서는 작품에 연결된 빈 관리 폴더를 만들거나, 이미 존재하는 폴더를 파일 이동 없이
+`primary`, `edition`, `auxiliary` 역할로 등록할 수 있습니다. 관리 폴더의 이름·위치를 바꾸면 그 아래
+DB 도서, JPG·ZIP 같은 미등록 부속 파일과 빈 하위 폴더를 하나의 operation group으로 묶어 house 안에서
+통째로 이동합니다. symlink, house 밖 목적지, 기존 목적지 충돌, stale 파일 identity, 다른 작품이 섞인
+기존 폴더 등록은 실행 전에 차단하며 자동 덮어쓰기나 `_dup_N` 이름은 만들지 않습니다.
+
+schema v12의 `operation_groups`와 `work_folders`가 폴더 작업과 작품 역할을 보존합니다. 서버가 이전
+schema v11 DB를 처음 열 때는 mutation lock 아래 검증된 SQLite 백업을 만든 뒤에만 migration합니다.
+폴더 작업이 중단되면 `dedup_recover.py recover`가 상위 group을 우선 복구하고, 완료된 이동은 Doctor와
+index를 다시 동기화합니다. 운영 DB는 서버를 재시작할 때 migration되며 단순 코드 테스트만으로는
+변경되지 않습니다.
+
+1.3.3은 합성·전체 회귀와 production build까지 완료했지만 운영 DB migration과 실제 UI 왕복 테스트는
+후속 1.3.5 안정화 단계로 이월했습니다.
+
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
 query-only normal keeper를 서버 수명 동안 보유합니다. `/health`도 DB 파일 존재만 보지 않고 실제
 읽기 전용 연결을 열어 확인하므로 DB가 열리지 않으면 503으로 보고합니다. 코드 변경을 자동으로

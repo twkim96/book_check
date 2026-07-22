@@ -579,6 +579,16 @@ def _folder_snapshot(state_db: os.PathLike | str, house_dir: os.PathLike | str) 
             ORDER BY f.canonical_path
             """
         ).fetchall()
+        managed_rows = conn.execute(
+            """
+            SELECT wf.folder_id, wf.work_bucket_id, wf.canonical_path, wf.role,
+                   wf.state, w.display_title
+            FROM work_folders AS wf
+            JOIN works AS w ON w.work_bucket_id = wf.work_bucket_id
+            WHERE wf.state = 'active'
+            ORDER BY wf.canonical_path
+            """
+        ).fetchall()
     finally:
         conn.close()
     grouped: dict[str, dict[str, Any]] = {}
@@ -599,6 +609,9 @@ def _folder_snapshot(state_db: os.PathLike | str, house_dir: os.PathLike | str) 
             "work_bucket_ids": set(),
             "variant_ids": set(),
             "sample_files": [],
+            "managed_folder_id": None,
+            "managed_role": None,
+            "managed_work_title": None,
         })
         item["file_count"] += 1
         item["total_size"] += int(row["size"])
@@ -610,6 +623,30 @@ def _folder_snapshot(state_db: os.PathLike | str, house_dir: os.PathLike | str) 
             item["variant_ids"].add(int(row["variant_id"]))
         if len(item["sample_files"]) < 5:
             item["sample_files"].append(path.name)
+    for row in managed_rows:
+        path = Path(str(row["canonical_path"]))
+        try:
+            relative = path.relative_to(house)
+        except ValueError:
+            continue
+        item = grouped.setdefault(str(path), {
+            "path": str(path),
+            "name": path.name,
+            "relative_path": str(relative),
+            "file_count": 0,
+            "total_size": 0,
+            "core_titles": set(),
+            "work_bucket_ids": set(),
+            "variant_ids": set(),
+            "sample_files": [],
+            "managed_folder_id": None,
+            "managed_role": None,
+            "managed_work_title": None,
+        })
+        item["managed_folder_id"] = int(row["folder_id"])
+        item["managed_role"] = row["role"]
+        item["managed_work_title"] = row["display_title"]
+        item["work_bucket_ids"].add(int(row["work_bucket_id"]))
     output = []
     for item in grouped.values():
         output.append({
@@ -637,7 +674,7 @@ def folder_listing(
     cursor: str | None = None,
     refresh: bool = False,
 ) -> dict:
-    if state not in {"all", "mixed_core", "mixed_work", "single_file", "grouped"}:
+    if state not in {"all", "managed", "mixed_core", "mixed_work", "single_file", "grouped"}:
         raise ValueError("unknown folder state filter")
     if sort not in {"name", "files", "size", "depth"}:
         raise ValueError("unknown folder sort")
@@ -649,10 +686,12 @@ def folder_listing(
     needle = str(search or "").strip().casefold()
     if needle:
         items = [item for item in items if needle in " ".join([
-            item["path"], *item["core_titles"], *item["sample_files"]
+            item["path"], item.get("managed_work_title") or "",
+            *item["core_titles"], *item["sample_files"]
         ]).casefold()]
     filters = {
         "all": lambda item: True,
+        "managed": lambda item: item.get("managed_folder_id") is not None,
         "mixed_core": lambda item: item["mixed_core"],
         "mixed_work": lambda item: item["mixed_work"],
         "single_file": lambda item: item["file_count"] == 1,
@@ -703,6 +742,16 @@ def folder_detail(
             """,
             (str(folder), _like(str(folder) + os.sep)),
         ).fetchall()
+        managed = conn.execute(
+            """
+            SELECT wf.folder_id, wf.work_bucket_id, wf.role, wf.state,
+                   w.display_title AS work_title
+            FROM work_folders AS wf
+            JOIN works AS w ON w.work_bucket_id = wf.work_bucket_id
+            WHERE wf.canonical_path = ? AND wf.state = 'active'
+            """,
+            (str(folder),),
+        ).fetchone()
     finally:
         conn.close()
     by_path = {decision_store.canonicalize_path(row["canonical_path"]): dict(row) for row in db_rows}
@@ -740,11 +789,12 @@ def folder_detail(
         "unregistered_count": len(entries) - registered,
         "total_size": sum(int(item["size"]) for item in entries),
         "truncated": truncated,
+        "managed_folder": dict(managed) if managed else None,
         "actions": {
-            "rename": False,
-            "move": False,
+            "rename": managed is not None,
+            "move": managed is not None,
             "quarantine": False,
-            "future_version": "1.3.2~1.3.3",
+            "future_version": None if managed else "1.3.3",
         },
         "readonly": True,
     }

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -69,7 +69,9 @@ REQUIRED_TABLES = frozenset({
     "review_items",
     "pair_cache",
     "actual_runs",
+    "operation_groups",
     "operations",
+    "work_folders",
     "file_analysis",
     "catalog_titles",
     "catalog_platform_stats",
@@ -408,6 +410,54 @@ CREATE TABLE actual_runs (
     finished_at TEXT,
     error TEXT
 );
+
+CREATE TABLE operation_groups (
+    group_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES actual_runs(run_id) ON DELETE RESTRICT,
+    action TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('planned', 'fs_done', 'db_done', 'committed', 'rolled_back', 'stale', 'failed')
+    ),
+    source_path TEXT,
+    dest_path TEXT,
+    item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+    plan_sha256 TEXT NOT NULL,
+    manifest_path TEXT,
+    source_manifest_json TEXT,
+    source_dev INTEGER,
+    source_ino INTEGER,
+    source_ctime_ns INTEGER,
+    destination_dev INTEGER,
+    destination_ino INTEGER,
+    destination_ctime_ns INTEGER,
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX operation_groups_run_state
+ON operation_groups(run_id, state);
+
+CREATE TABLE work_folders (
+    folder_id INTEGER PRIMARY KEY,
+    work_bucket_id INTEGER NOT NULL REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+    canonical_path TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL CHECK (role IN ('primary', 'edition', 'auxiliary')),
+    state TEXT NOT NULL CHECK (state IN ('planned', 'active', 'retired', 'failed')),
+    operation_group_id INTEGER REFERENCES operation_groups(group_id) ON DELETE RESTRICT,
+    dev INTEGER,
+    ino INTEGER,
+    ctime_ns INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX work_folders_work_state
+ON work_folders(work_bucket_id, state, role);
+
+CREATE UNIQUE INDEX work_folders_one_primary
+ON work_folders(work_bucket_id)
+WHERE state = 'active' AND role = 'primary';
 
 CREATE TABLE operations (
     operation_id INTEGER PRIMARY KEY,
@@ -776,6 +826,64 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 11")
         conn.commit()
         version = 11
+    if version == 11:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS operation_groups (
+                group_id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES actual_runs(run_id) ON DELETE RESTRICT,
+                action TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('planned', 'fs_done', 'db_done', 'committed', 'rolled_back', 'stale', 'failed')
+                ),
+                source_path TEXT,
+                dest_path TEXT,
+                item_count INTEGER NOT NULL DEFAULT 0 CHECK (item_count >= 0),
+                plan_sha256 TEXT NOT NULL,
+                manifest_path TEXT,
+                source_manifest_json TEXT,
+                source_dev INTEGER,
+                source_ino INTEGER,
+                source_ctime_ns INTEGER,
+                destination_dev INTEGER,
+                destination_ino INTEGER,
+                destination_ctime_ns INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS operation_groups_run_state
+            ON operation_groups(run_id, state);
+            CREATE TABLE IF NOT EXISTS work_folders (
+                folder_id INTEGER PRIMARY KEY,
+                work_bucket_id INTEGER NOT NULL REFERENCES works(work_bucket_id) ON DELETE RESTRICT,
+                canonical_path TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL CHECK (role IN ('primary', 'edition', 'auxiliary')),
+                state TEXT NOT NULL CHECK (state IN ('planned', 'active', 'retired', 'failed')),
+                operation_group_id INTEGER REFERENCES operation_groups(group_id) ON DELETE RESTRICT,
+                dev INTEGER,
+                ino INTEGER,
+                ctime_ns INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS work_folders_work_state
+            ON work_folders(work_bucket_id, state, role);
+            CREATE UNIQUE INDEX IF NOT EXISTS work_folders_one_primary
+            ON work_folders(work_bucket_id)
+            WHERE state = 'active' AND role = 'primary';
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v12 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active');
+            DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup');
+            UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP
+            WHERE key = 'actual_mutation_enabled';
+            PRAGMA user_version = 12;
+            """
+        )
+        conn.commit()
+        version = 12
     validate_schema(conn)
     return conn
 
@@ -803,6 +911,39 @@ def validate_schema(
     missing = REQUIRED_TABLES - tables
     if missing:
         raise RuntimeError(f"schema tables missing: {sorted(missing)}")
+    required_columns = {
+        "operation_groups": {
+            "group_id", "run_id", "action", "state", "source_path",
+            "dest_path", "item_count", "plan_sha256", "manifest_path",
+            "source_manifest_json", "source_dev", "source_ino",
+            "source_ctime_ns", "destination_dev", "destination_ino",
+            "destination_ctime_ns", "error",
+        },
+        "work_folders": {
+            "folder_id", "work_bucket_id", "canonical_path", "role", "state",
+            "operation_group_id", "dev", "ino", "ctime_ns",
+        },
+    }
+    for table, expected in required_columns.items():
+        actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        missing_columns = expected - actual
+        if missing_columns:
+            raise RuntimeError(
+                f"schema columns missing from {table}: {sorted(missing_columns)}"
+            )
+    indexes = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        )
+    }
+    required_indexes = {
+        "operation_groups_run_state",
+        "work_folders_work_state",
+        "work_folders_one_primary",
+    }
+    missing_indexes = required_indexes - indexes
+    if missing_indexes:
+        raise RuntimeError(f"schema indexes missing: {sorted(missing_indexes)}")
     views = {
         row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'view'"
@@ -1399,7 +1540,9 @@ def _is_state_backup(path: Path) -> bool:
 
 def protected_state_backup_paths(conn: sqlite3.Connection) -> set[str]:
     """Return backups that are still required by an unfinished actual run."""
-    rows = conn.execute(
+    protected = {
+        str(Path(row[0]).resolve())
+        for row in conn.execute(
         """
         SELECT DISTINCT ar.backup_path
         FROM actual_runs AS ar
@@ -1410,8 +1553,28 @@ def protected_state_backup_paths(conn: sqlite3.Connection) -> set[str]:
                  AND op.state IN ('planned', 'fs_done', 'db_done')
            )
         """
-    )
-    return {str(Path(row[0]).resolve()) for row in rows if row[0]}
+        )
+        if row[0]
+    }
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "operation_groups" in tables:
+        protected.update(
+            str(Path(row[0]).resolve())
+            for row in conn.execute(
+                """
+                SELECT DISTINCT ar.backup_path
+                FROM actual_runs AS ar
+                JOIN operation_groups AS og ON og.run_id = ar.run_id
+                WHERE og.state IN ('planned', 'fs_done', 'db_done')
+                """
+            )
+            if row[0]
+        )
+    return protected
 
 
 def prune_state_backups(
@@ -1657,6 +1820,59 @@ def create_operation(
         ),
     )
     return cursor.lastrowid
+
+
+def create_operation_group(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    action: str,
+    plan_sha256: str,
+    source_path: Optional[str] = None,
+    dest_path: Optional[str] = None,
+    item_count: int = 0,
+    manifest_path: Optional[str] = None,
+    source_manifest_json: Optional[str] = None,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO operation_groups(
+            run_id, action, state, source_path, dest_path, item_count,
+            plan_sha256, manifest_path, source_manifest_json
+        ) VALUES (?, ?, 'planned', ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id, action, source_path, dest_path, int(item_count),
+            plan_sha256, manifest_path, source_manifest_json,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def transition_operation_group(
+    conn: sqlite3.Connection,
+    group_id: int,
+    new_state: str,
+    *,
+    error: Optional[str] = None,
+) -> None:
+    if new_state not in OPERATION_STATES:
+        raise ValueError(f"unknown operation group state: {new_state}")
+    row = conn.execute(
+        "SELECT state FROM operation_groups WHERE group_id = ?", (int(group_id),)
+    ).fetchone()
+    if row is None:
+        raise KeyError(group_id)
+    current = row["state"]
+    if new_state not in _ALLOWED_OPERATION_TRANSITIONS[current]:
+        raise RuntimeError(f"invalid operation group transition: {current} -> {new_state}")
+    conn.execute(
+        """
+        UPDATE operation_groups SET state = ?, error = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE group_id = ? AND state = ?
+        """,
+        (new_state, error, int(group_id), current),
+    )
 
 
 def record_operation_destination(conn, operation_id, evidence) -> None:
@@ -2057,6 +2273,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
         "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
+        "library_file_relocate",
         "volume_coordinate_hold",
     }:
         raise ValueError("operation is not a queue move")
@@ -2075,7 +2292,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
     }:
         assert_actual_run_path(actual_run, source, "house_root")
         assert_actual_run_path(actual_run, destination, "temp_root")
-    elif row["action"] == "volume_group_merge":
+    elif row["action"] in {"volume_group_merge", "library_file_relocate"}:
         assert_actual_run_path(actual_run, source, "house_root")
         assert_actual_run_path(actual_run, destination, "house_root")
     else:
@@ -2105,6 +2322,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "title_cleanup_requeue": "house",
                 "user_title_requeue": "house",
                 "volume_group_merge": "house",
+                "library_file_relocate": "house",
             }.get(row["action"], "temp")
             _rollback_owned_destination(
                 conn, row, destination, source, source_bucket
@@ -2118,6 +2336,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 "title_cleanup_requeue": "house",
                 "user_title_requeue": "house",
                 "volume_group_merge": "house",
+                "library_file_relocate": "house",
             }.get(row["action"], "temp")
             _finalize_existing_source_rollback(
                 conn, row, source, source_bucket
@@ -2155,7 +2374,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 error="db_done title requeue state mismatch",
             )
         return "failed"
-    if row["action"] == "volume_group_merge":
+    if row["action"] in {"volume_group_merge", "library_file_relocate"}:
         db_committed = (
             file_row is not None
             and file_row["canonical_path"] == str(destination)
@@ -2351,6 +2570,7 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
         "suspected_move", "warning_move", "house_review_move", "queue_restore",
         "house_ingest", "user_queue_restore", "user_queue_accept",
         "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
+        "library_file_relocate",
         "volume_coordinate_hold",
     }:
         return _recover_interrupted_queue_operation(conn, operation_id)
@@ -2405,6 +2625,16 @@ def doctor_issues(
         issues.append({
             "kind": "unfinished_operation",
             "operation_id": row["operation_id"],
+            "state": row["state"],
+        })
+    for row in conn.execute(
+        "SELECT group_id, action, state FROM operation_groups "
+        "WHERE state IN ('planned', 'fs_done', 'db_done')"
+    ):
+        issues.append({
+            "kind": "unfinished_operation_group",
+            "group_id": row["group_id"],
+            "action": row["action"],
             "state": row["state"],
         })
     for row in conn.execute(
@@ -2464,6 +2694,30 @@ def doctor_issues(
                 issues.append({"kind": "stale_identity", "file_id": row["file_id"], "path": str(path)})
             if row["current_fingerprint_id"] is None and row["assignment_state"] == "managed":
                 issues.append({"kind": "missing_fingerprint", "file_id": row["file_id"]})
+        for row in conn.execute(
+            """
+            SELECT folder_id, canonical_path, dev, ino, ctime_ns
+            FROM work_folders WHERE state = 'active'
+            """
+        ):
+            path = Path(row["canonical_path"])
+            if not path.is_dir() or path.is_symlink():
+                issues.append({
+                    "kind": "managed_folder_missing",
+                    "folder_id": row["folder_id"],
+                    "path": str(path),
+                })
+                continue
+            info = os.stat(path, follow_symlinks=False)
+            if row["dev"] is not None and (
+                row["dev"] != info.st_dev
+                or row["ino"] != info.st_ino
+            ):
+                issues.append({
+                    "kind": "managed_folder_identity_stale",
+                    "folder_id": row["folder_id"],
+                    "path": str(path),
+                })
     for row in conn.execute(
         """
         SELECT r.variant_id, r.file_id, f.protected, f.active, f.assignment_state

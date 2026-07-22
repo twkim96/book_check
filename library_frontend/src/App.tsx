@@ -75,7 +75,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.2</small>
+            <small>file_check 1.3.3</small>
           </div>
         </div>
         <nav>
