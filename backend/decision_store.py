@@ -1854,8 +1854,9 @@ def coordinate_fields_from_name(name: str) -> dict:
     stem = Path(filename).stem
     info = analyze_name(filename)
     part = None
+    bare_volume = None
     if info["volume_number"] is not None:
-        part, _ = info["volume_number"]
+        part, bare_volume = info["volume_number"]
     part_rational = canonical_rational(part)
 
     masked = re.sub(
@@ -1865,6 +1866,27 @@ def coordinate_fields_from_name(name: str) -> dict:
     )
     numeric_matches = re.findall(r"(?<![\d.])(\d+(?:\.\d+)?)\s*권", masked)
     volume_rational = canonical_rational(numeric_matches[0]) if len(numeric_matches) == 1 else None
+    inferred_bare_volume = False
+    if (
+        volume_rational is None
+        and part_rational is None
+        and bare_volume is not None
+        and Path(filename).suffix.lower() in {".epub", ".pdf"}
+        and info.get("author")
+        and not info.get("complete")
+        and not info.get("span_ambiguous")
+        and 1 <= int(bare_volume) <= 99
+    ):
+        # 전자책 유통 파일의 ``작품명 38 (작가).epub`` 형식만 권수로
+        # 추론한다. TXT, 작가 없는 단독 숫자, 100 이상의 합본 회차는
+        # 기존 episode 판정을 유지해 웹소설 완결본 오탐을 피한다.
+        bare_match = re.search(
+            r"(?:^|\s)(\d{1,2})\s*(?:\([^()]+\)|\[[^\[\]]+\])\s*$",
+            stem,
+        )
+        if bare_match is not None and int(bare_match.group(1)) == int(bare_volume):
+            volume_rational = canonical_rational(bare_volume)
+            inferred_bare_volume = True
     symbol_match = re.search(r"(상권|중권|하권)\s*$", stem)
     if symbol_match is None:
         symbol_match = re.search(r"(?:^|\s)(상|중|하)\s*$", stem)
@@ -1876,7 +1898,9 @@ def coordinate_fields_from_name(name: str) -> dict:
         symbol, sort_key = canonical_symbol(symbol_match.group(1))
         coordinate_raw = symbol_match.group(1)
     elif volume_rational is not None:
-        coordinate_raw = numeric_matches[0]
+        coordinate_raw = (
+            str(int(bare_volume)) if inferred_bare_volume else numeric_matches[0]
+        )
     elif info["is_side_story"]:
         symbol, sort_key = canonical_symbol("외전")
         coordinate_raw = "외전"

@@ -1124,6 +1124,7 @@ def move_to_house(
                         conn,
                         source_file_id=source_row["file_id"],
                         house_root=dst_dir,
+                        new_group_parent=target_folder,
                     )
                     if volume_decision["status"] == "coordinate_conflict":
                         raise VolumeCoordinateConflict(volume_decision)

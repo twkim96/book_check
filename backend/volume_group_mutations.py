@@ -40,7 +40,8 @@ def _coordinate_key(row: Mapping[str, object]):
 
 
 def classify_folderling_volume_target(
-    conn, *, source_file_id: str, house_root: Path
+    conn, *, source_file_id: str, house_root: Path,
+    new_group_parent: Path | None = None,
 ) -> dict:
     """Classify one volume as targetable, coordinate-conflicting, or unrelated.
 
@@ -104,7 +105,106 @@ def classify_folderling_volume_target(
         ).fetchall()
     ]
     if not existing:
-        return no_target("no_existing_core")
+        if new_group_parent is None:
+            return no_target("no_existing_core")
+        source_path = Path(str(source["canonical_path"]))
+        if source_path.suffix.lower() not in {".epub", ".pdf"}:
+            return no_target("new_group_requires_ebook")
+        source_author = str(source.get("author") or "").strip()
+        if not source_author:
+            return no_target("new_group_requires_author")
+        peers = []
+        for row in conn.execute(
+            "SELECT * FROM files WHERE active = 1 AND source = 'temp' "
+            "ORDER BY canonical_path"
+        ):
+            peer = dict(row)
+            peer_path = Path(str(peer["canonical_path"]))
+            if peer_path.suffix.lower() not in {".epub", ".pdf"}:
+                continue
+            analysis = decision_store.build_file_analysis(peer_path.name)
+            if analysis["core_title"] != source["core_title"]:
+                continue
+            peer["author"] = analysis["author"]
+            peer["disambig"] = analysis["disambig"]
+            peers.append(peer)
+        if len(peers) < 2:
+            return no_target("new_group_requires_multiple_volumes")
+        authors = {str(row.get("author") or "").strip() for row in peers}
+        if authors != {source_author}:
+            return no_target("new_group_author_conflict")
+        if any(
+            row["coordinate_kind"] != "volume"
+            or row["span_ambiguous"]
+            or int(row.get("disambig") or 1) > 1
+            for row in peers
+        ):
+            return no_target("new_group_coordinate_shape_conflict")
+        peer_coordinates = [_coordinate_key(row) for row in peers]
+        if None in peer_coordinates or len(peer_coordinates) != len(set(peer_coordinates)):
+            return no_target("new_group_duplicate_coordinate")
+        integer_volumes = sorted(
+            coordinate[1]
+            for coordinate in peer_coordinates
+            if coordinate[0] == "volume" and coordinate[2] == 1
+        )
+        if (
+            len(integer_volumes) != len(peer_coordinates)
+            or integer_volumes != list(range(integer_volumes[0], integer_volumes[-1] + 1))
+        ):
+            return no_target("new_group_requires_contiguous_volumes")
+        display_title = str(source["readable_title"] or source["core_title"]).strip()
+        if not display_title or Path(display_title).name != display_title:
+            return no_target("new_group_title_is_not_safe_folder_name")
+        target = Path(new_group_parent).resolve() / display_title
+        try:
+            target.relative_to(house_root)
+        except ValueError:
+            return no_target("new_group_target_outside_house")
+        if target.exists() or target.is_symlink():
+            return no_target("new_group_destination_exists")
+        return {
+            "status": "target",
+            "target_folder": str(target),
+            "existing_file_ids": [],
+            "display_title": display_title,
+            "core_title": str(source["core_title"]),
+            "new_batch": True,
+            "batch_file_ids": [str(row["file_id"]) for row in peers],
+        }
+    # 같은 core에 과거 미관리 합본이 섞여 있어도 하나의 managed work가
+    # 일관된 권수 폴더를 이루면 그 집합을 라우팅 기준으로 삼는다. 다만
+    # 같은 좌표의 미관리 파일은 아래 필터 전에 충돌로 잡아 중복 검사를
+    # 우회하지 못하게 한다.
+    all_existing = existing
+    coordinate_matches = [
+        row for row in all_existing
+        if row["coordinate_kind"] == source["coordinate_kind"]
+        and _coordinate_key(row) == source_coordinate
+    ]
+    if coordinate_matches:
+        return {
+            "status": "coordinate_conflict",
+            "reason": "existing_same_coordinate",
+            "core_title": str(source["core_title"]),
+            "display_title": str(source["readable_title"] or source["core_title"]),
+            "coordinate_kind": source_coordinate[0],
+            "coordinate_num": source_coordinate[1],
+            "coordinate_den": source_coordinate[2],
+            "conflicting_file_ids": [str(row["file_id"]) for row in coordinate_matches],
+            "conflicting_paths": [str(row["canonical_path"]) for row in coordinate_matches],
+        }
+    managed_existing = [
+        row for row in all_existing
+        if row["assignment_state"] == "managed"
+        and row["work_bucket_id"] is not None
+    ]
+    managed_works = {
+        int(row["work_bucket_id"]) for row in managed_existing
+    }
+    if managed_existing and len(managed_works) == 1:
+        existing = managed_existing
+
     if any(
         (
             row["coordinate_kind"] != source["coordinate_kind"]
@@ -125,23 +225,6 @@ def classify_folderling_volume_target(
     coordinates = [_coordinate_key(row) for row in main_existing]
     if None in coordinates:
         return no_target("existing_coordinate_missing")
-    coordinate_matches = [
-        row for row in main_existing
-        if _coordinate_key(row) == source_coordinate
-    ]
-    if coordinate_matches:
-        return {
-            "status": "coordinate_conflict",
-            "reason": "existing_same_coordinate",
-            "core_title": str(source["core_title"]),
-            "display_title": str(source["readable_title"] or source["core_title"]),
-            "coordinate_kind": source_coordinate[0],
-            "coordinate_num": source_coordinate[1],
-            "coordinate_den": source_coordinate[2],
-            "conflicting_file_ids": [str(row["file_id"]) for row in coordinate_matches],
-            "conflicting_paths": [str(row["canonical_path"]) for row in coordinate_matches],
-        }
-
     authors = {str(row["author"]) for row in existing if row["author"]}
     if source["author"]:
         authors.add(str(source["author"]))
@@ -184,11 +267,13 @@ def classify_folderling_volume_target(
 
 
 def suggest_folderling_volume_target(
-    conn, *, source_file_id: str, house_root: Path
+    conn, *, source_file_id: str, house_root: Path,
+    new_group_parent: Path | None = None,
 ) -> dict | None:
     """Return one fail-closed existing-folder target for a new volume intake."""
     decision = classify_folderling_volume_target(
-        conn, source_file_id=source_file_id, house_root=house_root
+        conn, source_file_id=source_file_id, house_root=house_root,
+        new_group_parent=new_group_parent,
     )
     return decision if decision["status"] == "target" else None
 

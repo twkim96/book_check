@@ -401,6 +401,17 @@ rollback도 복원 실패 시 backup을 보존합니다. standalone deduplicator
 파일이 하나도 없는 하위 디렉터리는 도서 의미 데이터가 아닌 컨테이너로 취급해 목적지에 복제하지 않습니다.
 파일이 들어 있는 경로 구조만 재생성하며, 빈 source shell은 모든 승인 파일이 정상 입고된 뒤 정리합니다.
 
+EPUB/PDF의 `작품명 38 (작가)` 형식은 작가가 명시되고, 완결·범위 표기가 없으며, 숫자가 1~99일 때만
+`38권`과 같은 volume 좌표로 추론합니다. TXT와 작가 없는 단독 숫자, 100 이상의 합본 회차는 기존 판정을
+유지합니다. 따라서 `Re … 5`와 `Re … 5권`은 같은 권 좌표로 비교되어 exact·본문 감사·동일 권 충돌 검사를
+우회하지 않습니다. 기존에 하나의 managed work로 정리된 권수 폴더가 있으면 같은 core의 미관리 합본이
+초성 루트에 남아 있어도 관리 집합을 목적지 근거로 사용하되, 미관리 파일의 같은 권 좌표도 충돌 검사에는
+계속 포함합니다.
+
+기존 house 작품이 없는 신규 EPUB/PDF도 같은 temp 배치에 동일 core·동일 작가의 권수가 2개 이상 있고,
+중복 없이 연속된 정수 권수일 때만 `초성/읽기 제목` 폴더를 새로 만들어 한 work의 서로 다른 variant로
+입고합니다. 권수 중복·누락, 작가 충돌, 혼합 좌표, 심볼릭 링크 또는 기존 목적지 충돌은 자동 묶지 않습니다.
+
 Folderling 결과와 구조화 event에는 snapshot·dedup·intake·index 생성·배포·final Doctor의 단계별 시간을
 기록합니다. auditor의 후보 수, 실제 read bytes, fingerprint/pair cache hit·miss도 dedup summary에 포함합니다.
 검증된 snapshot entry는 deduplicator 첫 입력으로 직접 전달해 같은 `file_index.json`을 한 번 더 parse하는
@@ -410,7 +421,7 @@ mutation 직전 SHA 재검증 제거는 판정·안전 gate 영향에 비해 운
 
 재개·generation·강제 종료·동시 실행·symlink 경계 테스트는 임시 fixture만 사용합니다. 운영 적용 후에는 작은 신규 분권 폴더 한 건을
 입고해 operation group committed, unfinished operation/group 0, final Doctor 0과 세 surface generation ID를
-확인한 뒤 버전을 닫습니다. 리뷰 후속 코드 검증은 `624 passed`, Python compileall, TypeScript/Vite production
+확인한 뒤 버전을 닫습니다. 리뷰 후속 코드 검증은 `628 passed`, Python compileall, TypeScript/Vite production
 build와 `git diff --check`를 통과했습니다.
 
 도서 관리 서버는 macOS SQLite WAL의 `-wal`/`-shm` coordination 파일을 안정적으로 유지하도록
