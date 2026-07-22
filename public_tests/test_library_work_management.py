@@ -430,3 +430,68 @@ def test_representative_replacement_keeps_variant_relationship(tmp_path):
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()
+
+
+def test_resolve_work_route_blocks_aliases_pointing_to_different_works(tmp_path):
+    state_db, house, temp = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            core_work = _work(conn, "코어 작품")
+            readable_work = _work(conn, "표시 작품")
+        core_folder = _folder(conn, house / "ㅋ" / "코어 작품", core_work)
+        readable_folder = _folder(conn, house / "ㅍ" / "표시 작품", readable_work)
+    finally:
+        conn.close()
+
+    core_plan = alias_preview(
+        state_db,
+        alias_kind="core_title",
+        alias_value="충돌작품",
+        work_bucket_id=core_work,
+        preferred_folder_id=core_folder,
+    )
+    apply_alias(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        alias_kind="core_title",
+        alias_value="충돌작품",
+        work_bucket_id=core_work,
+        preferred_folder_id=core_folder,
+        replace_alias_id=None,
+        confirm_count=1,
+        confirm_plan_sha256=core_plan["plan_sha256"],
+    )
+    readable_plan = alias_preview(
+        state_db,
+        alias_kind="readable_title",
+        alias_value="충돌 표시 제목",
+        work_bucket_id=readable_work,
+        preferred_folder_id=readable_folder,
+    )
+    apply_alias(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        alias_kind="readable_title",
+        alias_value="충돌 표시 제목",
+        work_bucket_id=readable_work,
+        preferred_folder_id=readable_folder,
+        replace_alias_id=None,
+        confirm_count=1,
+        confirm_plan_sha256=readable_plan["plan_sha256"],
+    )
+
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        route = resolve_work_route(
+            conn,
+            core_title="충돌작품",
+            readable_title="충돌 표시 제목",
+        )
+    finally:
+        conn.close()
+    assert route["status"] == "route_conflict"
+    assert route["matched"] is False
+    assert route["work_bucket_ids"] == sorted([core_work, readable_work])

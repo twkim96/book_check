@@ -415,6 +415,7 @@ def inspect_epub_content(
     path,
     *,
     max_members=10_000,
+    max_file_bytes=None,
     max_uncompressed_bytes=1024 * 1024 * 1024,
     budget=None,
 ):
@@ -431,7 +432,15 @@ def inspect_epub_content(
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise RuntimeError(f"source is not a regular file: {path}")
+        if max_file_bytes is not None and before.st_size > int(max_file_bytes):
+            raise RuntimeError(
+                f"EPUB file limit exceeded: {before.st_size}>{int(max_file_bytes)}"
+            )
+        if budget is not None:
+            budget.reserve_pass(before.st_size)
         raw_sha = _hash_fd(fd)
+        if budget is not None:
+            budget.consume(before.st_size)
         os.lseek(fd, 0, os.SEEK_SET)
         with os.fdopen(os.dup(fd), "rb", closefd=True) as stream:
             with zipfile.ZipFile(stream) as archive:

@@ -656,3 +656,71 @@ def test_managed_folder_adopt_final_commit_failure_recovers_as_success(
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()
+
+
+def test_managed_folder_relocate_rejects_file_changed_after_actual_manifest(
+    tmp_path, monkeypatch
+):
+    state_db, house, temp, index, source, target_parent, _, folder_id = (
+        _managed_folder_with_book(tmp_path)
+    )
+    plan = managed_folder_relocate_preview(
+        state_db,
+        house_dir=house,
+        folder_id=folder_id,
+        target_parent=str(target_parent),
+        new_name="변경 차단 작품",
+    )
+    changed = source / "cover.jpg"
+    original_prepare = decision_store.prepare_actual_run
+
+    def prepare_then_change(*args, **kwargs):
+        result = original_prepare(*args, **kwargs)
+        changed.write_bytes(b"changed after approval")
+        return result
+
+    monkeypatch.setattr(decision_store, "prepare_actual_run", prepare_then_change)
+    with pytest.raises(RuntimeError, match="folder contents changed after confirmation"):
+        apply_managed_folder_relocate(
+            state_db,
+            house_dir=house,
+            temp_dir=temp,
+            index_path=index,
+            folder_id=folder_id,
+            target_parent=str(target_parent),
+            new_name="변경 차단 작품",
+            confirm_count=plan["item_count"],
+            confirm_plan_sha256=plan["plan_sha256"],
+        )
+    assert source.is_dir()
+    assert not (target_parent / "변경 차단 작품").exists()
+
+
+def test_folder_quarantine_rejects_file_changed_after_actual_manifest(
+    tmp_path, monkeypatch
+):
+    state_db, house, temp, index, source, _, _ = _fixture(tmp_path)
+    folder = source.parent
+    plan = folder_quarantine_preview(
+        state_db, house_dir=house, temp_dir=temp, folder_path=str(folder)
+    )
+    original_prepare = decision_store.prepare_actual_run
+
+    def prepare_then_change(*args, **kwargs):
+        result = original_prepare(*args, **kwargs)
+        source.write_bytes(b"changed after approval")
+        return result
+
+    monkeypatch.setattr(decision_store, "prepare_actual_run", prepare_then_change)
+    with pytest.raises(RuntimeError, match="folder contents changed after confirmation"):
+        apply_folder_quarantine(
+            state_db,
+            house_dir=house,
+            temp_dir=temp,
+            index_path=index,
+            folder_path=str(folder),
+            confirm_count=plan["item_count"],
+            confirm_plan_sha256=plan["plan_sha256"],
+        )
+    assert folder.is_dir()
+    assert not Path(plan["destination_path"]).exists()

@@ -188,6 +188,62 @@ def _tree_file_stats(root):
     return count, size
 
 
+def _cleanup_unpack_tree_owned(root, *, reusable):
+    """Delete only entries observed in one no-follow snapshot.
+
+    A file arriving after the snapshot is never passed to unlink.  It instead
+    keeps a directory non-empty (or leaves the reusable inbox non-empty), so the
+    caller reports cleanup_failed and preserves the late arrival.
+    """
+    root = os.path.abspath(root)
+    files = []
+    directories = []
+    for current, child_dirs, filenames in os.walk(root, topdown=True, followlinks=False):
+        for name in child_dirs:
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            if not os.path.isdir(path) or os.path.islink(path):
+                raise OSError(f"unpack directory is not owned safely: {path}")
+            directories.append((path, info.st_dev, info.st_ino))
+        for name in filenames:
+            path = os.path.join(current, name)
+            info = os.lstat(path)
+            if not os.path.isfile(path) or os.path.islink(path):
+                raise OSError(f"unpack file is not owned safely: {path}")
+            files.append((
+                path, info.st_dev, info.st_ino, info.st_ctime_ns,
+                info.st_size, info.st_mtime_ns,
+            ))
+
+    removed_files = 0
+    removed_bytes = 0
+    for path, dev, ino, ctime_ns, size, mtime_ns in files:
+        current = os.lstat(path)
+        if (
+            current.st_dev, current.st_ino, current.st_ctime_ns,
+            current.st_size, current.st_mtime_ns,
+        ) != (dev, ino, ctime_ns, size, mtime_ns):
+            raise OSError(f"unpack file changed during cleanup: {path}")
+        os.unlink(path)
+        removed_files += 1
+        removed_bytes += size
+
+    for path, dev, ino in sorted(
+        directories, key=lambda item: len(item[0].split(os.sep)), reverse=True
+    ):
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino) != (dev, ino):
+            raise OSError(f"unpack directory changed during cleanup: {path}")
+        os.rmdir(path)
+
+    if reusable:
+        if os.listdir(root):
+            raise OSError("unpack inbox changed during cleanup")
+    else:
+        os.rmdir(root)
+    return removed_files, removed_bytes
+
+
 def cleanup_unpack_sources(src_dir):
     """Discard unpack wrappers only after every supported file left safely.
 
@@ -220,17 +276,10 @@ def cleanup_unpack_sources(src_dir):
                 "discarded_bytes": 0,
             })
             continue
-        discarded_files, discarded_bytes = _tree_file_stats(root)
         try:
-            if reusable:
-                for child in sorted(os.listdir(root)):
-                    child_path = os.path.join(root, child)
-                    if os.path.isdir(child_path):
-                        shutil.rmtree(child_path)
-                    else:
-                        os.unlink(child_path)
-            else:
-                shutil.rmtree(root)
+            discarded_files, discarded_bytes = _cleanup_unpack_tree_owned(
+                root, reusable=reusable
+            )
             status = "cleaned"
         except OSError as exc:
             status = "cleanup_failed"
@@ -357,6 +406,11 @@ def move_to_house(
                 )
                 if explicit_route["status"] == "target":
                     target_folder = explicit_route["target_folder"]
+                elif explicit_route["status"] == "route_conflict":
+                    raise RuntimeError(
+                        "사람 지정 작품 alias가 서로 다른 작품을 가리킵니다: "
+                        f"works={explicit_route['work_bucket_ids']}"
+                    )
                 elif explicit_route.get("matched"):
                     raise RuntimeError(
                         "사람 지정 작품 alias는 있지만 활성 목적 폴더가 없습니다: "

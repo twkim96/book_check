@@ -57,6 +57,30 @@ def test_unpack_cleanup_waits_for_supported_files_then_discards_assets(tmp_path)
     assert not (temp / "___예전 묶음").exists()
 
 
+def test_unpack_cleanup_preserves_supported_file_arriving_during_cleanup(
+    tmp_path, monkeypatch
+):
+    temp = tmp_path / "temp"
+    unpack = temp / "unpack"
+    unpack.mkdir(parents=True)
+    cover = unpack / "표지.jpg"
+    late = unpack / "늦게 들어온 작품.txt"
+    cover.write_bytes(b"cover")
+    original_unlink = folderling.os.unlink
+
+    def unlink_then_arrive(path):
+        original_unlink(path)
+        if str(path) == str(cover):
+            late.write_text("late book", encoding="utf-8")
+
+    monkeypatch.setattr(folderling.os, "unlink", unlink_then_arrive)
+    result = cleanup_unpack_sources(str(temp))
+
+    assert result[0]["status"] == "cleanup_failed"
+    assert late.read_text(encoding="utf-8") == "late book"
+    assert not cover.exists()
+
+
 def test_folderling_journals_unpacked_book_then_discards_wrapper_assets(tmp_path):
     script_dir = tmp_path / "project"
     house = tmp_path / "house"

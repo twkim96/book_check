@@ -486,7 +486,23 @@ def resolve_work_route(
             candidates.append((priority, row))
     if not candidates:
         return {"status": "no_alias", "matched": False}
-    _, alias = sorted(candidates, key=lambda item: item[0])[0]
+    ordered = sorted(candidates, key=lambda item: item[0])
+    work_ids = {int(row["work_bucket_id"]) for _, row in ordered}
+    if len(work_ids) > 1:
+        return {
+            "status": "route_conflict",
+            "matched": False,
+            "work_bucket_ids": sorted(work_ids),
+            "candidates": [
+                {
+                    "alias_id": int(row["alias_id"]),
+                    "alias_kind": row["alias_kind"],
+                    "work_bucket_id": int(row["work_bucket_id"]),
+                }
+                for _, row in ordered
+            ],
+        }
+    _, alias = ordered[0]
     if alias["work_status"] != "active":
         return {
             "status": "retired_work",

@@ -2,6 +2,9 @@ import json
 import zipfile
 
 import duplicate_auditor
+import mutation_io
+import pytest
+from text_preview import ReadBudget
 
 
 def _write_epub(path, body, *, compression, timestamp):
@@ -107,3 +110,40 @@ def test_candidate_file_limit_fails_closed_before_unbounded_read(tmp_path):
     assert "candidate_file_limit" in report.stop_reasons
     assert report.stats["unique_candidate_files"] <= 4
     assert report.stats["coverage_counts"]["candidate_file_limit_deferred_pairs"] == 1
+
+
+def test_epub_audit_counts_raw_and_uncompressed_reads(tmp_path):
+    path = tmp_path / "읽기 집계.epub"
+    body = b"budgeted chapter"
+    _write_epub(
+        path,
+        body,
+        compression=zipfile.ZIP_STORED,
+        timestamp=(2024, 1, 1, 0, 0, 0),
+    )
+    budget = ReadBudget(max_bytes=1024 * 1024)
+
+    evidence = mutation_io.inspect_epub_content(
+        path, max_file_bytes=1024 * 1024, budget=budget
+    )
+
+    assert budget.read_bytes == path.stat().st_size + evidence.uncompressed_size
+
+
+def test_epub_file_limit_is_checked_before_raw_hash(tmp_path, monkeypatch):
+    path = tmp_path / "크기 제한.epub"
+    _write_epub(
+        path,
+        b"chapter",
+        compression=zipfile.ZIP_STORED,
+        timestamp=(2024, 1, 1, 0, 0, 0),
+    )
+
+    def unexpected_hash(_fd):
+        raise AssertionError("raw hash must not run above max_file_bytes")
+
+    monkeypatch.setattr(mutation_io, "_hash_fd", unexpected_hash)
+    with pytest.raises(RuntimeError, match="EPUB file limit exceeded"):
+        mutation_io.inspect_epub_content(
+            path, max_file_bytes=path.stat().st_size - 1
+        )

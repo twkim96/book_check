@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import sqlite3
@@ -13,6 +14,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Sequence
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
@@ -84,6 +86,23 @@ from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DI
 
 
 SERVER_VERSION = "1.3.5"
+
+
+def _is_loopback_host(value: str | None) -> bool:
+    host = str(value or "").strip().rstrip(".").casefold()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _request_host_name(value: str) -> str | None:
+    try:
+        return urlsplit(f"//{value}").hostname
+    except ValueError:
+        return None
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
@@ -614,6 +633,36 @@ def create_app(
     app.extensions["library_job_runner"] = runner
     app.extensions["library_service_registry"] = services
     appearance_path = config.runtime_dir / "appearance.json"
+
+    @app.before_request
+    def local_api_guard():
+        if not request.path.startswith("/api/"):
+            return None
+        host_name = _request_host_name(request.host)
+        if not _is_loopback_host(host_name):
+            return jsonify({
+                "ok": False,
+                "error": {
+                    "code": "local_access_required",
+                    "message": "도서 관리 API는 로컬 주소에서만 사용할 수 있습니다.",
+                },
+            }), 403
+        origin = request.headers.get("Origin")
+        if origin:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not _is_loopback_host(parsed.hostname)
+                or parsed.netloc.casefold() != request.host.casefold()
+            ):
+                return jsonify({
+                    "ok": False,
+                    "error": {
+                        "code": "origin_rejected",
+                        "message": "다른 Origin에서는 도서 관리 API를 호출할 수 없습니다.",
+                    },
+                }), 403
+        return None
 
     @app.after_request
     def response_headers(response):
@@ -1441,6 +1490,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    if not _is_loopback_host(args.host):
+        print(
+            "도서 관리 서버는 localhost, 127.0.0.1 또는 ::1에만 바인딩할 수 있습니다.",
+            file=sys.stderr,
+        )
+        return 2
     app = create_app(
         state_db=Path(args.state_db),
         house_dir=Path(args.house),

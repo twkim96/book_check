@@ -922,3 +922,27 @@ def test_readonly_connection_retries_a_transient_open_failure(tmp_path, monkeypa
     finally:
         readonly.close()
     assert calls == 2
+
+
+def test_api_rejects_non_loopback_host_and_cross_origin(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+
+    hostile_host = client.get(
+        "/api/dashboard", headers={"Host": "library.example"}
+    )
+    assert hostile_host.status_code == 403
+    assert hostile_host.get_json()["error"]["code"] == "local_access_required"
+
+    hostile_origin = client.get(
+        "/api/dashboard",
+        headers={"Host": "localhost", "Origin": "https://attacker.example"},
+    )
+    assert hostile_origin.status_code == 403
+    assert hostile_origin.get_json()["error"]["code"] == "origin_rejected"
+
+    allowed = client.get(
+        "/api/dashboard",
+        headers={"Host": "localhost", "Origin": "http://localhost"},
+    )
+    assert allowed.status_code == 200

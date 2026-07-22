@@ -11,6 +11,7 @@ import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Mapping
 
 import decision_store
@@ -771,6 +772,54 @@ def _folder_inventory(
     return items, directories
 
 
+_FOLDER_ITEM_SNAPSHOT_FIELDS = (
+    "relative_path", "source_path", "size", "mtime_ns", "dev", "ino",
+    "ctime_ns", "registered", "file_id", "fingerprint_id",
+)
+
+
+def _assert_folder_plan_sources_current(
+    conn,
+    actual_run,
+    plan: Mapping[str, object],
+    *,
+    require_fingerprint: bool,
+) -> None:
+    """Revalidate every planned child immediately before the atomic rename."""
+    source = Path(str(plan["source_path"]))
+    try:
+        current_items, current_directories = _folder_inventory(
+            conn, source, require_fingerprint=require_fingerprint
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"folder contents changed after confirmation: {exc}"
+        ) from exc
+
+    def snapshot(items):
+        return [
+            tuple(item.get(field) for field in _FOLDER_ITEM_SNAPSHOT_FIELDS)
+            for item in items
+        ]
+
+    if snapshot(current_items) != snapshot(plan["items"]):
+        raise RuntimeError("folder contents changed after confirmation")
+    if sorted(current_directories) != sorted(plan["directories"]):
+        raise RuntimeError("folder directories changed after confirmation")
+
+    for item in current_items:
+        evidence = SimpleNamespace(
+            dev=item["dev"],
+            ino=item["ino"],
+            ctime_ns=item["ctime_ns"],
+            size=item["size"],
+            mtime_ns=item["mtime_ns"],
+        )
+        decision_store.assert_manifest_source(
+            actual_run, item["source_path"], "house_root", evidence
+        )
+
+
 def managed_folder_relocate_preview(
     state_db: Path,
     *,
@@ -1457,6 +1506,9 @@ def _quarantine_folder(conn, *, plan: Mapping[str, object], run_id: str, manifes
             ))
     recovered_after_error = None
     try:
+        _assert_folder_plan_sources_current(
+            conn, actual_run, plan, require_fingerprint=False
+        )
         _rename_directory_no_clobber(source, destination)
         destination_identity = _directory_identity(destination)
         if destination_identity[:2] != current_identity[:2]:
@@ -1699,6 +1751,9 @@ def _relocate_managed_folder(
 
     recovered_after_error = None
     try:
+        _assert_folder_plan_sources_current(
+            conn, actual_run, plan, require_fingerprint=True
+        )
         _rename_directory_no_clobber(source, destination)
         destination_identity = _directory_identity(destination)
         if destination_identity[:2] != current_identity[:2]:

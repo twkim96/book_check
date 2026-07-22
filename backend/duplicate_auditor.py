@@ -1163,7 +1163,11 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
         try:
             analysis = persistent.analysis(entry) if persistent is not None else None
             if analysis is None:
-                evidence = inspect_epub_content(path, budget=budget)
+                evidence = inspect_epub_content(
+                    path,
+                    max_file_bytes=config.max_file_bytes,
+                    budget=budget,
+                )
                 analysis = TextAnalysis(
                     path=path,
                     size=evidence.file_evidence.size,
@@ -1177,7 +1181,9 @@ def analyze_candidates(candidates, config, coverage, stop_reasons, persistent=No
                     front_anchor="",
                     tail_anchor="",
                     status="epub_content",
-                    read_bytes=evidence.uncompressed_size,
+                    read_bytes=(
+                        evidence.file_evidence.size + evidence.uncompressed_size
+                    ),
                 )
                 if persistent is not None:
                     persistent.store_analysis(entry, analysis)
