@@ -147,9 +147,16 @@ def test_file_explorer_detail_and_compare_are_readonly(tmp_path):
     listing = file_listing(state_db, search="검사 작품", source="house")
     assert listing["total"] == 2
     assert {item["file_id"] for item in listing["items"]} == set(ids)
+    first_listing = next(item for item in listing["items"] if item["file_id"] == ids[0])
+    assert first_listing["open_review_count"] == 1
+    assert first_listing["open_review_sample_path"].endswith("검사 작품 1권 extra.txt")
+    assert first_listing["open_review_sample_classification"] == "metadata_only"
     detail = file_detail(state_db, ids[0])
     assert detail["file"]["core_title"] == "검사작품"
     assert detail["reviews"][0]["evidence"] == {"fixture": True}
+    assert detail["reviews"][0]["counterpart_file_id"] == ids[1]
+    assert detail["reviews"][0]["counterpart_name"] == "검사 작품 1권 extra.txt"
+    assert detail["reviews"][0]["counterpart_core_title"] == "검사작품"
     assert detail["actions"]["quarantine"] is True
     comparison = compare_files(state_db, ids[0], ids[1])
     assert comparison["comparison"]["same_raw_sha256"] is True
@@ -157,6 +164,23 @@ def test_file_explorer_detail_and_compare_are_readonly(tmp_path):
     assert comparison["relationship_preview"]["apply_available"] is False
 
     assert _snapshot(state_db, house, temp) == before
+
+
+def test_review_filter_excludes_open_edges_to_inactive_files(tmp_path):
+    state_db, house, temp, ids, *_ = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET active = 0, source = 'quarantine' WHERE file_id = ?",
+                (ids[1],),
+            )
+    finally:
+        conn.close()
+
+    listing = file_listing(state_db, source="review")
+
+    assert listing["total"] == 0
 
 
 def test_folder_explorer_distinguishes_registered_and_auxiliary_files(tmp_path):

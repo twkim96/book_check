@@ -780,6 +780,9 @@ def _exact_quarantine(
                 assignment_origin, source_file_id,
             ),
         )
+        decision_store.supersede_open_reviews_for_inactive_file(
+            conn, source_file_id, reason="exact_quarantine"
+        )
         decision_store.transition_operation(conn, operation_id, "db_done")
     with decision_store.transaction(conn):
         decision_store.transition_operation(conn, operation_id, "committed")

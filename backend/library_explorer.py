@@ -237,6 +237,7 @@ def file_listing(
             "JOIN files AS reference ON reference.file_id = open_review.reference_file_id "
             "WHERE open_review.state IN ('pending', 'deferred') "
             "AND open_review.queue_path IS NULL "
+            "AND candidate.active = 1 AND reference.active = 1 "
             "AND candidate.source != 'queue' AND reference.source != 'queue' "
             "AND (open_review.candidate_file_id = f.file_id "
             "OR open_review.reference_file_id = f.file_id))"
@@ -296,9 +297,46 @@ def file_listing(
                    fp.fingerprint_id, fp.status AS fingerprint_status,
                    fp.raw_sha256, fp.normalized_sha256, fp.normalized_length,
                    (SELECT COUNT(*) FROM review_items AS open_review
+                    JOIN files AS candidate
+                      ON candidate.file_id = open_review.candidate_file_id
+                    JOIN files AS reference
+                      ON reference.file_id = open_review.reference_file_id
                     WHERE open_review.state IN ('pending', 'deferred')
+                      AND open_review.queue_path IS NULL
+                      AND candidate.active = 1 AND reference.active = 1
+                      AND candidate.source != 'queue' AND reference.source != 'queue'
                       AND (open_review.candidate_file_id = f.file_id
-                           OR open_review.reference_file_id = f.file_id)) AS open_review_count
+                           OR open_review.reference_file_id = f.file_id)) AS open_review_count,
+                   (SELECT CASE
+                               WHEN open_review.candidate_file_id = f.file_id
+                               THEN reference.canonical_path
+                               ELSE candidate.canonical_path
+                           END
+                    FROM review_items AS open_review
+                    JOIN files AS candidate
+                      ON candidate.file_id = open_review.candidate_file_id
+                    JOIN files AS reference
+                      ON reference.file_id = open_review.reference_file_id
+                    WHERE open_review.state IN ('pending', 'deferred')
+                      AND open_review.queue_path IS NULL
+                      AND candidate.active = 1 AND reference.active = 1
+                      AND (open_review.candidate_file_id = f.file_id
+                           OR open_review.reference_file_id = f.file_id)
+                    ORDER BY open_review.updated_at DESC, open_review.review_id DESC
+                    LIMIT 1) AS open_review_sample_path,
+                   (SELECT open_review.classification
+                    FROM review_items AS open_review
+                    JOIN files AS candidate
+                      ON candidate.file_id = open_review.candidate_file_id
+                    JOIN files AS reference
+                      ON reference.file_id = open_review.reference_file_id
+                    WHERE open_review.state IN ('pending', 'deferred')
+                      AND open_review.queue_path IS NULL
+                      AND candidate.active = 1 AND reference.active = 1
+                      AND (open_review.candidate_file_id = f.file_id
+                           OR open_review.reference_file_id = f.file_id)
+                    ORDER BY open_review.updated_at DESC, open_review.review_id DESC
+                    LIMIT 1) AS open_review_sample_classification
             {base}
             ORDER BY {order} {direction_sql}, f.file_id {direction_sql}
             LIMIT ? OFFSET ?
@@ -376,19 +414,55 @@ def file_detail(state_db: os.PathLike | str, file_id: str) -> dict:
         item["retired_virtual_path"] = (
             not item["active"] and ".dedup_state/retired_paths/" in str(row["canonical_path"])
         )
-        reviews = [
-            {**dict(review), "evidence": _json(review["evidence_json"])}
-            for review in conn.execute(
+        reviews = []
+        for review in conn.execute(
                 """
-                SELECT review_id, candidate_file_id, reference_file_id, classification,
-                       state, decision_id, queue_path, evidence_json, created_at, updated_at
-                FROM review_items
-                WHERE candidate_file_id = ? OR reference_file_id = ?
-                ORDER BY updated_at DESC, review_id DESC LIMIT 50
+                SELECT review.review_id, review.candidate_file_id,
+                       review.reference_file_id, review.classification,
+                       review.state, review.decision_id, review.queue_path,
+                       review.evidence_json, review.created_at, review.updated_at,
+                       CASE WHEN review.candidate_file_id = ?
+                            THEN 'reference' ELSE 'candidate' END AS counterpart_role,
+                       counterpart.file_id AS counterpart_file_id,
+                       counterpart.canonical_path AS counterpart_path,
+                       counterpart.source AS counterpart_source,
+                       counterpart.active AS counterpart_active,
+                       counterpart.size AS counterpart_size,
+                       analysis.core_title AS counterpart_core_title,
+                       analysis.readable_title AS counterpart_readable_title,
+                       analysis.author AS counterpart_author,
+                       counterpart.coordinate_kind AS counterpart_coordinate_kind,
+                       counterpart.part_num AS counterpart_part_num,
+                       counterpart.part_den AS counterpart_part_den,
+                       counterpart.volume_num AS counterpart_volume_num,
+                       counterpart.volume_den AS counterpart_volume_den,
+                       counterpart.coordinate_symbol AS counterpart_coordinate_symbol,
+                       counterpart.episode_start AS counterpart_episode_start,
+                       counterpart.episode_end AS counterpart_episode_end,
+                       counterpart.coordinate_raw AS counterpart_coordinate_raw,
+                       fingerprint.status AS counterpart_fingerprint_status
+                FROM review_items AS review
+                JOIN files AS counterpart
+                  ON counterpart.file_id = CASE
+                      WHEN review.candidate_file_id = ? THEN review.reference_file_id
+                      ELSE review.candidate_file_id END
+                LEFT JOIN file_analysis AS analysis
+                  ON analysis.file_id = counterpart.file_id
+                LEFT JOIN fingerprints AS fingerprint
+                  ON fingerprint.fingerprint_id = counterpart.current_fingerprint_id
+                WHERE review.candidate_file_id = ? OR review.reference_file_id = ?
+                ORDER BY CASE WHEN review.state IN ('pending', 'deferred') THEN 0 ELSE 1 END,
+                         review.updated_at DESC, review.review_id DESC
+                LIMIT 50
                 """,
-                (file_id, file_id),
-            )
-        ]
+                (file_id, file_id, file_id, file_id),
+            ):
+            review_item = {**dict(review), "evidence": _json(review["evidence_json"])}
+            counterpart_path = Path(str(review["counterpart_path"]))
+            review_item["counterpart_name"] = counterpart_path.name
+            review_item["counterpart_parent"] = str(counterpart_path.parent)
+            review_item["counterpart_active"] = bool(review["counterpart_active"])
+            reviews.append(review_item)
         decisions = [
             {**dict(decision), "evidence": _json(decision["evidence_json"])}
             for decision in conn.execute(

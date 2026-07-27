@@ -161,18 +161,24 @@ input:focus, select:focus { border-color: var(--blue-2); box-shadow: 0 0 0 3px v
 .explorer-toolbar { flex-wrap: wrap; }
 .explorer-toolbar .search-form { min-width: 360px; }
 .explorer-toolbar select { max-width: 190px; }
-.explorer-file-table { min-width: 1280px; table-layout: fixed; }
+.explorer-file-table { width: calc(100% - 2px); min-width: 0; table-layout: fixed; }
 .explorer-file-table th:nth-child(1), .explorer-file-table td:nth-child(1) { width: 55px; text-align: center; }
-.explorer-file-table th:nth-child(2) { width: 28%; }
-.explorer-file-table th:nth-child(3) { width: 22%; }
-.explorer-file-table th:nth-child(4) { width: 17%; }
-.explorer-file-table th:nth-child(5) { width: 15%; }
-.explorer-file-table th:nth-child(6) { width: 74px; }
+.explorer-file-table th:nth-child(2) { width: 27%; }
+.explorer-file-table th:nth-child(3) { width: 18%; }
+.explorer-file-table th:nth-child(4) { width: 13%; }
+.explorer-file-table th:nth-child(5) { width: 22%; }
+.explorer-file-table th:nth-child(6) { width: 10%; }
+.explorer-file-table th:nth-child(7) { width: 70px; }
 .explorer-file-table td > strong, .explorer-file-table td > b, .explorer-file-table td > small { display: block; }
 .explorer-file-table td > strong { line-height: 1.4; overflow-wrap: anywhere; }
 .explorer-file-table td > small { margin-top: 6px; color: var(--muted); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
-.explorer-file-table .explorer-review-count { width: fit-content; padding: 3px 6px; border-radius: 5px; color: #f4cc82; background: #4a3718; font-weight: 800; }
+.explorer-file-table .explorer-review-count { width: fit-content; margin-top: 7px; padding: 4px 7px; border-radius: 5px; color: #f4cc82; background: #4a3718; font-weight: 800; }
+.explorer-file-table .explorer-review-button { border: 1px solid color-mix(in srgb, var(--accent) 58%, var(--line)); cursor: pointer; }
+.explorer-file-table .explorer-review-button:hover { color: var(--text); background: color-mix(in srgb, var(--accent) 24%, var(--surface)); }
 .explorer-file-table td .core { display: inline-block; max-width: 100%; }
+.explorer-review-cell > strong, .explorer-review-cell > small { display: block; }
+.explorer-review-cell > strong { margin-top: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.explorer-review-cell > small { margin-top: 5px; color: var(--muted); overflow-wrap: anywhere; }
 .explorer-retired { opacity: .65; background: #181419; }
 .explorer-modal { padding: 0; overflow-x: hidden; }
 .explorer-modal-wide { width: min(1120px, 94vw); }
@@ -205,6 +211,7 @@ input:focus, select:focus { border-color: var(--blue-2); box-shadow: 0 0 0 3px v
 .explorer-same-coordinate button { display: flex; justify-content: space-between; gap: 15px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--input); text-align: left; }
 .explorer-same-coordinate small { color: var(--muted); }
 .explorer-history-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }
+.explorer-history-grid-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .explorer-history { min-width: 0; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-low); }
 .explorer-history h3 small { color: var(--muted); }
 .explorer-history article { padding: 8px; border: 1px solid var(--line-strong); background: var(--input); }
@@ -212,6 +219,25 @@ input:focus, select:focus { border-color: var(--blue-2); box-shadow: 0 0 0 3px v
 .explorer-history article strong, .explorer-history article small { display: block; overflow-wrap: anywhere; }
 .explorer-history article small { margin-top: 4px; color: var(--muted); font-size: 13px; }
 .explorer-history article p { margin: 5px 0 0; color: #b9c4d3; font-size: 13px; }
+.explorer-review-relations { margin-top: 12px; padding: 14px; }
+.explorer-review-relations > header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
+.explorer-review-relations > header h3 { margin: 3px 0 0; font-size: 18px; }
+.explorer-review-relations > header > strong { color: var(--accent); font-size: 22px; }
+.explorer-review-relation-list { display: grid; gap: 9px; }
+.explorer-review-relation-list > article { display: grid; grid-template-columns: minmax(0, 1fr) minmax(210px, 0.28fr); gap: 16px; padding: 13px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--input); }
+.explorer-review-relation-main { min-width: 0; }
+.explorer-review-relation-main > strong, .explorer-review-relation-main > small, .explorer-review-relation-main > code { display: block; }
+.explorer-review-relation-main > strong { margin-top: 8px; font-size: 17px; line-height: 1.4; overflow-wrap: anywhere; }
+.explorer-review-relation-main > small { margin-top: 5px; color: var(--muted); }
+.explorer-review-relation-main > code { margin-top: 8px; color: #b9cbe5; white-space: normal; overflow-wrap: anywhere; }
+.explorer-review-class { display: inline-flex; padding: 4px 7px; border: 1px solid color-mix(in srgb, var(--accent) 58%, var(--line)); border-radius: 6px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--surface)); font-weight: 800; }
+.explorer-review-relation-side { display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 6px; padding-left: 14px; border-left: 1px solid var(--line); }
+.explorer-review-relation-side > span, .explorer-review-relation-side > small { color: var(--muted); }
+.explorer-review-relation-side > b { font-size: 17px; }
+.explorer-review-relation-side .button { margin-top: 4px; }
+.explorer-review-history { margin-top: 12px; color: var(--muted); }
+.explorer-review-history > summary { cursor: pointer; font-weight: 800; }
+.explorer-review-history .explorer-history { margin-top: 9px; }
 .explorer-action-footer { display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
 .explorer-action-footer > span { margin-right: auto; color: var(--muted); font-size: 13px; }
 .explorer-action-footer a { text-decoration: none; }

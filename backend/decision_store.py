@@ -4187,6 +4187,38 @@ def supersede_open_reviews_for_file(
     return len(rows)
 
 
+def supersede_open_reviews_for_inactive_file(
+    conn: sqlite3.Connection, file_id: str, *, reason: str
+) -> int:
+    """Close review edges that cannot be acted on after an automatic quarantine."""
+    rows = conn.execute(
+        """
+        SELECT review_id, evidence_json FROM review_items
+        WHERE state IN ('pending', 'deferred')
+          AND (candidate_file_id = ? OR reference_file_id = ?)
+        """,
+        (file_id, file_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {"previous_evidence": row["evidence_json"]}
+        evidence["automatic_suppression"] = {
+            "reason": reason,
+            "file_id": file_id,
+        }
+        conn.execute(
+            """
+            UPDATE review_items SET state = 'superseded', decision_id = NULL,
+                evidence_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = ?
+            """,
+            (json.dumps(evidence, ensure_ascii=False, sort_keys=True), row["review_id"]),
+        )
+    return len(rows)
+
+
 def record_human_restore_disposition(
     conn: sqlite3.Connection, file_id: str,
     *, reason: str = "user_selected_restore",

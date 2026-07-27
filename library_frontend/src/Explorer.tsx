@@ -12,6 +12,7 @@ import type {
   ExplorerFolderDetail,
   ExplorerFolderListing,
   ExplorerHistoryItem,
+  ExplorerReviewItem,
   ExplorerQuarantineListing,
   JobRecord
 } from "./types";
@@ -34,6 +35,36 @@ function formatBytes(value: number | null | undefined): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileName(filePath: string | null | undefined): string {
+  if (!filePath) return "파일명 없음";
+  return filePath.replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? filePath;
+}
+
+function reviewClassLabel(value: string | undefined): string {
+  return ({
+    text_equivalent: "본문 동일 추정",
+    epub_equivalent: "EPUB 내용 동일 추정",
+    metadata_only: "제목·좌표 기반 검토",
+    decode_lossy: "본문 디코딩 불확실",
+    longer_unresolved: "더 긴 판본 여부 미확정",
+    near_identical: "거의 동일한 본문",
+    contained_exact: "본문 포함 관계",
+    contained_version: "다른 범위를 포함한 판본",
+  } as Record<string, string>)[value ?? ""] ?? value ?? "검토 관계";
+}
+
+function reviewCoordinate(item: ExplorerReviewItem): string {
+  if (item.counterpart_coordinate_kind === "volume" && item.counterpart_volume_num !== null) {
+    return `${item.counterpart_volume_num}${item.counterpart_volume_den && item.counterpart_volume_den !== 1 ? `/${item.counterpart_volume_den}` : ""}권`;
+  }
+  if (item.counterpart_coordinate_kind === "part" && item.counterpart_part_num !== null) {
+    return `${item.counterpart_part_num}${item.counterpart_part_den && item.counterpart_part_den !== 1 ? `/${item.counterpart_part_den}` : ""}부`;
+  }
+  if (item.counterpart_coordinate_kind === "symbol") return item.counterpart_coordinate_symbol ?? "기호 좌표";
+  if (item.counterpart_coordinate_kind === "episode") return `${item.counterpart_episode_start ?? "?"}~${item.counterpart_episode_end ?? "?"}화`;
+  return item.counterpart_coordinate_raw ?? "좌표 없음";
 }
 
 function coordinate(item: Partial<ExplorerFile>): string {
@@ -126,6 +157,47 @@ function History({ label, items }: { label: string; items: ExplorerHistoryItem[]
   </article>) : <p className="muted">기록 없음</p>}</section>;
 }
 
+function ReviewRelations({ items, compareWith }: { items: ExplorerReviewItem[]; compareWith: (fileId: string) => void }) {
+  const open = items.filter((item) => item.state === "pending" || item.state === "deferred");
+  const closed = items.filter((item) => item.state !== "pending" && item.state !== "deferred");
+  return <section className="panel explorer-review-relations">
+    <header><div><span className="eyebrow">OPEN REVIEW RELATIONS</span><h3>검토할 상대 파일</h3></div><strong>{open.length}건</strong></header>
+    {open.length ? <div className="explorer-review-relation-list">{open.map((item) => <article key={item.review_id}>
+      <div className="explorer-review-relation-main">
+        <span className="explorer-review-class">{reviewClassLabel(item.classification)}</span>
+        <strong>{item.counterpart_name}</strong>
+        <small>{item.counterpart_core_title ?? "core 없음"} · {reviewCoordinate(item)} · {item.counterpart_author ?? "작가 미상"}</small>
+        <code title={item.counterpart_path}>{item.counterpart_path}</code>
+      </div>
+      <div className="explorer-review-relation-side">
+        <span>{item.counterpart_role === "candidate" ? "후보 파일" : "비교 기준"}</span>
+        <b>{formatBytes(item.counterpart_size)}</b>
+        <small>{item.counterpart_source} · {item.counterpart_active ? "활성" : "비활성"} · {item.counterpart_fingerprint_status ?? "지문 없음"}</small>
+        <button className="button primary" onClick={() => compareWith(item.counterpart_file_id)}>이 파일과 비교</button>
+      </div>
+    </article>)}</div> : <div className="empty">현재 열린 검토 관계가 없습니다.</div>}
+    {closed.length > 0 && <details className="explorer-review-history"><summary>지난 검토 이력 {closed.length}건</summary><History label="종료·교체된 검토" items={closed}/></details>}
+  </section>;
+}
+
+function FileCatalogRow({ item, selected, toggle, inspect }: { item: ExplorerFile; selected: boolean; toggle: () => void; inspect: () => void }) {
+  return <>
+    <tr className={item.retired_virtual_path ? "explorer-retired" : ""}>
+      <td><input type="checkbox" checked={selected} onChange={toggle} aria-label={`${item.name} 비교 선택`}/></td>
+      <td><strong>{item.name}</strong><small>{item.parent}</small><small>{item.source} · {item.active ? "활성" : "비활성"}{item.retired_virtual_path ? " · 가상 이력" : ""}</small><small className="explorer-inline-id">ID {item.file_id}</small></td>
+      <td><code className="core">{item.core_title ?? "core 없음"}</code><small>{coordinate(item)} · {item.author ?? "작가 미상"}</small></td>
+      <td><b>작품 {item.work_bucket_id ?? "-"} · 변형 {item.variant_id ?? "-"}</b><small>{item.assignment_state} · {item.variant_kind ?? "미분류"}</small><small>{item.representative ? "대표 파일" : "일반 파일"}{item.protected ? " · 보호" : ""}</small></td>
+      <td className="explorer-review-cell">{item.open_review_count > 0 ? <>
+        <button type="button" className="explorer-review-count explorer-review-button" onClick={inspect}>열린 검토 {item.open_review_count}건</button>
+        <strong title={item.open_review_sample_path ?? undefined}>{fileName(item.open_review_sample_path)}</strong>
+        <small>{reviewClassLabel(item.open_review_sample_classification ?? undefined)}{item.open_review_count > 1 ? ` · 외 ${item.open_review_count - 1}건` : ""}</small>
+      </> : <span className="muted-value">없음</span>}</td>
+      <td><b>{formatBytes(item.size)}</b><small>{item.fingerprint_status ?? "지문 없음"}</small><small>{item.normalized_sha256 ? `${item.normalized_sha256.slice(0, 12)}…` : "normalized SHA 없음"}</small></td>
+      <td><button className="button ghost" onClick={inspect}>검사</button></td>
+    </tr>
+  </>;
+}
+
 function FileInspector({ fileId, close, compareWith, quarantine, organize, correctTitle }: { fileId: string; close: () => void; compareWith: (fileId: string) => void; quarantine: () => void; organize: (file: ExplorerFile) => void; correctTitle: () => void }) {
   const [detail, setDetail] = useState<ExplorerFileDetail>();
   const [error, setError] = useState("");
@@ -146,7 +218,8 @@ function FileInspector({ fileId, close, compareWith, quarantine, organize, corre
       {detail.actions.quarantine_blocked_reasons.length > 0 && <div className="explorer-blockers"><strong>격리 차단 사유</strong>{detail.actions.quarantine_blocked_reasons.map((reason) => <span key={reason}>{reason}</span>)}</div>}
       <section className="panel explorer-fingerprint"><h3>본문 지문</h3><dl><dt>상태</dt><dd>{detail.file.fingerprint_status ?? "없음"}</dd><dt>raw SHA</dt><dd>{detail.file.raw_sha256 ?? "없음"}</dd><dt>normalized SHA</dt><dd>{detail.file.normalized_sha256 ?? "없음"}</dd><dt>정규화 길이</dt><dd>{detail.file.normalized_length ? formatNumber(detail.file.normalized_length) : "-"}</dd></dl></section>
       {detail.same_coordinate.length > 0 && <section className="panel explorer-same-coordinate"><h3>같은 작품 좌표 {detail.same_coordinate.length}개</h3>{detail.same_coordinate.map((item) => <button key={item.file_id} onClick={() => compareWith(item.file_id)}><strong>{item.canonical_path.split("/").pop()}</strong><small>{formatBytes(item.size)} · {item.author ?? "작가 미상"}</small></button>)}</section>}
-      <div className="explorer-history-grid"><History label="검토" items={detail.reviews} /><History label="사람 결정" items={detail.decisions} /><History label="파일 작업" items={detail.operations} /></div>
+      <ReviewRelations items={detail.reviews} compareWith={compareWith}/>
+      <div className="explorer-history-grid explorer-history-grid-two"><History label="사람 결정" items={detail.decisions} /><History label="파일 작업" items={detail.operations} /></div>
       <footer className="explorer-action-footer"><span>파일 정리와 격리는 계획 SHA와 현재 identity를 다시 확인한 뒤 실행됩니다.</span>{detail.actions.title_correction && <button className="button secondary" onClick={correctTitle}>빠른 제목 교정</button>}<button className="button secondary" disabled={!detail.file.active || detail.file.source !== "house"} onClick={() => organize(detail.file)}>이름·위치 정리</button><button className="button danger" disabled={!detail.actions.quarantine} onClick={quarantine}>사용자 승인 격리</button></footer>
     </>}
   </Modal>;
@@ -197,7 +270,7 @@ function FileCatalog() {
       <button className="button primary" disabled={selected.length !== 2} onClick={() => setCompare(selected)}>두 파일 비교</button>
     </div>
     <section className="table-panel"><div className="table-summary"><span>현재 조건 <strong>{formatNumber(listing?.total ?? 0)}</strong>파일 · 비교 선택 {selected.length}/2</span><span>변경 작업은 계획 확인 후에만 실행</span></div>
-      {!listing ? <div className="loading"><span/>파일 목록을 확인하고 있습니다.</div> : listing.items.length ? <div className="catalog-table-wrap"><table className="explorer-file-table"><thead><tr><th>선택</th><th>파일·경로</th><th>core·좌표</th><th>관계</th><th>크기·지문</th><th>상세</th></tr></thead><tbody>{listing.items.map((item) => <tr key={item.file_id} className={item.retired_virtual_path ? "explorer-retired" : ""}><td><input type="checkbox" checked={selected.includes(item.file_id)} onChange={() => toggle(item.file_id)} aria-label={`${item.name} 비교 선택`}/></td><td><strong>{item.name}</strong><small>{item.parent}</small><small>{item.source} · {item.active ? "활성" : "비활성"}{item.retired_virtual_path ? " · 가상 이력" : ""}</small><small className="explorer-inline-id">ID {item.file_id}</small></td><td><code className="core">{item.core_title ?? "core 없음"}</code><small>{coordinate(item)} · {item.author ?? "작가 미상"}</small></td><td><b>작품 {item.work_bucket_id ?? "-"} · 변형 {item.variant_id ?? "-"}</b><small>{item.assignment_state} · {item.variant_kind ?? "미분류"}</small><small>{item.representative ? "대표 파일" : "일반 파일"}{item.protected ? " · 보호" : ""}</small>{item.open_review_count > 0 && <small className="explorer-review-count">열린 검토 {item.open_review_count}건</small>}</td><td><b>{formatBytes(item.size)}</b><small>{item.fingerprint_status ?? "지문 없음"}</small><small>{item.normalized_sha256 ? `${item.normalized_sha256.slice(0, 12)}…` : "normalized SHA 없음"}</small></td><td><button className="button ghost" onClick={() => setDetailId(item.file_id)}>검사</button></td></tr>)}</tbody></table></div> : <div className="empty">조건에 맞는 파일이 없습니다.</div>}
+      {!listing ? <div className="loading"><span/>파일 목록을 확인하고 있습니다.</div> : listing.items.length ? <div className="catalog-table-wrap"><table className="explorer-file-table"><thead><tr><th>선택</th><th>파일·경로</th><th>core·좌표</th><th>관계</th><th>검토 상대</th><th>크기·지문</th><th>상세</th></tr></thead><tbody>{listing.items.map((item) => <FileCatalogRow key={item.file_id} item={item} selected={selected.includes(item.file_id)} toggle={() => toggle(item.file_id)} inspect={() => setDetailId(item.file_id)}/>)}</tbody></table></div> : <div className="empty">조건에 맞는 파일이 없습니다.</div>}
       {listing && <Pager cursor={cursor} next={listing.next_cursor} limit={listing.limit} setCursor={(value) => update({ cursor: value === "0" ? "" : value })}/>}</section>
     {detailId && <FileInspector fileId={detailId} close={() => setDetailId(undefined)} compareWith={(other) => { setDetailId(undefined); setCompare([detailId, other]); }} quarantine={() => { setQuarantinePair({ source: detailId }); setDetailId(undefined); }} organize={(file) => { setOrganizeFile(file); setDetailId(undefined); }} correctTitle={() => { setQuickTitleId(detailId); setDetailId(undefined); }}/>} {compare?.length === 2 && <CompareModal leftId={compare[0]} rightId={compare[1]} close={() => setCompare(undefined)} manage={(decisionId) => { setRelationship({ left: compare[0], right: compare[1], decisionId }); setCompare(undefined); }} quarantine={(sourceId, keepId) => { setQuarantinePair({ source: sourceId, keep: keepId }); setCompare(undefined); }}/>} {relationship && <RelationshipManager leftId={relationship.left} rightId={relationship.right} currentDecisionId={relationship.decisionId} close={() => setRelationship(undefined)} done={load}/>} {quarantinePair && <QuarantineManager sourceId={quarantinePair.source} keepId={quarantinePair.keep} close={() => setQuarantinePair(undefined)} started={setJobNotice}/>} {organizeFile && <FileRelocateManager fileId={organizeFile.file_id} currentName={organizeFile.name} currentParent={organizeFile.parent} close={() => setOrganizeFile(undefined)} started={setJobNotice}/>} {quickTitleId && <QuickTitleCorrectionManager fileId={quickTitleId} close={() => setQuickTitleId(undefined)} started={setJobNotice}/>}</>;
 }

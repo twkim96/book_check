@@ -101,6 +101,20 @@ def test_unassigned_house_exact_duplicate_is_cleaned_by_same_pipeline(tmp_path):
         duplicate = _add(
             conn, house / "ㄴ" / "남궁세가의 서자 1-175 완_dup_1.txt", "house"
         )
+        with decision_store.transaction(conn):
+            review_id = conn.execute(
+                """
+                INSERT INTO review_items(
+                    candidate_file_id, reference_file_id,
+                    left_fingerprint_id, right_fingerprint_id,
+                    classification, evidence_json
+                ) VALUES (?, ?, ?, ?, 'text_equivalent', '{}')
+                """,
+                (
+                    duplicate["file_id"], keep["file_id"],
+                    duplicate["current_fingerprint_id"], keep["current_fingerprint_id"],
+                ),
+            ).lastrowid
     finally:
         conn.close()
 
@@ -113,8 +127,16 @@ def test_unassigned_house_exact_duplicate_is_cleaned_by_same_pipeline(tmp_path):
         moved = conn.execute(
             "SELECT * FROM files WHERE file_id = ?", (duplicate["file_id"],)
         ).fetchone()
+        review = conn.execute(
+            "SELECT state, evidence_json FROM review_items WHERE review_id = ?", (review_id,)
+        ).fetchone()
         assert moved["active"] == 0
         assert moved["source"] == "quarantine"
+        assert review["state"] == "superseded"
+        assert (
+            __import__("json").loads(review["evidence_json"])["automatic_suppression"]["reason"]
+            == "exact_quarantine"
+        )
         assert decision_store.doctor_issues(conn) == []
     finally:
         conn.close()

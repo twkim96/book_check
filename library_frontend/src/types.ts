@@ -479,6 +479,8 @@ export interface ExplorerFile {
   normalized_sha256: string | null;
   normalized_length: number | null;
   open_review_count: number;
+  open_review_sample_path: string | null;
+  open_review_sample_classification: string | null;
   retired_virtual_path: boolean;
 }
 
@@ -516,9 +518,35 @@ export interface ExplorerHistoryItem {
   evidence?: unknown;
 }
 
+export interface ExplorerReviewItem extends ExplorerHistoryItem {
+  candidate_file_id: string;
+  reference_file_id: string;
+  counterpart_role: "candidate" | "reference";
+  counterpart_file_id: string;
+  counterpart_path: string;
+  counterpart_name: string;
+  counterpart_parent: string;
+  counterpart_source: string;
+  counterpart_active: boolean;
+  counterpart_size: number;
+  counterpart_core_title: string | null;
+  counterpart_readable_title: string | null;
+  counterpart_author: string | null;
+  counterpart_coordinate_kind: string | null;
+  counterpart_part_num: number | null;
+  counterpart_part_den: number | null;
+  counterpart_volume_num: number | null;
+  counterpart_volume_den: number | null;
+  counterpart_coordinate_symbol: string | null;
+  counterpart_episode_start: number | null;
+  counterpart_episode_end: number | null;
+  counterpart_coordinate_raw: string | null;
+  counterpart_fingerprint_status: string | null;
+}
+
 export interface ExplorerFileDetail {
   file: ExplorerFile & Record<string, unknown>;
-  reviews: ExplorerHistoryItem[];
+  reviews: ExplorerReviewItem[];
   decisions: ExplorerHistoryItem[];
   operations: ExplorerHistoryItem[];
   same_coordinate: Array<{ file_id: string; canonical_path: string; size: number; source: string; active: number; author: string | null }>;
