@@ -1,0 +1,319 @@
+from pathlib import Path
+
+import decision_store
+import dedup_mutations
+import deduplicator
+
+
+def _add(conn, path: Path, source: str, content=b"identical bytes"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    with decision_store.transaction(conn):
+        row = decision_store.reconcile_file_metadata(conn, path, source=source)
+    dedup_mutations.refresh_user_approved_snapshot(conn, row["file_id"])
+    result = dict(dedup_mutations._file_state(conn, row["file_id"]))
+    result.update({
+        "name": path.name,
+        "path": str(path),
+        "ext": path.suffix.lower(),
+        "mutation_eligible": True,
+    })
+    return result
+
+
+def _approve(state_db: Path, house: Path, temp: Path):
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        backup = decision_store.backup_state_db(
+            conn, state_db.parent / "backups" / "before-exact-cleanup.sqlite3"
+        )
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+    return decision_store.prepare_actual_run(state_db, house, temp)[0]
+
+
+def _exact_group(keep, duplicate):
+    return {
+        "hash": keep["raw_sha256"],
+        "keep": keep,
+        "duplicates": [duplicate],
+    }
+
+
+def _run_exact_group(state_db, temp, run_id, keep, duplicate):
+    return deduplicator._managed_exact_records(
+        [_exact_group(keep, duplicate)],
+        str(state_db),
+        str(temp),
+        False,
+        actual_run_id=run_id,
+    )[0]
+
+
+def test_unassigned_temp_exact_is_quarantined_against_unassigned_house_keep(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "ㄴ" / "남궁세가의 서자 1-175 완.txt", "house")
+        duplicate = _add(conn, temp / "남궁세가의 서자 1-175 완.txt", "temp")
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        moved = conn.execute(
+            "SELECT * FROM files WHERE file_id = ?", (duplicate["file_id"],)
+        ).fetchone()
+        assert moved["active"] == 0
+        assert moved["source"] == "quarantine"
+        assert moved["assignment_state"] == "unassigned"
+        assert moved["variant_id"] is None
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert record["action"] == "exact_quarantine"
+    assert Path(record["dest_path"]).is_file()
+    assert Path(keep["canonical_path"]).is_file()
+    assert not Path(duplicate["canonical_path"]).exists()
+
+
+def test_unassigned_house_exact_duplicate_is_cleaned_by_same_pipeline(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "ㄴ" / "남궁세가의 서자 1-175 완.txt", "house")
+        duplicate = _add(
+            conn, house / "ㄴ" / "남궁세가의 서자 1-175 완_dup_1.txt", "house"
+        )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        moved = conn.execute(
+            "SELECT * FROM files WHERE file_id = ?", (duplicate["file_id"],)
+        ).fetchone()
+        assert moved["active"] == 0
+        assert moved["source"] == "quarantine"
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert record["action"] == "exact_quarantine"
+    assert Path(record["dest_path"]).is_file()
+    assert Path(keep["canonical_path"]).is_file()
+    assert not Path(duplicate["canonical_path"]).exists()
+
+
+def test_unassigned_house_cleanup_still_revalidates_raw_sha(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "원본.txt", "house", b"keep")
+        duplicate = _add(conn, house / "원본_dup_1.txt", "house", b"different")
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        try:
+            dedup_mutations.exact_quarantine(
+                conn,
+                source_file_id=duplicate["file_id"],
+                keep_file_id=keep["file_id"],
+                quarantine_dir=temp / "trash_bin" / "exact_quarantine",
+                run_id=run_id,
+            )
+        except RuntimeError as exc:
+            assert "raw SHA" in str(exc)
+        else:
+            raise AssertionError("different bytes must not be quarantined as exact")
+        decision_store.finish_actual_run(conn, run_id, success=False, error="expected")
+    finally:
+        conn.close()
+
+    assert Path(keep["canonical_path"]).is_file()
+    assert Path(duplicate["canonical_path"]).is_file()
+
+
+def test_exact_cleanup_accepts_decode_lossy_fingerprint_without_cached_raw_sha(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "손실 디코딩.txt", "house")
+        duplicate = _add(conn, house / "손실 디코딩_dup_1.txt", "house")
+        with decision_store.transaction(conn):
+            lossy_ids = []
+            for item in (keep, duplicate):
+                lossy_ids.append(conn.execute(
+                    """
+                    INSERT INTO fingerprints(
+                        file_id, canonical_path, size, mtime_ns, normalizer_version,
+                        fingerprint_version, dev, ino, ctime_ns, status
+                    ) VALUES (?, ?, ?, ?, '1.3.0', ?, ?, ?, ?, 'decode_lossy')
+                    """,
+                    (
+                        item["file_id"], item["canonical_path"], item["size"],
+                        item["mtime_ns"], f"test-lossy-{item['file_id']}",
+                        item["dev"], item["ino"], item["ctime_ns"],
+                    ),
+                ).lastrowid)
+            conn.execute(
+                "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ?",
+                (lossy_ids[0], keep["file_id"]),
+            )
+            conn.execute(
+                "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ?",
+                (lossy_ids[1], duplicate["file_id"]),
+            )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert record["action"] == "exact_quarantine"
+    assert Path(record["dest_path"]).is_file()
+    assert Path(keep["canonical_path"]).is_file()
+
+
+def test_exact_cleanup_prepares_missing_legacy_fingerprints(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "레거시.txt", "house")
+        duplicate = _add(conn, house / "레거시_dup_1.txt", "house")
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET current_fingerprint_id = NULL WHERE file_id IN (?, ?)",
+                (keep["file_id"], duplicate["file_id"]),
+            )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        current_keep = conn.execute(
+            "SELECT current_fingerprint_id FROM files WHERE file_id = ?", (keep["file_id"],)
+        ).fetchone()
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert current_keep["current_fingerprint_id"] is not None
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert record["action"] == "exact_quarantine"
+    assert Path(record["dest_path"]).is_file()
+
+
+def test_exact_cleanup_preserves_decision_required_keep(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "검토 대상.txt", "house")
+        duplicate = _add(conn, house / "검토 대상_dup_1.txt", "house")
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET assignment_state = 'decision_required' WHERE file_id = ?",
+                (keep["file_id"],),
+            )
+        keep["assignment_state"] = "decision_required"
+        keep["mutation_eligible"] = False
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        current_keep = conn.execute(
+            "SELECT active, assignment_state FROM files WHERE file_id = ?", (keep["file_id"],)
+        ).fetchone()
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert current_keep["active"] == 1
+        assert current_keep["assignment_state"] == "decision_required"
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert record["action"] == "exact_quarantine"
+    assert Path(keep["canonical_path"]).is_file()
+
+
+def test_exact_cleanup_quarantines_unprotected_legacy_duplicate(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "레거시 중복.txt", "house")
+        duplicate = _add(conn, house / "레거시 중복〔P〕.txt", "house")
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET assignment_state = 'legacy_unresolved' WHERE file_id = ?",
+                (duplicate["file_id"],),
+            )
+        duplicate["assignment_state"] = "legacy_unresolved"
+        duplicate["mutation_eligible"] = False
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert record["action"] == "exact_quarantine"
+    assert Path(record["dest_path"]).is_file()
+    assert Path(keep["canonical_path"]).is_file()

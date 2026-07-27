@@ -46,19 +46,35 @@ def _ensure_intake_fingerprint(conn, source):
     from normalizer import NORMALIZER_VERSION
 
     with decision_store.transaction(conn):
-        fingerprint_id = conn.execute(
+        existing = conn.execute(
             """
-            INSERT INTO fingerprints(
-                file_id, canonical_path, size, mtime_ns, normalizer_version,
-                fingerprint_version, dev, ino, ctime_ns, raw_sha256, status
-            ) VALUES (?, ?, ?, ?, ?, 'intake-raw-v1', ?, ?, ?, ?, 'raw_only')
+            SELECT fingerprint_id FROM fingerprints
+            WHERE file_id = ? AND canonical_path = ? AND size = ? AND mtime_ns = ?
+              AND dev = ? AND ino = ? AND ctime_ns = ? AND raw_sha256 = ?
+            ORDER BY fingerprint_id DESC LIMIT 1
             """,
             (
                 source["file_id"], source["canonical_path"], source["size"],
-                source["mtime_ns"], NORMALIZER_VERSION,
-                evidence.dev, evidence.ino, evidence.ctime_ns, evidence.sha256,
+                source["mtime_ns"], evidence.dev, evidence.ino,
+                evidence.ctime_ns, evidence.sha256,
             ),
-        ).lastrowid
+        ).fetchone()
+        if existing is not None:
+            fingerprint_id = existing["fingerprint_id"]
+        else:
+            fingerprint_id = conn.execute(
+                """
+                INSERT INTO fingerprints(
+                    file_id, canonical_path, size, mtime_ns, normalizer_version,
+                    fingerprint_version, dev, ino, ctime_ns, raw_sha256, status
+                ) VALUES (?, ?, ?, ?, ?, 'intake-raw-v1', ?, ?, ?, ?, 'raw_only')
+                """,
+                (
+                    source["file_id"], source["canonical_path"], source["size"],
+                    source["mtime_ns"], NORMALIZER_VERSION,
+                    evidence.dev, evidence.ino, evidence.ctime_ns, evidence.sha256,
+                ),
+            ).lastrowid
         conn.execute(
             "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ?",
             (fingerprint_id, source["file_id"]),
@@ -589,12 +605,24 @@ def _assert_row_identity(row, evidence, path):
         raise RuntimeError(f"stale source snapshot: {path}")
 
 
-def _ensure_mutable_source(row):
+def _ensure_mutable_source(row, *, allow_unassigned_house_exact=False):
     if row["protected"] or row["representative"]:
         raise RuntimeError("protected/representative file cannot be a mutation source")
-    if row["source"] == "house" and row["assignment_state"] != "managed":
+    if (
+        row["source"] == "house"
+        and row["assignment_state"] != "managed"
+        and not (
+            allow_unassigned_house_exact
+            and row["assignment_state"] in {
+                "unassigned", "legacy_unresolved", "decision_required"
+            }
+        )
+    ):
         raise RuntimeError("unassigned house file cannot be mutated")
-    if row["assignment_state"] in {"legacy_unresolved", "decision_required"}:
+    if (
+        row["assignment_state"] in {"legacy_unresolved", "decision_required"}
+        and not allow_unassigned_house_exact
+    ):
         raise RuntimeError(f"assignment state blocks mutation: {row['assignment_state']}")
 
 
@@ -627,19 +655,41 @@ def _exact_quarantine(
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     source = _file_state(conn, source_file_id)
     keep = _file_state(conn, keep_file_id)
+    # Some legacy files and analyses that could not decode the body have no
+    # current fingerprint.  Exact cleanup still has stronger evidence
+    # available: both regular files are hashed in full immediately below.
+    # Attach an immutable raw-only fingerprint first so the journal and guards
+    # remain identity-bound instead of weakening the mutation contract.
+    source = _ensure_intake_fingerprint(conn, source)
+    keep = _ensure_intake_fingerprint(conn, keep)
     source_root = "temp_root" if source["source"] == "temp" else "house_root"
     decision_store.assert_actual_run_path(actual_run, source["canonical_path"], source_root)
     decision_store.assert_actual_run_path(actual_run, keep["canonical_path"], "house_root")
     decision_store.assert_actual_run_path(actual_run, quarantine_dir, "temp_root")
-    _ensure_mutable_source(source)
+    # Exact cleanup is the only automatic mutation allowed to consume an
+    # unassigned or unresolved house file.  It is still bound to the approved
+    # manifest, never consumes a protected/representative file, and both files
+    # are raw-SHA revalidated immediately below.  Other mutation paths keep the
+    # stricter managed-only house rule.
+    _ensure_mutable_source(source, allow_unassigned_house_exact=True)
     source_path = _preflight(source)
     keep_path = _preflight(keep)
     if source_file_id == keep_file_id:
         raise ValueError("source and keep must differ")
-    if keep["assignment_state"] != "managed":
-        raise RuntimeError("exact keep must be managed")
-    if source["assignment_state"] == "managed" and source["variant_id"] != keep["variant_id"]:
-        raise RuntimeError("managed exact files belong to different variants")
+    if keep["source"] != "house":
+        raise RuntimeError("exact keep must be an active house file")
+    if keep["assignment_state"] not in {
+        "managed", "unassigned", "legacy_unresolved", "decision_required"
+    }:
+        raise RuntimeError("exact keep assignment state blocks mutation")
+    if keep["assignment_state"] == "managed" and not keep["representative"]:
+        raise RuntimeError("managed exact keep must be representative")
+    if source["assignment_state"] == "managed":
+        if (
+            keep["assignment_state"] != "managed"
+            or source["variant_id"] != keep["variant_id"]
+        ):
+            raise RuntimeError("managed exact files belong to different variants")
     if not decision_store.coordinates_compatible(source, keep):
         raise RuntimeError("exact files have incompatible canonical coordinates")
 
@@ -654,8 +704,17 @@ def _exact_quarantine(
     keep_hash = keep_evidence.sha256
     if source_hash != keep_hash:
         raise RuntimeError("exact raw SHA revalidation failed")
-    if source["raw_sha256"] != source_hash or keep["raw_sha256"] != keep_hash:
-        raise RuntimeError("cached raw SHA does not match current bytes")
+    # decode_lossy/epub_error fingerprints intentionally may not contain a raw
+    # cache.  Absence is not a mismatch: the two current files were just read
+    # in full and matched.  A populated cache, however, must still agree.
+    if source["raw_sha256"] is not None and source["raw_sha256"] != source_hash:
+        raise RuntimeError(
+            f"cached source raw SHA does not match current bytes: {source_path}"
+        )
+    if keep["raw_sha256"] is not None and keep["raw_sha256"] != keep_hash:
+        raise RuntimeError(
+            f"cached keep raw SHA does not match current bytes: {keep_path}"
+        )
 
     destination = _unique_destination(quarantine_dir, source_path.name)
     with decision_store.transaction(conn):
@@ -683,12 +742,17 @@ def _exact_quarantine(
         current_keep = _file_state(conn, keep_file_id)
         if current_source["current_fingerprint_id"] != source["current_fingerprint_id"]:
             raise RuntimeError("exact source fingerprint changed before consume")
-        if (
-            current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]
-            or not current_keep["representative"]
-            or current_keep["assignment_state"] != "managed"
-        ):
+        if current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
             raise RuntimeError("exact keep guard changed before consume")
+        if current_keep["source"] != "house":
+            raise RuntimeError("exact keep left house before consume")
+        if current_keep["assignment_state"] == "managed":
+            if not current_keep["representative"]:
+                raise RuntimeError("managed exact keep is no longer representative")
+        elif current_keep["assignment_state"] not in {
+            "unassigned", "legacy_unresolved", "decision_required"
+        }:
+            raise RuntimeError("exact keep assignment changed before consume")
         if not evidence_matches(inspect_regular_file(keep_path), keep_evidence):
             raise RuntimeError("exact keep identity changed before consume")
 
@@ -697,20 +761,23 @@ def _exact_quarantine(
     )
 
     with decision_store.transaction(conn):
-        variant_id = source["variant_id"] or keep["variant_id"]
-        assignment_origin = source["assignment_origin"] or "strong_match"
+        keep_is_managed = keep["assignment_state"] == "managed"
+        variant_id = keep["variant_id"] if keep_is_managed else None
+        assignment_state = "managed" if keep_is_managed else "unassigned"
+        assignment_origin = "strong_match" if keep_is_managed else None
         conn.execute(
             """
             UPDATE files
             SET canonical_path = ?, source = 'quarantine', active = 0,
                 dev = ?, ino = ?, ctime_ns = ?, size = ?, mtime_ns = ?,
-                variant_id = ?, assignment_state = 'managed', assignment_origin = ?
+                variant_id = ?, assignment_state = ?, assignment_origin = ?
             WHERE file_id = ?
             """,
             (
                 str(destination), destination_evidence.dev, destination_evidence.ino,
                 destination_evidence.ctime_ns, destination_evidence.size,
-                destination_evidence.mtime_ns, variant_id, assignment_origin, source_file_id,
+                destination_evidence.mtime_ns, variant_id, assignment_state,
+                assignment_origin, source_file_id,
             ),
         )
         decision_store.transition_operation(conn, operation_id, "db_done")

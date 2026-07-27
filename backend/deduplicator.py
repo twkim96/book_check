@@ -1346,16 +1346,37 @@ def _managed_exact_records(exact_groups, state_db_path, temp_dir, dry_run, actua
                     "dest_path": None,
                     "size": entry["size"],
                 }
+                keep_state = keep.get("assignment_state")
+                entry_state = entry.get("assignment_state")
+                managed_relation_conflict = (
+                    entry_state == "managed"
+                    and (
+                        keep_state != "managed"
+                        or entry.get("variant_id") != keep.get("variant_id")
+                    )
+                )
                 if (
                     not keep.get("file_id")
-                    or keep.get("assignment_state") != "managed"
-                    or not keep.get("representative")
+                    or keep.get("source") != "house"
+                    or keep_state not in {
+                        "managed", "unassigned", "legacy_unresolved", "decision_required"
+                    }
+                    or (keep_state == "managed" and not keep.get("representative"))
                     or not entry.get("file_id")
                     or entry.get("protected")
                     or entry.get("representative")
-                    or not entry.get("mutation_eligible", True)
+                    or (
+                        not entry.get("mutation_eligible", True)
+                        and entry_state not in {"legacy_unresolved", "decision_required"}
+                    )
                     or group_coordinate_conflict
-                    or (entry.get("source") == "house" and entry.get("assignment_state") != "managed")
+                    or (
+                        entry.get("source") == "house"
+                        and entry_state not in {
+                            "managed", "unassigned", "legacy_unresolved", "decision_required"
+                        }
+                    )
+                    or managed_relation_conflict
                     or not decision_store.coordinates_compatible(
                         decision_store.coordinate_fields_from_name(entry["name"]),
                         decision_store.coordinate_fields_from_name(keep["name"]),
