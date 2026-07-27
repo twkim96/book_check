@@ -2,6 +2,7 @@
 
 - 상태: 구현 및 운영 house 적용 완료
 - 기준 커밋: `febdc73` (`feat: infer safe ebook volume groups`)
+- 완료 커밋: `533f22c`, `b7fb5c8`
 - 적용일: 2026-07-27
 - 범위: 기존 Folderling 중복처리 파이프라인의 exact 격리 계약 보강
 
@@ -101,7 +102,7 @@ Folderling 파이프라인에 다시 넣어 exact, 제목·좌표, TXT 본문, E
 
 최종 검증 결과:
 
-- 공개 Python 회귀: `248 passed`
+- 공개 Python 회귀: `249 passed`
 - Python `compileall`: 통과
 - TypeScript/Vite production build: 통과
 - `git diff --check`: 통과
