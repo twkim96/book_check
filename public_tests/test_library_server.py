@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 
 import decision_store
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
-from library_jobs import JobActiveError, JobRunner, JobStore
+from library_jobs import JobActiveError, JobNeedsReview, JobRunner, JobStore
 from library_server import create_app
 
 
@@ -515,6 +516,19 @@ def test_management_relationship_preview_and_apply_routes(tmp_path):
     plan = preview.get_json()["data"]
     assert plan["apply_available"] is True
 
+    runner = app.extensions["library_job_runner"]
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_job(_payload, _progress):
+        entered.set()
+        assert release.wait(5)
+        return {"released": True}
+
+    runner.register("fixture_blocking_mutation", blocking_job)
+    runner.enqueue("fixture_blocking_mutation", {})
+    assert entered.wait(5)
+
     applied = client.post(
         "/api/management/relationships/apply",
         json={
@@ -523,8 +537,20 @@ def test_management_relationship_preview_and_apply_routes(tmp_path):
             "confirm_plan_sha256": plan["plan_sha256"],
         },
     )
-    assert applied.status_code == 200
-    assert applied.get_json()["data"]["decision_id"]
+    assert applied.status_code == 202
+    accepted = applied.get_json()["data"]
+    assert accepted["state"] == "queued"
+    assert accepted["queue_position"] == 2
+    job_id = accepted["job_id"]
+    release.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/jobs/{job_id}").get_json()["data"]
+        if job["state"] in {"succeeded", "failed", "needs_review"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "succeeded"
+    assert job["result"]["decision_id"]
 
     quarantine = client.post(
         "/api/management/quarantine/preview",
@@ -532,6 +558,87 @@ def test_management_relationship_preview_and_apply_routes(tmp_path):
     )
     assert quarantine.status_code == 200
     assert quarantine.get_json()["data"]["apply_available"] is True
+
+
+def test_queued_relationship_requires_reconfirmation_after_endpoint_changes(tmp_path):
+    app, first_id = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    second_path = config.house_dir / "대기 중 바뀔 extra.txt"
+    second_path.write_text("서로 다른 extra 본문", encoding="utf-8")
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        _ensure_intake_fingerprint(conn, _file_state(conn, first_id))
+        with decision_store.transaction(conn):
+            second = decision_store.reconcile_file_metadata(
+                conn, second_path, source="house"
+            )
+        _ensure_intake_fingerprint(conn, _file_state(conn, second["file_id"]))
+    finally:
+        conn.close()
+
+    payload = {
+        "left_file_id": first_id,
+        "right_file_id": second["file_id"],
+        "verdict": "same_work_distinct_variant",
+        "variant_kind": "other",
+        "note": "queued stale fixture",
+    }
+    client = app.test_client()
+    plan = client.post(
+        "/api/management/relationships/preview", json=payload
+    ).get_json()["data"]
+    runner = app.extensions["library_job_runner"]
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_job(_payload, _progress):
+        entered.set()
+        assert release.wait(5)
+        return {}
+
+    runner.register("fixture_stale_blocker", blocking_job)
+    runner.enqueue("fixture_stale_blocker", {})
+    assert entered.wait(5)
+    accepted = client.post(
+        "/api/management/relationships/apply",
+        json={
+            **payload,
+            "confirm_count": plan["item_count"],
+            "confirm_plan_sha256": plan["plan_sha256"],
+        },
+    ).get_json()["data"]
+    assert accepted["state"] == "queued"
+
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET active = 0 WHERE file_id = ?",
+                (second["file_id"],),
+            )
+    finally:
+        conn.close()
+    release.set()
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = runner.get(accepted["job_id"])
+        if job["state"] in {"needs_review", "failed", "succeeded"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "needs_review"
+    assert job["error"]["code"] == "reconfirmation_required"
+
+    conn = decision_store.connect_state_db_readonly(config.state_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM decisions WHERE active = 1 AND "
+            "((left_file_id = ? AND right_file_id = ?) OR "
+            "(left_file_id = ? AND right_file_id = ?))",
+            (first_id, second["file_id"], second["file_id"], first_id),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_readonly_review_queue_lists_managed_warning_files(tmp_path):
@@ -796,6 +903,18 @@ def test_job_store_marks_running_records_interrupted_after_restart(tmp_path):
     assert event["status"] == "interrupted"
 
 
+def test_job_cancel_api_only_cancels_waiting_record(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    runner = app.extensions["library_job_runner"]
+    waiting = runner.store.create("synthetic", {})
+
+    response = app.test_client().post(f"/api/jobs/{waiting['job_id']}/cancel")
+
+    assert response.status_code == 200
+    assert response.get_json()["data"]["state"] == "cancelled"
+    assert runner.store.events(waiting["job_id"])[-1]["phase"] == "job_cancelled"
+
+
 def test_job_runner_persists_structured_failure_event(tmp_path):
     runner = JobRunner(JobStore(tmp_path / "runtime"))
     try:
@@ -826,6 +945,75 @@ def test_job_runner_exclusive_rejects_a_second_active_job(tmp_path):
         with pytest.raises(JobActiveError) as raised:
             runner.start_exclusive("second", {})
         assert raised.value.job_id == active["job_id"]
+    finally:
+        runner.shutdown()
+
+
+def test_job_runner_queues_mutations_in_order_and_cancels_waiting_job(tmp_path):
+    runner = JobRunner(JobStore(tmp_path / "runtime"))
+    entered = threading.Event()
+    release = threading.Event()
+    order = []
+    try:
+        def handle(payload, _progress):
+            order.append(f"start:{payload['value']}")
+            if payload["value"] == 1:
+                entered.set()
+                assert release.wait(5)
+            order.append(f"finish:{payload['value']}")
+            return {"value": payload["value"]}
+
+        runner.register("mutation", handle)
+        first = runner.enqueue("mutation", {"value": 1})
+        assert entered.wait(5)
+        with pytest.raises(RuntimeError, match="실행을 시작한 작업"):
+            runner.cancel(first["job_id"])
+        second = runner.enqueue("mutation", {"value": 2})
+        duplicate = runner.enqueue("mutation", {"value": 2})
+        third = runner.enqueue("mutation", {"value": 3})
+
+        assert duplicate["job_id"] == second["job_id"]
+        assert runner.get(second["job_id"])["queue_position"] == 2
+        assert runner.get(second["job_id"])["jobs_ahead"] == 1
+        assert runner.get(third["job_id"])["queue_position"] == 3
+        cancelled = runner.cancel(third["job_id"])
+        assert cancelled["state"] == "cancelled"
+
+        release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if runner.get(second["job_id"])["state"] == "succeeded":
+                break
+            time.sleep(0.01)
+        assert runner.get(first["job_id"])["state"] == "succeeded"
+        assert runner.get(second["job_id"])["state"] == "succeeded"
+        assert runner.get(third["job_id"])["state"] == "cancelled"
+        assert order == ["start:1", "finish:1", "start:2", "finish:2"]
+    finally:
+        release.set()
+        runner.shutdown()
+
+
+def test_job_runner_records_queue_time_plan_drift_as_needs_review(tmp_path):
+    runner = JobRunner(JobStore(tmp_path / "runtime"))
+    try:
+        def needs_review(_payload, _progress):
+            raise JobNeedsReview(
+                "계획 재확인이 필요합니다.", cause="fixture plan changed"
+            )
+
+        runner.register("mutation", needs_review)
+        record = runner.enqueue("mutation", {})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = runner.get(record["job_id"])
+            if job["state"] == "needs_review":
+                break
+            time.sleep(0.01)
+        assert job["error"]["code"] == "reconfirmation_required"
+        event = runner.store.events(record["job_id"])[-1]
+        assert event["phase"] == "job_needs_review"
+        assert event["cause"] == "fixture plan changed"
     finally:
         runner.shutdown()
 

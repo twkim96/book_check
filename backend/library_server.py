@@ -30,7 +30,7 @@ from library_explorer import (
     folder_listing,
     quarantine_listing,
 )
-from library_jobs import JobActiveError, JobRunner, JobStore
+from library_jobs import JobActiveError, JobNeedsReview, JobRunner, JobStore
 from library_organize import (
     apply_folder_quarantine,
     apply_file_relocate,
@@ -85,7 +85,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.3.7"
+SERVER_VERSION = "1.3.9"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -106,6 +106,52 @@ def _request_host_name(value: str) -> str | None:
 DEFAULT_FRONTEND_DIST = PROJECT_ROOT / "library_frontend" / "dist"
 DEFAULT_RUNTIME_DIR = STATE_DB.parent / "library-server"
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
+
+_RECONFIRMATION_MARKERS = (
+    "confirmation is stale",
+    "confirmation count mismatch",
+    "confirmation is stale or incomplete",
+    "plan sha-256 mismatch",
+    "plan is not runnable",
+    "plan is blocked",
+    "fingerprint changed",
+    "source revision",
+)
+
+
+def _queued_mutation_handler(handler):
+    """Turn queue-time state drift into a safe, visible review outcome."""
+    def run(payload, progress):
+        try:
+            return handler(payload, progress)
+        except JobNeedsReview:
+            raise
+        except (KeyError, FileNotFoundError) as exc:
+            raise JobNeedsReview(
+                "대기 중 대상 파일이나 관계 상태가 변경되었습니다. "
+                "화면을 새로고침하고 계획을 다시 확인해 주세요.",
+                cause=str(exc),
+            ) from exc
+        except ValueError as exc:
+            message = str(exc)
+            if "active decision not found" in message.casefold():
+                raise JobNeedsReview(
+                    "대기 중 기존 사람 판정 상태가 변경되었습니다. "
+                    "현재 관계를 다시 확인해 주세요.",
+                    cause=message,
+                ) from exc
+            raise
+        except RuntimeError as exc:
+            message = str(exc)
+            lowered = message.casefold()
+            if any(marker in lowered for marker in _RECONFIRMATION_MARKERS):
+                raise JobNeedsReview(
+                    "대기 중 승인한 계획과 현재 상태가 달라졌습니다. "
+                    "파일을 변경하지 않았으며 계획 재확인이 필요합니다.",
+                    cause=message,
+                ) from exc
+            raise
+    return run
 
 
 @dataclass(frozen=True)
@@ -406,7 +452,7 @@ def create_app(
             ),
         )
 
-    runner.register("title_requeue", apply_title_job)
+    runner.register("title_requeue", _queued_mutation_handler(apply_title_job))
 
     def apply_volume_job(payload, progress):
         return volume_provider.apply_plan(
@@ -418,7 +464,35 @@ def create_app(
             ),
         )
 
-    runner.register("volume_group_merge", apply_volume_job)
+    runner.register("volume_group_merge", _queued_mutation_handler(apply_volume_job))
+
+    def apply_relationship_job(payload, progress):
+        progress(0, 1, "두 파일 관계 재확인")
+        result = apply_relationship(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            left_file_id=payload["left_file_id"],
+            right_file_id=payload["right_file_id"],
+            verdict=payload["verdict"],
+            variant_kind=payload["variant_kind"],
+            note=payload.get("note", ""),
+            confirm_count=payload["confirm_count"],
+            confirm_plan_sha256=payload["confirm_plan_sha256"],
+        )
+        progress(1, 1, "두 파일 관계 저장 완료")
+        return result
+
+    def cancel_relationship_job(payload, progress):
+        progress(0, 1, "기존 사람 판정 재확인")
+        result = cancel_relationship(
+            config.state_db,
+            house_dir=config.house_dir,
+            temp_dir=config.temp_dir,
+            decision_id=payload["decision_id"],
+        )
+        progress(1, 1, "사람 판정 취소 완료")
+        return result
 
     def apply_quarantine_job(payload, progress):
         return apply_quarantine(
@@ -603,19 +677,25 @@ def create_app(
         progress(1, 1, "대표 파일 변경 완료")
         return result
 
-    runner.register("management_quarantine", apply_quarantine_job)
-    runner.register("management_restore", apply_restore_job)
-    runner.register("management_purge", apply_purge_job)
-    runner.register("management_file_relocate", apply_file_relocate_job)
-    runner.register("management_folder_create", apply_managed_folder_create_job)
-    runner.register("management_folder_relocate", apply_managed_folder_relocate_job)
-    runner.register("management_folder_adopt", apply_managed_folder_adopt_job)
-    runner.register("management_folder_quarantine", apply_folder_quarantine_job)
-    runner.register("management_work_merge", apply_work_merge_job)
-    runner.register("management_work_split", apply_work_split_job)
-    runner.register("management_work_alias", apply_work_alias_job)
-    runner.register("management_work_alias_retire", apply_work_alias_retire_job)
-    runner.register("management_representative", apply_representative_job)
+    mutation_handlers = {
+        "management_relationship": apply_relationship_job,
+        "management_relationship_cancel": cancel_relationship_job,
+        "management_quarantine": apply_quarantine_job,
+        "management_restore": apply_restore_job,
+        "management_purge": apply_purge_job,
+        "management_file_relocate": apply_file_relocate_job,
+        "management_folder_create": apply_managed_folder_create_job,
+        "management_folder_relocate": apply_managed_folder_relocate_job,
+        "management_folder_adopt": apply_managed_folder_adopt_job,
+        "management_folder_quarantine": apply_folder_quarantine_job,
+        "management_work_merge": apply_work_merge_job,
+        "management_work_split": apply_work_split_job,
+        "management_work_alias": apply_work_alias_job,
+        "management_work_alias_retire": apply_work_alias_retire_job,
+        "management_representative": apply_representative_job,
+    }
+    for job_type, handler in mutation_handlers.items():
+        runner.register(job_type, _queued_mutation_handler(handler))
 
     services = LibraryServiceRegistry(
         state_db=config.state_db,
@@ -823,24 +903,23 @@ def create_app(
     @app.post("/api/management/relationships/apply")
     def management_relationship_apply():
         body = _json_body()
-        result = apply_relationship(
-            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
-            left_file_id=str(body.get("left_file_id") or ""),
-            right_file_id=str(body.get("right_file_id") or ""),
-            verdict=str(body.get("verdict") or ""),
-            variant_kind=str(body.get("variant_kind") or "other"),
-            note=str(body.get("note") or ""),
-            confirm_count=int(body.get("confirm_count", -1)),
-            confirm_plan_sha256=str(body.get("confirm_plan_sha256") or ""),
-        )
-        return jsonify({"ok": True, "data": result})
+        record = runner.enqueue("management_relationship", {
+            "left_file_id": str(body.get("left_file_id") or ""),
+            "right_file_id": str(body.get("right_file_id") or ""),
+            "verdict": str(body.get("verdict") or ""),
+            "variant_kind": str(body.get("variant_kind") or "other"),
+            "note": str(body.get("note") or ""),
+            "confirm_count": int(body.get("confirm_count", -1)),
+            "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
+        })
+        return jsonify({"ok": True, "data": record}), 202
 
     @app.post("/api/management/relationships/<int:decision_id>/cancel")
     def management_relationship_cancel(decision_id):
-        return jsonify({"ok": True, "data": cancel_relationship(
-            config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
-            decision_id=decision_id,
-        )})
+        record = runner.enqueue("management_relationship_cancel", {
+            "decision_id": int(decision_id),
+        })
+        return jsonify({"ok": True, "data": record}), 202
 
     @app.post("/api/management/quarantine/preview")
     def management_quarantine_preview():
@@ -854,7 +933,7 @@ def create_app(
     @app.post("/api/management/quarantine/apply")
     def management_quarantine_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_quarantine", {
+        record = runner.enqueue("management_quarantine", {
             "source_file_id": str(body.get("source_file_id") or ""),
             "keep_file_id": str(body["keep_file_id"]) if body.get("keep_file_id") else None,
             "confirm_count": int(body.get("confirm_count", -1)),
@@ -875,7 +954,7 @@ def create_app(
     @app.post("/api/management/quarantine/restore/apply")
     def management_restore_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_restore", {
+        record = runner.enqueue("management_restore", {
             "operation_id": int(body.get("operation_id", -1)),
             "reference_file_id": str(body["reference_file_id"]) if body.get("reference_file_id") else None,
             "verdict": str(body.get("verdict") or ""), "note": str(body.get("note") or ""),
@@ -900,7 +979,7 @@ def create_app(
         values = body.get("operation_ids")
         if not isinstance(values, list):
             raise ValueError("operation_ids 배열이 필요합니다")
-        record = runner.start_exclusive("management_purge", {
+        record = runner.enqueue("management_purge", {
             "operation_ids": values, "confirm_count": int(body.get("confirm_count", -1)),
             "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
         })
@@ -920,7 +999,7 @@ def create_app(
     @app.post("/api/management/files/relocate/apply")
     def management_file_relocate_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_file_relocate", {
+        record = runner.enqueue("management_file_relocate", {
             "file_id": str(body.get("file_id") or ""),
             "target_directory": str(body.get("target_directory") or ""),
             "new_name": str(body["new_name"]) if body.get("new_name") else None,
@@ -944,7 +1023,7 @@ def create_app(
     @app.post("/api/management/folders/create/apply")
     def management_folder_create_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_folder_create", {
+        record = runner.enqueue("management_folder_create", {
             "work_bucket_id": int(body.get("work_bucket_id", -1)),
             "parent_directory": str(body.get("parent_directory") or ""),
             "folder_name": str(body.get("folder_name") or ""),
@@ -968,7 +1047,7 @@ def create_app(
     @app.post("/api/management/folders/relocate/apply")
     def management_folder_relocate_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_folder_relocate", {
+        record = runner.enqueue("management_folder_relocate", {
             "folder_id": int(body.get("folder_id", -1)),
             "target_parent": str(body.get("target_parent") or ""),
             "new_name": str(body["new_name"]) if body.get("new_name") else None,
@@ -991,7 +1070,7 @@ def create_app(
     @app.post("/api/management/folders/adopt/apply")
     def management_folder_adopt_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_folder_adopt", {
+        record = runner.enqueue("management_folder_adopt", {
             "folder_path": str(body.get("folder_path") or ""),
             "work_bucket_id": int(body.get("work_bucket_id", -1)),
             "role": str(body.get("role") or ""),
@@ -1011,7 +1090,7 @@ def create_app(
     @app.post("/api/management/folders/quarantine/apply")
     def management_folder_quarantine_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_folder_quarantine", {
+        record = runner.enqueue("management_folder_quarantine", {
             "folder_path": str(body.get("folder_path") or ""),
             "confirm_count": int(body.get("confirm_count", -1)),
             "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
@@ -1048,7 +1127,7 @@ def create_app(
     @app.post("/api/management/works/merge/apply")
     def management_work_merge_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_work_merge", {
+        record = runner.enqueue("management_work_merge", {
             "source_work_id": int(body.get("source_work_id", -1)),
             "target_work_id": int(body.get("target_work_id", -1)),
             "confirm_count": int(body.get("confirm_count", -1)),
@@ -1071,7 +1150,7 @@ def create_app(
     @app.post("/api/management/works/split/apply")
     def management_work_split_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_work_split", {
+        record = runner.enqueue("management_work_split", {
             "source_work_id": int(body.get("source_work_id", -1)),
             "variant_ids": [int(value) for value in body.get("variant_ids", [])],
             "display_title": str(body.get("display_title") or ""),
@@ -1103,7 +1182,7 @@ def create_app(
     @app.post("/api/management/works/aliases/apply")
     def management_work_alias_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_work_alias", {
+        record = runner.enqueue("management_work_alias", {
             "alias_kind": str(body.get("alias_kind") or ""),
             "alias_value": str(body.get("alias_value") or ""),
             "work_bucket_id": int(body.get("work_bucket_id", -1)),
@@ -1131,7 +1210,7 @@ def create_app(
     @app.post("/api/management/works/aliases/retire/apply")
     def management_work_alias_retire_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_work_alias_retire", {
+        record = runner.enqueue("management_work_alias_retire", {
             "alias_id": int(body.get("alias_id", -1)),
             "confirm_count": int(body.get("confirm_count", -1)),
             "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
@@ -1150,7 +1229,7 @@ def create_app(
     @app.post("/api/management/variants/representative/apply")
     def management_representative_apply():
         body = _json_body()
-        record = runner.start_exclusive("management_representative", {
+        record = runner.enqueue("management_representative", {
             "variant_id": int(body.get("variant_id", -1)),
             "file_id": str(body.get("file_id") or ""),
             "confirm_count": int(body.get("confirm_count", -1)),
@@ -1287,7 +1366,7 @@ def create_app(
             return jsonify({"ok": False, "error": {"code": "plan_blocked", "message": "실행할 수 없는 항목이 있습니다"}, "data": plan}), 409
         if confirm_count != plan["item_count"] or confirm_sha != plan["plan_sha256"]:
             return jsonify({"ok": False, "error": {"code": "confirmation_stale", "message": "확인한 계획과 현재 계획이 다릅니다"}, "data": plan}), 409
-        record = runner.start_exclusive(
+        record = runner.enqueue(
             "title_requeue",
             {
                 "changes": changes,
@@ -1344,7 +1423,7 @@ def create_app(
             "confirm_count": confirm_count,
             "confirm_plan_sha256": confirm_sha,
         }
-        record = runner.start_exclusive("volume_group_merge", payload)
+        record = runner.enqueue("volume_group_merge", payload)
         return jsonify({"ok": True, "data": record}), 202
 
     @app.get("/api/jobs")
@@ -1395,6 +1474,10 @@ def create_app(
     @app.get("/api/jobs/<job_id>")
     def job(job_id):
         return jsonify({"ok": True, "data": runner.get(job_id)})
+
+    @app.post("/api/jobs/<job_id>/cancel")
+    def cancel_queued_job(job_id):
+        return jsonify({"ok": True, "data": runner.cancel(job_id)})
 
     @app.get("/api/jobs/<job_id>/log")
     def job_log(job_id):

@@ -12,18 +12,28 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 
-TERMINAL_STATES = frozenset({"succeeded", "failed", "needs_review", "interrupted"})
+TERMINAL_STATES = frozenset({
+    "succeeded", "failed", "needs_review", "interrupted", "cancelled"
+})
 ACTIVE_STATES = frozenset({"queued", "validating", "running", "verifying"})
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class JobActiveError(RuntimeError):
     def __init__(self, job_id: str):
         self.job_id = str(job_id)
         super().__init__(f"another job is active: {self.job_id}")
+
+
+class JobNeedsReview(RuntimeError):
+    """The queued intent is safe to keep, but its approved plan is stale."""
+
+    def __init__(self, message: str, *, cause: str | None = None):
+        self.cause = cause
+        super().__init__(message)
 
 
 class JobStore:
@@ -87,6 +97,18 @@ class JobStore:
     def update(self, job_id: str, **changes) -> dict:
         with self._lock:
             record = self.get(job_id)
+            record.update(changes)
+            record["updated_at"] = _now()
+            return self._write(record)
+
+    def transition_if_state(
+        self, job_id: str, expected_states, **changes
+    ) -> dict | None:
+        """Atomically update a record only while it is in an expected state."""
+        with self._lock:
+            record = self.get(job_id)
+            if record.get("state") not in frozenset(expected_states):
+                return None
             record.update(changes)
             record["updated_at"] = _now()
             return self._write(record)
@@ -178,10 +200,30 @@ class JobRunner:
             raise KeyError(job_type)
         record = self.store.create(job_type, payload)
         self.executor.submit(self._run, record["job_id"])
-        return record
+        return self.get(record["job_id"])
+
+    def enqueue(self, job_type: str, payload: Mapping[str, object]) -> dict:
+        """Queue one mutation behind existing work while preserving serial execution.
+
+        The same active intent is returned instead of being enqueued twice.  The
+        handler still has to rebuild and verify its confirmation-bound plan when
+        it reaches the front of the queue.
+        """
+        if job_type not in self.handlers:
+            raise KeyError(job_type)
+        normalized_payload = dict(payload)
+        with self._start_lock:
+            for record in self.store.list(limit=200):
+                if (
+                    record.get("state") in ACTIVE_STATES
+                    and record.get("job_type") == job_type
+                    and record.get("payload") == normalized_payload
+                ):
+                    return self.get(str(record["job_id"]))
+            return self.start(job_type, normalized_payload)
 
     def start_exclusive(self, job_type: str, payload: Mapping[str, object]) -> dict:
-        """Start one mutation job only when this server has no active job."""
+        """Start a non-queueable service only when no work is active or waiting."""
         with self._start_lock:
             active = [
                 record for record in self.store.list(limit=200)
@@ -190,6 +232,54 @@ class JobRunner:
             if active:
                 raise JobActiveError(str(active[0]["job_id"]))
             return self.start(job_type, payload)
+
+    def _active_in_order(self) -> list[dict]:
+        values = [
+            record for record in self.store.list(limit=200)
+            if record.get("state") in ACTIVE_STATES
+        ]
+        values.sort(key=lambda item: (
+            item.get("created_at") or "", item.get("job_id") or ""
+        ))
+        return values
+
+    def _decorate(self, record: Mapping[str, object]) -> dict:
+        value = dict(record)
+        value["queue_position"] = None
+        value["jobs_ahead"] = 0
+        if value.get("state") == "queued":
+            active = self._active_in_order()
+            for index, item in enumerate(active):
+                if item.get("job_id") == value.get("job_id"):
+                    value["queue_position"] = index + 1
+                    value["jobs_ahead"] = index
+                    break
+        return value
+
+    def cancel(self, job_id: str) -> dict:
+        """Cancel a job only while it is still waiting in the local queue."""
+        with self._start_lock:
+            record = self.store.transition_if_state(
+                job_id,
+                {"queued"},
+                state="cancelled",
+                stage="cancelled",
+                message="대기 작업 취소됨",
+                finished_at=_now(),
+                error=None,
+            )
+            if record is None:
+                current = self.store.get(job_id)
+                raise RuntimeError(
+                    "실행을 시작한 작업은 취소할 수 없습니다: "
+                    f"state={current.get('state')}"
+                )
+            self.store.append_log(job_id, "queued job cancelled")
+            self.store.append_event(job_id, {
+                "phase": "job_cancelled",
+                "status": "cancelled",
+            })
+            return self._decorate(self.store.get(job_id))
 
     def _run(self, job_id: str) -> None:
         record = self.store.get(job_id)
@@ -217,13 +307,16 @@ class JobRunner:
         progress.log = lambda message: self.store.append_log(job_id, str(message))
 
         started = _now()
-        self.store.update(
+        claimed = self.store.transition_if_state(
             job_id,
+            {"queued"},
             state="validating",
             stage="validating",
             message="실행 전 상태 확인 중",
             started_at=started,
         )
+        if claimed is None:
+            return
         try:
             self.store.append_log(job_id, "job started")
             result = handler(record["payload"], progress)
@@ -241,6 +334,26 @@ class JobRunner:
                 error=None,
             )
             self.store.append_log(job_id, f"job {terminal_state}")
+        except JobNeedsReview as exc:
+            self.store.append_log(job_id, f"job needs review: {exc}")
+            self.store.append_event(job_id, {
+                "phase": "job_needs_review",
+                "status": "needs_review",
+                "error_code": "reconfirmation_required",
+                "error_message": str(exc),
+                "cause": exc.cause,
+            })
+            self.store.update(
+                job_id,
+                state="needs_review",
+                stage="needs_review",
+                message="대기 중 상태가 변경되어 재확인 필요",
+                finished_at=_now(),
+                error={
+                    "code": "reconfirmation_required",
+                    "message": str(exc),
+                },
+            )
         except Exception as exc:  # noqa: BLE001 - persisted boundary
             self.store.append_log(job_id, traceback.format_exc())
             self.store.append_event(job_id, {
@@ -259,10 +372,10 @@ class JobRunner:
             )
 
     def get(self, job_id: str) -> dict:
-        return self.store.get(job_id)
+        return self._decorate(self.store.get(job_id))
 
     def list(self, *, limit: int = 50) -> list[dict]:
-        return self.store.list(limit=limit)
+        return [self._decorate(record) for record in self.store.list(limit=limit)]
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)

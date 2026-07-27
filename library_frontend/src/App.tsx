@@ -76,7 +76,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.7</small>
+            <small>file_check 1.3.9</small>
           </div>
         </div>
         <nav>
@@ -274,7 +274,7 @@ function WorksCatalog() {
     <PageHeader eyebrow="WORK CATALOG · 1.3.7" title="보유 작품 카탈로그" description="현재 house 파일·core title·플랫폼 수집 상태를 찾고, DB work가 있는 작품은 병합·분리·별칭·입고 경로를 관리합니다." />
     <CatalogTabs active="works" />
     {error && <div className="inline-error">{error}</div>}
-    {jobNotice && <div className="inline-notice"><span>작품 관계 작업을 시작했습니다. 현재 화면에서 계속 확인할 수 있습니다.</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
+    {jobNotice && <div className="inline-notice"><span>{acceptedJobMessage(jobNotice, "작품 관계")} 현재 화면에서 계속 확인할 수 있습니다.</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
     <div className="toolbar catalog-toolbar">
       <form className="search-form" onSubmit={submit}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="원본 제목·core title·작가 검색" /><button className="button secondary">검색</button></form>
       <select value={status} onChange={(event) => update({ status: event.target.value })}>
@@ -515,9 +515,10 @@ function TitleReview() {
       try {
         const record = await api<JobRecord>(`/api/jobs/${pendingJob.job_id}`);
         if (cancelled) return;
-        if (["succeeded", "failed", "needs_review", "interrupted"].includes(record.state)) {
+        if (["succeeded", "failed", "needs_review", "interrupted", "cancelled"].includes(record.state)) {
           setPendingJob(undefined);
-          if (record.state === "succeeded" || record.state === "needs_review") {
+          const reconfirm = record.error?.code === "reconfirmation_required";
+          if (record.state === "succeeded" || (record.state === "needs_review" && !reconfirm)) {
             const completed = new Set(pendingJob.file_ids);
             setDrafts((current) => Object.fromEntries(
               Object.entries(current).filter(([fileId]) => !completed.has(fileId))
@@ -526,7 +527,7 @@ function TitleReview() {
             load(true);
           } else {
             setJobNotice(undefined);
-            setError(record.error?.message ?? "제목 교정 작업이 완료되지 않았습니다. 작업 이력을 확인하세요.");
+            setError(record.error?.message ?? (record.state === "cancelled" ? "대기 중인 제목 교정 작업을 취소했습니다." : "제목 교정 작업이 완료되지 않았습니다. 작업 이력을 확인하세요."));
           }
           return;
         }
@@ -576,7 +577,7 @@ function TitleReview() {
         confirm_plan_sha256: plan.plan_sha256
       });
       setPlan(undefined);
-      setJobNotice({ job_id: job.job_id, message: "제목 교정 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
+      setJobNotice({ job_id: job.job_id, message: `${acceptedJobMessage(job, "제목 교정")} 완료되면 이 목록만 갱신합니다.` });
       setPendingJob({ job_id: job.job_id, file_ids: appliedChanges.map((change) => change.file_id) });
       const appliedIds = new Set(appliedChanges.map((change) => change.file_id));
       setDrafts((current) => Object.fromEntries(
@@ -875,14 +876,15 @@ function VolumeReview() {
       try {
         const record = await api<JobRecord>(`/api/jobs/${pendingJob.job_id}`);
         if (cancelled) return;
-        if (["succeeded", "failed", "needs_review", "interrupted"].includes(record.state)) {
+        if (["succeeded", "failed", "needs_review", "interrupted", "cancelled"].includes(record.state)) {
           setPendingJob(undefined);
-          if (record.state === "succeeded" || record.state === "needs_review") {
+          const reconfirm = record.error?.code === "reconfirmation_required";
+          if (record.state === "succeeded" || (record.state === "needs_review" && !reconfirm)) {
             setJobNotice({ job_id: record.job_id, message: "분권 묶기가 완료되었습니다. 현재 위치에서 계속 작업할 수 있습니다." });
             load(true);
           } else {
             setJobNotice(undefined);
-            setError(record.error?.message ?? "분권 묶기 작업이 완료되지 않았습니다. 작업 이력을 확인하세요.");
+            setError(record.error?.message ?? (record.state === "cancelled" ? "대기 중인 분권 묶기 작업을 취소했습니다." : "분권 묶기 작업이 완료되지 않았습니다. 작업 이력을 확인하세요."));
           }
           return;
         }
@@ -902,7 +904,7 @@ function VolumeReview() {
 
   const handleJobStarted = (job: JobRecord) => {
     setActiveCase(undefined);
-    setJobNotice({ job_id: job.job_id, message: "분권 묶기 작업을 실행 중입니다. 완료되면 이 목록만 갱신합니다." });
+    setJobNotice({ job_id: job.job_id, message: `${acceptedJobMessage(job, "분권 묶기")} 완료되면 이 목록만 갱신합니다.` });
     setPendingJob({ job_id: job.job_id });
   };
 
@@ -1275,6 +1277,21 @@ function jobLabel(jobType: string): string {
   const labels: Record<string, string> = {
     title_requeue: "제목 교정 재입고",
     volume_group_merge: "분권 묶기",
+    management_relationship: "두 파일 관계 저장",
+    management_relationship_cancel: "두 파일 관계 취소",
+    management_quarantine: "사용자 승인 격리",
+    management_restore: "격리 복원",
+    management_purge: "격리 영구 삭제",
+    management_file_relocate: "파일 이름·위치 정리",
+    management_folder_create: "관리 폴더 생성",
+    management_folder_relocate: "관리 폴더 정리",
+    management_folder_adopt: "현재 폴더 관리 등록",
+    management_folder_quarantine: "폴더 전체 격리",
+    management_work_merge: "작품 병합",
+    management_work_split: "작품 분리",
+    management_work_alias: "작품 별칭 저장",
+    management_work_alias_retire: "작품 별칭 해제",
+    management_representative: "대표 파일 변경",
     service_folderling: "Folderling 실제 입고",
     service_scanner: "Scanner / index 갱신",
     service_platform_update: "플랫폼 인기 DB 업데이트",
@@ -1284,6 +1301,13 @@ function jobLabel(jobType: string): string {
     service_google_sheet: "Google Sheet 동기화"
   };
   return labels[jobType] ?? jobType;
+}
+
+function acceptedJobMessage(job: JobRecord, label: string): string {
+  if (job.state === "queued") {
+    return `${label} 작업을 대기열 ${job.queue_position ?? "?"}번째에 등록했습니다.`;
+  }
+  return `${label} 작업을 시작했습니다.`;
 }
 
 const folderlingPhaseLabels: Record<string, string> = {
@@ -1555,6 +1579,7 @@ function JobDetail() {
   const [filter, setFilter] = useState("");
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const load = () => {
     Promise.all([
       api<JobRecord>(`/api/jobs/${jobId}`),
@@ -1571,7 +1596,7 @@ function JobDetail() {
     load();
   }, [jobId]);
   useEffect(() => {
-    if (!job || ["succeeded", "failed", "needs_review", "interrupted"].includes(job.state)) return;
+    if (!job || ["succeeded", "failed", "needs_review", "interrupted", "cancelled"].includes(job.state)) return;
     const id = window.setInterval(load, 1500);
     return () => window.clearInterval(id);
   }, [job?.state, jobId]);
@@ -1586,14 +1611,25 @@ function JobDetail() {
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
   };
+  const cancelQueued = async () => {
+    if (!window.confirm("아직 실행되지 않은 이 대기 작업을 취소할까요?")) return;
+    setCancelling(true); setError("");
+    try {
+      setJob(await postJson<JobRecord>(`/api/jobs/${job.job_id}/cancel`, {}));
+      await load();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "대기 작업을 취소하지 못했습니다.");
+    } finally { setCancelling(false); }
+  };
   return <>
     <PageHeader
       eyebrow="JOB OUTPUT"
       title={jobLabel(job.job_type)}
       description={`작업 ID ${job.job_id}`}
-      action={<NavLink className="button secondary" to="/jobs">작업 이력</NavLink>}
+      action={<div className="page-actions">{job.state === "queued" && <button className="button danger" disabled={cancelling} onClick={cancelQueued}>{cancelling ? "취소 중…" : "대기 취소"}</button>}<NavLink className="button secondary" to="/jobs">작업 이력</NavLink></div>}
     />
     {error && <div className="inline-error">{error}</div>}
+    {job.state === "queued" && <div className="inline-notice"><span>단일 변경 대기열 {job.queue_position ?? "?"}번째 · 앞 작업 {job.jobs_ahead ?? 0}개</span><strong>실행 차례에 계획과 fingerprint를 다시 확인합니다.</strong></div>}
     <section className="job-detail-summary">
       <article className="panel"><span>상태</span><strong className={`state-text state-text-${job.state}`}>{job.state}</strong><small>{job.message}</small></article>
       <article className="panel"><span>현재 단계</span><strong>{job.stage}</strong><small>{job.updated_at ? new Date(job.updated_at).toLocaleString("ko-KR") : "-"}</small></article>
@@ -1638,7 +1674,7 @@ function JobList({ jobs, empty, detailed = false }: { jobs: JobRecord[]; empty: 
       <div className={`job-state state-${job.state}`}>{job.state}</div>
       <div className="job-main">
         <strong>{jobLabel(job.job_type)}</strong>
-        <span>{job.message}</span>
+        <span>{job.state === "queued" ? `대기열 ${job.queue_position ?? "?"}번째 · 앞 작업 ${job.jobs_ahead ?? 0}개` : job.message}</span>
         {job.progress.total > 0 && <div className="progress"><i style={{ width: `${percent}%` }} /><small>{job.progress.current}/{job.progress.total}</small></div>}
         {job.error && <div className="job-error">{job.error.message}</div>}
         {detailed && job.result && <div className="job-result">완료 결과가 저장되었습니다 · 작업 ID {job.job_id}</div>}

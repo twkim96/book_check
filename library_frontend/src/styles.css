@@ -648,6 +648,7 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .state-needs_review { color: #f4cc82; background: #4a3718; }
 .state-failed, .state-interrupted { color: #ff9b9b; background: #4a242a; }
 .state-running, .state-validating, .state-queued, .state-verifying { color: var(--blue); background: color-mix(in srgb, var(--blue-2) 16%, var(--panel-2)); }
+.state-cancelled { color: var(--muted); background: var(--surface-low); }
 .job-main strong, .job-main span { display: block; }
 .job-main span { color: var(--muted); font-size: 13px; margin-top: 5px; }
 .job time { color: #6f7988; font-size: 13px; }
@@ -676,6 +677,8 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .state-text-succeeded { color: var(--green); }
 .state-text-needs_review { color: var(--yellow); }
 .state-text-failed, .state-text-interrupted { color: var(--red); }
+.state-text-cancelled { color: var(--muted); }
+.page-actions { display: flex; align-items: center; gap: 9px; }
 .job-detail-progress { margin: 0 0 16px; height: 20px; }
 .job-detail-progress small { line-height: 20px; }
 .folderling-summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 13px; margin-top: 16px; }

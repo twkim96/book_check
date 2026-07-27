@@ -180,6 +180,8 @@ export interface JobRecord {
   error: { code: string; message: string } | null;
   payload?: Record<string, unknown>;
   last_event?: JobEvent | null;
+  queue_position?: number | null;
+  jobs_ahead?: number;
 }
 
 export interface JobEvent {
