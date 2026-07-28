@@ -1322,6 +1322,8 @@ const folderlingPhaseLabels: Record<string, string> = {
   workflow_started: "입고 workflow 시작",
   legacy_pass_skipped: "legacy pass 보류",
   dedup_start: "중복 판정 시작",
+  auditor_rebaseline: "cold cache 전체 재기준",
+  auditor_rebaseline_result: "전체 재기준 완료",
   snapshot_result: "house snapshot 확인",
   dedup_result: "중복 판정 완료",
   intake_start: "temp 입고 시작",

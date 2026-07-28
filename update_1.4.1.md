@@ -1,6 +1,6 @@
 # file_check 1.4.1 — 순서형 본문 중복 자동 격리
 
-- 상태: 구현·회귀 검증 완료
+- 상태: 구현·운영 검증·cold-cache 마감 패치 완료
 - 시작 기준: `3334edb` (`docs: record strong review queue cleanup`)
 - 적용일: 2026-07-28
 - 범위: 동일 좌표·완전 중첩·외전 합계·회차/권 판본의 자동 중복 정리
@@ -74,7 +74,7 @@
 - [x] 반복 비교 그래프 500,000 노드 상한
 - [x] 변경 없는 pair cache hit와 실제 read 0
 - [x] 기존 1.4.0 엄격 포함판 회귀
-- [x] 전체 Python 공개 회귀: `326 passed`
+- [x] 전체 Python 공개 회귀: `327 passed`
 - [x] frontend production build: TypeScript + Vite 성공
 - [x] Python compile 및 `git diff --check` 성공
 
@@ -111,3 +111,19 @@
   `txt_house`, extension의 `file_index.json` SHA-256은 모두
   `f41e2c25b711c536b20660c23453b629e8d5f6add3d1359ab2f00215c23044b3`로 일치한다.
 - `pass/`의 legacy 항목 1개는 기존 정책대로 자동 입고하지 않고 사람 pair 판정 대상으로 남겼다.
+
+## 8. cold-cache 자동 재기준 마감
+
+- 일상 Folderling 감사는 기존 20 GiB 누적 읽기 예산과 파일당 정밀 후보 24쌍 제한을 유지한다.
+- actual managed run의 첫 감사가 오직 `body_budget_exhausted` 또는 `deep_check_deferred` 때문에
+  불완전하면, 아직 파일 mutation을 시작하기 전에 같은 fingerprint/pair cache를 이어 받아
+  64 GiB·파일당 128쌍으로 한 번 자동 재시도한다.
+- stale input, decode/구조 오류 등 다른 stop reason이 함께 있으면 재시도하지 않는다. 재기준
+  재시도도 완료되지 않으면 기존처럼 Folderling 전체를 fail-closed한다.
+- dry-run, pure-plan, 외부에서 주입한 auditor report에는 자동 재기준을 적용하지 않는다.
+- 구조화 event에 `auditor_rebaseline`과 `auditor_rebaseline_result`를 남기고, dedup summary에는
+  재시도 여부, 최초 stop reason, 최초·합계 read bytes를 기록한다.
+- 실제 house를 다시 움직이지 않고 20/64 GiB와 24/128쌍 설정 경계, 자원 stop reason만 허용하는
+  회귀를 추가했다. 최종 검증은 공개 회귀 327개, Python compileall, TypeScript/Vite production
+  build, `git diff --check`를 통과했다.
+- DB schema와 사용자 중복 판정 계약은 바뀌지 않았으며 file_check 버전은 1.4.1로 마감한다.

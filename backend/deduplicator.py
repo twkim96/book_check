@@ -54,6 +54,12 @@ def _sync_extension_index(index_path):
 DEFAULT_HOUSE_DIR = str(HOUSE_DIR)
 DEFAULT_TEMP_DIR = str(TEMP_DIR)
 DEFAULT_STATE_DB = str(STATE_DB)
+FOLDERLING_AUDIT_READ_BUDGET = "20GiB"
+FOLDERLING_REBASELINE_READ_BUDGET = "64GiB"
+FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE = 128
+FOLDERLING_REBASELINE_STOP_REASONS = frozenset({
+    "body_budget_exhausted", "deep_check_deferred",
+})
 
 AUDITOR_STRONG_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
 AUDITOR_RELATION_CLASSES = frozenset({
@@ -937,7 +943,7 @@ def move_suspect_group(group, temp_dir, dry_run):
 
 def run_auditor_queue_report(
     index_path, house_dir, temp_dir, state_db_path=None, cache_write=True,
-    progress_callback=None,
+    progress_callback=None, rebaseline=False,
 ):
     """folderling 검토 큐용 read-only auditor 실행. 파일 이동은 호출 측에서만 한다."""
     import duplicate_auditor
@@ -958,8 +964,16 @@ def run_auditor_queue_report(
         # auditor cache.  Resource caps are not fingerprint semantics, but
         # max_file_bytes is deliberately part of the pair-cache key.
         "--max-file-bytes", "256MiB",
-        "--max-read-bytes", "20GiB",
+        "--max-read-bytes", (
+            FOLDERLING_REBASELINE_READ_BUDGET
+            if rebaseline else FOLDERLING_AUDIT_READ_BUDGET
+        ),
     ]
+    if rebaseline:
+        argv.extend((
+            "--max-deep-pairs-per-file",
+            str(FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE),
+        ))
     if state_db_path:
         argv.extend(("--state-db", os.fspath(state_db_path)))
     args = duplicate_auditor.build_parser().parse_args(argv)
@@ -967,6 +981,16 @@ def run_auditor_queue_report(
     args.cache_write = cache_write
     args.progress_callback = progress_callback
     return duplicate_auditor.run_audit(args)
+
+
+def _auditor_rebaseline_reasons(report):
+    """Return resource-only stop reasons eligible for one cold-cache retry."""
+    if report is None or getattr(report, "completed", False):
+        return ()
+    reasons = frozenset(getattr(report, "stop_reasons", ()) or ())
+    if reasons and reasons <= FOLDERLING_REBASELINE_STOP_REASONS:
+        return tuple(sorted(reasons))
+    return ()
 
 
 def build_auditor_suspect_groups(
@@ -2222,6 +2246,8 @@ def _clean_duplicates_impl(
     verified_index_entries=None,
 ):
     performance_metrics = {}
+    auditor_rebaseline_retry = False
+    auditor_initial_stop_reasons = []
     script_dir = str(PROJECT_ROOT)
     index_path = index_path or os.path.join(script_dir, "file_index.json")
 
@@ -2280,19 +2306,87 @@ def _clean_duplicates_impl(
     if audit_suspects:
         print("🔎 cross/near-core 본문 감사 시작 (완료된 결과만 검토 큐에 반영)")
         stage_started_at = time.perf_counter()
+        auditor_report_supplied = auditor_report is not None
+        auditor_progress_callback = (
+            lambda update: event_callback({
+                "phase": "auditor_progress", "status": "running", **update
+            })
+            if event_callback is not None else None
+        )
         auditor_report = auditor_report or run_auditor_queue_report(
             index_path,
             house_dir,
             temp_dir,
             state_db_path=state_db_path if managed_mode else None,
             cache_write=not pure_plan,
-            progress_callback=(
-                lambda update: event_callback({
-                    "phase": "auditor_progress", "status": "running", **update
-                })
-                if event_callback is not None else None
-            ),
+            progress_callback=auditor_progress_callback,
         )
+        rebaseline_reasons = _auditor_rebaseline_reasons(auditor_report)
+        if (
+            rebaseline_reasons
+            and not dry_run
+            and managed_mode
+            and not pure_plan
+            and not auditor_report_supplied
+        ):
+            auditor_rebaseline_retry = True
+            auditor_initial_stop_reasons = list(rebaseline_reasons)
+            initial_read_bytes = int(
+                getattr(auditor_report, "stats", {}).get("actual_read_bytes", 0)
+            )
+            print(
+                "♻️ cold-cache 전체 재기준 자동 재시도: "
+                f"{list(rebaseline_reasons)} "
+                f"(read {FOLDERLING_REBASELINE_READ_BUDGET}, "
+                "파일당 정밀 후보 "
+                f"{FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE})"
+            )
+            if event_callback is not None:
+                event_callback({
+                    "phase": "auditor_rebaseline",
+                    "status": "running",
+                    "initial_stop_reasons": list(rebaseline_reasons),
+                    "max_read_bytes": FOLDERLING_REBASELINE_READ_BUDGET,
+                    "max_deep_pairs_per_file": (
+                        FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE
+                    ),
+                })
+            auditor_report = run_auditor_queue_report(
+                index_path,
+                house_dir,
+                temp_dir,
+                state_db_path=state_db_path,
+                cache_write=True,
+                progress_callback=auditor_progress_callback,
+                rebaseline=True,
+            )
+            if isinstance(getattr(auditor_report, "stats", None), dict):
+                retry_read_bytes = int(
+                    auditor_report.stats.get("actual_read_bytes", 0)
+                )
+                auditor_report.stats.update({
+                    "folderling_rebaseline_retry": True,
+                    "folderling_initial_stop_reasons": list(rebaseline_reasons),
+                    "folderling_initial_read_bytes": initial_read_bytes,
+                    "folderling_total_read_bytes": (
+                        initial_read_bytes + retry_read_bytes
+                    ),
+                })
+            if event_callback is not None:
+                event_callback({
+                    "phase": "auditor_rebaseline_result",
+                    "status": (
+                        "succeeded"
+                        if getattr(auditor_report, "completed", False)
+                        else "failed"
+                    ),
+                    "completed": bool(
+                        getattr(auditor_report, "completed", False)
+                    ),
+                    "stop_reasons": list(
+                        getattr(auditor_report, "stop_reasons", ()) or ()
+                    ),
+                })
         if not getattr(auditor_report, "completed", False):
             reasons = getattr(auditor_report, "stop_reasons", [])
             raise RuntimeError(f"auditor가 불완전 종료되어 폴더링을 중단합니다: {reasons}")
@@ -2494,10 +2588,14 @@ def _clean_duplicates_impl(
                     "result_pairs", "actual_read_bytes",
                     "fingerprint_cache_hits", "fingerprint_cache_misses",
                     "pair_cache_hits", "pair_cache_misses",
+                    "folderling_initial_read_bytes",
+                    "folderling_total_read_bytes",
                 )
             }
             if auditor_report is not None else {}
         ),
+        "auditor_rebaseline_retry": auditor_rebaseline_retry,
+        "auditor_initial_stop_reasons": auditor_initial_stop_reasons,
         "unsafe_legacy_bridge": bool(audit_suspects and not managed_mode),
         "auditor_group_count": len(auditor_groups),
         "auditor_report_relation_count": len(auditor_relations),

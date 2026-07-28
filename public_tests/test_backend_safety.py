@@ -133,6 +133,28 @@ def test_auditor_bridge_accepts_path_objects_at_argparse_boundary(tmp_path, monk
         "read_bytes": 1024,
     }]
 
+    deduplicator.run_auditor_queue_report(
+        index, house, temp, state_db_path=state_db, cache_write=True,
+        progress_callback=lambda _update: None, rebaseline=True,
+    )
+    assert captured["max_read_bytes"] == 64 * 1024 * 1024 * 1024
+    assert captured["max_deep_pairs_per_file"] == 128
+
+
+def test_folderling_rebaseline_retry_accepts_only_resource_stop_reasons():
+    class Report:
+        completed = False
+
+        def __init__(self, reasons):
+            self.stop_reasons = reasons
+
+    assert deduplicator._auditor_rebaseline_reasons(
+        Report(["body_budget_exhausted", "deep_check_deferred"])
+    ) == ("body_budget_exhausted", "deep_check_deferred")
+    assert deduplicator._auditor_rebaseline_reasons(
+        Report(["body_budget_exhausted", "stale_input"])
+    ) == ()
+
 
 def test_epub_representative_is_not_missing_from_txt_only_full_scan(tmp_path):
     house = tmp_path / "house"

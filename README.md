@@ -89,6 +89,12 @@ Finder에서 파일을 열거나 이름 수정창에 들어간 영향도 최신�
 identity 비교에서 제외하고, `mtime`·`ctime`만 바뀌어도 기존 본문 판정을 그대로 믿지 않고 stale로
 폐기해 현재 bytes를 다시 분석합니다. 즉 메타데이터 시각이 더 새롭다는 이유로 책을 격리하지 않습니다.
 
+일상 Folderling 감사의 누적 읽기 예산은 20 GiB입니다. actual run에서 cold cache 때문에
+`body_budget_exhausted` 또는 `deep_check_deferred`만 발생하면 파일 mutation 전에 기존 cache를 이어 받아
+64 GiB·파일당 정밀 후보 128쌍으로 한 번 자동 재기준합니다. stale input, decode/구조 오류 등 다른
+중단 사유가 함께 있거나 재시도도 완료되지 않으면 기존처럼 fail-closed합니다. dry-run과 사람이 주입한
+auditor report에는 이 자동 재시도를 적용하지 않습니다.
+
 다음 관계는 review/warning에 남깁니다.
 
 - 양쪽에 명시된 작가가 서로 다름
