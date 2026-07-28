@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSIGNMENT_STATES = (
@@ -1030,6 +1030,30 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 14")
         conn.commit()
         version = 14
+    if version == 14:
+        # v1.2.7 title cleanup deliberately created a fresh intake identity,
+        # but early runs left the inactive historical row on its former real
+        # house path.  ``files.canonical_path`` is globally unique, so a later
+        # intake materializing to that path could move the file successfully
+        # and then fail its DB commit.  Modern title requeue code already uses
+        # ``retired_canonical_path``; migrate every proven legacy tombstone once.
+        retire_legacy_title_requeue_path_owners(conn)
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v15 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute("DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')")
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 15")
+        conn.commit()
+        version = 15
     validate_schema(conn)
     return conn
 
@@ -2354,6 +2378,159 @@ def _finalize_existing_source_rollback(conn, row, source, source_bucket):
         transition_operation(conn, row["operation_id"], "rolled_back")
 
 
+def _complete_legacy_title_path_house_ingest(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    destination: Path,
+) -> bool:
+    """Finish a proven fs_done intake blocked by one legacy title tombstone.
+
+    Old title-requeue rows could keep their former real path after becoming
+    inactive.  A later full Scanner fallback may also reactivate that historical
+    row after the incoming file has already been copied there.  Complete the
+    intake only when the operation owns the destination bytes and the competing
+    row has committed title-requeue provenance proving that it released the
+    path.  Every other collision continues through the conservative rollback.
+    """
+    if row["action"] != "house_ingest" or row["state"] != "fs_done":
+        return False
+    owner = conn.execute(
+        """
+        SELECT f.*,
+               CASE WHEN rep.file_id IS NULL THEN 0 ELSE 1 END AS representative
+        FROM files AS f
+        LEFT JOIN representatives AS rep ON rep.file_id = f.file_id
+        WHERE f.canonical_path = ? AND f.file_id != ?
+        """,
+        (str(destination), row["file_id"]),
+    ).fetchone()
+    if owner is None:
+        return False
+    released = conn.execute(
+        """
+        SELECT operation_id
+        FROM operations
+        WHERE file_id = ?
+          AND action IN ('title_cleanup_requeue', 'user_title_requeue')
+          AND state = 'committed'
+          AND source_path = ?
+        ORDER BY operation_id DESC
+        LIMIT 1
+        """,
+        (owner["file_id"], str(destination)),
+    ).fetchone()
+    if released is None:
+        return False
+    if (
+        owner["source"] != "house"
+        or owner["protected"]
+        or owner["representative"]
+        or owner["variant_id"] is not None
+        or owner["assignment_state"]
+        not in {"unassigned", "legacy_unresolved", "decision_required"}
+    ):
+        raise RuntimeError(
+            "legacy title path owner gained protected or managed state; "
+            f"manual recovery required: file_id={owner['file_id']}"
+        )
+    owner_unfinished = conn.execute(
+        """
+        SELECT operation_id
+        FROM operations
+        WHERE file_id = ? AND state IN ('planned', 'fs_done', 'db_done')
+        LIMIT 1
+        """,
+        (owner["file_id"],),
+    ).fetchone()
+    if owner_unfinished is not None:
+        raise RuntimeError(
+            "legacy title path owner has an unfinished operation: "
+            f"file_id={owner['file_id']}, operation_id={owner_unfinished[0]}"
+        )
+    incoming = conn.execute(
+        """
+        SELECT canonical_path, source, active, current_fingerprint_id,
+               size, mtime_ns
+        FROM files WHERE file_id = ?
+        """,
+        (row["file_id"],),
+    ).fetchone()
+    if (
+        incoming is None
+        or incoming["canonical_path"] != row["source_path"]
+        or incoming["source"] != "temp"
+        or incoming["active"] != 1
+        or incoming["current_fingerprint_id"] != row["expected_fingerprint_id"]
+        or incoming["size"] != row["expected_size"]
+        or incoming["mtime_ns"] != row["expected_mtime_ns"]
+    ):
+        raise RuntimeError("fs_done house intake source DB state no longer matches journal")
+
+    from mutation_io import evidence_matches, inspect_regular_file
+
+    destination_evidence = inspect_regular_file(destination)
+    expected_destination = _operation_evidence(row, "destination")
+    if expected_destination is None or not evidence_matches(
+        destination_evidence, expected_destination
+    ):
+        raise RuntimeError("fs_done house intake destination evidence changed")
+    coordinates = coordinate_fields_from_name(destination.name)
+    current_fingerprint_id = (
+        incoming["current_fingerprint_id"]
+        if destination_evidence.size == incoming["size"]
+        and destination_evidence.mtime_ns == incoming["mtime_ns"]
+        else None
+    )
+    retired_path = retired_canonical_path(
+        conn, owner["file_id"], destination
+    )
+    with transaction(conn):
+        conn.execute(
+            """
+            UPDATE files
+            SET canonical_path = ?, active = 0, protected = 0,
+                last_seen_at = CURRENT_TIMESTAMP
+            WHERE file_id = ? AND canonical_path = ?
+            """,
+            (retired_path, owner["file_id"], str(destination)),
+        )
+        conn.execute(
+            """
+            UPDATE files
+            SET canonical_path = ?, source = 'house', active = 1,
+                size = ?, mtime_ns = ?, dev = ?, ino = ?, ctime_ns = ?,
+                current_fingerprint_id = ?, last_seen_at = CURRENT_TIMESTAMP,
+                coordinate_kind = ?, part_num = ?, part_den = ?,
+                volume_num = ?, volume_den = ?, coordinate_symbol = ?,
+                coordinate_sort_key = ?, episode_start = ?, episode_end = ?,
+                coordinate_raw = ?, span_ambiguous = ?
+            WHERE file_id = ?
+            """,
+            (
+                str(destination), destination_evidence.size,
+                destination_evidence.mtime_ns, destination_evidence.dev,
+                destination_evidence.ino, destination_evidence.ctime_ns,
+                current_fingerprint_id,
+                coordinates["coordinate_kind"], coordinates["part_num"],
+                coordinates["part_den"], coordinates["volume_num"],
+                coordinates["volume_den"], coordinates["coordinate_symbol"],
+                coordinates["coordinate_sort_key"], coordinates["episode_start"],
+                coordinates["episode_end"], coordinates["coordinate_raw"],
+                coordinates["span_ambiguous"], row["file_id"],
+            ),
+        )
+        upsert_file_analysis(
+            conn,
+            row["file_id"],
+            destination,
+            stat_result=os.stat(destination, follow_symlinks=False),
+        )
+        transition_operation(conn, row["operation_id"], "db_done")
+    with transaction(conn):
+        transition_operation(conn, row["operation_id"], "committed")
+    return True
+
+
 def _recover_interrupted_exact_operation(
     conn: sqlite3.Connection,
     operation_id: int,
@@ -2514,6 +2691,10 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
                 transition_operation(conn, operation_id, "rolled_back")
             return "rolled_back"
         if not source_exists and destination_exists:
+            if _complete_legacy_title_path_house_ingest(
+                conn, row, destination
+            ):
+                return "committed"
             source_bucket = {
                 "queue_restore": "queue", "user_queue_restore": "queue",
                 "user_queue_accept": "queue",
@@ -3398,6 +3579,71 @@ def retired_canonical_path(
     return canonicalize_path(
         state_dir / "retired_paths" / str(file_id) / original_name
     )
+
+
+def retire_legacy_title_requeue_path_owners(
+    conn: sqlite3.Connection,
+    *,
+    canonical_path: os.PathLike | str | None = None,
+) -> list[dict]:
+    """Release real paths held by proven inactive title-requeue tombstones.
+
+    Early title cleanup operations consumed the house source and left its file
+    row inactive, but did not move ``canonical_path`` to the virtual retired
+    namespace.  Only a committed title-requeue operation whose recorded source
+    is still the inactive row's path proves that the row intentionally released
+    that path.  Unknown inactive owners remain fail-closed.
+
+    The caller owns the transaction.  Operations and immutable fingerprints
+    retain the original real path as provenance.
+    """
+    target = canonicalize_path(canonical_path) if canonical_path is not None else None
+    params: list[object] = []
+    target_clause = ""
+    if target is not None:
+        target_clause = "AND f.canonical_path = ?"
+        params.append(target)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT f.file_id, f.canonical_path
+        FROM files AS f
+        WHERE f.active = 0
+          AND f.source = 'house'
+          {target_clause}
+          AND EXISTS (
+              SELECT 1
+              FROM operations AS requeue
+              WHERE requeue.file_id = f.file_id
+                AND requeue.action IN ('title_cleanup_requeue', 'user_title_requeue')
+                AND requeue.state = 'committed'
+                AND requeue.source_path = f.canonical_path
+          )
+        ORDER BY f.file_id
+        """,
+        params,
+    ).fetchall()
+    retired = []
+    for row in rows:
+        retired_path = retired_canonical_path(
+            conn, row["file_id"], row["canonical_path"]
+        )
+        updated = conn.execute(
+            """
+            UPDATE files
+            SET canonical_path = ?, protected = 0,
+                last_seen_at = CURRENT_TIMESTAMP
+            WHERE file_id = ? AND canonical_path = ? AND active = 0
+              AND source = 'house'
+            """,
+            (retired_path, row["file_id"], row["canonical_path"]),
+        ).rowcount
+        if updated:
+            retired.append({
+                "file_id": row["file_id"],
+                "original_path": row["canonical_path"],
+                "retired_path": retired_path,
+            })
+    return retired
 
 
 def canonicalize_real_path(path: os.PathLike | str) -> str:

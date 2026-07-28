@@ -12,6 +12,29 @@
 - 실제 이동은 상태 DB, backup, manifest, 일회성 승인, 복구 기록을 사용합니다.
 - `.dedup_state`, 인덱스, 로그와 실제 라이브러리는 Git에 포함하지 않습니다.
 
+### 같은 house 경로 재입고 안전 계약 (DB schema v15)
+
+제목 정리로 house 파일을 temp에 되돌린 뒤 새 intake identity를 만드는 경우, 과거 file row는
+실제 경로가 아닌 `.dedup_state/retired_paths/<file_id>/...` 가상 경로에 보존해야 합니다. operation과
+fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 삭제가 아니라 `canonical_path` 점유 해제입니다.
+
+- schema v15 migration은 과거 버전이 남긴 **비활성 + committed 제목 requeue** 실경로만 가상 경로로
+  옮깁니다. 출처가 불명확한 비활성 행은 추측해서 고치지 않습니다.
+- house 입고는 파일시스템 목적지가 비어 있는지 확인한 뒤, DB에서 같은 `canonical_path`를 점유한 행도
+  **파일 복사 전에** 검사합니다. 증명된 과거 제목 tombstone만 은퇴시키고, 그 밖의 점유자는 source를
+  temp에 그대로 둔 채 fail-closed합니다.
+- 파일 복사는 끝났지만 DB 반영이 끊긴 `fs_done` 복구는 destination의 inode·size·mtime·SHA-256이
+  journal과 모두 같고, 경쟁 행에 committed 제목 requeue 이력이 있을 때만 원복 없이 입고를 확정합니다.
+  그 외에는 기존 보수적 rollback을 유지합니다.
+- 제목 requeue 뒤 남은 `_최근` 링크가 끊어져 있더라도 그 링크의 기록된 target이 이번 house 목적지와
+  정확히 같으면 링크를 지우거나 다시 만들지 않고 그대로 재사용합니다. target이 다르거나 일반 파일이면
+  기존 항목을 보존하고 입고를 중단합니다.
+- Folderling 성공 판정은 최종 Doctor 0건까지 포함합니다. index fallback이 성공했더라도 미완료 operation이
+  있으면 다음 actual run을 시작하지 않습니다.
+
+이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
+이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
+
 ## 동일 작품 자동 중복 정리 계약 (1.4.1)
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
@@ -474,7 +497,7 @@ SHA-256·목적 경로를 `directory_house_ingest` operation group에 저장합�
 `operation_group_id`로 이 계획에 연결됩니다. 실패한 group을 재실행하면 이전 group이 실제로 committed한
 목적 파일과 현재 DB canonical path가 모두 일치하는 항목만 재사용하고 나머지만 입고합니다. 승인 뒤
 추가된 파일, 변경된 source, 변조된 destination, symlink 또는 같은 이름의 다른 bytes는 자동 합치거나
-덮어쓰지 않고 실패로 남깁니다. schema는 14이며 기존 DB migration은 종전과 같이 검증된 backup을 소유한
+덮어쓰지 않고 실패로 남깁니다. schema는 15이며 기존 DB migration은 종전과 같이 검증된 backup을 소유한
 진입점에서만 수행합니다.
 
 Scanner는 레거시 배열 형식의 `file_list.json`을 유지하면서 `file_index.json`에 `generation_id`를 넣고,

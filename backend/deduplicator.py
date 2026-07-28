@@ -1837,7 +1837,12 @@ def _managed_auditor_queue_records(
                     continue
                 recent_path = os.path.join(house_dir, "_최근", os.path.basename(destination))
                 if os.path.lexists(recent_path):
-                    continue
+                    from folderling import recent_link_matches_destination
+
+                    if not recent_link_matches_destination(
+                        recent_path, destination
+                    ):
+                        continue
 
             record = {
                 "dry_run": dry_run,
@@ -1861,7 +1866,11 @@ def _managed_auditor_queue_records(
                 if recent_path is not None:
                     from folderling import ensure_recent_link_slot
 
-                    ensure_recent_link_slot(os.path.basename(destination), os.path.dirname(recent_path))
+                    ensure_recent_link_slot(
+                        os.path.basename(destination),
+                        os.path.dirname(recent_path),
+                        destination,
+                    )
                 try:
                     result = apply_contained_upgrade(
                         conn,
@@ -1955,7 +1964,12 @@ def _managed_auditor_queue_records(
                     house_dir, "_최근", os.path.basename(destination)
                 )
                 if os.path.lexists(recent_path):
-                    continue
+                    from folderling import recent_link_matches_destination
+
+                    if not recent_link_matches_destination(
+                        recent_path, destination
+                    ):
+                        continue
 
             record = {
                 "dry_run": dry_run,
@@ -1981,7 +1995,9 @@ def _managed_auditor_queue_records(
                     from folderling import ensure_recent_link_slot
 
                     ensure_recent_link_slot(
-                        os.path.basename(destination), os.path.dirname(recent_path)
+                        os.path.basename(destination),
+                        os.path.dirname(recent_path),
+                        destination,
                     )
                 try:
                     result = apply_ordered_body_quarantine(

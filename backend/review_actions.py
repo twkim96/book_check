@@ -458,7 +458,7 @@ def process_claimed_actions(conn, *, temp_dir, house_dir, run_id):
         reserved.add(str(destination))
         needs_recent = origin is None or origin["action"] != "house_review_move"
         if needs_recent:
-            ensure_recent_link_slot(destination.name, recent_dir)
+            ensure_recent_link_slot(destination.name, recent_dir, destination)
         house_plans.append((row, destination, needs_recent))
 
     deleting = {row["file_id"] for row in delete_rows}

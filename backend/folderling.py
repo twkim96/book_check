@@ -73,6 +73,24 @@ def emit_folderling_event(event_callback, phase, **payload):
         event_callback({"phase": phase, **payload})
 
 
+def recent_link_matches_destination(link_path, dst_path):
+    """Return True only for a symlink that already names this exact target.
+
+    The target may be missing: legacy title requeue intentionally removed the
+    old house file while leaving the user-visible recent symlink untouched.
+    Re-materializing that exact target does not mutate or replace the symlink.
+    """
+    link_path = os.path.abspath(link_path)
+    if not os.path.islink(link_path):
+        return False
+    target = os.readlink(link_path)
+    if not os.path.isabs(target):
+        target = os.path.join(os.path.dirname(link_path), target)
+    return normalize_nfc(os.path.abspath(target)) == normalize_nfc(
+        os.path.abspath(dst_path)
+    )
+
+
 def create_recent_link(dst_path, clean_name, recent_dir):
     """최근 파일에 대한 심볼릭 링크 생성"""
     from mutation_io import ensure_directory_nofollow
@@ -81,17 +99,24 @@ def create_recent_link(dst_path, clean_name, recent_dir):
     abs_dst_path = os.path.abspath(dst_path)
 
     if os.path.lexists(link_path):
+        if recent_link_matches_destination(link_path, abs_dst_path):
+            return False
         raise FileExistsError(
             f"_최근 기존 경로는 소유권을 증명할 수 없어 보존합니다: {link_path}"
         )
 
     os.symlink(abs_dst_path, link_path)
+    return True
 
 
-def ensure_recent_link_slot(clean_name, recent_dir):
+def ensure_recent_link_slot(clean_name, recent_dir, dst_path=None):
     """Fail before intake when a user-owned non-link occupies the recent path."""
     link_path = os.path.join(recent_dir, clean_name)
     if os.path.lexists(link_path):
+        if dst_path is not None and recent_link_matches_destination(
+            link_path, dst_path
+        ):
+            return
         raise FileExistsError(
             f"_최근 기존 경로는 소유권을 증명할 수 없어 입고를 중단합니다: {link_path}"
         )
@@ -1172,7 +1197,7 @@ def move_to_house(
         dst_path = candidate_path
     final_name = os.path.basename(dst_path)
 
-    ensure_recent_link_slot(final_name, recent_dir)
+    ensure_recent_link_slot(final_name, recent_dir, dst_path)
 
     from mutation_io import ensure_directory_nofollow
     ensure_directory_nofollow(target_folder)

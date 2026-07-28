@@ -481,6 +481,19 @@ def _ingest_to_house(
     )
     routing_result = None
     with decision_store.transaction(conn):
+        decision_store.retire_legacy_title_requeue_path_owners(
+            conn, canonical_path=destination
+        )
+        reserved = conn.execute(
+            "SELECT file_id, active, source FROM files WHERE canonical_path = ?",
+            (str(destination),),
+        ).fetchone()
+        if reserved is not None and reserved["file_id"] != source_file_id:
+            raise RuntimeError(
+                "house intake destination is reserved in state DB: "
+                f"{destination} (file_id={reserved['file_id']}, "
+                f"active={reserved['active']}, source={reserved['source']})"
+            )
         operation_id = decision_store.create_operation(
             conn,
             run_id=run_id,
