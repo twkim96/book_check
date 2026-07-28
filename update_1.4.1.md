@@ -78,5 +78,36 @@
 - [x] frontend production build: TypeScript + Vite 성공
 - [x] Python compile 및 `git diff --check` 성공
 
-실제 `txt_house` 파일 이동은 이 패치 검증 범위에 포함하지 않는다. 운영 적용은 1.4.1 코드의
-정상 검증과 별도의 actual run 승인 아래에서만 수행한다.
+코드 커밋 단계에서는 실제 `txt_house` 파일을 이동하지 않았다. 이후 별도의 actual run 승인으로
+수행한 운영 적용과 검증 결과는 다음 절에 기록한다.
+
+## 7. 실제 전체 Folderling 운영 검증
+
+- DB schema는 1.4.1에서 변경하지 않았다. 코드와 실제 DB 모두 schema v14이며 migration은
+  `불필요(schema current)`로 확인됐다.
+- 실행 전 Doctor 0, 미완료 operation/group 0, active actual run 0, 활성 house 16,759개,
+  신규 temp 입력 0개를 확인했다.
+- 첫 actual run `actual-f35f11d5-1689-494e-99cb-7319116cb3e2`는 최초 1.4.1 재분석이 기본
+  20 GiB 읽기 예산을 소진해 `body_budget_exhausted/deep_check_deferred`로 fail-closed했다.
+  파일 mutation 전 중단됐고 run은 `failed`, Doctor 0, 미완료 operation 0으로 종결됐다.
+- 파일 이동 없는 유지보수 감사로 같은 cache 규약을 채웠다. 마지막 감사 보고서
+  `strong_candidates_20260728_174205_700428.json`은 house 16,759개, 후보 2,622쌍,
+  `completed=true`, stop reason 0이다. 모든 house 파일을 현재 후보 생성 규칙에 넣었지만,
+  감사기는 설계대로 all-pairs가 아닌 bounded heuristic이므로 `coverage_limited=true`는 유지된다.
+- 성공 actual run은 `actual-25e76368-7fca-434d-aecb-671505090679`이며 backup은
+  `before_folderling_20260728_174228_808741_65ab4105.sqlite3`, dedup 보고서는
+  `dedup_20260728_174325_116085.json`이다.
+- 성공 run은 fingerprint cache hit 2,705 / miss 0, pair cache hit 2,622 / miss 0,
+  actual auditor read 0으로 실행됐다.
+- `ordered_body_match` 28쌍 중 현재 mutation 안전선에 적격인 19권을 복구 가능한
+  `trash_bin/ordered_body_duplicates`로 격리했다. 좌표별로 동일 10권, 완전 중첩 8권,
+  회차/권 교차 1권이며 mutation 직전 점수는 95.4730~99.8104%였다.
+- 나머지 9쌍은 기존 managed variant, legacy marker, `decision_required` 또는 사람 판정 안전선으로
+  자동 mutation하지 않았다. 90~95%인 `ordered_body_review` 4쌍도 자동 격리하지 않았다.
+- 성공 run의 `user_quarantine` operation 19건은 모두 committed이고 actual run은 `finished`,
+  error 없음, 최종 Doctor 0, 미완료 operation/group 0이다.
+- 최종 활성 house/DB 지원 파일은 16,740개다. index revision은
+  `5e6e35bfea95a2f7ba4cb5dcd404d82e240436e835c37ff3567d9ec90f9c7a2e`이며 project,
+  `txt_house`, extension의 `file_index.json` SHA-256은 모두
+  `f41e2c25b711c536b20660c23453b629e8d5f6add3d1359ab2f00215c23044b3`로 일치한다.
+- `pass/`의 legacy 항목 1개는 기존 정책대로 자동 입고하지 않고 사람 pair 판정 대상으로 남겼다.
