@@ -332,13 +332,19 @@ def _peek_restore_review_snapshot(
     states = "'pending', 'deferred', 'decided'" if allow_decided else "'pending', 'deferred'"
     review = conn.execute(
         f"""
-        SELECT review_id, candidate_file_id, reference_file_id,
-               left_fingerprint_id, right_fingerprint_id, classification
-        FROM review_items
-        WHERE state IN ({states})
+        SELECT ri.review_id, ri.candidate_file_id, ri.reference_file_id,
+               ri.left_fingerprint_id, ri.right_fingerprint_id,
+               ri.classification
+        FROM review_items AS ri
+        JOIN files AS candidate ON candidate.file_id = ri.candidate_file_id
+        JOIN files AS reference ON reference.file_id = ri.reference_file_id
+        WHERE ri.state IN ({states})
+          AND ri.left_fingerprint_id = candidate.current_fingerprint_id
+          AND ri.right_fingerprint_id = reference.current_fingerprint_id
           AND ((candidate_file_id = ? AND reference_file_id = ?)
             OR (candidate_file_id = ? AND reference_file_id = ?))
-        ORDER BY CASE state WHEN 'decided' THEN 0 ELSE 1 END, review_id DESC
+        ORDER BY CASE ri.state WHEN 'decided' THEN 0 ELSE 1 END,
+                 ri.review_id DESC
         LIMIT 1
         """,
         (
@@ -580,11 +586,15 @@ def _explicit_restore_destination(house, item):
 def _latest_pair_review(conn, candidate_file_id, reference_file_id):
     review = conn.execute(
         """
-        SELECT * FROM review_items
-        WHERE state IN ('pending', 'deferred')
-          AND ((candidate_file_id = ? AND reference_file_id = ?)
-            OR (candidate_file_id = ? AND reference_file_id = ?))
-        ORDER BY review_id DESC LIMIT 1
+        SELECT ri.* FROM review_items AS ri
+        JOIN files AS candidate ON candidate.file_id = ri.candidate_file_id
+        JOIN files AS reference ON reference.file_id = ri.reference_file_id
+        WHERE ri.state IN ('pending', 'deferred')
+          AND ri.left_fingerprint_id = candidate.current_fingerprint_id
+          AND ri.right_fingerprint_id = reference.current_fingerprint_id
+          AND ((ri.candidate_file_id = ? AND ri.reference_file_id = ?)
+            OR (ri.candidate_file_id = ? AND ri.reference_file_id = ?))
+        ORDER BY ri.review_id DESC LIMIT 1
         """,
         (
             candidate_file_id,

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import decision_store
@@ -293,6 +294,49 @@ def test_restore_distinct_plan_requires_queue_source_and_keeps_evidence(tmp_path
     assert plan["explicit_restore"][0]["evidence"] == {
         "front_similarity": 0.05,
     }
+
+
+def test_restore_plan_selects_only_current_fingerprint_review(tmp_path):
+    fixture = _restore_resume_fixture(tmp_path)
+    reference_path = Path(fixture["reference"]["canonical_path"])
+    info = reference_path.stat()
+    os.utime(
+        reference_path,
+        ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000),
+    )
+    conn = decision_store.connect_state_db(fixture["state_db"])
+    try:
+        refreshed = dedup_mutations.refresh_user_approved_snapshot(
+            conn, fixture["reference"]["file_id"]
+        )
+        stale_only = resolve_house_review_batch.build_plan(
+            conn, [], _bound_plan(conn, restore_distinct=[{
+                "restore_file_id": fixture["restore"]["file_id"],
+                "reference_file_id": fixture["reference"]["file_id"],
+                "destination_rel": "ㅇ/오탐 후보.txt",
+            }])
+        )
+        assert "review_snapshot" not in stale_only["explicit_restore"][0]
+        review_id = decision_store.add_review_item(
+            conn,
+            candidate_file_id=fixture["restore"]["file_id"],
+            reference_file_id=fixture["reference"]["file_id"],
+            classification="manual_false_positive_restore",
+            evidence_json=json.dumps({"current": True}),
+        )
+        current = resolve_house_review_batch.build_plan(
+            conn, [], _bound_plan(conn, restore_distinct=[{
+                "restore_file_id": fixture["restore"]["file_id"],
+                "reference_file_id": fixture["reference"]["file_id"],
+                "destination_rel": "ㅇ/오탐 후보.txt",
+            }])
+        )
+    finally:
+        conn.close()
+
+    snapshot = current["explicit_restore"][0]["review_snapshot"]
+    assert snapshot["review_id"] == review_id
+    assert snapshot["right_fingerprint_id"] == refreshed["current_fingerprint_id"]
 
 
 def test_normal_house_source_cannot_masquerade_as_restore_resume(tmp_path):
