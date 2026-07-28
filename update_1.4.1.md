@@ -1,7 +1,8 @@
 # file_check 1.4.1 — 순서형 본문 중복 자동 격리
 
-- 상태: 구현·운영 검증·cold-cache 마감 패치 완료
+- 상태: 구현·전체 운영 적용·무결성 복구·재발 방지까지 완료
 - 시작 기준: `3334edb` (`docs: record strong review queue cleanup`)
+- 코드 마감 기준: `3ef1ff4` (`fix: recover legacy canonical path collisions`)
 - 적용일: 2026-07-28
 - 범위: 동일 좌표·완전 중첩·외전 합계·회차/권 판본의 자동 중복 정리
 
@@ -74,17 +75,18 @@
 - [x] 반복 비교 그래프 500,000 노드 상한
 - [x] 변경 없는 pair cache hit와 실제 read 0
 - [x] 기존 1.4.0 엄격 포함판 회귀
-- [x] 전체 Python 공개 회귀: `327 passed`
+- [x] 전체 Python 공개 회귀: `332 passed`
 - [x] frontend production build: TypeScript + Vite 성공
 - [x] Python compile 및 `git diff --check` 성공
 
 코드 커밋 단계에서는 실제 `txt_house` 파일을 이동하지 않았다. 이후 별도의 actual run 승인으로
 수행한 운영 적용과 검증 결과는 다음 절에 기록한다.
 
-## 7. 실제 전체 Folderling 운영 검증
+## 7. 첫 전체 Folderling 운영 검증
 
-- DB schema는 1.4.1에서 변경하지 않았다. 코드와 실제 DB 모두 schema v14이며 migration은
-  `불필요(schema current)`로 확인됐다.
+- 순서형 본문 자동 격리와 cold-cache 재기준까지의 첫 운영 검증 당시에는 코드와 실제 DB가
+  schema v14였다. 이후 전체 temp 재입고에서 발견한 과거 canonical path 충돌을 해결하며 최종
+  schema는 v15로 올랐다. 최종 상태는 9절을 기준으로 한다.
 - 실행 전 Doctor 0, 미완료 operation/group 0, active actual run 0, 활성 house 16,759개,
   신규 temp 입력 0개를 확인했다.
 - 첫 actual run `actual-f35f11d5-1689-494e-99cb-7319116cb3e2`는 최초 1.4.1 재분석이 기본
@@ -124,6 +126,82 @@
 - 구조화 event에 `auditor_rebaseline`과 `auditor_rebaseline_result`를 남기고, dedup summary에는
   재시도 여부, 최초 stop reason, 최초·합계 read bytes를 기록한다.
 - 실제 house를 다시 움직이지 않고 20/64 GiB와 24/128쌍 설정 경계, 자원 stop reason만 허용하는
-  회귀를 추가했다. 최종 검증은 공개 회귀 327개, Python compileall, TypeScript/Vite production
+  회귀를 추가했다. 해당 패치 시점 검증은 공개 회귀 327개, Python compileall, TypeScript/Vite production
   build, `git diff --check`를 통과했다.
-- DB schema와 사용자 중복 판정 계약은 바뀌지 않았으며 file_check 버전은 1.4.1로 마감한다.
+- 이 재기준 패치는 DB schema와 사용자 중복 판정 계약을 바꾸지 않았다.
+
+## 9. canonical path 무결성 복구와 최종 마감
+
+### 발견된 원인
+
+전체 temp 재입고 중 파일 복사는 끝났지만 DB 반영에서 `files.canonical_path UNIQUE`가 실패하는
+사례를 확인했다. 과거 제목 교정으로 퇴역한 비활성 file row가 실제 house 경로를 계속 점유한 것이
+원인이었다. 실패한 입고를 단순 재실행하면 같은 단계에서 다시 실패할 수 있으므로, 남은 작업만
+재시도하지 않고 원인을 제거한 뒤 전체 입고를 다시 마쳤다.
+
+### schema v15 재발 방지 계약
+
+- migration은 **비활성이고 committed 제목 requeue 이력이 입증된** 과거 path owner만
+  `.dedup_state/retired_paths/<file_id>/...` 가상 경로로 옮긴다. 이력은 operation과 fingerprint에
+  그대로 남고, 출처가 불명확한 비활성 행은 건드리지 않는다.
+- house 입고는 파일 복사 전에 파일시스템 목적지뿐 아니라 DB의 같은 canonical path 점유도 검사한다.
+  증명되지 않은 점유가 있으면 source를 temp에 보존한 채 fail-closed한다.
+- 복사 후 DB 반영 전에 끊긴 `fs_done` operation은 destination의 inode·size·mtime·SHA-256과 journal이
+  모두 일치할 때만 committed로 합류 복구한다.
+- 제목 requeue가 남긴 깨진 `_recent` symlink는 기록된 target이 이번 house 목적지와 정확히 같을 때만
+  기존 링크를 안전하게 재사용한다.
+
+schema v15 migration으로 과거 실경로 점유자 413개를 0개로 정리했고, 이미 파일 복사가 끝나 있던
+`fs_done` operation 12건은 journal 증거를 대조한 뒤 모두 committed로 복구했다.
+
+### 최종 전체 적용 결과
+
+- 최종 actual run: `actual-f51afb30-521c-47df-89df-d79cb71b6060` (`finished`)
+- 신규 house 입고: 45권 committed
+- SHA-256 exact 중복: 1,311권을 복구 가능한 exact quarantine으로 이동
+- 일반 지원 형식 temp 잔여: 0권
+- `_recent` 링크 45개: 모두 실제 target 존재 확인
+- legacy `pass/` 1개: 자동 입고 대상이 아닌 사람 pair 판정 항목으로 의도적으로 보존
+- 최종 Doctor issue: 0
+- 미완료 operation: 0
+- SQLite `integrity_check`: `ok`
+- 활성 house DB row: 17,645
+- index entry: 17,823, projection 검증 성공
+- 최종 inventory revision:
+  `afc5259c3aa276076e9a03bbfd49bcd817a1d82ebfe9b895dad5ae010dc900cf`
+
+권한이 제한된 중간 실행 `actual-c3071e24-ab0b-4240-b291-cbf371a76c9e`은 첫 exact quarantine 쓰기에서
+중단됐지만 source는 보존됐고 미완료 operation은 0개로 종결됐다. 이후 정상 권한의 최종 run이 전체
+대상을 처리했으므로 추가 재실행은 필요하지 않다.
+
+### 최종 검증과 증거
+
+- 공개 회귀: `332 passed`
+- Python compile: 성공
+- frontend TypeScript/Vite production build: 성공
+- `git diff --check`: 성공
+- 복구 감사 보고서:
+  `.dedup_state/reports/canonical_path_recovery_20260728_232037.json`
+- 최종 중복 보고서:
+  `~/Documents/txt_temp/dedup_logs/dedup_20260728_232023_350938.json`
+- 복구 전 DB backup:
+  `.dedup_state/backups/before_schema_v15_recovery_20260728.sqlite3`
+- backup SHA-256:
+  `9f4d6b10be1e9111b7d3d10dd2cb523dd50c5a6b48e7ffd93b116b200e3aa5da`
+
+이 상태를 file_check 1.4.1의 최종 운영 기준으로 삼는다. 이후 동일한 canonical path 충돌은 입고 전
+차단되며, 증명 가능한 과거 tombstone만 자동 은퇴한다. 흔한 동일 작품 중복은 1~5절의 자동화 계약대로
+복구 가능한 격리로 보내고, 작가 충돌·managed variant·본문 증거 부족 같은 예외만 review에 남긴다.
+
+## 10. 이후 운영 기준
+
+1. 평소 목록 갱신은 `python3 scanner.py`, 실제 입고는 `python3 run_folderling_one_button.py`를
+   기존 방식대로 사용한다.
+2. 실제 입고의 성공 여부는 run이 `finished`인지뿐 아니라 최종 Doctor 0, 미완료 operation 0,
+   index projection 성공까지 함께 확인한다. 필요하면 `python3 backend/dedup_recover.py doctor`로
+   복구 상태를 다시 검사한다.
+3. 자동 격리 결과는 `txt_temp/dedup_logs`의 JSON과 `trash_bin`의 복구 가능한 실제 파일로 확인한다.
+   warning/review는 자동 처리 실패가 아니라, 1~5절의 안전선 밖에 있는 의도적인 사람 판정 대상이다.
+4. 1.4.1의 핵심 구현 이력은 `52a291e`(순서형 본문 자동화), `c15ed40`(cold-cache 재기준),
+   `3ef1ff4`(schema v15 canonical path 복구)다. 중복 판정 경계를 바꿀 때는 README의 설계 계약과
+   이 문서를 함께 갱신한다.
