@@ -1909,6 +1909,10 @@ def _process_items_authorized(
             "  최신판 교체: 완전 포함으로 증명된 짧은 판본 "
             f"{dedup_summary.get('contained_upgrade_count', 0)}개 자동 격리"
         )
+        print(
+            "  본문 95% 중복: 동일/중첩/외전 총량/화↔권 관계 "
+            f"{dedup_summary.get('ordered_body_quarantine_count', 0)}개 자동 격리"
+        )
     print(f"  폴더링  : 입고 {move_count}개, pass {pass_count}개")
     print(f"  좌표 충돌: warning 보류 {volume_conflict_hold_count}개")
     print(

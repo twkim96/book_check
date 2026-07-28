@@ -14,6 +14,7 @@ import os
 import re
 import codecs
 import hashlib
+import stat
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,11 @@ MIN_STRONG_TEXT_CHARS = 512
 DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_READ_BYTES = 20 * 1024 * 1024 * 1024
 DEFAULT_NFC_CARRY_CHARS = 1024 * 1024
+ORDERED_BODY_MATCH_THRESHOLD_PPM = 950_000
+ORDERED_BODY_MIN_SOURCE_CHARS = 100_000
+ORDERED_BODY_MAX_GAP_PPM = 20_000
+ORDERED_BODY_MAX_LINE_OCCURRENCES = 64
+ORDERED_BODY_MAX_MATCH_NODES = 500_000
 
 
 class TextAnalysisError(Exception):
@@ -100,6 +106,45 @@ class EdgePreview:
     uncertain: bool
     error: str | None
     read_bytes: int
+
+
+@dataclass(frozen=True)
+class NormalizedLineSequence:
+    path: str
+    size: int
+    mtime_ns: int
+    dev: int
+    ino: int
+    ctime_ns: int
+    lines: tuple[str, ...]
+    weights: tuple[int, ...]
+    total_chars: int
+    read_bytes: int
+
+
+@dataclass(frozen=True)
+class OrderedBodyCoverage:
+    source_chars: int
+    target_chars: int
+    source_lines: int
+    target_lines: int
+    matched_chars: int
+    matched_lines: int
+    coverage_ppm: int
+    max_unmatched_chars: int
+    repetitive_source_chars: int
+
+
+def ordered_body_coverage_sufficient(proof: OrderedBodyCoverage) -> bool:
+    max_gap = max(
+        2_048,
+        proof.source_chars * ORDERED_BODY_MAX_GAP_PPM // 1_000_000,
+    )
+    return bool(
+        proof.source_chars >= ORDERED_BODY_MIN_SOURCE_CHARS
+        and proof.coverage_ppm >= ORDERED_BODY_MATCH_THRESHOLD_PPM
+        and proof.max_unmatched_chars <= max_gap
+    )
 
 
 _EDGE_CACHE = {}
@@ -452,6 +497,198 @@ def analyze_text_file(
             resolved, size, mtime_ns, None, True, str(exc), None, None, 0, "", "",
             "decode_lossy", budget.read_bytes - before,
         )
+
+
+def read_normalized_line_sequence(
+    path,
+    encoding,
+    *,
+    budget=None,
+    max_file_bytes=DEFAULT_MAX_FILE_BYTES,
+):
+    """Read one current TXT into exact, whitespace-free NFC line tokens.
+
+    Physical lines are retained as order units, while their whitespace is
+    removed so line indentation and CRLF/LF differences do not affect proof.
+    The caller supplies the already fingerprinted strict encoding.  A complete
+    identity check prevents a changed file from contributing cached evidence.
+    """
+    budget = budget or ReadBudget()
+    resolved = str(Path(path).resolve())
+    before = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        raise TextAnalysisError(f"ordered body source is not regular: {path}")
+    if before.st_size > max_file_bytes:
+        raise NormalizationDeferred(
+            f"ordered body source exceeds {max_file_bytes} bytes"
+        )
+    budget.reserve_pass(before.st_size)
+    read_before = budget.read_bytes
+    lines = []
+    weights = []
+    first = True
+    try:
+        with open(path, "r", encoding=encoding, errors="strict", newline=None) as stream:
+            for raw_line in stream:
+                if first:
+                    raw_line = raw_line.lstrip("\ufeff")
+                    first = False
+                token = _WHITESPACE_RE.sub(
+                    "", unicodedata.normalize("NFC", raw_line)
+                )
+                if not token:
+                    continue
+                lines.append(token)
+                weights.append(len(token))
+    finally:
+        # TextIO may buffer ahead, so charge the complete reserved pass even
+        # when strict decoding fails partway through.
+        budget.consume(before.st_size)
+    after = os.stat(path, follow_symlinks=False)
+    identity_before = (
+        before.st_dev, before.st_ino, before.st_ctime_ns,
+        before.st_size, before.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_dev, after.st_ino, after.st_ctime_ns,
+        after.st_size, after.st_mtime_ns,
+    )
+    if identity_before != identity_after:
+        raise TextAnalysisError(f"ordered body source changed during read: {path}")
+    return NormalizedLineSequence(
+        path=resolved,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+        dev=after.st_dev,
+        ino=after.st_ino,
+        ctime_ns=after.st_ctime_ns,
+        lines=tuple(lines),
+        weights=tuple(weights),
+        total_chars=sum(weights),
+        read_bytes=budget.read_bytes - read_before,
+    )
+
+
+def ordered_body_coverage(source: NormalizedLineSequence, target: NormalizedLineSequence):
+    """Return a weighted ordered-line LCS from ``source`` into ``target``.
+
+    Hunt-Szymanski style matching keeps normal cases near O(matches log N).
+    Lines occurring more than 64 times on either side remain in the denominator
+    but are not accepted as identity evidence; this both bounds repeated-text
+    cost and prevents separators or boilerplate from inflating the score.
+    """
+    if not source.lines or not target.lines or source.total_chars <= 0:
+        return OrderedBodyCoverage(
+            source.total_chars, target.total_chars,
+            len(source.lines), len(target.lines),
+            0, 0, 0, source.total_chars, 0,
+        )
+
+    target_positions = {}
+    for index, token in enumerate(target.lines, start=1):
+        target_positions.setdefault(token, []).append(index)
+
+    source_occurrences = {}
+    for token in source.lines:
+        source_occurrences[token] = source_occurrences.get(token, 0) + 1
+    repetitive_tokens = {
+        token for token, count in source_occurrences.items()
+        if count > ORDERED_BODY_MAX_LINE_OCCURRENCES
+        or len(target_positions.get(token, ())) > ORDERED_BODY_MAX_LINE_OCCURRENCES
+    }
+    estimated_nodes = sum(
+        count * len(target_positions.get(token, ()))
+        for token, count in source_occurrences.items()
+        if token not in repetitive_tokens
+    )
+    if estimated_nodes > ORDERED_BODY_MAX_MATCH_NODES:
+        raise NormalizationDeferred(
+            "ordered body match graph exceeds safe node budget: "
+            f"{estimated_nodes}>{ORDERED_BODY_MAX_MATCH_NODES}"
+        )
+
+    # Each node is (matched chars, matched lines, source index, previous node).
+    nodes = []
+    tree = [-1] * (len(target.lines) + 1)
+
+    def better(left_id, right_id):
+        if left_id < 0:
+            return right_id
+        if right_id < 0:
+            return left_id
+        left = nodes[left_id]
+        right = nodes[right_id]
+        if (right[0], right[1]) > (left[0], left[1]):
+            return right_id
+        return left_id
+
+    def query(position):
+        best = -1
+        while position > 0:
+            best = better(best, tree[position])
+            position -= position & -position
+        return best
+
+    def update(position, node_id):
+        while position < len(tree):
+            tree[position] = better(tree[position], node_id)
+            position += position & -position
+
+    repetitive_source_chars = 0
+    for source_index, (token, weight) in enumerate(
+        zip(source.lines, source.weights)
+    ):
+        positions = target_positions.get(token, ())
+        if token in repetitive_tokens:
+            repetitive_source_chars += weight
+            continue
+        # Descending target positions prevent one source line from extending
+        # another match created for that same line.
+        for target_position in reversed(positions):
+            previous_id = query(target_position - 1)
+            previous_chars = nodes[previous_id][0] if previous_id >= 0 else 0
+            previous_lines = nodes[previous_id][1] if previous_id >= 0 else 0
+            node_id = len(nodes)
+            nodes.append((
+                previous_chars + weight,
+                previous_lines + 1,
+                source_index,
+                previous_id,
+            ))
+            update(target_position, node_id)
+
+    best_id = query(len(target.lines))
+    if best_id < 0:
+        matched_chars = matched_lines = 0
+        matched_source_indices = set()
+    else:
+        matched_chars, matched_lines = nodes[best_id][:2]
+        matched_source_indices = set()
+        current = best_id
+        while current >= 0:
+            matched_source_indices.add(nodes[current][2])
+            current = nodes[current][3]
+
+    max_unmatched = current_unmatched = 0
+    for index, weight in enumerate(source.weights):
+        if index in matched_source_indices:
+            max_unmatched = max(max_unmatched, current_unmatched)
+            current_unmatched = 0
+        else:
+            current_unmatched += weight
+    max_unmatched = max(max_unmatched, current_unmatched)
+    coverage_ppm = matched_chars * 1_000_000 // source.total_chars
+    return OrderedBodyCoverage(
+        source_chars=source.total_chars,
+        target_chars=target.total_chars,
+        source_lines=len(source.lines),
+        target_lines=len(target.lines),
+        matched_chars=matched_chars,
+        matched_lines=matched_lines,
+        coverage_ppm=coverage_ppm,
+        max_unmatched_chars=max_unmatched,
+        repetitive_source_chars=repetitive_source_chars,
+    )
 
 
 def extract_position_anchors(

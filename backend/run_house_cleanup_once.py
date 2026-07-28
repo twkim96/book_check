@@ -62,6 +62,7 @@ def _better_house_entry(left, right):
 QUEUEABLE = {
     "text_equivalent", "epub_equivalent",
     "near_identical", "contained_exact", "contained_version",
+    "ordered_body_match", "ordered_body_review",
 }
 EXACT_EQUIVALENT = {"text_equivalent", "epub_equivalent"}
 

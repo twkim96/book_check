@@ -1474,7 +1474,7 @@ def folder_quarantine_preview(
             "representative_transitions": representative_transitions,
         }
         return {
-            "version": "1.4.0",
+            "version": "1.4.1",
             "kind": "user_folder_quarantine",
             "item_count": len(items),
             "source_path": str(source),
@@ -1726,7 +1726,7 @@ def apply_folder_quarantine(
     folder_path: str, confirm_count: int, confirm_plan_sha256: str, progress=None,
 ) -> dict:
     from library_review import _refresh_review_index
-    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.4.0"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.4.1"):
         plan = folder_quarantine_preview(
             state_db, house_dir=house_dir, temp_dir=temp_dir, folder_path=folder_path
         )

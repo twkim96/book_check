@@ -49,6 +49,7 @@ def dedup_report_summary_line(payload: Mapping[str, Any]) -> str:
         f"(같은 작가/미상 {summary.get('same_author_count', 0)}, "
         f"작가 충돌 {summary.get('author_conflict_count', 0)}) | "
         f"애매 보류(warning) {summary.get('warning_count', 0)}개 | "
+        f"본문 95% 자동 격리 {summary.get('ordered_body_quarantine_count', 0)}개 | "
         f"본문 증거 없음(metadata_only) {summary.get('metadata_only_count', 0)}개"
     )
 

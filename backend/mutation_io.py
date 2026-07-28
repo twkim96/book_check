@@ -18,6 +18,12 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from text_preview import (
+    NormalizedLineSequence,
+    OrderedBodyCoverage,
+    ordered_body_coverage,
+)
+
 
 class MutationLockBusy(RuntimeError):
     pass
@@ -65,6 +71,17 @@ class ContainedTextEvidence:
     ordered_anchor_count: int
     anchor_chars: int
     anchor_offset_span: int | None
+
+
+@dataclass(frozen=True)
+class OrderedTextEvidence:
+    source_file_evidence: FileEvidence
+    target_file_evidence: FileEvidence
+    source_normalized_sha256: str
+    target_normalized_sha256: str
+    source_normalized_length: int
+    target_normalized_length: int
+    coverage: OrderedBodyCoverage
 
 
 def contained_anchor_proof_sufficient(proof: ContainedTextEvidence) -> bool:
@@ -574,6 +591,114 @@ def _normalized_anchor_occurrences(fd, encoding, anchors):
         search_tail = window[-(max_anchor - 1):] if max_anchor > 1 else ""
         offset += len(chunk)
     return occurrences
+
+
+def _normalized_line_sequence_from_fd(fd, encoding, path, info):
+    lines = []
+    weights = []
+    first = True
+    duplicate = os.dup(fd)
+    try:
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        with os.fdopen(
+            duplicate, "r", encoding=encoding, errors="strict", newline=None
+        ) as stream:
+            duplicate = None
+            for raw_line in stream:
+                if first:
+                    raw_line = raw_line.lstrip("\ufeff")
+                    first = False
+                token = _WHITESPACE_RE.sub(
+                    "", unicodedata.normalize("NFC", raw_line)
+                )
+                if not token:
+                    continue
+                lines.append(token)
+                weights.append(len(token))
+    finally:
+        if duplicate is not None:
+            os.close(duplicate)
+    return NormalizedLineSequence(
+        path=str(path),
+        size=info.st_size,
+        mtime_ns=info.st_mtime_ns,
+        dev=info.st_dev,
+        ino=info.st_ino,
+        ctime_ns=info.st_ctime_ns,
+        lines=tuple(lines),
+        weights=tuple(weights),
+        total_chars=sum(weights),
+        read_bytes=info.st_size,
+    )
+
+
+def inspect_ordered_text(source_path, target_path) -> OrderedTextEvidence:
+    """Revalidate one directional 95% ordered-body proof on pinned TXT files."""
+    source_parent_fd, source_fd, _ = _open_regular_nofollow(source_path)
+    target_parent_fd = target_fd = None
+    try:
+        target_parent_fd, target_fd, _ = _open_regular_nofollow(target_path)
+        source_before = os.fstat(source_fd)
+        target_before = os.fstat(target_fd)
+        if not stat.S_ISREG(source_before.st_mode) or not stat.S_ISREG(
+            target_before.st_mode
+        ):
+            raise RuntimeError("ordered text endpoints must be regular files")
+
+        source_raw_sha = _hash_fd(source_fd)
+        target_raw_sha = _hash_fd(target_fd)
+        (
+            source_sha,
+            source_length,
+            _,
+            source_encoding,
+        ) = _normalized_metrics_with_fallback(source_fd)
+        (
+            target_sha,
+            target_length,
+            _,
+            target_encoding,
+        ) = _normalized_metrics_with_fallback(target_fd)
+        source_lines = _normalized_line_sequence_from_fd(
+            source_fd, source_encoding, source_path, source_before
+        )
+        target_lines = _normalized_line_sequence_from_fd(
+            target_fd, target_encoding, target_path, target_before
+        )
+        coverage = ordered_body_coverage(source_lines, target_lines)
+
+        source_after = os.fstat(source_fd)
+        target_after = os.fstat(target_fd)
+        for label, before, after in (
+            ("source", source_before, source_after),
+            ("target", target_before, target_after),
+        ):
+            if (
+                before.st_dev, before.st_ino, before.st_ctime_ns,
+                before.st_size, before.st_mtime_ns,
+            ) != (
+                after.st_dev, after.st_ino, after.st_ctime_ns,
+                after.st_size, after.st_mtime_ns,
+            ):
+                raise SourceIdentityChanged(
+                    f"{label} source changed during ordered-text proof"
+                )
+        return OrderedTextEvidence(
+            source_file_evidence=_identity(source_after, source_raw_sha),
+            target_file_evidence=_identity(target_after, target_raw_sha),
+            source_normalized_sha256=source_sha,
+            target_normalized_sha256=target_sha,
+            source_normalized_length=source_length,
+            target_normalized_length=target_length,
+            coverage=coverage,
+        )
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        if target_parent_fd is not None:
+            os.close(target_parent_fd)
+        os.close(source_fd)
+        os.close(source_parent_fd)
 
 
 def inspect_contained_text(short_path, long_path) -> ContainedTextEvidence:

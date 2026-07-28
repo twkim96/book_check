@@ -178,7 +178,7 @@ def test_corrupt_epub_candidate_makes_audit_incomplete(tmp_path):
 
 def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.0"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.1"
 
 
 def test_full_sweep_backfills_cross_core_txt_and_warm_run_reuses_cache(tmp_path):

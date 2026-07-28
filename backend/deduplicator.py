@@ -24,6 +24,7 @@ from normalizer import (
     strip_trash_suffix,
     units_comparable,
 )
+from dedup_episode_relation import classify_dedup_coordinate_relation
 from scanner import generate_file_list, validate_index_generation
 from text_preview import count_text_chars, preview_similarity, read_text_edges
 from project_paths import EXTENSION_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
@@ -57,7 +58,9 @@ DEFAULT_STATE_DB = str(STATE_DB)
 AUDITOR_STRONG_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
 AUDITOR_RELATION_CLASSES = frozenset({
     "text_equivalent", "epub_equivalent", "marker_recheck",
-    "near_identical", "contained_exact", "contained_version", "longer_unresolved",
+    "near_identical", "contained_exact", "contained_version", "ordered_body_match",
+    "ordered_body_review",
+    "longer_unresolved",
     "decode_lossy", "metadata_only", "insufficient_text", "boilerplate_only",
     "different",
 })
@@ -940,7 +943,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.4.0"
+        duplicate_auditor.AUDITOR_VERSION == "1.4.1"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -1540,6 +1543,66 @@ def _contained_upgrade_direction(relation):
     return shorter, longer
 
 
+def _ordered_body_direction(relation):
+    """Return (discard, keep, coordinate mode) for a proven 1.4.1 relation."""
+    if relation.get("classification") != "ordered_body_match":
+        return None
+    left, right = relation["left"], relation["right"]
+    if {left.get("source"), right.get("source")} == {"temp"}:
+        return None
+    if "house" not in {left.get("source"), right.get("source")}:
+        return None
+    if not left.get("mutation_eligible", True) or not right.get(
+        "mutation_eligible", True
+    ):
+        return None
+    if os.path.splitext(left.get("name", ""))[1].lower() != ".txt" or os.path.splitext(
+        right.get("name", "")
+    )[1].lower() != ".txt":
+        return None
+    if normalize_nfc(left.get("core_title") or "").casefold() != normalize_nfc(
+        right.get("core_title") or ""
+    ).casefold():
+        return None
+    if not left.get("core_title") or _authors_conflict(left, right):
+        return None
+
+    coordinate_relation = classify_dedup_coordinate_relation(
+        left["name"],
+        right["name"],
+        left_span_ambiguous=bool(left.get("span_ambiguous")),
+        right_span_ambiguous=bool(right.get("span_ambiguous")),
+    )
+    if coordinate_relation is None:
+        return None
+    if coordinate_relation.preferred_side == "left":
+        keep, discard = left, right
+    elif coordinate_relation.preferred_side == "right":
+        keep, discard = right, left
+    else:
+        keep = choose_keep([left, right])
+        discard = right if keep is left else left
+
+    if discard.get("protected") and not discard.get("representative"):
+        return None
+    if (
+        discard.get("assignment_state") == "managed"
+        and not discard.get("representative")
+        and not (
+            keep.get("representative")
+            and discard.get("variant_id") == keep.get("variant_id")
+        )
+    ):
+        return None
+    if (
+        discard.get("assignment_state") == "managed"
+        and keep.get("assignment_state") == "managed"
+        and discard.get("variant_id") != keep.get("variant_id")
+    ):
+        return None
+    return discard, keep, coordinate_relation.mode
+
+
 def _managed_auditor_queue_records(
     auditor_groups,
     auditor_relations,
@@ -1554,7 +1617,9 @@ def _managed_auditor_queue_records(
     from dedup_mutations import (
         ContainedUpgradeNotProven,
         HUMAN_REVIEW_CLASSES,
+        OrderedBodyMatchNotProven,
         apply_contained_upgrade,
+        apply_ordered_body_quarantine,
         house_review_move,
         queue_candidate,
     )
@@ -1658,6 +1723,7 @@ def _managed_auditor_queue_records(
         suspected_dir = os.path.join(temp_dir, "trash_bin", "suspected_duplicates")
         warning_dir = os.path.join(temp_dir, "trash_bin", "warning")
         superseded_dir = os.path.join(temp_dir, "trash_bin", "superseded_versions")
+        ordered_dir = os.path.join(temp_dir, "trash_bin", "ordered_body_duplicates")
         for group in auditor_groups:
             reference = group["keep"]
             classification = group.get("classification", "text_equivalent")
@@ -1818,6 +1884,129 @@ def _managed_auditor_queue_records(
             queued_paths.add(shorter["path"])
             if original_long_path != longer["path"]:
                 queued_paths.add(original_long_path)
+
+        ordered_relations = []
+        for relation in auditor_relations:
+            direction = _ordered_body_direction(relation)
+            if direction is None:
+                continue
+            discard, keep, coordinate_mode = direction
+            ordered_relations.append((
+                discard["path"], keep["path"], relation,
+                discard, keep, coordinate_mode,
+            ))
+        for _, _, relation, discard, keep, coordinate_mode in sorted(
+            ordered_relations, key=lambda item: (item[0], item[1])
+        ):
+            if discard["path"] in queued_paths or keep["path"] in queued_paths:
+                continue
+            if not discard.get("file_id") or not keep.get("file_id"):
+                continue
+            review_id = _review_id_for_unordered_pair(
+                conn,
+                discard["file_id"],
+                keep["file_id"],
+                relation["classification"],
+            )
+            if review_id is None:
+                continue
+
+            original_keep_path = keep["path"]
+            destination = None
+            recent_path = None
+            if keep.get("source") == "temp":
+                if discard.get("source") != "house" or not house_dir:
+                    continue
+                clean_name = materialize_title_markup(
+                    normalize_filename(keep["name"])
+                )
+                if not clean_name:
+                    continue
+                destination = os.path.join(
+                    os.path.dirname(discard["path"]), clean_name
+                )
+                if os.path.lexists(destination):
+                    continue
+                recent_path = os.path.join(
+                    house_dir, "_최근", os.path.basename(destination)
+                )
+                if os.path.lexists(recent_path):
+                    continue
+
+            record = {
+                "dry_run": dry_run,
+                "core_title": keep.get("core_title") or discard.get("core_title"),
+                "keep": keep,
+                "entry": discard,
+                "dest_path": (
+                    os.path.join(ordered_dir, os.path.basename(discard["path"]))
+                    if dry_run else None
+                ),
+                "size": discard["size"],
+                "distinct_authors": False,
+                "status": "ordered_duplicate",
+                "classification": relation["classification"],
+                "review_id": review_id,
+                "house_destination": destination,
+                "recent_link": recent_path,
+                "coordinate_mode": coordinate_mode,
+                "ordered_body_evidence": relation.get("evidence") or {},
+            }
+            if not dry_run:
+                if recent_path is not None:
+                    from folderling import ensure_recent_link_slot
+
+                    ensure_recent_link_slot(
+                        os.path.basename(destination), os.path.dirname(recent_path)
+                    )
+                try:
+                    result = apply_ordered_body_quarantine(
+                        conn,
+                        review_id=review_id,
+                        discard_file_id=discard["file_id"],
+                        keep_file_id=keep["file_id"],
+                        quarantine_dir=ordered_dir,
+                        run_id=actual_run_id,
+                        house_destination=destination,
+                        classification=relation["classification"],
+                    )
+                except OrderedBodyMatchNotProven:
+                    continue
+                record["dest_path"] = result["quarantine_path"]
+                record["operation_id"] = result["quarantine_operation_id"]
+                record["ingest_operation_id"] = result["ingest_operation_id"]
+                record["house_destination"] = result["ingested_path"]
+                record["ordered_body_evidence"] = {
+                    key: result[key] for key in (
+                        "source_normalized_sha256",
+                        "target_normalized_sha256",
+                        "source_normalized_length",
+                        "target_normalized_length",
+                        "coverage_ppm",
+                        "matched_chars",
+                        "source_chars",
+                        "max_unmatched_chars",
+                        "coordinate_mode",
+                    )
+                }
+                if recent_path is not None:
+                    from folderling import create_recent_link
+
+                    create_recent_link(
+                        result["ingested_path"],
+                        os.path.basename(result["ingested_path"]),
+                        os.path.dirname(recent_path),
+                    )
+                    keep["path"] = result["ingested_path"]
+                    keep["name"] = os.path.basename(result["ingested_path"])
+                    keep["rel_path"] = normalize_nfc(
+                        os.path.relpath(result["ingested_path"], house_dir)
+                    )
+                    keep["source"] = "house"
+            records.append(record)
+            queued_paths.add(discard["path"])
+            if original_keep_path != keep["path"]:
+                queued_paths.add(original_keep_path)
 
         by_temp = defaultdict(list)
         for relation in auditor_relations:
@@ -1987,6 +2176,7 @@ def _emit_dedup_record_events(event_callback, exact_records, suspect_move_record
     status_labels = {
         "moved": "suspected_duplicate",
         "superseded": "superseded_version",
+        "ordered_duplicate": "ordered_body_duplicate",
         "warning": "warning",
         "author_review": "author_conflict",
         "metadata_only": "metadata_only",
@@ -2258,6 +2448,9 @@ def _clean_duplicates_impl(
     superseded_records = [
         r for r in suspect_move_records if r.get("status") == "superseded"
     ]
+    ordered_duplicate_records = [
+        r for r in suspect_move_records if r.get("status") == "ordered_duplicate"
+    ]
     metadata_only_records = [
         r for r in suspect_move_records
         if r.get("status") == "metadata_only"
@@ -2320,6 +2513,7 @@ def _clean_duplicates_impl(
         "review_queue_move_count": review_queue_move_count,
         "warning_count": len(warning_records),
         "contained_upgrade_count": len(superseded_records),
+        "ordered_body_quarantine_count": len(ordered_duplicate_records),
         "metadata_only_count": len(metadata_only_records),
         "author_conflict_count": author_conflict_count,
         "same_author_count": same_author_count,
@@ -2344,7 +2538,8 @@ def _clean_duplicates_impl(
     moved_suspects = [
         r for r in suspect_move_records
         if r.get("status") in (
-            "moved", "warning", "author_review", "metadata_only", "superseded"
+            "moved", "warning", "author_review", "metadata_only", "superseded",
+            "ordered_duplicate",
         )
     ]
     changed = bool(exact_mutation_records or moved_suspects or disambig_assigned)
@@ -2381,6 +2576,11 @@ def _clean_duplicates_impl(
             print(
                 f"→ 완전 포함 최신판 자동 교체: {len(superseded_records)}개 "
                 "(짧은 판본은 superseded_versions에 격리)"
+            )
+        if ordered_duplicate_records:
+            print(
+                f"→ 순서형 본문 95% 자동 격리: {len(ordered_duplicate_records)}개 "
+                "(ordered_body_duplicates에서 복구 가능)"
             )
         if metadata_only_records:
             print(f"→ 본문 증거 없음(metadata_only): {len(metadata_only_records)}개")

@@ -76,7 +76,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.4.0</small>
+            <small>file_check 1.4.1</small>
           </div>
         </div>
         <nav>
@@ -336,7 +336,7 @@ function ReviewQueue() {
     <div className="toolbar">
       <form className="search-form" onSubmit={(event) => { event.preventDefault(); update({ search: draft.trim() }); }}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="파일명·후보 경로 검색" /><button className="button secondary">검색</button></form>
       <select value={category} onChange={(event) => update({ category: event.target.value })}>
-        <option value="all">전체 검토 큐</option><option value="database">DB review</option><option value="warning">warning</option><option value="author_conflicts">작가 충돌</option><option value="suspected_duplicates">중복 의심</option><option value="exact_quarantine">정확 중복 격리</option><option value="exact_duplicates">legacy 정확 중복</option>
+        <option value="all">전체 검토 큐</option><option value="database">DB review</option><option value="warning">warning</option><option value="author_conflicts">작가 충돌</option><option value="suspected_duplicates">중복 의심</option><option value="ordered_body_duplicates">본문 95% 자동 격리</option><option value="exact_quarantine">정확 중복 격리</option><option value="exact_duplicates">legacy 정확 중복</option>
       </select>
       <select value={physical} onChange={(event) => update({ physical: event.target.value })}>
         <option value="all">전체 보관 상태</option><option value="relation_only">관계 검토 · 미격리</option><option value="quarantined">실제 격리됨</option><option value="queue_missing">격리 경로 확인 필요</option>
@@ -1338,6 +1338,7 @@ const folderlingStatusLabels: Record<string, string> = {
   ingested: "입고",
   pass_ingested: "승인 입고",
   exact_duplicate: "정확 중복",
+  ordered_body_duplicate: "본문 95% 중복",
   suspected_duplicate: "검토 격리",
   warning: "경고 보류",
   author_conflict: "작가 충돌",
@@ -1350,6 +1351,7 @@ const folderlingStatusLabels: Record<string, string> = {
 const folderlingReasonLabels: Record<string, string> = {
   journaled_house_ingest: "journal을 남기고 house에 입고",
   exact_fingerprint: "파일 내용·크기 fingerprint 일치",
+  ordered_body_match: "같은 작품·호환 좌표에서 본문 95% 이상 순서 일치",
   volume_coordinate_conflict: "기존 파일과 같은 권 좌표",
   volume_coordinate_hold_failed: "같은 권 좌표 보류 처리 실패",
   excluded_source_item: "운영 보조 파일 또는 제외 폴더",

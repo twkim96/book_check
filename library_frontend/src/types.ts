@@ -760,7 +760,7 @@ export interface ExplorerFolderDetail {
 }
 
 export interface FolderQuarantinePlan {
-  version: "1.4.0";
+  version: "1.4.1";
   kind: "user_folder_quarantine";
   item_count: number;
   source_path: string;

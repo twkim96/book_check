@@ -22,6 +22,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from dedup_episode_relation import classify_dedup_coordinate_relation
 from normalizer import (
     NORMALIZER_VERSION,
     analyze_name,
@@ -39,11 +40,19 @@ from text_preview import (
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_READ_BYTES,
     MIN_STRONG_TEXT_CHARS,
+    ORDERED_BODY_MATCH_THRESHOLD_PPM,
+    ORDERED_BODY_MIN_SOURCE_CHARS,
+    NormalizationDeferred,
+    OrderedBodyCoverage,
     ReadBudget,
     TextAnalysis,
+    TextAnalysisError,
     TextAnalysisCache,
     batch_scan_normalized,
     extract_position_anchors,
+    ordered_body_coverage,
+    ordered_body_coverage_sufficient,
+    read_normalized_line_sequence,
 )
 from project_paths import FILE_INDEX, HOUSE_DIR, TEMP_DIR
 from mutation_io import inspect_epub_content, inspect_regular_file
@@ -55,17 +64,18 @@ from review_noise import (
 )
 
 
-# 한 파일은 인코딩 확정 중 최대 3회, deep 검사에서 short/long 역할로 각 1회 읽힐 수 있다.
-MAX_ESTIMATED_READ_PASSES = 5
+# 한 파일은 인코딩 확정 중 최대 3회, deep/ordered 검사에서 추가로 읽힐 수 있다.
+MAX_ESTIMATED_READ_PASSES = 6
 # v2: BOM UTF-16 LE/BE strict 판독을 fingerprint 의미에 포함한다.
 # 판독 규칙이 바뀌면 기존 decode_lossy 결과를 재사용하지 않도록 반드시 올린다.
 FINGERPRINT_VERSION = "5"
-AUDITOR_VERSION = "1.4.0"
+AUDITOR_VERSION = "1.4.1"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
 DEFAULT_FULL_SWEEP_MAX_FILE_BYTES = 1024 * 1024 * 1024
 DEFAULT_FULL_SWEEP_MAX_EPUB_UNCOMPRESSED_BYTES = 6 * 1024 * 1024 * 1024
+ORDERED_BODY_REVIEW_FLOOR_PPM = 900_000
 
 
 class StaleInputDuringAnalysis(RuntimeError):
@@ -1215,7 +1225,8 @@ class PersistentAuditCache:
     def store_pair_results(self, candidates, results):
         stable = {
             "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
-            "contained_version", "longer_unresolved", "boilerplate_only", "different",
+            "contained_version", "ordered_body_match", "ordered_body_review",
+            "longer_unresolved", "boilerplate_only", "different",
             "decode_lossy", "empty_text", "insufficient_text", "metadata_only",
         }
         by_pair = {result.pair_id: result for result in results}
@@ -1256,7 +1267,8 @@ class PersistentAuditCache:
     def _store_review_item(self, candidate, result, ordered_left_fp, ordered_right_fp):
         reviewable = {
             "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
-            "contained_version", "longer_unresolved", "decode_lossy",
+            "contained_version", "ordered_body_match", "ordered_body_review",
+            "longer_unresolved", "decode_lossy",
             "metadata_only", "insufficient_text",
         }
         if result.classification not in reviewable:
@@ -1704,6 +1716,193 @@ def _analysis_for_use(analyses, entry, stop_reasons):
     return analysis
 
 
+def _ordered_author_tokens(value):
+    normalized = normalize_nfc(str(value or "")).strip().casefold()
+    return {
+        token for token in re.split(r"[\s,/&·]+", normalized) if token
+    }
+
+
+def _ordered_body_relation(candidate):
+    left, right = candidate.left, candidate.right
+    if left.ext != ".txt" or right.ext != ".txt":
+        return None
+    if not left.core_title or normalize_nfc(left.core_title).casefold() != normalize_nfc(
+        right.core_title
+    ).casefold():
+        return None
+    left_authors = _ordered_author_tokens(left.author)
+    right_authors = _ordered_author_tokens(right.author)
+    if left_authors and right_authors and not (left_authors & right_authors):
+        return None
+    return classify_dedup_coordinate_relation(
+        left.name,
+        right.name,
+        left_span_ambiguous=left.span_ambiguous,
+        right_span_ambiguous=right.span_ambiguous,
+    )
+
+
+def _ordered_keep_side(candidate, relation, left_analysis, right_analysis):
+    if relation.preferred_side is not None:
+        return relation.preferred_side, "wider_declared_coverage"
+    left, right = candidate.left, candidate.right
+    if (
+        left.unit == right.unit
+        and left.effective_max > 0
+        and right.effective_max > 0
+        and left.effective_max != right.effective_max
+    ):
+        return (
+            ("left", "higher_effective_max")
+            if left.effective_max > right.effective_max
+            else ("right", "higher_effective_max")
+        )
+    left_chars = left_analysis.normalized_length
+    right_chars = right_analysis.normalized_length
+    larger = max(left_chars, right_chars)
+    smaller = min(left_chars, right_chars)
+    if larger > 0 and (larger - smaller) / larger > 0.05:
+        return (
+            ("left", "larger_normalized_body")
+            if left_chars > right_chars
+            else ("right", "larger_normalized_body")
+        )
+    if left.complete != right.complete:
+        return (
+            ("left", "complete_marker")
+            if left.complete else ("right", "complete_marker")
+        )
+    if len(left.name) != len(right.name):
+        return (
+            ("left", "cleaner_filename")
+            if len(left.name) < len(right.name)
+            else ("right", "cleaner_filename")
+        )
+    return (
+        ("left", "stable_filename_order")
+        if left.name <= right.name
+        else ("right", "stable_filename_order")
+    )
+
+
+def _exact_ordered_coverage(source_analysis, target_analysis):
+    source_chars = source_analysis.normalized_length
+    return OrderedBodyCoverage(
+        source_chars=source_chars,
+        target_chars=target_analysis.normalized_length,
+        source_lines=0,
+        target_lines=0,
+        matched_chars=source_chars,
+        matched_lines=0,
+        coverage_ppm=1_000_000,
+        max_unmatched_chars=0,
+        repetitive_source_chars=0,
+    )
+
+
+def _apply_ordered_body_classification(
+    candidates,
+    results,
+    analyses,
+    config,
+    budget,
+    stop_reasons,
+):
+    """Promote eligible same-core editions only after a complete ordered proof."""
+    results_by_id = {result.pair_id: result for result in results}
+    line_cache = {}
+
+    def sequence(entry, analysis):
+        cached = line_cache.get(entry.path)
+        if cached is not None:
+            return cached
+        loaded = read_normalized_line_sequence(
+            entry.path,
+            analysis.encoding,
+            budget=budget,
+            max_file_bytes=config.max_file_bytes,
+        )
+        line_cache[entry.path] = loaded
+        return loaded
+
+    for candidate in candidates:
+        result = results_by_id.get(candidate.pair_id)
+        if result is None or result.evidence.get("ordered_body_checked"):
+            continue
+        relation = _ordered_body_relation(candidate)
+        if relation is None:
+            continue
+        left_analysis = analyses.get(candidate.left.path)
+        right_analysis = analyses.get(candidate.right.path)
+        if (
+            left_analysis is None
+            or right_analysis is None
+            or left_analysis.status != "ok"
+            or right_analysis.status != "ok"
+        ):
+            continue
+        keep_side, selection_policy = _ordered_keep_side(
+            candidate, relation, left_analysis, right_analysis
+        )
+        if keep_side == "left":
+            source_entry, source_analysis = candidate.right, right_analysis
+            target_entry, target_analysis = candidate.left, left_analysis
+            direction = "right_to_left"
+        else:
+            source_entry, source_analysis = candidate.left, left_analysis
+            target_entry, target_analysis = candidate.right, right_analysis
+            direction = "left_to_right"
+
+        try:
+            if (
+                source_analysis.normalized_sha256
+                and source_analysis.normalized_sha256
+                == target_analysis.normalized_sha256
+            ):
+                proof = _exact_ordered_coverage(source_analysis, target_analysis)
+            else:
+                proof = ordered_body_coverage(
+                    sequence(source_entry, source_analysis),
+                    sequence(target_entry, target_analysis),
+                )
+        except BodyBudgetExceeded:
+            result.classification = "body_budget_exhausted"
+            result.evidence["ordered_body_checked"] = False
+            result.evidence["ordered_body_reason"] = "body_budget_exhausted"
+            stop_reasons.append("body_budget_exhausted")
+            continue
+        except (OSError, UnicodeError, TextAnalysisError, NormalizationDeferred) as exc:
+            result.evidence["ordered_body_checked"] = True
+            result.evidence["ordered_body_reason"] = f"read_failed:{type(exc).__name__}"
+            continue
+
+        result.evidence.update({
+            "ordered_body_checked": True,
+            "ordered_body_version": "1.4.1",
+            "ordered_body_direction": direction,
+            "ordered_body_keep_side": keep_side,
+            "ordered_body_selection_policy": selection_policy,
+            "ordered_body_threshold_ppm": ORDERED_BODY_MATCH_THRESHOLD_PPM,
+            "ordered_body_min_source_chars": ORDERED_BODY_MIN_SOURCE_CHARS,
+            "ordered_body_coverage": asdict(proof),
+            "ordered_body_coordinate": relation.as_evidence(),
+        })
+        if ordered_body_coverage_sufficient(proof):
+            result.classification = "ordered_body_match"
+        elif (
+            proof.coverage_ppm >= ORDERED_BODY_REVIEW_FLOOR_PPM
+            and result.classification
+            not in {"text_equivalent", "contained_exact", "contained_version", "near_identical"}
+        ):
+            result.classification = "ordered_body_review"
+    return [
+        results_by_id[candidate.pair_id]
+        for candidate in candidates
+        if candidate.pair_id in results_by_id
+    ]
+
+
 def analyze_candidates(
     candidates, config, coverage, stop_reasons, persistent=None,
     preloaded_analyses=None, budget=None, cache=None,
@@ -1937,7 +2136,19 @@ def analyze_candidates(
             config, "deep_scan", len(grouped_items), len(grouped_items), budget
         )
 
-    return [results[candidate.pair_id] for candidate in candidates if candidate.pair_id in results], budget, cache, stop_reasons
+    ordered_results = _apply_ordered_body_classification(
+        candidates,
+        [
+            results[candidate.pair_id]
+            for candidate in candidates
+            if candidate.pair_id in results
+        ],
+        analyses,
+        config,
+        budget,
+        stop_reasons,
+    )
+    return ordered_results, budget, cache, stop_reasons
 
 
 def _configuration(args):
@@ -2435,6 +2646,7 @@ def _text_report(report, include_details=True):
     ]
     for key in (
         "text_equivalent", "epub_equivalent", "near_identical", "contained_exact", "contained_version",
+        "ordered_body_match", "ordered_body_review",
         "marker_recheck", "boilerplate_only", "longer_unresolved", "metadata_only",
         "decode_lossy", "empty_text", "insufficient_text", "oversize_deferred",
         "normalization_deferred", "deep_check_deferred", "body_budget_exhausted", "different",

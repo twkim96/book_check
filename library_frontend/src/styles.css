@@ -700,7 +700,7 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .folderling-dot-needs_review, .folderling-dot-warning, .folderling-dot-fallback { background: var(--yellow); box-shadow: 0 0 8px #ffd45c77; }
 .folderling-dot-failed { background: var(--red); box-shadow: 0 0 8px #ff727277; }
 .folderling-status { display: inline-block; width: fit-content; border-radius: 99px; padding: 3px 7px; color: #aeb8c8; background: #29313d; font-size: 13px; font-weight: 800; white-space: nowrap; }
-.folderling-status-succeeded, .folderling-status-completed, .folderling-status-ingested, .folderling-status-pass_ingested { color: #7fe3a7; background: #183d27; }
+.folderling-status-succeeded, .folderling-status-completed, .folderling-status-ingested, .folderling-status-pass_ingested, .folderling-status-ordered_body_duplicate { color: #7fe3a7; background: #183d27; }
 .folderling-status-exact_duplicate { color: var(--blue); background: color-mix(in srgb, var(--blue-2) 16%, var(--panel-2)); }
 .folderling-status-needs_review, .folderling-status-warning, .folderling-status-fallback, .folderling-status-suspected_duplicate, .folderling-status-author_conflict { color: #f4cc82; background: #4a3718; }
 .folderling-status-failed { color: #ff9b9b; background: #4a242a; }

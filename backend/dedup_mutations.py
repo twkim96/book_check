@@ -5,6 +5,7 @@ import unicodedata
 from pathlib import Path
 
 import decision_store
+from dedup_episode_relation import classify_dedup_coordinate_relation
 from mutation_io import (
     assert_mutation_lock_held,
     contained_anchor_proof_sufficient,
@@ -12,10 +13,12 @@ from mutation_io import (
     ensure_directory_nofollow,
     inspect_contained_text,
     inspect_epub_content,
+    inspect_ordered_text,
     inspect_regular_file,
     inspect_normalized_text,
     mutation_lock,
 )
+from text_preview import ordered_body_coverage_sufficient
 
 
 STRONG_QUEUE_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
@@ -25,6 +28,8 @@ WEAK_QUEUE_CLASSES = frozenset({
     "near_identical",
     "contained_exact",
     "contained_version",
+    "ordered_body_match",
+    "ordered_body_review",
 })
 REPORT_ONLY_CLASSES = frozenset({
     "longer_unresolved", "decode_lossy", "metadata_only", "insufficient_text",
@@ -36,6 +41,10 @@ HUMAN_REVIEW_CLASSES = (
 
 
 class ContainedUpgradeNotProven(RuntimeError):
+    pass
+
+
+class OrderedBodyMatchNotProven(RuntimeError):
     pass
 
 
@@ -1305,6 +1314,216 @@ def apply_contained_upgrade(
         "ingested_path": (
             ingest_result["dest_path"] if ingest_result is not None
             else longer["canonical_path"]
+        ),
+        "quarantine_operation_id": quarantine_result["operation_id"],
+        "quarantine_path": quarantine_result["dest_path"],
+    }
+
+
+def apply_ordered_body_quarantine(
+    conn,
+    *,
+    review_id,
+    discard_file_id,
+    keep_file_id,
+    quarantine_dir,
+    run_id,
+    house_destination=None,
+    classification="ordered_body_match",
+):
+    """Finalize a same-core edition after a directional 95% body proof."""
+    actual_run = decision_store.assert_active_actual_run(conn, run_id)
+    assert_mutation_lock_held(conn, run_id=run_id)
+    discard = _file_state(conn, discard_file_id)
+    keep = _file_state(conn, keep_file_id)
+    if discard_file_id == keep_file_id:
+        raise ValueError("ordered body endpoints must differ")
+    if discard["source"] not in {"house", "temp"} or keep["source"] not in {
+        "house", "temp"
+    }:
+        raise RuntimeError("ordered body endpoints must be active house/temp files")
+    if discard["source"] == keep["source"] == "temp":
+        raise RuntimeError("ordered body quarantine requires a house endpoint")
+    if Path(discard["canonical_path"]).suffix.lower() != ".txt" or Path(
+        keep["canonical_path"]
+    ).suffix.lower() != ".txt":
+        raise RuntimeError("ordered body quarantine supports TXT only")
+
+    review = conn.execute(
+        "SELECT * FROM review_items WHERE review_id = ?", (review_id,)
+    ).fetchone()
+    if (
+        review is None
+        or review["classification"] != classification
+        or classification != "ordered_body_match"
+        or review["state"] not in {"pending", "deferred"}
+        or {review["candidate_file_id"], review["reference_file_id"]}
+        != {discard_file_id, keep_file_id}
+    ):
+        raise RuntimeError("ordered body quarantine requires a current review")
+    expected_fingerprints = {
+        review["candidate_file_id"]: review["left_fingerprint_id"],
+        review["reference_file_id"]: review["right_fingerprint_id"],
+    }
+    if (
+        discard["current_fingerprint_id"]
+        != expected_fingerprints[discard_file_id]
+        or keep["current_fingerprint_id"] != expected_fingerprints[keep_file_id]
+    ):
+        raise RuntimeError("ordered body quarantine fingerprint changed")
+
+    discard_meta = _contained_metadata(conn, discard_file_id)
+    keep_meta = _contained_metadata(conn, keep_file_id)
+    if not _normalized_metadata_token(discard_meta["core_title"]) or (
+        _normalized_metadata_token(discard_meta["core_title"])
+        != _normalized_metadata_token(keep_meta["core_title"])
+    ):
+        raise RuntimeError("ordered body quarantine core title mismatch")
+    discard_authors = _author_tokens(discard_meta["author"])
+    keep_authors = _author_tokens(keep_meta["author"])
+    if discard_authors and keep_authors and not (discard_authors & keep_authors):
+        raise RuntimeError("ordered body quarantine author mismatch")
+
+    coordinate_relation = classify_dedup_coordinate_relation(
+        Path(discard["canonical_path"]).name,
+        Path(keep["canonical_path"]).name,
+        left_span_ambiguous=bool(discard["span_ambiguous"]),
+        right_span_ambiguous=bool(keep["span_ambiguous"]),
+    )
+    if coordinate_relation is None:
+        raise RuntimeError("ordered body quarantine coordinate relation changed")
+    if coordinate_relation.preferred_side not in {None, "right"}:
+        raise RuntimeError("ordered body quarantine would discard wider coverage")
+
+    discard_path = _preflight(discard)
+    keep_path = _preflight(keep)
+    proof = inspect_ordered_text(discard_path, keep_path)
+    _assert_row_identity(discard, proof.source_file_evidence, discard_path)
+    _assert_row_identity(keep, proof.target_file_evidence, keep_path)
+    if (
+        not discard["normalized_sha256"]
+        or not keep["normalized_sha256"]
+        or proof.source_normalized_sha256 != discard["normalized_sha256"]
+        or proof.target_normalized_sha256 != keep["normalized_sha256"]
+    ):
+        raise RuntimeError("ordered body normalized SHA revalidation failed")
+    if not ordered_body_coverage_sufficient(proof.coverage):
+        raise OrderedBodyMatchNotProven(
+            "ordered body coverage fell below the current 1.4.1 contract"
+        )
+
+    discard_root = "house_root" if discard["source"] == "house" else "temp_root"
+    keep_root = "house_root" if keep["source"] == "house" else "temp_root"
+    decision_store.assert_manifest_source(
+        actual_run, discard_path, discard_root, proof.source_file_evidence
+    )
+    decision_store.assert_manifest_source(
+        actual_run, keep_path, keep_root, proof.target_file_evidence
+    )
+
+    ingest_result = None
+    if keep["source"] == "temp":
+        if house_destination is None:
+            raise RuntimeError("ordered body keep destination is required")
+        destination = Path(decision_store.canonicalize_path(house_destination))
+        decision_store.assert_actual_run_path(actual_run, destination, "house_root")
+        ingest_result = ingest_to_house(
+            conn,
+            source_file_id=keep_file_id,
+            destination=destination,
+            run_id=run_id,
+        )
+        keep = _file_state(conn, keep_file_id)
+    elif house_destination is not None and decision_store.canonicalize_path(
+        house_destination
+    ) != keep["canonical_path"]:
+        raise RuntimeError("ordered body destination disagrees with keep path")
+
+    discard = _file_state(conn, discard_file_id)
+    keep = _file_state(conn, keep_file_id)
+    if keep["source"] != "house":
+        raise RuntimeError("ordered body keep endpoint is not in house")
+
+    with decision_store.transaction(conn):
+        if discard["source"] == "house" and discard["variant_id"] is not None:
+            if discard["assignment_state"] != "managed":
+                raise RuntimeError("ordered body discard has unresolved relationships")
+            if discard["representative"]:
+                if keep["variant_id"] not in {None, discard["variant_id"]}:
+                    raise RuntimeError("ordered body quarantine crosses managed variants")
+                if keep["representative"] and keep_file_id != discard_file_id:
+                    raise RuntimeError("ordered body keep is another representative")
+                conn.execute(
+                    """
+                    UPDATE files SET variant_id = ?, assignment_state = 'managed',
+                        assignment_origin = 'strong_match', protected = 1
+                    WHERE file_id = ?
+                    """,
+                    (discard["variant_id"], keep_file_id),
+                )
+                replaced = conn.execute(
+                    """
+                    UPDATE representatives SET file_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE variant_id = ? AND file_id = ?
+                    """,
+                    (keep_file_id, discard["variant_id"], discard_file_id),
+                )
+                if replaced.rowcount != 1:
+                    raise RuntimeError("ordered body representative changed")
+                conn.execute(
+                    "UPDATE files SET protected = 0 WHERE file_id = ?",
+                    (discard_file_id,),
+                )
+            elif not (
+                keep["representative"]
+                and keep["variant_id"] == discard["variant_id"]
+                and not discard["protected"]
+            ):
+                raise RuntimeError("ordered body managed relationship is ambiguous")
+        elif discard["source"] == "house" and (
+            discard["protected"] or discard["representative"]
+        ):
+            raise RuntimeError("ordered body cannot consume a protected loose file")
+        elif discard["source"] == "house" and discard["assignment_state"] not in {
+            "unassigned", "managed"
+        }:
+            raise RuntimeError("ordered body discard requires a prior decision")
+        elif discard["source"] == "temp" and (
+            discard["protected"] or discard["representative"]
+        ):
+            raise RuntimeError("ordered body temp discard is protected")
+
+    quarantine_result = user_quarantine(
+        conn,
+        source_file_id=discard_file_id,
+        keep_file_id=keep_file_id,
+        quarantine_dir=quarantine_dir,
+        run_id=run_id,
+        reason="ordered_body_95_auto_duplicate",
+        keep_origin_operation_id=(
+            ingest_result["operation_id"] if ingest_result is not None else None
+        ),
+    )
+    coverage = proof.coverage
+    return {
+        "classification": classification,
+        "discard_file_id": discard_file_id,
+        "keep_file_id": keep_file_id,
+        "source_normalized_sha256": proof.source_normalized_sha256,
+        "target_normalized_sha256": proof.target_normalized_sha256,
+        "source_normalized_length": proof.source_normalized_length,
+        "target_normalized_length": proof.target_normalized_length,
+        "coverage_ppm": coverage.coverage_ppm,
+        "matched_chars": coverage.matched_chars,
+        "source_chars": coverage.source_chars,
+        "max_unmatched_chars": coverage.max_unmatched_chars,
+        "coordinate_mode": coordinate_relation.mode,
+        "ingest_operation_id": (
+            ingest_result["operation_id"] if ingest_result is not None else None
+        ),
+        "ingested_path": (
+            ingest_result["dest_path"] if ingest_result is not None
+            else keep["canonical_path"]
         ),
         "quarantine_operation_id": quarantine_result["operation_id"],
         "quarantine_path": quarantine_result["dest_path"],
