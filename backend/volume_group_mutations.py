@@ -226,8 +226,11 @@ def classify_folderling_volume_target(
     if None in coordinates:
         return no_target("existing_coordinate_missing")
     authors = {str(row["author"]) for row in existing if row["author"]}
-    if source["author"]:
-        authors.add(str(source["author"]))
+    source_author = str(source.get("author") or "").strip()
+    if authors and not source_author:
+        return no_target("source_author_missing_for_authored_work")
+    if source_author:
+        authors.add(source_author)
     if len(authors) > 1:
         return no_target("author_conflict")
     works = {

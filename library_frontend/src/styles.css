@@ -667,6 +667,7 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .report-kind, .report-format { width: fit-content; border-radius: 99px; padding: 5px 8px; font-size: 13px; font-weight: 800; white-space: nowrap; }
 .report-kind-dedup { color: var(--blue); background: color-mix(in srgb, var(--blue-2) 16%, var(--panel-2)); }
 .report-kind-strong_candidates { color: #f4cc82; background: #4a3718; }
+.report-kind-cleanup { color: #9de2c1; background: #183f31; }
 .report-format { color: #7fe3a7; background: #183d27; }
 .report-root { display: block; margin-top: 12px; color: #687383; overflow-wrap: anywhere; }
 .job-detail-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 13px; margin-bottom: 13px; }

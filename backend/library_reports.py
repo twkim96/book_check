@@ -17,6 +17,10 @@ REPORT_STEM_RE = re.compile(
     r"(?:_(?P<microseconds>\d{6}))?"
     r"|(?P<strong>strong_candidates)_(?P<strong_date>\d{8})_"
     r"(?P<strong_time>\d{6})_(?P<suffix>\d{6})"
+    r"|(?P<cleanup>(?:manual_)?house_cleanup)_"
+    r"(?P<cleanup_version>\d+_\d+_\d+)_"
+    r"(?P<cleanup_date>\d{8})_(?P<cleanup_time>\d{6})_"
+    r"(?P<cleanup_suffix>\d{6})"
 )
 REPORT_FILE_RE = re.compile(rf"(?P<stem>{REPORT_STEM_RE.pattern})\.(?P<extension>txt|json)")
 SUMMARY_READ_BYTES = 128 * 1024
@@ -68,8 +72,16 @@ def _report_files(temp_dir: os.PathLike | str, identifier: str) -> tuple[str, di
 
 
 def _created_at(match: re.Match[str], modified_at: float) -> str:
-    date = match.group("date") or match.group("strong_date")
-    clock = match.group("time") or match.group("strong_time")
+    date = (
+        match.group("date")
+        or match.group("strong_date")
+        or match.group("cleanup_date")
+    )
+    clock = (
+        match.group("time")
+        or match.group("strong_time")
+        or match.group("cleanup_time")
+    )
     try:
         # Filenames were written in the machine's local time.
         return datetime.strptime(date + clock, "%Y%m%d%H%M%S").astimezone().isoformat()
@@ -124,7 +136,12 @@ def _report_item(stem: str, files: dict[str, Path]) -> dict:
     match = REPORT_STEM_RE.fullmatch(stem)
     if match is None:
         raise ValueError(stem)
-    kind = "dedup" if match.group("kind") else "strong_candidates"
+    if match.group("kind"):
+        kind = "dedup"
+    elif match.group("strong"):
+        kind = "strong_candidates"
+    else:
+        kind = "cleanup"
     primary = files.get("txt") or files["json"]
     latest_mtime = max(path.stat().st_mtime for path in files.values())
     try:
@@ -161,7 +178,7 @@ def dedup_report_listing(
     limit: int = 200,
     cursor: str | int | None = None,
 ) -> dict:
-    if kind not in {"all", "dedup", "strong_candidates"}:
+    if kind not in {"all", "dedup", "strong_candidates", "cleanup"}:
         raise ValueError("지원하지 않는 dedup 보고서 종류입니다")
     limit = max(1, min(int(limit), 500))
     try:

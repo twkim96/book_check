@@ -2940,6 +2940,25 @@ def doctor_issues(
             })
     for row in conn.execute(
         """
+        SELECT v.variant_id, w.work_bucket_id, COUNT(f.file_id) AS managed_file_count
+        FROM variants AS v
+        JOIN works AS w ON w.work_bucket_id = v.work_bucket_id
+        JOIN files AS f ON f.variant_id = v.variant_id
+        LEFT JOIN representatives AS r ON r.variant_id = v.variant_id
+        WHERE v.status = 'active' AND w.status = 'active'
+          AND f.active = 1 AND f.assignment_state = 'managed'
+          AND r.variant_id IS NULL
+        GROUP BY v.variant_id, w.work_bucket_id
+        """
+    ):
+        issues.append({
+            "kind": "active_managed_variant_missing_representative",
+            "variant_id": row["variant_id"],
+            "work_bucket_id": row["work_bucket_id"],
+            "managed_file_count": row["managed_file_count"],
+        })
+    for row in conn.execute(
+        """
         SELECT f.file_id, f.variant_id, v.status AS variant_status,
                w.work_bucket_id, w.status AS work_status
         FROM files AS f

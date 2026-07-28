@@ -939,7 +939,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.3.6"
+        duplicate_auditor.AUDITOR_VERSION == "1.4.0"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -1316,11 +1316,19 @@ def enrich_entries_from_state_db(entries, state_db_path, read_only=False):
         conn.close()
 
 
-def _managed_exact_records(exact_groups, state_db_path, temp_dir, dry_run, actual_run_id=None):
+def _managed_exact_records(
+    exact_groups,
+    state_db_path,
+    temp_dir,
+    dry_run,
+    actual_run_id=None,
+    blocked_candidate_paths=(),
+):
     import decision_store
     from dedup_mutations import exact_quarantine
 
     records = []
+    blocked_candidates = set(blocked_candidate_paths)
     conn = decision_store.connect_state_db(state_db_path)
     quarantine_dir = os.path.join(temp_dir, "trash_bin", "exact_quarantine")
     try:
@@ -1355,6 +1363,11 @@ def _managed_exact_records(exact_groups, state_db_path, temp_dir, dry_run, actua
                         or entry.get("variant_id") != keep.get("variant_id")
                     )
                 )
+                if entry.get("path") in blocked_candidates:
+                    record["action"] = "managed_report_only"
+                    record["reason"] = "multi_representative_conflict"
+                    records.append(record)
+                    continue
                 if (
                     not keep.get("file_id")
                     or keep.get("source") != "house"
@@ -1900,7 +1913,12 @@ def _clean_duplicates_impl(
     excluded_paths = set()
     if managed_mode:
         exact_records = _managed_exact_records(
-            exact_groups, state_db_path, temp_dir, dry_run, actual_run_id
+            exact_groups,
+            state_db_path,
+            temp_dir,
+            dry_run,
+            actual_run_id,
+            blocked_candidate_paths=multi_representative_paths,
         )
         excluded_paths.update(
             record["entry"]["path"] for record in exact_records

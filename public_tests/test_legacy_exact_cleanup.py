@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import decision_store
 import dedup_mutations
 import deduplicator
@@ -51,6 +53,45 @@ def _run_exact_group(state_db, temp, run_id, keep, duplicate):
         False,
         actual_run_id=run_id,
     )[0]
+
+
+def _multi_representative_exact_fixture(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        first = _add(conn, house / "첫 작품.txt", "house")
+        second = _add(conn, house / "둘째 작품.txt", "house")
+        incoming = _add(conn, temp / "검토 대상.txt", "temp")
+        with decision_store.transaction(conn):
+            for title, representative in (
+                ("첫 작품", first),
+                ("둘째 작품", second),
+            ):
+                work_id = conn.execute(
+                    "INSERT INTO works(display_title) VALUES (?)", (title,)
+                ).lastrowid
+                variant_id = conn.execute(
+                    "INSERT INTO variants(work_bucket_id, variant_kind) "
+                    "VALUES (?, 'base')",
+                    (work_id,),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE files SET variant_id = ?, assignment_state = 'managed', "
+                    "assignment_origin = 'human_decision', protected = 1 "
+                    "WHERE file_id = ?",
+                    (variant_id, representative["file_id"]),
+                )
+                conn.execute(
+                    "INSERT INTO representatives(variant_id, file_id) VALUES (?, ?)",
+                    (variant_id, representative["file_id"]),
+                )
+    finally:
+        conn.close()
+    return state_db, house, temp, first, second, incoming
 
 
 def test_unassigned_temp_exact_is_quarantined_against_unassigned_house_keep(tmp_path):
@@ -181,6 +222,69 @@ def test_unassigned_house_cleanup_still_revalidates_raw_sha(tmp_path):
 
     assert Path(keep["canonical_path"]).is_file()
     assert Path(duplicate["canonical_path"]).is_file()
+
+
+def test_exact_mutation_api_blocks_multiple_managed_representative_identities(tmp_path):
+    state_db, house, temp, first, second, incoming = (
+        _multi_representative_exact_fixture(tmp_path)
+    )
+
+    run_id = _approve(state_db, house, temp)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="multiple managed representative identities",
+        ):
+            dedup_mutations.exact_quarantine(
+                conn,
+                source_file_id=incoming["file_id"],
+                keep_file_id=first["file_id"],
+                quarantine_dir=temp / "trash_bin" / "exact_quarantine",
+                run_id=run_id,
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == 0
+        decision_store.finish_actual_run(
+            conn, run_id, success=False, error="expected conflict"
+        )
+    finally:
+        conn.close()
+
+    assert Path(first["canonical_path"]).is_file()
+    assert Path(second["canonical_path"]).is_file()
+    assert Path(incoming["canonical_path"]).is_file()
+
+
+def test_exact_orchestrator_reports_blocked_multi_representative_candidate(tmp_path):
+    state_db, house, temp, first, second, incoming = (
+        _multi_representative_exact_fixture(tmp_path)
+    )
+    run_id = _approve(state_db, house, temp)
+    record = deduplicator._managed_exact_records(
+        [_exact_group(first, incoming)],
+        str(state_db),
+        str(temp),
+        False,
+        actual_run_id=run_id,
+        blocked_candidate_paths={incoming["path"]},
+    )[0]
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == 0
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
+    assert record["action"] == "managed_report_only"
+    assert record["reason"] == "multi_representative_conflict"
+    assert record["dest_path"] is None
+    assert Path(first["canonical_path"]).is_file()
+    assert Path(second["canonical_path"]).is_file()
+    assert Path(incoming["canonical_path"]).is_file()
 
 
 def test_exact_cleanup_accepts_decode_lossy_fingerprint_without_cached_raw_sha(tmp_path):

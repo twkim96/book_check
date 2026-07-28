@@ -249,6 +249,34 @@ def test_folderling_volume_target_rejects_duplicate_coordinate(tmp_path):
         conn.close()
 
 
+def test_folderling_volume_target_rejects_missing_author_for_authored_work(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add(
+            conn,
+            house / "ㅂ" / "별빛 연대기" / "별빛 연대기 1권 [한작가].epub",
+            "house",
+        )
+        incoming = _add(conn, temp / "별빛 연대기 2권.epub", "temp")
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming["file_id"],
+            house_root=house,
+        )
+    finally:
+        conn.close()
+
+    assert decision == {
+        "status": "no_target",
+        "reason": "source_author_missing_for_authored_work",
+    }
+
+
 def test_folderling_volume_target_requires_existing_work_folder(tmp_path):
     state_db, house, temp, _, incoming = _fixture(tmp_path)
     conn = decision_store.connect_state_db(state_db)

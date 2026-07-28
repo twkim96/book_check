@@ -191,7 +191,9 @@ def user_queue_restore(conn, *, file_id, run_id):
         }
 
 
-def user_queue_accept_to_house(conn, *, file_id, destination, run_id):
+def user_queue_accept_to_house(
+    conn, *, file_id, destination, run_id, operation_group_id=None
+):
     """Accept a human-reviewed queue file into house in one journaled move.
 
     Unlike ``user_queue_restore``, this also supports files that originally came
@@ -229,6 +231,7 @@ def user_queue_accept_to_house(conn, *, file_id, destination, run_id):
                 expected_size=source["size"],
                 expected_mtime_ns=source["mtime_ns"],
                 expected_fingerprint_id=source["current_fingerprint_id"],
+                operation_group_id=operation_group_id,
                 source_dev=source_evidence.dev,
                 source_ino=source_evidence.ino,
                 source_ctime_ns=source_evidence.ctime_ns,
@@ -626,6 +629,43 @@ def _ensure_mutable_source(row, *, allow_unassigned_house_exact=False):
         raise RuntimeError(f"assignment state blocks mutation: {row['assignment_state']}")
 
 
+def _managed_representative_identities_for_raw_sha(
+    conn, raw_sha256, size, *, known_sha_by_file_id=None
+):
+    """Return managed work/variant identities whose current representative matches bytes.
+
+    The orchestrator normally detects this conflict before exact cleanup.  This
+    second check keeps the mutation API fail-closed when it is called directly
+    or a future caller forgets to carry the conflict set forward.  Same-size
+    representatives are inspected from their current no-follow paths so stale
+    or legacy fingerprint caches cannot hide an identity conflict.
+    """
+    rows = conn.execute(
+        """
+        SELECT v.work_bucket_id, f.variant_id, f.file_id, f.canonical_path,
+               f.dev, f.ino, f.ctime_ns, f.size, f.mtime_ns
+        FROM representatives AS r
+        JOIN files AS f ON f.file_id = r.file_id
+        JOIN variants AS v ON v.variant_id = f.variant_id
+        WHERE f.active = 1 AND f.assignment_state = 'managed'
+          AND f.size = ?
+        """,
+        (size,),
+    ).fetchall()
+    identities = set()
+    known_hashes = known_sha_by_file_id or {}
+    for row in rows:
+        representative_sha = known_hashes.get(row["file_id"])
+        if representative_sha is None:
+            path = Path(row["canonical_path"])
+            evidence = inspect_regular_file(path)
+            _assert_row_identity(row, evidence, path)
+            representative_sha = evidence.sha256
+        if representative_sha == raw_sha256:
+            identities.add((row["work_bucket_id"], row["variant_id"]))
+    return identities
+
+
 def exact_quarantine(
     conn,
     *,
@@ -704,6 +744,16 @@ def _exact_quarantine(
     keep_hash = keep_evidence.sha256
     if source_hash != keep_hash:
         raise RuntimeError("exact raw SHA revalidation failed")
+    representative_identities = _managed_representative_identities_for_raw_sha(
+        conn,
+        source_hash,
+        source_evidence.size,
+        known_sha_by_file_id={keep_file_id: keep_hash},
+    )
+    if len(representative_identities) > 1:
+        raise RuntimeError(
+            "exact source matches multiple managed representative identities"
+        )
     # decode_lossy/epub_error fingerprints intentionally may not contain a raw
     # cache.  Absence is not a mismatch: the two current files were just read
     # in full and matched.  A populated cache, however, must still agree.

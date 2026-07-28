@@ -60,21 +60,38 @@ def _reports(tmp_path):
         "강력 후보 감사: house 100개 / temp 0개 / 메타 후보 2쌍\n",
         encoding="utf-8",
     )
+    cleanup = root / "manual_house_cleanup_1_4_0_20260728_120535_063869.json"
+    cleanup.write_text(
+        json.dumps({
+            "schema_version": 2,
+            "kind": "manual_house_cleanup_1_4_0",
+            "generated_at": "2026-07-28T12:05:35+09:00",
+            "result": {"quarantined": []},
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
     (root / "terminal.code-workspace").write_text("ignored", encoding="utf-8")
-    return temp, old, paired, current, strong
+    return temp, old, paired, current, strong, cleanup
 
 
 def test_dedup_report_listing_groups_legacy_pairs_and_json_only_reports(tmp_path):
-    temp, _old, paired, current, _strong = _reports(tmp_path)
+    temp, _old, paired, current, _strong, cleanup = _reports(tmp_path)
 
     listing = dedup_report_listing(temp)
 
     assert listing["readonly"] is True
-    assert listing["total"] == 4
-    assert listing["items"][0]["name"] == current.name
-    assert listing["items"][0]["report_id"] == current.stem
-    assert listing["items"][0]["text_available"] is False
-    assert listing["items"][0]["structured_available"] is True
+    assert listing["total"] == 5
+    cleanup_item = next(
+        item for item in listing["items"] if item["report_id"] == cleanup.stem
+    )
+    assert cleanup_item["kind"] == "cleanup"
+    assert cleanup_item["text_available"] is False
+    assert cleanup_item["structured_available"] is True
+    current_item = next(
+        item for item in listing["items"] if item["report_id"] == current.stem
+    )
+    assert current_item["text_available"] is False
+    assert current_item["structured_available"] is True
     paired_item = next(item for item in listing["items"] if item["report_id"] == paired.stem)
     assert paired_item["text_available"] is True
     assert paired_item["structured_available"] is True
@@ -107,7 +124,7 @@ def test_dedup_report_listing_pages_twenty_reports_at_a_time(tmp_path):
 
 
 def test_json_only_detail_renders_text_and_exports_without_creating_txt(tmp_path):
-    temp, _old, _paired, current, _strong = _reports(tmp_path)
+    temp, _old, _paired, current, _strong, _cleanup = _reports(tmp_path)
 
     detail = read_dedup_report(temp, current.stem)
     export_name, export_text = export_dedup_report_text(temp, current.name)
@@ -124,7 +141,7 @@ def test_json_only_detail_renders_text_and_exports_without_creating_txt(tmp_path
 
 
 def test_legacy_text_detail_and_export_remain_compatible(tmp_path):
-    temp, old, _paired, _current, _strong = _reports(tmp_path)
+    temp, old, _paired, _current, _strong, _cleanup = _reports(tmp_path)
 
     detail = read_dedup_report(temp, old.name)
     export_name, export_text = export_dedup_report_text(temp, old.stem)
@@ -136,7 +153,7 @@ def test_legacy_text_detail_and_export_remain_compatible(tmp_path):
 
 
 def test_dedup_report_rejects_non_report_names_and_missing_json(tmp_path):
-    temp, old, _paired, _current, _strong = _reports(tmp_path)
+    temp, old, _paired, _current, _strong, _cleanup = _reports(tmp_path)
 
     with pytest.raises(ValueError):
         read_dedup_report(temp, "../success.log")

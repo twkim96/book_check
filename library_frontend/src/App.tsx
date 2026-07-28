@@ -76,7 +76,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.3.9</small>
+            <small>file_check 1.4.0</small>
           </div>
         </div>
         <nav>
@@ -1155,15 +1155,17 @@ function Jobs() {
   );
 }
 
-function reportKindLabel(kind: "dedup" | "strong_candidates"): string {
-  return kind === "dedup" ? "Folderling 중복 정리" : "강력 후보 감사";
+function reportKindLabel(kind: "dedup" | "strong_candidates" | "cleanup"): string {
+  if (kind === "dedup") return "Folderling 중복 정리";
+  if (kind === "strong_candidates") return "강력 후보 감사";
+  return "도서 정리·복구 기록";
 }
 
 function DedupReports() {
   const [data, setData] = useState<DedupReportListing>();
   const [search, setSearch] = useState("");
   const [submittedSearch, setSubmittedSearch] = useState("");
-  const [kind, setKind] = useState<"all" | "dedup" | "strong_candidates">("all");
+  const [kind, setKind] = useState<"all" | "dedup" | "strong_candidates" | "cleanup">("all");
   const [cursor, setCursor] = useState("");
   const [error, setError] = useState("");
   const load = () => {
@@ -1190,6 +1192,7 @@ function DedupReports() {
         <option value="all">전체 보고서</option>
         <option value="dedup">Folderling 중복 정리</option>
         <option value="strong_candidates">강력 후보 감사</option>
+        <option value="cleanup">도서 정리·복구 기록</option>
       </select>
     </section>
     {error && <div className="inline-error">{error}</div>}

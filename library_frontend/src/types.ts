@@ -193,7 +193,7 @@ export interface JobEvent {
 export interface DedupReportItem {
   report_id: string;
   name: string;
-  kind: "dedup" | "strong_candidates";
+  kind: "dedup" | "strong_candidates" | "cleanup";
   size: number;
   created_at: string;
   modified_at: string;
@@ -209,7 +209,7 @@ export interface DedupReportListing {
   cursor: string | null;
   next_cursor: string | null;
   search: string;
-  kind: "all" | "dedup" | "strong_candidates";
+  kind: "all" | "dedup" | "strong_candidates" | "cleanup";
   readonly: true;
   root: string;
 }
@@ -760,7 +760,7 @@ export interface ExplorerFolderDetail {
 }
 
 export interface FolderQuarantinePlan {
-  version: "1.3.7";
+  version: "1.4.0";
   kind: "user_folder_quarantine";
   item_count: number;
   source_path: string;
@@ -772,6 +772,19 @@ export interface FolderQuarantinePlan {
   work_bucket_ids: number[];
   managed_folders: Array<{ folder_id: number; work_bucket_id: number; canonical_path: string; role: string }>;
   related_folders: Array<{ folder_id: number; work_bucket_id: number; canonical_path: string; role: string; display_title: string | null }>;
+  representative_transitions: Array<{
+    variant_id: number;
+    representative_file_id: string;
+    replacement_file_id: string | null;
+    remaining_active_managed_files: Array<{
+      file_id: string;
+      source: string;
+      canonical_path: string;
+      current_fingerprint_id: number | null;
+      protected: number;
+    }>;
+    blocker: string | null;
+  }>;
   items: Array<{ relative_path: string; source_path: string; size: number; registered: boolean; file_id: string | null }>;
   blocked_reasons: string[];
   apply_available: boolean;

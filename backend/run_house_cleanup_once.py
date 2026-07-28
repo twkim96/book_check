@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""One-time, explicitly approved queueing of existing house review relations."""
+"""Explicitly queue strong house review relations with a recovery report."""
 
 import argparse
 from collections import defaultdict, deque
+from datetime import datetime
+import hashlib
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 
 import decision_store
 import folderling
 from dedup_mutations import HUMAN_REVIEW_CLASSES, house_review_move
 from deduplicator import get_better_entry
-from mutation_io import mutation_lock_for_roots
+from mutation_io import (
+    ensure_directory_nofollow,
+    inspect_regular_file,
+    mutation_lock_for_roots,
+)
 from normalizer import analyze_name
 from run_folderling_one_button import (
     _prune_folderling_backups,
@@ -21,6 +29,7 @@ from project_paths import FILE_INDEX, FILE_LIST, PROJECT_ROOT, STATE_DB
 
 
 DEFAULT_DB = STATE_DB
+REPORT_SCHEMA_VERSION = 2
 
 
 def _entry(row):
@@ -54,6 +63,7 @@ QUEUEABLE = {
     "text_equivalent", "epub_equivalent",
     "near_identical", "contained_exact", "contained_version",
 }
+EXACT_EQUIVALENT = {"text_equivalent", "epub_equivalent"}
 
 
 def build_plan(conn, scope="queueable", review_ids=None):
@@ -72,7 +82,10 @@ def build_plan(conn, scope="queueable", review_ids=None):
         params.extend(review_ids)
     rows = conn.execute(
         f"""
-        SELECT ri.review_id, ri.classification, cf.*, rf.file_id AS r_file_id
+        SELECT ri.review_id, ri.classification,
+               ri.left_fingerprint_id, ri.right_fingerprint_id,
+               ri.evidence_json AS review_evidence_json,
+               cf.*, rf.file_id AS r_file_id
         FROM review_items AS ri
         JOIN files AS cf ON cf.file_id = ri.candidate_file_id
         JOIN files AS rf ON rf.file_id = ri.reference_file_id
@@ -97,7 +110,10 @@ def build_plan(conn, scope="queueable", review_ids=None):
         if not row["active"] or not right["active"]:
             continue
         if scope == "queueable":
-            if row["protected"] or right["protected"]:
+            if (
+                (row["protected"] or right["protected"])
+                and row["classification"] not in EXACT_EQUIVALENT
+            ):
                 continue
             if row["assignment_state"] in {"legacy_unresolved", "decision_required"}:
                 continue
@@ -108,9 +124,44 @@ def build_plan(conn, scope="queueable", review_ids=None):
         left_entry, right_entry = _entry(row), _entry(right)
         files[left_entry["file_id"]] = left_entry
         files[right_entry["file_id"]] = right_entry
-        edge = (row["review_id"], row["classification"])
+        try:
+            review_evidence = json.loads(row["review_evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            review_evidence = {
+                "previous_evidence": row["review_evidence_json"],
+            }
+        edge = {
+            "review_id": row["review_id"],
+            "classification": row["classification"],
+            "left_fingerprint_id": row["left_fingerprint_id"],
+            "right_fingerprint_id": row["right_fingerprint_id"],
+            "review_evidence": review_evidence,
+        }
         edges[left_entry["file_id"]].append((right_entry["file_id"], edge))
         edges[right_entry["file_id"]].append((left_entry["file_id"], edge))
+
+    protected_exact_nodes = {
+        file_id for file_id, item in files.items() if item["protected"]
+    }
+    queue = deque(protected_exact_nodes)
+    while queue:
+        node = queue.popleft()
+        for neighbor, edge in edges[node]:
+            if (
+                edge["classification"] in EXACT_EQUIVALENT
+                and neighbor not in protected_exact_nodes
+            ):
+                protected_exact_nodes.add(neighbor)
+                queue.append(neighbor)
+
+    def edge_allowed(left, right, edge):
+        return (
+            edge["classification"] in EXACT_EQUIVALENT
+            or (
+                left not in protected_exact_nodes
+                and right not in protected_exact_nodes
+            )
+        )
 
     seen = set()
     for start in sorted(files):
@@ -124,7 +175,10 @@ def build_plan(conn, scope="queueable", review_ids=None):
                 continue
             seen.add(node)
             component.append(node)
-            stack.extend(neighbor for neighbor, _ in edges[node] if neighbor not in seen)
+            stack.extend(
+                neighbor for neighbor, edge in edges[node]
+                if neighbor not in seen and edge_allowed(node, neighbor, edge)
+            )
         if len(component) < 2:
             continue
         protected = [files[node] for node in component if files[node]["protected"]]
@@ -140,7 +194,7 @@ def build_plan(conn, scope="queueable", review_ids=None):
         while queue:
             node = queue.popleft()
             for neighbor, edge in edges[node]:
-                if neighbor in parent:
+                if neighbor in parent or not edge_allowed(node, neighbor, edge):
                     continue
                 parent[neighbor] = node
                 parent_edge[neighbor] = edge
@@ -149,9 +203,8 @@ def build_plan(conn, scope="queueable", review_ids=None):
         for node in sorted((n for n in component if n != root), key=lambda n: -depth[n]):
             if files[node]["protected"]:
                 continue
-            review_id, classification = parent_edge[node]
             plans.append({
-                "review_id": review_id, "classification": classification,
+                **parent_edge[node],
                 "keep_file_id": parent[node], "move_file_id": node,
                 "component_keep": keep["path"], "keep": files[parent[node]]["path"],
                 "move": files[node]["path"],
@@ -159,7 +212,10 @@ def build_plan(conn, scope="queueable", review_ids=None):
     return plans
 
 
-def run(state_db, house, temp, execute=False, scope="queueable", review_ids=None):
+def run(
+    state_db, house, temp, execute=False, scope="queueable", review_ids=None,
+    *, report_path=None, intent_report_path=None,
+):
     if not execute:
         conn = decision_store.connect_state_db_readonly(state_db)
         try:
@@ -175,6 +231,10 @@ def run(state_db, house, temp, execute=False, scope="queueable", review_ids=None
             conn.close()
 
     with mutation_lock_for_roots(house, temp, "house-cleanup-once"):
+        if intent_report_path is None:
+            intent_report_path = _intent_report_path(temp)
+        if report_path is not None and Path(report_path) == Path(intent_report_path):
+            raise RuntimeError("intent and terminal report paths must differ")
         conn = decision_store.connect_state_db(state_db)
         try:
             issues = decision_store.doctor_issues(conn)
@@ -186,14 +246,31 @@ def run(state_db, house, temp, execute=False, scope="queueable", review_ids=None
             backup = decision_store.backup_state_db(
                 conn, _unique_backup_path(Path(state_db).parent / "backups", "before_house_cleanup")
             )
+            intent = write_intent_report(
+                intent_report_path,
+                plans=plans,
+                scope=scope,
+                review_ids=review_ids,
+                state_db=state_db,
+                house=house,
+                temp=temp,
+                backup=backup,
+            )
             decision_store.issue_actual_run_token(
                 conn, str(backup), house_dir=house, temp_dir=temp
             )
         finally:
             conn.close()
-        run_id, _ = decision_store.prepare_actual_run(state_db, house, temp)
+        manifest_paths = [intent["path"]]
+        for plan in plans:
+            manifest_paths.extend((plan["move"], plan["keep"]))
+        manifest_paths = list(dict.fromkeys(manifest_paths))
+        run_id, manifest_path = decision_store.prepare_actual_run(
+            state_db, house, temp, manifest_paths=manifest_paths
+        )
         conn = decision_store.connect_state_db(state_db)
         moved = []
+        run_finished = False
         try:
             for plan in plans:
                 if scope == "all-pending":
@@ -211,29 +288,230 @@ def run(state_db, house, temp, execute=False, scope="queueable", review_ids=None
                     queue_dir=Path(temp) / "trash_bin" / queue_name, run_id=run_id,
                 )
                 moved.append({**plan, **result})
+            index_ok = folderling.generate_file_list(
+                [house], str(FILE_LIST),
+                str(FILE_INDEX), state_db_path=state_db, temp_root=temp,
+            )
+            if not index_ok:
+                raise RuntimeError("file list/index generation failed")
+            folderling.sync_house_index(str(FILE_INDEX), house)
+            folderling.sync_extension_index(
+                str(FILE_INDEX), str(PROJECT_ROOT)
+            )
+            _prune_folderling_backups(
+                state_db, Path(state_db).parent / "backups"
+            )
             decision_store.finish_actual_run(conn, run_id, success=True)
+            run_finished = True
         except BaseException as exc:
-            decision_store.finish_actual_run(conn, run_id, success=False, error=str(exc))
+            if not run_finished:
+                decision_store.finish_actual_run(
+                    conn, run_id, success=False, error=str(exc)
+                )
             raise
         finally:
             conn.close()
-            _prune_folderling_backups(state_db, Path(state_db).parent / "backups")
 
-        folderling.generate_file_list(
-            [house], str(FILE_LIST),
-            str(FILE_INDEX), state_db_path=state_db,
-        )
-        folderling.sync_house_index(str(FILE_INDEX), house)
-        folderling.sync_extension_index(
-            str(FILE_INDEX), str(PROJECT_ROOT)
-        )
-        return {
+        result = {
             "dry_run": False,
             "scope": scope,
             "review_ids": sorted(set(review_ids or ())),
             "run_id": run_id,
+            "manifest_path": manifest_path,
+            "backup_path": str(backup),
+            "intent_report_path": intent["path"],
+            "intent_report_sha256": intent["sha256"],
             "moved": moved,
         }
+        if report_path is not None:
+            result["report_path"] = str(report_path)
+            write_execution_report(
+                report_path,
+                result=result,
+                state_db=state_db,
+            )
+        return result
+
+
+def _report_path(temp_dir, requested=None):
+    lexical_root = Path(temp_dir).resolve() / "dedup_logs"
+    ensure_directory_nofollow(lexical_root)
+    root = lexical_root.resolve()
+    if requested:
+        target = Path(requested).expanduser().resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                "--report-path must resolve inside <temp>/dedup_logs"
+            ) from exc
+        if target.parent != root:
+            raise ValueError("--report-path must be a direct child of <temp>/dedup_logs")
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"report path already exists: {target}")
+        return target
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = root / f"house_cleanup_1_4_0_{stamp}.json"
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"report path already exists: {target}")
+    return target
+
+
+def _intent_report_path(temp_dir):
+    lexical_root = Path(temp_dir).resolve() / "dedup_logs"
+    ensure_directory_nofollow(lexical_root)
+    root = lexical_root.resolve()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    target = root / f"house_cleanup_1_4_0_{stamp}.json"
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"intent report path already exists: {target}")
+    return target
+
+
+def _cleanup_plan_sha256(*, plans, scope, review_ids):
+    payload = {
+        "scope": scope,
+        "review_ids": sorted(set(review_ids or ())),
+        "plans": plans,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def write_intent_report(
+    path, *, plans, scope, review_ids, state_db, house, temp, backup
+):
+    backup_evidence = inspect_regular_file(backup)
+    plan_sha256 = _cleanup_plan_sha256(
+        plans=plans, scope=scope, review_ids=review_ids
+    )
+    payload = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "kind": "house_cleanup_intent_1_4_0",
+        "phase": "intent",
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "plan_sha256": plan_sha256,
+        "plan": {
+            "scope": scope,
+            "review_ids": sorted(set(review_ids or ())),
+            "plans": plans,
+        },
+        "run_preparation": {
+            "state_db": str(Path(state_db).resolve()),
+            "house_root": str(Path(house).resolve()),
+            "temp_root": str(Path(temp).resolve()),
+            "backup": {
+                "path": str(Path(backup).resolve()),
+                "sha256": backup_evidence.sha256,
+                "size": backup_evidence.size,
+                "mtime_ns": backup_evidence.mtime_ns,
+            },
+        },
+    }
+    target = Path(path)
+    temporary = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.link(temporary, target, follow_symlinks=False)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    evidence = inspect_regular_file(target)
+    return {
+        "path": str(target),
+        "sha256": evidence.sha256,
+        "plan_sha256": plan_sha256,
+    }
+
+
+def write_execution_report(path, *, result, state_db, index_path=FILE_INDEX):
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        final_snapshot = {
+            "doctor_issues": decision_store.doctor_issues(conn),
+            "active_house": conn.execute(
+                "SELECT COUNT(*) FROM files WHERE active=1 AND source='house'"
+            ).fetchone()[0],
+            "active_queue": conn.execute(
+                "SELECT COUNT(*) FROM files WHERE active=1 AND source='queue'"
+            ).fetchone()[0],
+            "unfinished_operations": conn.execute(
+                "SELECT COUNT(*) FROM operations "
+                "WHERE state IN ('planned', 'fs_done', 'db_done')"
+            ).fetchone()[0],
+            "active_runs": conn.execute(
+                "SELECT COUNT(*) FROM actual_runs WHERE state='active'"
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+    try:
+        index = json.loads(Path(index_path).read_text(encoding="utf-8"))
+        final_snapshot["index"] = {
+            "generation_id": index.get("generation_id"),
+            "generated_at": index.get("generated_at"),
+            "entries": len(index.get("entries") or []),
+        }
+    except (OSError, ValueError, TypeError):
+        final_snapshot["index"] = {"read_error": True}
+    payload = {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "kind": "house_cleanup_1_4_0",
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "result": result,
+        "final_snapshot": final_snapshot,
+    }
+    target = Path(path)
+    temporary = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.link(temporary, target, follow_symlinks=False)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return str(target)
+
+
+def _recovery_context(state_db, limit=4):
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        runs = [dict(row) for row in conn.execute(
+            """
+            SELECT run_id, state, backup_path, manifest_path, error,
+                   approved_at, activated_at, finished_at
+            FROM actual_runs ORDER BY rowid DESC LIMIT ?
+            """,
+            (limit,),
+        )]
+        run_ids = [row["run_id"] for row in runs]
+        operations = []
+        if run_ids:
+            placeholders = ", ".join("?" for _ in run_ids)
+            operations = [dict(row) for row in conn.execute(
+                f"""
+                SELECT operation_id, run_id, action, state, file_id,
+                       source_path, dest_path, error
+                FROM operations WHERE run_id IN ({placeholders})
+                ORDER BY operation_id
+                """,
+                tuple(run_ids),
+            )]
+        return {"actual_runs": runs, "operations": operations}
+    finally:
+        conn.close()
 
 
 def main(argv=None):
@@ -243,6 +521,10 @@ def main(argv=None):
     parser.add_argument("--temp", default=folderling.DEFAULT_SRC_DIR)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--ack-user-approved", action="store_true")
+    parser.add_argument(
+        "--report-path",
+        help="actual-run JSON log path below <temp>/dedup_logs",
+    )
     parser.add_argument(
         "--scope",
         choices=("queueable", "all-pending"),
@@ -256,11 +538,51 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.run and not args.ack_user_approved:
         parser.error("--run requires --ack-user-approved")
-    print(json.dumps(
-        run(
+    report_target = (
+        _report_path(args.temp, args.report_path) if args.run else None
+    )
+    intent_target = _intent_report_path(args.temp) if args.run else None
+    try:
+        result = run(
             args.state_db, args.house, args.temp, args.run,
             scope=args.scope, review_ids=args.review_id,
-        ),
+            report_path=report_target,
+            intent_report_path=intent_target,
+        )
+    except BaseException as exc:
+        if report_target is not None:
+            failure = {
+                "dry_run": False,
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "report_path": str(report_target),
+                "recovery": _recovery_context(args.state_db),
+            }
+            if intent_target is not None and intent_target.is_file():
+                intent_evidence = inspect_regular_file(intent_target)
+                failure["intent_report_path"] = str(intent_target)
+                failure["intent_report_sha256"] = intent_evidence.sha256
+            try:
+                write_execution_report(
+                    report_target,
+                    result=failure,
+                    state_db=args.state_db,
+                )
+            except BaseException as report_exc:
+                print(
+                    f"failed to write recovery report: {report_exc}",
+                    file=sys.stderr,
+                )
+        raise
+    if args.run and "report_path" not in result:
+        result["report_path"] = write_execution_report(
+            report_target,
+            result=result,
+            state_db=args.state_db,
+        )
+    print(json.dumps(
+        result,
         ensure_ascii=False,
         indent=2,
     ))

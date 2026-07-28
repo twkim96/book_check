@@ -841,6 +841,76 @@ def _assert_folder_plan_sources_current(
         )
 
 
+def _folder_representative_transitions(
+    conn, selected_file_ids
+) -> tuple[list[dict], list[str]]:
+    """Plan representative changes without promoting temp/queue members.
+
+    A folder quarantine may remove the current house representative while a
+    strong-matched managed file remains active in temp or queue.  Such a file is
+    not an eligible representative, but it also means the variant cannot safely
+    lose its representative.  Capture every remaining managed member in the
+    confirmation payload and block unless another active managed house file can
+    take over.
+    """
+    selected = {str(file_id) for file_id in selected_file_ids if file_id}
+    if not selected:
+        return [], []
+    representatives = [
+        row
+        for row in conn.execute(
+            """
+            SELECT r.variant_id, r.file_id
+            FROM representatives AS r
+            ORDER BY r.variant_id
+            """
+        )
+        if row["file_id"] in selected
+    ]
+    transitions = []
+    blockers = []
+    for representative in representatives:
+        remaining = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT file_id, source, canonical_path, current_fingerprint_id,
+                       protected
+                FROM files
+                WHERE variant_id = ? AND active = 1
+                  AND assignment_state = 'managed'
+                ORDER BY source, canonical_path, file_id
+                """,
+                (representative["variant_id"],),
+            ).fetchall()
+            if row["file_id"] not in selected
+        ]
+        replacements = [row for row in remaining if row["source"] == "house"]
+        replacements.sort(
+            key=lambda row: (
+                -int(row["protected"]),
+                row["canonical_path"],
+                row["file_id"],
+            )
+        )
+        replacement_file_id = replacements[0]["file_id"] if replacements else None
+        blocker = None
+        if remaining and replacement_file_id is None:
+            blocker = (
+                "variant_has_no_managed_house_replacement:"
+                f"{representative['variant_id']}"
+            )
+            blockers.append(blocker)
+        transitions.append({
+            "variant_id": int(representative["variant_id"]),
+            "representative_file_id": representative["file_id"],
+            "replacement_file_id": replacement_file_id,
+            "remaining_active_managed_files": remaining,
+            "blocker": blocker,
+        })
+    return transitions, blockers
+
+
 def managed_folder_relocate_preview(
     state_db: Path,
     *,
@@ -1348,6 +1418,12 @@ def folder_quarantine_preview(
         registered = [item for item in items if item["registered"]]
         if not registered:
             blockers.append("folder_has_no_registered_books")
+        representative_transitions, representative_blockers = (
+            _folder_representative_transitions(
+                conn, [item["file_id"] for item in registered]
+            )
+        )
+        blockers.extend(representative_blockers)
         managed_folders = [dict(row) for row in conn.execute(
             """
             SELECT folder_id, work_bucket_id, canonical_path, role
@@ -1395,9 +1471,10 @@ def folder_quarantine_preview(
             "items": confirmation_items,
             "directories": directories,
             "managed_folder_ids": [row["folder_id"] for row in managed_folders],
+            "representative_transitions": representative_transitions,
         }
         return {
-            "version": "1.3.7",
+            "version": "1.4.0",
             "kind": "user_folder_quarantine",
             "item_count": len(items),
             "source_path": str(source),
@@ -1410,6 +1487,7 @@ def folder_quarantine_preview(
             "work_bucket_ids": work_ids,
             "managed_folders": managed_folders,
             "related_folders": related_folders,
+            "representative_transitions": representative_transitions,
             "items": items,
             "directories": directories,
             "blocked_reasons": blockers,
@@ -1495,6 +1573,18 @@ def _quarantine_folder(conn, *, plan: Mapping[str, object], run_id: str, manifes
     expected_identity = tuple(plan["source_identity"])
     if current_identity != expected_identity:
         raise RuntimeError("folder identity changed before quarantine")
+    selected_ids = [
+        item["file_id"] for item in plan["items"] if item["registered"]
+    ]
+    current_transitions, transition_blockers = _folder_representative_transitions(
+        conn, selected_ids
+    )
+    if transition_blockers:
+        raise RuntimeError(
+            "folder representative plan is blocked: " + ",".join(transition_blockers)
+        )
+    if current_transitions != plan.get("representative_transitions", []):
+        raise RuntimeError("folder representative plan changed after confirmation")
     ensure_directory_nofollow(destination.parent)
     manifest_json = json.dumps(
         {"items": plan["items"], "directories": plan["directories"]},
@@ -1551,32 +1641,38 @@ def _quarantine_folder(conn, *, plan: Mapping[str, object], run_id: str, manifes
             decision_store.transition_operation_group(conn, group_id, "fs_done")
 
         with decision_store.transaction(conn):
-            selected_ids = [item["file_id"] for item in plan["items"] if item["registered"]]
-            selected_set = set(selected_ids)
-            representatives = conn.execute(
-                "SELECT variant_id, file_id FROM representatives WHERE file_id IN ({})".format(
-                    ",".join("?" for _ in selected_ids)
-                ), selected_ids,
-            ).fetchall() if selected_ids else []
-            for representative in representatives:
-                replacement = conn.execute(
-                    "SELECT file_id FROM files WHERE variant_id = ? AND active = 1 AND source = 'house' "
-                    "AND assignment_state = 'managed' "
-                    "ORDER BY protected DESC, canonical_path",
-                    (representative["variant_id"],),
-                ).fetchall()
-                replacement_id = next(
-                    (row["file_id"] for row in replacement if row["file_id"] not in selected_set),
-                    None,
-                )
+            current_transitions, transition_blockers = (
+                _folder_representative_transitions(conn, selected_ids)
+            )
+            if transition_blockers or current_transitions != plan.get(
+                "representative_transitions", []
+            ):
+                raise RuntimeError("folder representative plan changed before DB commit")
+            for transition in current_transitions:
+                replacement_id = transition["replacement_file_id"]
                 if replacement_id:
-                    conn.execute(
+                    updated = conn.execute(
                         "UPDATE representatives SET file_id = ?, updated_at = CURRENT_TIMESTAMP "
-                        "WHERE variant_id = ?", (replacement_id, representative["variant_id"]),
+                        "WHERE variant_id = ? AND file_id = ?",
+                        (
+                            replacement_id,
+                            transition["variant_id"],
+                            transition["representative_file_id"],
+                        ),
                     )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("folder representative changed before replacement")
                     conn.execute("UPDATE files SET protected = 1 WHERE file_id = ?", (replacement_id,))
                 else:
-                    conn.execute("DELETE FROM representatives WHERE variant_id = ?", (representative["variant_id"],))
+                    deleted = conn.execute(
+                        "DELETE FROM representatives WHERE variant_id = ? AND file_id = ?",
+                        (
+                            transition["variant_id"],
+                            transition["representative_file_id"],
+                        ),
+                    )
+                    if deleted.rowcount != 1:
+                        raise RuntimeError("folder representative changed before retirement")
             for item in plan["items"]:
                 if not item["registered"]:
                     continue
@@ -1630,7 +1726,7 @@ def apply_folder_quarantine(
     folder_path: str, confirm_count: int, confirm_plan_sha256: str, progress=None,
 ) -> dict:
     from library_review import _refresh_review_index
-    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.3.7"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "folder-quarantine-1.4.0"):
         plan = folder_quarantine_preview(
             state_db, house_dir=house_dir, temp_dir=temp_dir, folder_path=folder_path
         )
