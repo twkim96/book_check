@@ -1,6 +1,6 @@
 # file_check 1.4.0 — 버전형 전수 중복 감사와 house 재기준
 
-- 상태: 구현·운영 재기준 진행 중
+- 상태: 구현·운영 재기준 완료
 - 시작 기준: `43ce099` (`fix: finalize v1.3.9 relationship choices`)
 - 적용일: 2026-07-28
 - 범위: 격리 불변식, 제목 무관 콘텐츠 중복 회수, 증분 fingerprint 전수 감사,
@@ -35,20 +35,20 @@
 
 ### C. 실제 house 재기준
 
-- [ ] 새 auditor를 full sweep으로 실행하고 구조화 report 저장
-- [ ] 자동 회수 가능한 strong review를 journal quarantine
-- [ ] cross-title strong-anchor 예외를 수동 JSON plan으로 quarantine
-- [ ] 확인된 false-positive 3건을 house로 복원하고 `distinct_work` 기록
-- [ ] 모든 격리에 원본·keep·근거·operation/run ID·복구 경로 기록
+- [x] 새 auditor를 full sweep으로 실행하고 구조화 report 저장
+- [x] 자동 회수 가능한 exact EPUB review 12권을 journal quarantine
+- [x] cross-title/near strong-anchor 예외 50권을 수동 JSON plan으로 quarantine
+- [x] 확인된 false-positive 3건을 house로 복원하고 `distinct_work` 기록
+- [x] 모든 격리에 원본·keep·근거·operation/run ID·복구 경로 기록
 
 ### D. 완료 검증
 
 - [x] 전체 Python 회귀와 frontend production build
-- [ ] final Doctor 0
-- [ ] unfinished operation/group 0, active run 0
-- [ ] 실제 house와 `file_index.json` 지원 파일 일치
-- [ ] warm auditor에서 기존 fingerprint 재사용 확인
-- [ ] 최종 strong 후보가 예상된 보존 판본·수동 보류만 남는지 재감사
+- [x] final Doctor 0
+- [x] unfinished operation/group 0, active run 0
+- [x] 실제 house·DB·`file_index.json` 지원 파일 16,788개 일치
+- [x] warm auditor에서 fingerprint cache hit 16,771 / miss 0 / 실제 read 0 확인
+- [x] 최종 exact 0, near는 판본 결정 3쌍·수동 보류 2쌍만 남는지 재감사
 
 ## 3. 자동화와 수동 예외의 경계
 
@@ -66,7 +66,8 @@
 - EPUB 내부 콘텐츠 동일: 12그룹. 현재 콘텐츠 SHA와 좌표가 일치하는 관계만 자동 격리 대상으로 삼는다.
 - 강한 TXT 본문 관계 49간선: 기존 후보 밖 22간선(20 component)은 21권 격리, 기존 후보 안 27간선은 15권 격리·10쌍 판본 관계 보존·2쌍 unresolved 보존으로 판정했다.
 - false-positive queue 3권: 앞/뒤·분산 본문 유사도가 모두 매우 낮아 서로 다른 작품으로 복원 계획에 고정했다.
-- 실행 계획: 수동 격리 44권, false-positive 복원 3권, `same_work_distinct_variant` 10쌍, unresolved 보존 2쌍. 모든 실행 항목은 양쪽 현재 raw SHA-256에 묶였다.
+- 최초 실행 계획: 수동 격리 44권, false-positive 복원 3권, `same_work_distinct_variant` 10쌍, unresolved 보존 2쌍. 모든 실행 항목은 양쪽 현재 raw SHA-256에 묶였다.
+- full sweep 뒤 새로 남은 미기록 near 6쌍은 line-level 공통 본문 99.70~99.95% 또는 순서형 4 KiB anchor 44/64를 재검증해 별도 follow-up plan으로 격리했다. 최종 수동 격리는 50권이다.
 - 보존 예외: decode-lossy TXT 68권, 짧은 TXT 7권, 구조 오류 EPUB 1권, PDF 16권. decode 대체 판독에서는 추가 동일본문 그룹이 없었다.
 
 독립 안전 리뷰에서 다음 회귀도 재현해 수정했다.
@@ -81,12 +82,59 @@
 
 ## 5. 운영 증거
 
-완료 시 아래를 실제 값으로 갱신한다.
-
-- 구현 커밋:
-- 전수 auditor report:
-- 자동 strong 격리 report/run:
-- 수동 예외 plan/report/run:
-- false-positive 복원 decision:
-- 최종 index generation:
-- 최종 검증:
+- 구현 커밋: `e72d3ff` (`feat: rebaseline library dedup in v1.4.0`)
+- 운영 중 발견한 stale review 선택 수정: `91a6885` (`fix: bind restores to current fingerprints`)
+- 검증: Python `687 passed`, frontend `npm run build`, `compileall`, `git diff --check` 통과.
+- full sweep 전 DB backup:
+  `.dedup_state/backups/before_v1_4_0_full_sweep_20260728_123351_cd554485.sqlite3`
+- full sweep report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/strong_candidates_20260728_125923_861536.json`
+  (`sha256=4cb6ae01700aa6c27062dc43341760655288a8af64a008b4bb939eb654719284`)
+  - eligible 16,831 / available 16,831 / analyzed 16,830 / known failed 69
+  - fingerprint preparation read 100,184,909,872 bytes, 전체 read 111,095,688,362 bytes
+  - TXT normalized exact 8쌍, EPUB content exact 12쌍
+  - decode/EPUB 구조 오류 때문에 fail-closed `completed=false`; 파일 이동 0
+- 최초 warm report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/strong_candidates_20260728_130034_999343.json`
+  (`sha256=ff3a662e72cb6564820d6753f197887a019d7c0569895d52783907a6a6a6690d`)
+  - fingerprint cache hit 16,830 / miss 0, pair cache hit 2,717, read 55,979,564 bytes
+- 보존 판본 10쌍 decision 1~10:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_130713_114421.json`
+  (`sha256=bc5d91322f6dcae31f7cfa7b71c2406af67300ebdf8b612b6417dd80091b92a9`)
+- stale review preflight 실패 로그(이동/operation 0):
+  `/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_130855_998406.json`
+  (`sha256=0a5b2edfcc78b9e39736b6aa1c5929737cc9171df274e7b080ce7e5df1757416`)
+- 최초 수동 plan:
+  `/Users/twkim/Documents/GitHub/python/test/file_check/manual_duplicate_plan_20260728_v1_4_0.json`
+- 수동 44권 격리 + false-positive 3권 복원 terminal report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_131223_725629.json`
+  (`sha256=9c163260f25b68b0109bc7c6ba86d7eb1ab935b8cc2b948ce676110ab44c7475`)
+  - restore run `actual-87a32087-56a4-46bb-a0ff-32d2847f3179`
+  - discard run `actual-986053a3-5814-4190-a57b-1ee1bc5bcb43`
+  - restore decisions 11~13, operations 3620~3666
+- exact EPUB 12권 자동 격리 terminal report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/house_cleanup_1_4_0_20260728_131519_698948.json`
+  (`sha256=5b8d927a32e10dcf11bb2a86fdb09549815c6520ad13e6d270d68994b3388528`)
+  - run `actual-adcfe9fc-b3ab-4340-89c8-779da4830d50`, operations 3667~3678
+- 후속 near 6쌍 plan:
+  `/Users/twkim/Documents/GitHub/python/test/file_check/manual_duplicate_plan_followup_20260728_v1_4_0.json`
+- 후속 near 6권 격리 terminal report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_132401_567028.json`
+  (`sha256=6414bee425371f9aba55e725e1d4d9aa17e0f88d24a6ce040819908fab7de76d`)
+  - discard run `actual-e2f364a5-c654-41d0-bf17-c11695519b2d`, operations 3679~3684
+- 최종 auditor report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/strong_candidates_20260728_132521_653576.json`
+  (`sha256=39621e0bf234d2d7356a263ae9962b9342bb54a3348735f5869e59610d823257`)
+  - `completed=true`, stop reason 없음, actual read 0
+  - TXT/EPUB exact 0, 미기록 near 0
+  - near 5쌍 = 결정된 보존 판본 3쌍 + 수동 보류 2쌍
+  - contained-version 59쌍은 합본/권별·외전·구간판 관계로 보존; review-only
+- 최종 상태:
+  - 지원 도서 16,788개(TXT/EPUB/PDF), 실제 disk = DB = index
+  - baseline 16,847 - 수동 격리 50 + 복원 3 - EPUB 격리 12 = 16,788
+  - 새 operation 65개 모두 committed, source 잔존 0, destination 누락 0
+  - Doctor 0, active run 0, unfinished operation/group 0
+  - raw exact group 0, normalized/content exact group 0
+  - index generation `c374f23e6fb24e07bf4ed4d283a0c3c2`
+    (`2026-07-28T13:24:39+09:00`)
+  - 실제 bytes purge 없음. 모든 62권은 `txt_temp/trash_bin` 아래 복구 가능.
