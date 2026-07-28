@@ -15,6 +15,7 @@ from normalizer import (
     analyze_name,
     has_pass_marker,
     is_supported_file,
+    materialize_title_markup,
     normalize_filename,
     normalize_nfc,
     should_exclude_dir,
@@ -950,8 +951,11 @@ def run_auditor_queue_report(
         "--index", os.fspath(index_path),
         "--house", os.fspath(house_dir),
         "--temp", os.fspath(temp_dir),
-        "--max-file-bytes", "512MiB",
-        "--max-read-bytes", "48GiB",
+        # Keep the normal Folderling policy identical to the persisted warm
+        # auditor cache.  Resource caps are not fingerprint semantics, but
+        # max_file_bytes is deliberately part of the pair-cache key.
+        "--max-file-bytes", "256MiB",
+        "--max-read-bytes", "20GiB",
     ]
     if state_db_path:
         argv.extend(("--state-db", os.fspath(state_db_path)))
@@ -1456,6 +1460,86 @@ def _auditor_relation_queue_eligible(classification, left, right):
     return bool(left_core and right_core and left_core == right_core)
 
 
+def _contained_upgrade_direction(relation):
+    """Return (shorter, longer) only for an automatic strict-version upgrade."""
+    if relation.get("classification") not in {"contained_exact", "contained_version"}:
+        return None
+    evidence = relation.get("evidence") or {}
+    left, right = relation["left"], relation["right"]
+    left_length = evidence.get("left_normalized_length")
+    right_length = evidence.get("right_normalized_length")
+    if (
+        not isinstance(left_length, int)
+        or not isinstance(right_length, int)
+        or left_length <= 0
+        or right_length <= 0
+        or left_length == right_length
+    ):
+        return None
+    shorter, longer = (
+        (left, right) if left_length < right_length else (right, left)
+    )
+    if {shorter.get("source"), longer.get("source")} == {"temp"}:
+        return None
+    if "house" not in {shorter.get("source"), longer.get("source")}:
+        return None
+    if not shorter.get("mutation_eligible", True) or not longer.get(
+        "mutation_eligible", True
+    ):
+        return None
+    if os.path.splitext(shorter.get("name", ""))[1].lower() != ".txt" or os.path.splitext(
+        longer.get("name", "")
+    )[1].lower() != ".txt":
+        return None
+    if normalize_nfc(shorter.get("core_title") or "").casefold() != normalize_nfc(
+        longer.get("core_title") or ""
+    ).casefold():
+        return None
+    if not shorter.get("core_title") or _authors_conflict(shorter, longer):
+        return None
+    if shorter.get("unit") != longer.get("unit"):
+        return None
+
+    import decision_store
+
+    def coordinates(entry):
+        if "episode_start" in entry:
+            return entry
+        return decision_store.coordinate_fields_from_name(entry["name"])
+
+    short_coordinates = coordinates(shorter)
+    long_coordinates = coordinates(longer)
+    if (
+        short_coordinates.get("span_ambiguous")
+        or long_coordinates.get("span_ambiguous")
+        or short_coordinates.get("episode_start") is None
+        or short_coordinates.get("episode_end") is None
+        or long_coordinates.get("episode_start") is None
+        or long_coordinates.get("episode_end") is None
+        or short_coordinates["episode_start"] != long_coordinates["episode_start"]
+        or long_coordinates["episode_end"] <= short_coordinates["episode_end"]
+    ):
+        return None
+
+    if shorter.get("protected") and not shorter.get("representative"):
+        return None
+    if shorter.get("assignment_state") == "managed" and not shorter.get(
+        "representative"
+    ):
+        if not (
+            longer.get("representative")
+            and shorter.get("variant_id") == longer.get("variant_id")
+        ):
+            return None
+    if (
+        shorter.get("assignment_state") == "managed"
+        and longer.get("assignment_state") == "managed"
+        and shorter.get("variant_id") != longer.get("variant_id")
+    ):
+        return None
+    return shorter, longer
+
+
 def _managed_auditor_queue_records(
     auditor_groups,
     auditor_relations,
@@ -1464,10 +1548,13 @@ def _managed_auditor_queue_records(
     dry_run,
     excluded_paths,
     actual_run_id=None,
+    house_dir=None,
 ):
     import decision_store
     from dedup_mutations import (
+        ContainedUpgradeNotProven,
         HUMAN_REVIEW_CLASSES,
+        apply_contained_upgrade,
         house_review_move,
         queue_candidate,
     )
@@ -1570,11 +1657,167 @@ def _managed_auditor_queue_records(
     try:
         suspected_dir = os.path.join(temp_dir, "trash_bin", "suspected_duplicates")
         warning_dir = os.path.join(temp_dir, "trash_bin", "warning")
+        superseded_dir = os.path.join(temp_dir, "trash_bin", "superseded_versions")
         for group in auditor_groups:
             reference = group["keep"]
             classification = group.get("classification", "text_equivalent")
             for entry in group.get("move_entries", []):
                 queue_temp(entry, reference, classification, suspected_dir, "moved")
+
+        # A complete normalized prefix plus a strictly wider episode span is a
+        # normal latest-version replacement, not a human-review exception.
+        # Process these directed edges before the generic weak-relation queue so
+        # a new long version can replace an established managed representative.
+        contained_relations = []
+        for relation in auditor_relations:
+            direction = _contained_upgrade_direction(relation)
+            if direction is None:
+                continue
+            shorter, longer = direction
+            contained_relations.append((
+                -int(longer.get("char_count") or 0),
+                int(shorter.get("char_count") or 0),
+                relation,
+                shorter,
+                longer,
+            ))
+        for _, _, relation, shorter, longer in sorted(
+            contained_relations,
+            key=lambda item: (item[0], item[1], item[3]["path"], item[4]["path"]),
+        ):
+            if shorter["path"] in queued_paths or longer["path"] in queued_paths:
+                continue
+            if not shorter.get("file_id") or not longer.get("file_id"):
+                continue
+            review_id = _review_id_for_unordered_pair(
+                conn,
+                shorter["file_id"],
+                longer["file_id"],
+                relation["classification"],
+            )
+            if review_id is None:
+                continue
+
+            dry_containment_evidence = None
+            if dry_run:
+                from mutation_io import (
+                    contained_anchor_proof_sufficient,
+                    inspect_contained_text,
+                )
+
+                try:
+                    proof = inspect_contained_text(shorter["path"], longer["path"])
+                except (OSError, RuntimeError, UnicodeError):
+                    continue
+                if proof.short_normalized_length >= proof.long_normalized_length:
+                    continue
+                if relation["classification"] == "contained_exact" and (
+                    proof.long_prefix_sha256 != proof.short_normalized_sha256
+                ):
+                    continue
+                if relation["classification"] == "contained_version" and not (
+                    contained_anchor_proof_sufficient(proof)
+                ):
+                    continue
+                dry_containment_evidence = {
+                    "short_normalized_sha256": proof.short_normalized_sha256,
+                    "long_normalized_sha256": proof.long_normalized_sha256,
+                    "short_normalized_length": proof.short_normalized_length,
+                    "long_normalized_length": proof.long_normalized_length,
+                    "ordered_anchor_count": proof.ordered_anchor_count,
+                    "anchor_chars": proof.anchor_chars,
+                    "anchor_offset_span": proof.anchor_offset_span,
+                }
+
+            original_long_path = longer["path"]
+            destination = None
+            recent_path = None
+            if longer.get("source") == "temp":
+                if shorter.get("source") != "house" or not house_dir:
+                    continue
+                clean_name = materialize_title_markup(
+                    normalize_filename(longer["name"])
+                )
+                if not clean_name:
+                    continue
+                destination = os.path.join(
+                    os.path.dirname(shorter["path"]), clean_name
+                )
+                if os.path.lexists(destination):
+                    continue
+                recent_path = os.path.join(house_dir, "_최근", os.path.basename(destination))
+                if os.path.lexists(recent_path):
+                    continue
+
+            record = {
+                "dry_run": dry_run,
+                "core_title": longer.get("core_title") or shorter.get("core_title"),
+                "keep": longer,
+                "entry": shorter,
+                "dest_path": (
+                    os.path.join(superseded_dir, os.path.basename(shorter["path"]))
+                    if dry_run else None
+                ),
+                "size": shorter["size"],
+                "distinct_authors": False,
+                "status": "superseded",
+                "classification": relation["classification"],
+                "review_id": review_id,
+                "house_destination": destination,
+                "recent_link": recent_path,
+                "containment_evidence": dry_containment_evidence,
+            }
+            if not dry_run:
+                if recent_path is not None:
+                    from folderling import ensure_recent_link_slot
+
+                    ensure_recent_link_slot(os.path.basename(destination), os.path.dirname(recent_path))
+                try:
+                    result = apply_contained_upgrade(
+                        conn,
+                        review_id=review_id,
+                        shorter_file_id=shorter["file_id"],
+                        longer_file_id=longer["file_id"],
+                        quarantine_dir=superseded_dir,
+                        run_id=actual_run_id,
+                        house_destination=destination,
+                        classification=relation["classification"],
+                    )
+                except ContainedUpgradeNotProven:
+                    continue
+                record["dest_path"] = result["quarantine_path"]
+                record["operation_id"] = result["quarantine_operation_id"]
+                record["ingest_operation_id"] = result["ingest_operation_id"]
+                record["house_destination"] = result["ingested_path"]
+                record["containment_evidence"] = {
+                    key: result[key] for key in (
+                        "short_normalized_sha256",
+                        "long_normalized_sha256",
+                        "short_normalized_length",
+                        "long_normalized_length",
+                        "ordered_anchor_count",
+                        "anchor_chars",
+                        "anchor_offset_span",
+                    )
+                }
+                if recent_path is not None:
+                    from folderling import create_recent_link
+
+                    create_recent_link(
+                        result["ingested_path"],
+                        os.path.basename(result["ingested_path"]),
+                        os.path.dirname(recent_path),
+                    )
+                    longer["path"] = result["ingested_path"]
+                    longer["name"] = os.path.basename(result["ingested_path"])
+                    longer["rel_path"] = normalize_nfc(
+                        os.path.relpath(result["ingested_path"], house_dir)
+                    )
+                    longer["source"] = "house"
+            records.append(record)
+            queued_paths.add(shorter["path"])
+            if original_long_path != longer["path"]:
+                queued_paths.add(original_long_path)
 
         by_temp = defaultdict(list)
         for relation in auditor_relations:
@@ -1743,6 +1986,7 @@ def _emit_dedup_record_events(event_callback, exact_records, suspect_move_record
 
     status_labels = {
         "moved": "suspected_duplicate",
+        "superseded": "superseded_version",
         "warning": "warning",
         "author_review": "author_conflict",
         "metadata_only": "metadata_only",
@@ -1980,6 +2224,7 @@ def _clean_duplicates_impl(
                 dry_run,
                 already_queued,
                 actual_run_id,
+                house_dir,
             ))
         elif not managed_mode:
             for group in auditor_groups:
@@ -2010,6 +2255,9 @@ def _clean_duplicates_impl(
     author_review_records = [r for r in suspect_move_records if r.get("status") == "author_review"]
     # 애매 보류: 출처와 무관하게 warning 검토 큐로 이동.
     warning_records = [r for r in suspect_move_records if r.get("status") == "warning"]
+    superseded_records = [
+        r for r in suspect_move_records if r.get("status") == "superseded"
+    ]
     metadata_only_records = [
         r for r in suspect_move_records
         if r.get("status") == "metadata_only"
@@ -2071,6 +2319,7 @@ def _clean_duplicates_impl(
         "suspect_move_count": len(moved_records),
         "review_queue_move_count": review_queue_move_count,
         "warning_count": len(warning_records),
+        "contained_upgrade_count": len(superseded_records),
         "metadata_only_count": len(metadata_only_records),
         "author_conflict_count": author_conflict_count,
         "same_author_count": same_author_count,
@@ -2094,7 +2343,9 @@ def _clean_duplicates_impl(
     # 실제 파일 상태가 바뀐 경우에만 인덱스를 재생성한다.
     moved_suspects = [
         r for r in suspect_move_records
-        if r.get("status") in ("moved", "warning", "author_review", "metadata_only")
+        if r.get("status") in (
+            "moved", "warning", "author_review", "metadata_only", "superseded"
+        )
     ]
     changed = bool(exact_mutation_records or moved_suspects or disambig_assigned)
     if not dry_run and changed and update_index_after_run:
@@ -2126,6 +2377,11 @@ def _clean_duplicates_impl(
             print(f"→ 작가 충돌 큐(author_conflicts): {len(author_review_records)}개 (사람 판별)")
         if warning_records:
             print(f"→ 애매(warning) 검토 큐 이동: {len(warning_records)}개")
+        if superseded_records:
+            print(
+                f"→ 완전 포함 최신판 자동 교체: {len(superseded_records)}개 "
+                "(짧은 판본은 superseded_versions에 격리)"
+            )
         if metadata_only_records:
             print(f"→ 본문 증거 없음(metadata_only): {len(metadata_only_records)}개")
     if log_path:

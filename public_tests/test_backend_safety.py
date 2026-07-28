@@ -124,6 +124,8 @@ def test_auditor_bridge_accepts_path_objects_at_argparse_boundary(tmp_path, monk
     assert captured["house"] == str(house)
     assert captured["temp"] == str(temp)
     assert captured["state_db"] == str(state_db)
+    assert captured["max_file_bytes"] == 256 * 1024 * 1024
+    assert captured["max_read_bytes"] == 20 * 1024 * 1024 * 1024
     assert progress_events == [{
         "audit_phase": "text_analysis",
         "completed": 100,

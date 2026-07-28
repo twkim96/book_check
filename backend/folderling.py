@@ -1905,6 +1905,10 @@ def _process_items_authorized(
             f"(같은 작가/미상 {dedup_summary.get('same_author_count', 0)}, "
             f"작가 충돌 {dedup_summary.get('author_conflict_count', 0)})"
         )
+        print(
+            "  최신판 교체: 완전 포함으로 증명된 짧은 판본 "
+            f"{dedup_summary.get('contained_upgrade_count', 0)}개 자동 격리"
+        )
     print(f"  폴더링  : 입고 {move_count}개, pass {pass_count}개")
     print(f"  좌표 충돌: warning 보류 {volume_conflict_hold_count}개")
     print(

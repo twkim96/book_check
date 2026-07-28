@@ -53,6 +53,29 @@ class EpubContentEvidence:
     uncompressed_size: int
 
 
+@dataclass(frozen=True)
+class ContainedTextEvidence:
+    short_file_evidence: FileEvidence
+    long_file_evidence: FileEvidence
+    short_normalized_sha256: str
+    long_normalized_sha256: str
+    short_normalized_length: int
+    long_normalized_length: int
+    long_prefix_sha256: str | None
+    ordered_anchor_count: int
+    anchor_chars: int
+    anchor_offset_span: int | None
+
+
+def contained_anchor_proof_sufficient(proof: ContainedTextEvidence) -> bool:
+    return bool(
+        proof.ordered_anchor_count == 5
+        and proof.anchor_offset_span is not None
+        and proof.anchor_offset_span
+        <= max(4_096, proof.short_normalized_length // 1_000)
+    )
+
+
 _WHITESPACE_RE = re.compile(r"\s+")
 _LOCK_REGISTRY = {}
 _LOCK_REGISTRY_GUARD = threading.RLock()
@@ -226,6 +249,22 @@ def mutation_lock_for_roots(house_root, temp_root, owner):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def assert_mutation_lock_held(conn, *, run_id=None):
+    """Require the current process/thread to own the roots mutation lock."""
+    lock_path = _lock_path_for_roots(_lock_roots(conn, run_id=run_id))
+    with _LOCK_REGISTRY_GUARD:
+        held = _LOCK_REGISTRY.get(str(lock_path))
+        if not (
+            held
+            and held["pid"] == os.getpid()
+            and held["thread"] == threading.get_ident()
+            and held["depth"] > 0
+        ):
+            raise MutationLockBusy(
+                f"mutation lock is not held by the current command: {lock_path}"
+            )
 
 
 def _identity(info, sha256: str) -> FileEvidence:
@@ -418,6 +457,204 @@ def inspect_normalized_text(path):
     finally:
         os.close(fd)
         os.close(parent_fd)
+
+
+def _iter_normalized_chunks_from_fd(fd: int, encoding: str):
+    os.lseek(fd, 0, os.SEEK_SET)
+    decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+    carry = ""
+    first = True
+    while True:
+        raw = os.read(fd, 1024 * 1024)
+        if not raw:
+            break
+        normalized = unicodedata.normalize("NFC", carry + decoder.decode(raw))
+        emit, carry = _safe_nfc_split(normalized)
+        if first:
+            emit = emit.lstrip("\ufeff")
+            first = False
+        cleaned = _WHITESPACE_RE.sub("", emit)
+        if cleaned:
+            yield cleaned
+    final = unicodedata.normalize("NFC", carry + decoder.decode(b"", final=True))
+    if first:
+        final = final.lstrip("\ufeff")
+    final = _WHITESPACE_RE.sub("", final)
+    if final:
+        yield final
+
+
+def _normalized_metrics_from_fd(fd: int, encoding: str, *, prefix_chars=None):
+    """Hash one pinned text descriptor and optionally checkpoint a character prefix."""
+    digest = hashlib.sha256()
+    prefix_digest = hashlib.sha256() if prefix_chars is not None else None
+    prefix_remaining = int(prefix_chars or 0)
+    normalized_length = 0
+    for cleaned in _iter_normalized_chunks_from_fd(fd, encoding):
+        digest.update(cleaned.encode("utf-8"))
+        normalized_length += len(cleaned)
+        if prefix_digest is not None and prefix_remaining > 0:
+            piece = cleaned[:prefix_remaining]
+            if piece:
+                prefix_digest.update(piece.encode("utf-8"))
+                prefix_remaining -= len(piece)
+    checkpoint = None
+    if prefix_digest is not None and prefix_remaining == 0:
+        checkpoint = prefix_digest.hexdigest()
+    return digest.hexdigest(), normalized_length, checkpoint
+
+
+def _normalized_metrics_with_fallback(fd: int, *, prefix_chars=None):
+    prefix = os.pread(fd, 4, 0)
+    if prefix.startswith(codecs.BOM_UTF16_LE):
+        encodings = ("utf-16-le",)
+    elif prefix.startswith(codecs.BOM_UTF16_BE):
+        encodings = ("utf-16-be",)
+    elif prefix.startswith(codecs.BOM_UTF8):
+        encodings = ("utf-8-sig",)
+    else:
+        encodings = ("utf-8", "cp949")
+    errors = []
+    for encoding in encodings:
+        try:
+            metrics = _normalized_metrics_from_fd(
+                fd, encoding, prefix_chars=prefix_chars
+            )
+            return (*metrics, encoding)
+        except UnicodeDecodeError as exc:
+            errors.append(f"{encoding}: {exc}")
+    raise RuntimeError("text decode failed: " + "; ".join(errors))
+
+
+def _normalized_position_anchors(fd, encoding, total_length, *, count=5):
+    anchor_chars = min(16_384, max(2_048, int(total_length) // 40))
+    if total_length < anchor_chars * 8:
+        return [], anchor_chars
+    starts = [
+        max(0, min(total_length - anchor_chars, total_length * step // 10 - anchor_chars // 2))
+        for step in (1, 3, 5, 7, 9)[:count]
+    ]
+    parts = [[] for _ in starts]
+    offset = 0
+    for chunk in _iter_normalized_chunks_from_fd(fd, encoding):
+        chunk_end = offset + len(chunk)
+        for index, start in enumerate(starts):
+            end = start + anchor_chars
+            local_start = max(0, start - offset)
+            local_end = min(len(chunk), end - offset)
+            if local_end > local_start:
+                parts[index].append(chunk[local_start:local_end])
+        offset = chunk_end
+    anchors = [
+        (start, "".join(piece)) for start, piece in zip(starts, parts)
+    ]
+    if any(len(anchor) != anchor_chars for _, anchor in anchors):
+        return [], anchor_chars
+    return anchors, anchor_chars
+
+
+def _normalized_anchor_occurrences(fd, encoding, anchors):
+    occurrences = [[] for _ in anchors]
+    max_anchor = max((len(anchor) for _, anchor in anchors), default=1)
+    search_tail = ""
+    offset = 0
+    for chunk in _iter_normalized_chunks_from_fd(fd, encoding):
+        window = search_tail + chunk
+        base_position = offset - len(search_tail)
+        for anchor_index, (_, needle) in enumerate(anchors):
+            start = 0
+            while len(occurrences[anchor_index]) < 2:
+                found = window.find(needle, start)
+                if found < 0:
+                    break
+                absolute = base_position + found
+                if not occurrences[anchor_index] or occurrences[anchor_index][-1] != absolute:
+                    occurrences[anchor_index].append(absolute)
+                start = found + 1
+        search_tail = window[-(max_anchor - 1):] if max_anchor > 1 else ""
+        offset += len(chunk)
+    return occurrences
+
+
+def inspect_contained_text(short_path, long_path) -> ContainedTextEvidence:
+    """Collect pinned prefix and distributed-anchor evidence for two TXT files.
+
+    Both files remain pinned by no-follow descriptors for the complete read.  The
+    returned prefix digest is only populated when the long file actually reaches
+    the short normalized character length.
+    """
+    short_parent_fd, short_fd, _ = _open_regular_nofollow(short_path)
+    long_parent_fd = long_fd = None
+    try:
+        long_parent_fd, long_fd, _ = _open_regular_nofollow(long_path)
+        short_before = os.fstat(short_fd)
+        long_before = os.fstat(long_fd)
+        if not stat.S_ISREG(short_before.st_mode) or not stat.S_ISREG(long_before.st_mode):
+            raise RuntimeError("contained text endpoints must be regular files")
+
+        short_raw_sha = _hash_fd(short_fd)
+        long_raw_sha = _hash_fd(long_fd)
+        short_sha, short_length, _, short_encoding = _normalized_metrics_with_fallback(
+            short_fd
+        )
+        long_sha, long_length, prefix_sha, long_encoding = _normalized_metrics_with_fallback(
+            long_fd, prefix_chars=short_length
+        )
+        anchors, anchor_chars = _normalized_position_anchors(
+            short_fd, short_encoding, short_length
+        )
+        occurrences = _normalized_anchor_occurrences(
+            long_fd, long_encoding, anchors
+        ) if anchors else []
+        unique_ordered = bool(
+            anchors
+            and all(len(items) == 1 for items in occurrences)
+            and all(
+                occurrences[index][0] < occurrences[index + 1][0]
+                for index in range(len(occurrences) - 1)
+            )
+        )
+        offsets = [
+            matches[0] - anchors[index][0]
+            for index, matches in enumerate(occurrences)
+        ] if unique_ordered else []
+        offset_span = max(offsets) - min(offsets) if offsets else None
+
+        short_after = os.fstat(short_fd)
+        long_after = os.fstat(long_fd)
+        for label, before, after in (
+            ("short", short_before, short_after),
+            ("long", long_before, long_after),
+        ):
+            if (
+                before.st_dev, before.st_ino, before.st_ctime_ns,
+                before.st_size, before.st_mtime_ns,
+            ) != (
+                after.st_dev, after.st_ino, after.st_ctime_ns,
+                after.st_size, after.st_mtime_ns,
+            ):
+                raise SourceIdentityChanged(
+                    f"{label} source changed during contained-text proof"
+                )
+        return ContainedTextEvidence(
+            short_file_evidence=_identity(short_after, short_raw_sha),
+            long_file_evidence=_identity(long_after, long_raw_sha),
+            short_normalized_sha256=short_sha,
+            long_normalized_sha256=long_sha,
+            short_normalized_length=short_length,
+            long_normalized_length=long_length,
+            long_prefix_sha256=prefix_sha,
+            ordered_anchor_count=len(anchors) if unique_ordered else 0,
+            anchor_chars=anchor_chars,
+            anchor_offset_span=offset_span,
+        )
+    finally:
+        if long_fd is not None:
+            os.close(long_fd)
+        if long_parent_fd is not None:
+            os.close(long_parent_fd)
+        os.close(short_fd)
+        os.close(short_parent_fd)
 
 
 def inspect_epub_content(

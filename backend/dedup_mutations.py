@@ -1,11 +1,16 @@
 """Journaled filesystem mutations for managed dedup mode."""
 
+import re
+import unicodedata
 from pathlib import Path
 
 import decision_store
 from mutation_io import (
+    assert_mutation_lock_held,
+    contained_anchor_proof_sufficient,
     evidence_matches,
     ensure_directory_nofollow,
+    inspect_contained_text,
     inspect_epub_content,
     inspect_regular_file,
     inspect_normalized_text,
@@ -28,6 +33,10 @@ HUMAN_REVIEW_CLASSES = (
     NORMALIZED_EQUAL_CLASSES | EPUB_EQUAL_CLASSES | WEAK_QUEUE_CLASSES | REPORT_ONLY_CLASSES
     | frozenset({"exact_bytes"})
 )
+
+
+class ContainedUpgradeNotProven(RuntimeError):
+    pass
 
 
 def _copy_record_consume(conn, operation_id, source, destination, evidence, *, guard=None):
@@ -854,6 +863,7 @@ def user_quarantine(
     quarantine_dir,
     run_id,
     reason="user_approved_discard",
+    keep_origin_operation_id=None,
 ):
     """Journal an explicit user-approved discard without asserting byte equality.
 
@@ -911,9 +921,43 @@ def user_quarantine(
             actual_run, source_path, source_root, source_evidence
         )
         if keep_path is not None:
-            decision_store.assert_manifest_source(
-                actual_run, keep_path, "house_root", keep_evidence
-            )
+            if keep_origin_operation_id is None:
+                decision_store.assert_manifest_source(
+                    actual_run, keep_path, "house_root", keep_evidence
+                )
+            else:
+                keep_origin = conn.execute(
+                    "SELECT * FROM operations WHERE operation_id = ?",
+                    (int(keep_origin_operation_id),),
+                ).fetchone()
+                expected_destination = (
+                    keep_evidence.dev,
+                    keep_evidence.ino,
+                    keep_evidence.ctime_ns,
+                    keep_evidence.size,
+                    keep_evidence.mtime_ns,
+                    keep_evidence.sha256,
+                )
+                recorded_destination = (
+                    keep_origin["destination_dev"],
+                    keep_origin["destination_ino"],
+                    keep_origin["destination_ctime_ns"],
+                    keep_origin["destination_size"],
+                    keep_origin["destination_mtime_ns"],
+                    keep_origin["destination_sha256"],
+                ) if keep_origin is not None else None
+                if (
+                    keep_origin is None
+                    or keep_origin["run_id"] != run_id
+                    or keep_origin["action"] != "house_ingest"
+                    or keep_origin["state"] != "committed"
+                    or keep_origin["file_id"] != keep_file_id
+                    or keep_origin["dest_path"] != str(keep_path)
+                    or recorded_destination != expected_destination
+                ):
+                    raise RuntimeError(
+                        "user-discard keep is not owned by the current ingest"
+                    )
         if replacement_path is not None and replacement_path != keep_path:
             decision_store.assert_manifest_source(
                 actual_run, replacement_path, "house_root", replacement_evidence
@@ -1006,6 +1050,265 @@ def user_quarantine(
             "keep_file_id": keep_file_id,
             "dest_path": str(destination),
         }
+
+
+def _normalized_metadata_token(value):
+    return unicodedata.normalize("NFC", str(value or "")).strip().casefold()
+
+
+def _author_tokens(value):
+    return {
+        token for token in re.split(r"[\s,/&·]+", _normalized_metadata_token(value))
+        if token
+    }
+
+
+def _contained_metadata(conn, file_id):
+    row = conn.execute(
+        "SELECT core_title, author, unit FROM file_analysis WHERE file_id = ?",
+        (file_id,),
+    ).fetchone()
+    if row is not None:
+        return row
+    file_row = conn.execute(
+        "SELECT canonical_path FROM files WHERE file_id = ? AND active = 1",
+        (file_id,),
+    ).fetchone()
+    if file_row is None:
+        raise RuntimeError("contained upgrade endpoint is no longer active")
+    return decision_store.build_effective_file_analysis(
+        conn, file_id, Path(file_row["canonical_path"]).name
+    )
+
+
+def _coordinate_view(row):
+    if row["episode_start"] is not None or row["episode_end"] is not None:
+        return row
+    return decision_store.coordinate_fields_from_name(Path(row["canonical_path"]).name)
+
+
+def apply_contained_upgrade(
+    conn,
+    *,
+    review_id,
+    shorter_file_id,
+    longer_file_id,
+    quarantine_dir,
+    run_id,
+    house_destination=None,
+    classification="contained_exact",
+):
+    """Adopt a strictly longer TXT version and quarantine its complete prefix.
+
+    The command-level root lock held by managed Folderling spans this orchestration.
+    Each filesystem move is additionally journaled by ``house_ingest`` or
+    ``user_quarantine``.  Intermediate crash states remain safe: the old
+    representative stays valid until the new file is in house, and a later run
+    can finish quarantining an already-ingested longer endpoint.
+    """
+    actual_run = decision_store.assert_active_actual_run(conn, run_id)
+    assert_mutation_lock_held(conn, run_id=run_id)
+    shorter = _file_state(conn, shorter_file_id)
+    longer = _file_state(conn, longer_file_id)
+    if shorter_file_id == longer_file_id:
+        raise ValueError("contained upgrade endpoints must differ")
+    if shorter["source"] not in {"house", "temp"} or longer["source"] not in {
+        "house", "temp"
+    }:
+        raise RuntimeError("contained upgrade endpoints must be active house/temp files")
+    if shorter["source"] == longer["source"] == "temp":
+        raise RuntimeError("contained upgrade requires an established house endpoint")
+    if Path(shorter["canonical_path"]).suffix.lower() != ".txt" or Path(
+        longer["canonical_path"]
+    ).suffix.lower() != ".txt":
+        raise RuntimeError("contained upgrade currently supports TXT only")
+
+    review = conn.execute(
+        "SELECT * FROM review_items WHERE review_id = ?", (review_id,)
+    ).fetchone()
+    if (
+        review is None
+        or review["classification"] != classification
+        or classification not in {"contained_exact", "contained_version"}
+        or review["state"] not in {"pending", "deferred"}
+        or {review["candidate_file_id"], review["reference_file_id"]}
+        != {shorter_file_id, longer_file_id}
+    ):
+        raise RuntimeError("contained upgrade requires a current contained review")
+    expected_fingerprints = {
+        review["candidate_file_id"]: review["left_fingerprint_id"],
+        review["reference_file_id"]: review["right_fingerprint_id"],
+    }
+    if (
+        shorter["current_fingerprint_id"] != expected_fingerprints[shorter_file_id]
+        or longer["current_fingerprint_id"] != expected_fingerprints[longer_file_id]
+    ):
+        raise RuntimeError("contained upgrade fingerprint changed")
+
+    short_meta = _contained_metadata(conn, shorter_file_id)
+    long_meta = _contained_metadata(conn, longer_file_id)
+    if not _normalized_metadata_token(short_meta["core_title"]) or (
+        _normalized_metadata_token(short_meta["core_title"])
+        != _normalized_metadata_token(long_meta["core_title"])
+    ):
+        raise RuntimeError("contained upgrade core title mismatch")
+    short_authors = _author_tokens(short_meta["author"])
+    long_authors = _author_tokens(long_meta["author"])
+    if short_authors and long_authors and not (short_authors & long_authors):
+        raise RuntimeError("contained upgrade author mismatch")
+    if short_meta["unit"] != long_meta["unit"]:
+        raise RuntimeError("contained upgrade unit mismatch")
+
+    short_coordinates = _coordinate_view(shorter)
+    long_coordinates = _coordinate_view(longer)
+    if (
+        short_coordinates["span_ambiguous"]
+        or long_coordinates["span_ambiguous"]
+        or short_coordinates["episode_start"] is None
+        or short_coordinates["episode_end"] is None
+        or long_coordinates["episode_start"] is None
+        or long_coordinates["episode_end"] is None
+        or short_coordinates["episode_start"] != long_coordinates["episode_start"]
+        or long_coordinates["episode_end"] <= short_coordinates["episode_end"]
+    ):
+        raise RuntimeError("contained upgrade requires a strict matching episode span")
+
+    short_path = _preflight(shorter)
+    long_path = _preflight(longer)
+    proof = inspect_contained_text(short_path, long_path)
+    _assert_row_identity(shorter, proof.short_file_evidence, short_path)
+    _assert_row_identity(longer, proof.long_file_evidence, long_path)
+    anchors_prove_same_body = contained_anchor_proof_sufficient(proof)
+    prefix_proves_same_body = (
+        proof.long_prefix_sha256 == proof.short_normalized_sha256
+    )
+    if (
+        not shorter["normalized_sha256"]
+        or not longer["normalized_sha256"]
+        or proof.short_normalized_sha256 != shorter["normalized_sha256"]
+        or proof.long_normalized_sha256 != longer["normalized_sha256"]
+        or proof.short_normalized_length >= proof.long_normalized_length
+    ):
+        raise RuntimeError("contained upgrade normalized-prefix revalidation failed")
+    if classification == "contained_exact" and not prefix_proves_same_body:
+        raise RuntimeError("contained_exact prefix proof changed")
+    if classification == "contained_version" and not anchors_prove_same_body:
+        raise ContainedUpgradeNotProven(
+            "contained_version distributed-anchor proof is insufficient"
+        )
+    short_root = "house_root" if shorter["source"] == "house" else "temp_root"
+    long_root = "house_root" if longer["source"] == "house" else "temp_root"
+    decision_store.assert_manifest_source(
+        actual_run, short_path, short_root, proof.short_file_evidence
+    )
+    decision_store.assert_manifest_source(
+        actual_run, long_path, long_root, proof.long_file_evidence
+    )
+
+    ingest_result = None
+    if longer["source"] == "temp":
+        if house_destination is None:
+            raise RuntimeError("contained upgrade house destination is required")
+        destination = Path(decision_store.canonicalize_path(house_destination))
+        decision_store.assert_actual_run_path(actual_run, destination, "house_root")
+        ingest_result = ingest_to_house(
+            conn,
+            source_file_id=longer_file_id,
+            destination=destination,
+            run_id=run_id,
+        )
+        longer = _file_state(conn, longer_file_id)
+    elif house_destination is not None and decision_store.canonicalize_path(
+        house_destination
+    ) != longer["canonical_path"]:
+        raise RuntimeError("contained upgrade destination disagrees with current house path")
+
+    shorter = _file_state(conn, shorter_file_id)
+    longer = _file_state(conn, longer_file_id)
+    if longer["source"] != "house":
+        raise RuntimeError("contained upgrade keep endpoint is not in house")
+
+    with decision_store.transaction(conn):
+        if shorter["source"] == "house" and shorter["variant_id"] is not None:
+            if shorter["assignment_state"] != "managed":
+                raise RuntimeError("contained upgrade source has an unresolved relationship")
+            if shorter["representative"]:
+                if longer["variant_id"] not in {None, shorter["variant_id"]}:
+                    raise RuntimeError("contained upgrade crosses managed variants")
+                if longer["representative"] and longer_file_id != shorter_file_id:
+                    raise RuntimeError("contained upgrade keep is already another representative")
+                conn.execute(
+                    """
+                    UPDATE files SET variant_id = ?, assignment_state = 'managed',
+                        assignment_origin = 'strong_match', protected = 1
+                    WHERE file_id = ?
+                    """,
+                    (shorter["variant_id"], longer_file_id),
+                )
+                replaced = conn.execute(
+                    """
+                    UPDATE representatives SET file_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE variant_id = ? AND file_id = ?
+                    """,
+                    (longer_file_id, shorter["variant_id"], shorter_file_id),
+                )
+                if replaced.rowcount != 1:
+                    raise RuntimeError("contained upgrade representative changed")
+                conn.execute(
+                    "UPDATE files SET protected = 0 WHERE file_id = ?",
+                    (shorter_file_id,),
+                )
+            elif not (
+                longer["representative"]
+                and longer["variant_id"] == shorter["variant_id"]
+                and not shorter["protected"]
+            ):
+                raise RuntimeError("contained upgrade managed relationship is ambiguous")
+        elif shorter["source"] == "house" and (
+            shorter["protected"] or shorter["representative"]
+        ):
+            raise RuntimeError("contained upgrade cannot consume a protected loose file")
+        elif shorter["source"] == "house" and shorter["assignment_state"] not in {
+            "unassigned", "managed"
+        }:
+            raise RuntimeError("contained upgrade source requires a prior decision")
+        elif shorter["source"] == "temp" and (
+            shorter["protected"] or shorter["representative"]
+        ):
+            raise RuntimeError("contained upgrade temp source is protected")
+
+    quarantine_result = user_quarantine(
+        conn,
+        source_file_id=shorter_file_id,
+        keep_file_id=longer_file_id,
+        quarantine_dir=quarantine_dir,
+        run_id=run_id,
+        reason=f"{classification}_auto_superseded",
+        keep_origin_operation_id=(
+            ingest_result["operation_id"] if ingest_result is not None else None
+        ),
+    )
+    return {
+        "classification": classification,
+        "shorter_file_id": shorter_file_id,
+        "longer_file_id": longer_file_id,
+        "short_normalized_sha256": proof.short_normalized_sha256,
+        "long_normalized_sha256": proof.long_normalized_sha256,
+        "short_normalized_length": proof.short_normalized_length,
+        "long_normalized_length": proof.long_normalized_length,
+        "ordered_anchor_count": proof.ordered_anchor_count,
+        "anchor_chars": proof.anchor_chars,
+        "anchor_offset_span": proof.anchor_offset_span,
+        "ingest_operation_id": (
+            ingest_result["operation_id"] if ingest_result is not None else None
+        ),
+        "ingested_path": (
+            ingest_result["dest_path"] if ingest_result is not None
+            else longer["canonical_path"]
+        ),
+        "quarantine_operation_id": quarantine_result["operation_id"],
+        "quarantine_path": quarantine_result["dest_path"],
+    }
 
 
 def user_action_quarantine(

@@ -12,7 +12,8 @@
 2. 이후에는 파일 identity와 감사 버전이 바뀐 항목만 다시 읽는다.
 3. 제목이 달라도 전체 TXT 정규화 hash 또는 EPUB 내부 콘텐츠 hash가 같으면 후보로 회수한다.
 4. 강한 의심 도서는 삭제하지 않고 journal quarantine에 보관하며 keep/discard 근거와 복구 경로를 남긴다.
-5. 일반화하면 오탐 비용이 큰 cross-title near/contained 예외는 수동 계획으로 기록해 같은 안전 경계로 정리한다.
+5. 같은 작품의 짧은 구간판이 더 긴 최신·완전판에 포함됨을 현재 본문으로 엄격히 증명하면 자동 교체하고,
+   cross-title near나 좌표·본문 증거가 불충분한 contained 예외만 수동 판단으로 남긴다.
 
 ## 2. 구현 단계
 
@@ -39,6 +40,7 @@
 - [x] 자동 회수 가능한 exact EPUB review 12권을 journal quarantine
 - [x] cross-title/near strong-anchor 예외 50권을 수동 JSON plan으로 quarantine
 - [x] 확인된 false-positive 3건을 house로 복원하고 `distinct_work` 기록
+- [x] 같은 시작 회차·더 큰 종료 회차와 5개 분산 고유 본문 anchor로 증명된 짧은 판본 4권 자동 격리
 - [x] 모든 격리에 원본·keep·근거·operation/run ID·복구 경로 기록
 
 ### D. 완료 검증
@@ -46,14 +48,21 @@
 - [x] 전체 Python 회귀와 frontend production build
 - [x] final Doctor 0
 - [x] unfinished operation/group 0, active run 0
-- [x] 실제 house·DB·`file_index.json` 지원 파일 16,788개 일치
-- [x] warm auditor에서 fingerprint cache hit 16,771 / miss 0 / 실제 read 0 확인
+- [x] 최초 재기준 뒤 실제 house·DB·`file_index.json` 지원 파일 16,788개 일치
+- [x] 최신판 자동 교체 뒤 실제 house·DB·`file_index.json` 지원 파일 16,784개 일치
+- [x] 최종 warm auditor에서 fingerprint cache hit 16,767 / miss 0 / 실제 read 0 확인
 - [x] 최종 exact 0, near는 판본 결정 3쌍·수동 보류 2쌍만 남는지 재감사
+- [x] 동일 로직 재실행에서 최신판 자동 교체·warning·기타 이동 모두 0건 확인
 
 ## 3. 자동화와 수동 예외의 경계
 
 - 자동 strong: 전체 TXT normalized hash 동일, EPUB 내부 콘텐츠 hash 동일.
-- review-only: near-identical, contained-version, 앞/뒤 문구만 다른 판본.
+- 자동 최신판 교체: TXT의 exact core가 같고, 같은 시작 회차에서 종료 회차가 더 크며, 현재 normalized
+  전체 접두 SHA 또는 본문 전역의 고유 anchor 5개가 같은 순서·간격으로 일치하는 관계.
+- 작가 차단: 양쪽에 작가가 모두 있고 서로 다를 때만 적용한다. 한쪽 또는 양쪽의 작가 누락은 흔한
+  정상 입력이므로 무시하며 warning 사유로도 삼지 않는다.
+- review-only: near-identical, 시작·단위·managed variant가 충돌하는 관계, 고유 anchor가 부족하거나
+  순서·간격이 흔들려 중간 삽입·누락 가능성을 배제할 수 없는 contained 관계.
 - 수동 예외: 서로 다른 `core_title`이지만 분산된 여러 고유 4 KiB 본문 anchor가 순서대로 일치하는 관계.
 - 보존: decode 실패, EPUB 구조 오류, 부분본 여부가 불명확하거나 좌표가 충돌하는 관계.
 - 실제 bytes 제거는 하지 않는다. 모든 정리 대상은 `txt_temp/trash_bin` 아래 복구 가능한 격리로 이동한다.
@@ -84,7 +93,7 @@
 
 - 구현 커밋: `e72d3ff` (`feat: rebaseline library dedup in v1.4.0`)
 - 운영 중 발견한 stale review 선택 수정: `91a6885` (`fix: bind restores to current fingerprints`)
-- 검증: Python `687 passed`, frontend `npm run build`, `compileall`, `git diff --check` 통과.
+- 검증: Python `695 passed`, frontend `npm run build`, `compileall`, `git diff --check` 통과.
 - full sweep 전 DB backup:
   `.dedup_state/backups/before_v1_4_0_full_sweep_20260728_123351_cd554485.sqlite3`
 - full sweep report:
@@ -122,19 +131,44 @@
   `/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_132401_567028.json`
   (`sha256=6414bee425371f9aba55e725e1d4d9aa17e0f88d24a6ce040819908fab7de76d`)
   - discard run `actual-e2f364a5-c654-41d0-bf17-c11695519b2d`, operations 3679~3684
-- 최종 auditor report:
+- 최초 재기준 완료 auditor report:
   `/Users/twkim/Documents/txt_temp/dedup_logs/strong_candidates_20260728_132521_653576.json`
   (`sha256=39621e0bf234d2d7356a263ae9962b9342bb54a3348735f5869e59610d823257`)
   - `completed=true`, stop reason 없음, actual read 0
   - TXT/EPUB exact 0, 미기록 near 0
   - near 5쌍 = 결정된 보존 판본 3쌍 + 수동 보류 2쌍
-  - contained-version 59쌍은 합본/권별·외전·구간판 관계로 보존; review-only
+  - contained-version 59쌍은 이 시점 구현에서 모두 review-only였음
+- 최신판 자동 교체 사전 dry-run:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/dedup_20260728_140912_888557.json`
+  (`sha256=dca6a75fd47e1b2cf26059873bb74e6b9ed86bddb7abe6273fa24ae2a148a5b7`)
+  - 지원 도서 16,788개, auditor 후보 2,656쌍
+  - fingerprint cache hit 16,771 / miss 0, pair cache hit 2,656 / miss 0, actual read 0
+  - 같은 시작 회차의 더 긴 TXT에 분산 고유 anchor 5개가 순서대로 일치한 4건만 교체 예측
+  - 작가: 양쪽 누락 2건, 양쪽 명시·호환 1건, 짧은 쪽 누락 1건
+- 최신판 자동 교체 DB backup:
+  `.dedup_state/backups/before_v1_4_0_contained_upgrade_20260728_141200.sqlite3`
+- 최신판 자동 교체 실제 실행 report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/dedup_20260728_141326_974695.json`
+  (`sha256=d796cdbf66db38cf482afd609bfcc512eaac24a5199afe7df7a8b5a700cd95a6`)
+  - run `actual-6b8f5c3a-3881-496a-8d98-3d68d4fb5123`, operations 3685~3688
+  - `contained_version` 4건 모두 `status=superseded`, `user_quarantine committed`
+  - 짧은 범위 `1-1210`, `1-522`, `1-138`, `1-135`를 각각 더 긴 `1-1350`, `1-587`,
+    `1-425`, `1-251` 판본으로 교체
+  - 각 기록에 양쪽 normalized SHA·길이, 고유 anchor 5개, anchor offset span 0~19,
+    review/operation ID와 최종 격리 경로 보존
+- 정리 후 동일 로직 dry-run:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/dedup_20260728_142527_150381.json`
+  (`sha256=ecdeb8c9028580605a6ccdee182b97a028357e8bbf94a374020c2885461d6bff`)
+  - 지원 도서 16,784개, auditor 후보 2,652쌍
+  - fingerprint cache hit 16,767 / miss 0, pair cache hit 2,652 / miss 0, actual read 0
+  - 추가 최신판 교체 0, exact mutation 0, 기타 suspect 이동 0, warning 0
+  - 현재 active pair-cache의 나머지 contained-version 55쌍은 엄격한 자동 교체 조건 밖이라 보존
 - 최종 상태:
-  - 지원 도서 16,788개(TXT/EPUB/PDF), 실제 disk = DB = index
-  - baseline 16,847 - 수동 격리 50 + 복원 3 - EPUB 격리 12 = 16,788
-  - 새 operation 65개 모두 committed, source 잔존 0, destination 누락 0
+  - 지원 도서 16,784개(TXT/EPUB/PDF), 실제 disk = DB = index
+  - baseline 16,847 - 수동 격리 50 + 복원 3 - EPUB 격리 12 - 최신판 격리 4 = 16,784
+  - 새 operation 69개 모두 committed, source 잔존 0, destination 누락 0
   - Doctor 0, active run 0, unfinished operation/group 0
   - raw exact group 0, normalized/content exact group 0
-  - index generation `c374f23e6fb24e07bf4ed4d283a0c3c2`
-    (`2026-07-28T13:24:39+09:00`)
-  - 실제 bytes purge 없음. 모든 62권은 `txt_temp/trash_bin` 아래 복구 가능.
+  - index generation `bfc1bce1fce64492a558efe2e89c3654`
+    (`2026-07-28T14:13:45+09:00`)
+  - 실제 bytes purge 없음. 모든 66권은 `txt_temp/trash_bin` 아래 복구 가능.
