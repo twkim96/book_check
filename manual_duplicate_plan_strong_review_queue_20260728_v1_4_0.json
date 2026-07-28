@@ -1,0 +1,1371 @@
+{
+  "schema_version": 2,
+  "kind": "manual_house_cleanup_1_4_0_strong_review_queue",
+  "source_audit": {
+    "generated_on": "2026-07-28",
+    "scope": "current active house-house TXT reviews with matching core title and same or fully nested episode spans",
+    "thresholds": {
+      "same_core_and_episode_span": true,
+      "episode_span_relation": "same_or_fully_nested",
+      "explicit_author_conflict": false,
+      "both_unassigned_unprotected_house_txt": true,
+      "minimum_equal_line_ratio_smaller": 0.99,
+      "maximum_same_span_normalized_length_delta_ratio": 0.05,
+      "maximum_nested_span_normalized_length_delta_ratio": null
+    },
+    "reviewed_candidates": 40,
+    "quarantine_actions": 24,
+    "preserved_below_threshold": 16,
+    "keep_policy": "backend.deduplicator.choose_keep current v1.4.0 ordering"
+  },
+  "quarantine": [
+    {
+      "delete_file_id": "6543a313-f376-496c-bd2d-37bc1cd15661",
+      "keep_file_id": "4560dc53-41a7-401a-8ecb-b087e30755d1",
+      "delete_expected_sha256": "b60ec054c5c1b0ff70e2692497807252f10aee77b4ca46829edc3872c955dddf",
+      "keep_expected_sha256": "340754c344e3cc97f6204943ce8d1c1f2634f8945e14c11a64b40f517835282c",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2071,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          3562686,
+          3563021
+        ],
+        "normalized_length_delta_ratio": 0.000094,
+        "line_sequence_ratio": 0.998036,
+        "equal_line_ratio_smaller": 0.998074,
+        "nonempty_lines": [
+          156812,
+          156824
+        ],
+        "change_blocks": 266,
+        "candidate_episode_span": [
+          1,
+          836
+        ],
+        "reference_episode_span": [
+          1,
+          836
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅈ/적룡무제 0-836(完, 후기 포함)@천봉.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅈ/적룡무제@천봉 1-836완.txt"
+      }
+    },
+    {
+      "delete_file_id": "2b95f386-58e3-4a1d-9369-4e7f3c0dbb5f",
+      "keep_file_id": "068108d8-1b53-4462-8c36-0f2a5ef1bd3c",
+      "delete_expected_sha256": "2424cf5f1526336bbc7a2543e2fa29772c6338df10b33b3374cacd0f93e426ee",
+      "keep_expected_sha256": "857a078e49235a02370e26e137bcba7be9518babd2a78e9290e38d906d6f8445",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2091,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          3599501,
+          3602391
+        ],
+        "normalized_length_delta_ratio": 0.000802,
+        "line_sequence_ratio": 0.993208,
+        "equal_line_ratio_smaller": 0.994621,
+        "nonempty_lines": [
+          167311,
+          167787
+        ],
+        "change_blocks": 897,
+        "candidate_episode_span": [
+          1,
+          874
+        ],
+        "reference_episode_span": [
+          1,
+          874
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅅ/상남자 [ⓒ김태궁] 1-874 完.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅅ/상남자 1-874 완.txt"
+      }
+    },
+    {
+      "delete_file_id": "5ad9f18b-ad77-44d9-a467-1338ff4d4ac5",
+      "keep_file_id": "f22f13ba-5831-48c3-9bc4-4ba5b4877360",
+      "delete_expected_sha256": "166bd598e74b6d3cd4d8c068a1595e75f7d8e989bebee9bedf3147bb951e1c08",
+      "keep_expected_sha256": "c32ffa555d973f1b72424c0e4cb5a937515e2f6d2fbfe30806c9c7f5e1328e9b",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2093,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          2007324,
+          2030088
+        ],
+        "normalized_length_delta_ratio": 0.011213,
+        "line_sequence_ratio": 0.987601,
+        "equal_line_ratio_smaller": 0.990244,
+        "nonempty_lines": [
+          65193,
+          65542
+        ],
+        "change_blocks": 481,
+        "candidate_episode_span": [
+          1,
+          433
+        ],
+        "reference_episode_span": [
+          1,
+          431
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄷ/던전 마제스티 1~431(완).txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄷ/던전 마제스티%40박제후 19N  -433 완%2B외전 .txt"
+      }
+    },
+    {
+      "delete_file_id": "1e1a48e3-b663-4f33-bb55-4ade39c65f03",
+      "keep_file_id": "5cdc1407-012a-403f-883f-bc76870b4e4e",
+      "delete_expected_sha256": "ddad096133c9124052a9958d7c9296e9b73e5e16ad441c4d231d82ec2938eb54",
+      "keep_expected_sha256": "c183f497bc7330f1b57ca88640a065a0924dfae9b5744fab270fd1c030c16a8c",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2095,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1339690,
+          1342022
+        ],
+        "normalized_length_delta_ratio": 0.001738,
+        "line_sequence_ratio": 0.994695,
+        "equal_line_ratio_smaller": 0.994695,
+        "nonempty_lines": [
+          38266,
+          38266
+        ],
+        "change_blocks": 203,
+        "candidate_episode_span": [
+          1,
+          202
+        ],
+        "reference_episode_span": [
+          1,
+          202
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/영어/EX급 만능사제가 되었다 1-202(完, 에필 포함)@김현준.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/영어/EX급 만능사제가 되었다@김현준 1-202완-현260319.txt"
+      }
+    },
+    {
+      "delete_file_id": "07998cf7-c28e-46aa-abfc-271d046ddf5c",
+      "keep_file_id": "1b939501-8566-4ece-8fe9-4a8ad3c74b48",
+      "delete_expected_sha256": "27fb67ba47eb66ee129fd032cea4c85f479717ca2a4ad2b442996212d25d2e5e",
+      "keep_expected_sha256": "991f9725aaf142de1855bc58824843a7bf28f3a5fcfeb9d854dc38a2f4a5640c",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2106,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          832436,
+          837319
+        ],
+        "normalized_length_delta_ratio": 0.005832,
+        "line_sequence_ratio": 0.992376,
+        "equal_line_ratio_smaller": 0.999922,
+        "nonempty_lines": [
+          12887,
+          13083
+        ],
+        "change_blocks": 198,
+        "candidate_episode_span": [
+          1,
+          197
+        ],
+        "reference_episode_span": [
+          1,
+          197
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/용의 혈흔 001-197 (완).txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/용의 혈흔 1-197 (완).txt"
+      }
+    },
+    {
+      "delete_file_id": "559c21f7-16f9-4f64-96a9-6e57dde7ae28",
+      "keep_file_id": "6b954b8e-7612-4578-8bf8-58fc538547ac",
+      "delete_expected_sha256": "9d3c19d6b626f4875473b570baff013c19b250ff25d2f41ae950e0877064d46b",
+      "keep_expected_sha256": "3692f15d577c31ef9ab43bdf2456d0174d916fdf4e05e73637f8aad0da78be58",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2138,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          986700,
+          974471
+        ],
+        "normalized_length_delta_ratio": 0.012394,
+        "line_sequence_ratio": 0.984115,
+        "equal_line_ratio_smaller": 0.993497,
+        "nonempty_lines": [
+          36826,
+          36137
+        ],
+        "change_blocks": 229,
+        "candidate_episode_span": [
+          1,
+          224
+        ],
+        "reference_episode_span": [
+          1,
+          224
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄱ/금융치료하는 재벌 스폰서 [ⓒ커피밀크] 001-224 (完)(ㅎㅅㅇ).txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄱ/금융치료하는 재벌 스폰서 1-224화 완결.txt"
+      }
+    },
+    {
+      "delete_file_id": "e79cfd57-1434-434c-a156-f597dba17af2",
+      "keep_file_id": "19bd96ad-74ac-4e56-9332-742aa28a7956",
+      "delete_expected_sha256": "0980ef4c13518a81c424210c8b461872c2c9ce8cc825d52aa71ac372b991057c",
+      "keep_expected_sha256": "575ad4633965f35cc3feed9f2000eadf1770c986bfd39a28e0016148c30709f6",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2146,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          4099142,
+          4624482
+        ],
+        "normalized_length_delta_ratio": 0.1136,
+        "line_sequence_ratio": 0.921724,
+        "equal_line_ratio_smaller": 0.993687,
+        "nonempty_lines": [
+          113263,
+          130949
+        ],
+        "change_blocks": 703,
+        "candidate_episode_span": [
+          1,
+          775
+        ],
+        "reference_episode_span": [
+          1,
+          869
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄱ/괴물 천재투수가 메이저리그를 찢음 1-775 완 (외전없음).txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄱ/괴물 천재투수가 메이저리그를 찢음 0-869(본편 및 외전 完, 에필 및 후기 포함)@단팥빵소년.txt"
+      }
+    },
+    {
+      "delete_file_id": "b69e2c82-24f2-4f6d-a6f0-ef7699f3f864",
+      "keep_file_id": "b8991466-7da0-4691-a396-a5d3cb4232f2",
+      "delete_expected_sha256": "6c3c2127898e00812b3dba89c5fd67fb6fe3aafb8fa8c96fdc5ca32c60d4527d",
+      "keep_expected_sha256": "2fea86120068b0fdf10187cb79927c370f349b58d2f27d3ab2e747e56eea8193",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2160,
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          2612648,
+          2611839
+        ],
+        "normalized_length_delta_ratio": 0.00031,
+        "line_sequence_ratio": 0.998206,
+        "equal_line_ratio_smaller": 0.998303,
+        "nonempty_lines": [
+          87208,
+          87225
+        ],
+        "change_blocks": 5,
+        "candidate_episode_span": [
+          1,
+          547
+        ],
+        "reference_episode_span": [
+          1,
+          547
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/이세계에서 소크라테스로 살아가는 방법 [ⓒVENOME] 1-547 完.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/이세계에서 소크라테스로 살아가는방법 1~547完@VENOME.txt"
+      }
+    },
+    {
+      "delete_file_id": "0a3d486a-9e3e-464a-8782-a1f06d51709a",
+      "keep_file_id": "17a40540-e767-4e2f-b8b5-83daa5276362",
+      "delete_expected_sha256": "3b312085f91156a6c726c68a1484992cd2933c7877f88196d077ab337a0d200d",
+      "keep_expected_sha256": "f0bedee6016d56746bfaeeed7c34c6af882840a7016111f4ee499f72c9a8afae",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2164,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          686401,
+          684206
+        ],
+        "normalized_length_delta_ratio": 0.003198,
+        "line_sequence_ratio": 0.991821,
+        "equal_line_ratio_smaller": 0.991847,
+        "nonempty_lines": [
+          19012,
+          19011
+        ],
+        "change_blocks": 156,
+        "candidate_episode_span": [
+          1,
+          156
+        ],
+        "reference_episode_span": [
+          1,
+          156
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅂ/빌어먹을 매너 게임 001-156 (완).txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅂ/빌어먹을 매너 게임  1~156 완.txt"
+      }
+    },
+    {
+      "delete_file_id": "d1a2f9c5-0eea-4047-9189-dd607a3ea2e7",
+      "keep_file_id": "d10b8fac-8cbd-4c33-ab54-47291febc709",
+      "delete_expected_sha256": "326da08a7d9adc188c5c421b6d90082ea9dddf2dec043387507691f3cc8c5a2e",
+      "keep_expected_sha256": "bf69b5a5da7494b645f9560ec61ab7bb7bf3ee78a62241a637226a55de5f3f9b",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2169,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1051329,
+          1050955
+        ],
+        "normalized_length_delta_ratio": 0.000356,
+        "line_sequence_ratio": 0.997937,
+        "equal_line_ratio_smaller": 0.998147,
+        "nonempty_lines": [
+          42655,
+          42637
+        ],
+        "change_blocks": 67,
+        "candidate_episode_span": [
+          1,
+          251
+        ],
+        "reference_episode_span": [
+          1,
+          251
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/얼굴천재 연기천재로 회귀 [ⓒ마라맛] 1-251 完.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/얼굴천재 연기천재로 회귀 1 251화 完 [마라맛].txt"
+      }
+    },
+    {
+      "delete_file_id": "938d0be2-e6c6-4141-b1ec-7d675c819daf",
+      "keep_file_id": "361aa166-9945-45a6-ac05-6db0fd84df6e",
+      "delete_expected_sha256": "faa7594031e6176efd01805ccb32f767656231b52a733d8033bcbe763ff13234",
+      "keep_expected_sha256": "e2d6df7216cd24a89489a2af24186fc8e8faf3a5eb8572dff115f2afe0db7e61",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2178,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          899463,
+          898209
+        ],
+        "normalized_length_delta_ratio": 0.001394,
+        "line_sequence_ratio": 0.987025,
+        "equal_line_ratio_smaller": 0.991313,
+        "nonempty_lines": [
+          24267,
+          24058
+        ],
+        "change_blocks": 209,
+        "candidate_episode_span": [
+          1,
+          217
+        ],
+        "reference_episode_span": [
+          1,
+          217
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/숫자/26살까지 100억 모으기 1-217(시즌1,2 및 외전 完)@불량집사.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/숫자/26살까지 100억 모으기 1-217완@불량집사-현260312.txt"
+      }
+    },
+    {
+      "delete_file_id": "3d01b176-2fb7-42f3-b1b4-47bb2a5a6dff",
+      "keep_file_id": "e783bfcb-00b7-47c2-9fea-0e3b02f8ceab",
+      "delete_expected_sha256": "dd974aee013b2bba994d4abfd7e159a1431af3ebaf2f3116b24ce46fcabf042b",
+      "keep_expected_sha256": "6913d85d10badcf3819f5f004f2443216d57aeeb522ed4e71d61ccb454e52db2",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2180,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          952490,
+          952173
+        ],
+        "normalized_length_delta_ratio": 0.000333,
+        "line_sequence_ratio": 0.990806,
+        "equal_line_ratio_smaller": 0.993811,
+        "nonempty_lines": [
+          32802,
+          33001
+        ],
+        "change_blocks": 202,
+        "candidate_episode_span": [
+          1,
+          201
+        ],
+        "reference_episode_span": [
+          1,
+          201
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/아포칼립스 속 최강자 001-201 완결 (M.m).txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/아포칼립스 속 최강자 [ⓒ베르헤라] 1-201 完.txt"
+      }
+    },
+    {
+      "delete_file_id": "4a66d712-3417-4869-bf42-abe8bbfb18ba",
+      "keep_file_id": "82514a38-93ef-42c4-8616-40f2ad9dd36c",
+      "delete_expected_sha256": "a62ff24466b7432e2279ed12c352937b60d52a1eef9b9a2c516f6f13de030110",
+      "keep_expected_sha256": "1fa80d7bbb20c82781386dba9b1ac41abf9a98453027b2ca5245bec2bdbb2b41",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2190,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1642846,
+          1644134
+        ],
+        "normalized_length_delta_ratio": 0.000783,
+        "line_sequence_ratio": 0.992758,
+        "equal_line_ratio_smaller": 0.99516,
+        "nonempty_lines": [
+          72111,
+          72460
+        ],
+        "change_blocks": 348,
+        "candidate_episode_span": [
+          1,
+          346
+        ],
+        "reference_episode_span": [
+          1,
+          346
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄹ/리턴 투 플레이어 1-346(본편 및 외전 完)@인덱스.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄹ/리턴 투 플레이어 1-346 완결-판260302.txt"
+      }
+    },
+    {
+      "delete_file_id": "80170042-c41a-4e76-a54a-27632bd4539b",
+      "keep_file_id": "3c3f5f1a-aa99-4369-b4f1-736bbb1a2413",
+      "delete_expected_sha256": "16c93b0f7ea2ada51d3472ad445003f47b5357fb724406eea983b06caef35a9c",
+      "keep_expected_sha256": "e6f5b2b805a7f1a28b594002a84779be584eca54fba43688f88db53d8b19c149",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2210,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          3315367,
+          3315434
+        ],
+        "normalized_length_delta_ratio": 0.00002,
+        "line_sequence_ratio": 0.998627,
+        "equal_line_ratio_smaller": 0.998634,
+        "nonempty_lines": [
+          161741,
+          161739
+        ],
+        "change_blocks": 222,
+        "candidate_episode_span": [
+          1,
+          722
+        ],
+        "reference_episode_span": [
+          1,
+          722
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅁ/무림에서온배달부1-722외전3부完.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅁ/무림에서 온 배달부 1-722 (외전1-3) 완.txt"
+      }
+    },
+    {
+      "delete_file_id": "7217e577-7622-4181-a07c-cb515dbfd7aa",
+      "keep_file_id": "bad43d63-f924-4066-938d-e3031a3af87d",
+      "delete_expected_sha256": "f430acc7845ffefb8a22f86026aeba5c67912ad48d19d69e48a2ede1cbae74fe",
+      "keep_expected_sha256": "cbb87fbb4b65b78228f153ba9e4c0b020bbc5da900c5fec487f76c11f852adbc",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2231,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          2086232,
+          2087464
+        ],
+        "normalized_length_delta_ratio": 0.00059,
+        "line_sequence_ratio": 0.996801,
+        "equal_line_ratio_smaller": 0.999409,
+        "nonempty_lines": [
+          76082,
+          76480
+        ],
+        "change_blocks": 416,
+        "candidate_episode_span": [
+          1,
+          381
+        ],
+        "reference_episode_span": [
+          1,
+          382
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/아카데미 고인물이 다 해먹음@민트맛맥콜 000-381 외전 포함 완.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/아카데미 고인물이 다 해먹음 1화-382화 (완) - 민트맛맥콜.txt"
+      }
+    },
+    {
+      "delete_file_id": "25569c6d-4b0c-4dd5-ac25-feae599edaeb",
+      "keep_file_id": "d6f87551-f043-4b32-9ab6-4d5a4807b414",
+      "delete_expected_sha256": "b48b17b6fc315b13ffc0dc4d4096e029f1745b342b629a4d38c18887af9e0d2e",
+      "keep_expected_sha256": "c8888d5a513edf17a373457fa1768d9c4ecc1aa23ad9a6b7a1e825458fa918a8",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2240,
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          2554166,
+          2669120
+        ],
+        "normalized_length_delta_ratio": 0.043068,
+        "line_sequence_ratio": 0.968831,
+        "equal_line_ratio_smaller": 0.99796,
+        "nonempty_lines": [
+          92647,
+          98218
+        ],
+        "change_blocks": 185,
+        "candidate_episode_span": [
+          1,
+          600
+        ],
+        "reference_episode_span": [
+          1,
+          625
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/일홀도 [ⓒ설봉] 001-600 완결.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅇ/일홀도 1-625 (완).txt"
+      }
+    },
+    {
+      "delete_file_id": "e6656dc3-94f3-4f7d-ab42-acb426360303",
+      "keep_file_id": "0c12a018-47d6-4648-b511-42c13c49f32b",
+      "delete_expected_sha256": "e6d6914853c4455260a30d8ad75e21ca1c7c5726e8a17c3d3a91329d18740ad2",
+      "keep_expected_sha256": "f5196388308050db9430c72243df1ba7006a2bf93f57997ed33469b8f0f8bc90",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2248,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          2484594,
+          2485803
+        ],
+        "normalized_length_delta_ratio": 0.000486,
+        "line_sequence_ratio": 0.993469,
+        "equal_line_ratio_smaller": 0.995636,
+        "nonempty_lines": [
+          92355,
+          92758
+        ],
+        "change_blocks": 403,
+        "candidate_episode_span": [
+          1,
+          402
+        ],
+        "reference_episode_span": [
+          1,
+          402
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅁ/망한 세계를 게임으로 착각시켰다 0-402(完, 에필 및 후기 포함)@크레도.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅁ/망한 세계를 게임으로 착각시켰다 0-402 완결-판260312.txt"
+      }
+    },
+    {
+      "delete_file_id": "c3013937-d5d8-4363-90d2-221647e1be3d",
+      "keep_file_id": "13de8461-ecca-48d8-89d9-148ca48e27ab",
+      "delete_expected_sha256": "5c09048f12d4304e561a4b8187434172a0ad30eca70a12aa108c8daedcc20946",
+      "keep_expected_sha256": "81ec29f3bf53ac4523f8e71844cf9ae1979a1a1a5e6239e36f4175a58e2bd35c",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2252,
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          7644954,
+          5581422
+        ],
+        "normalized_length_delta_ratio": 0.269921,
+        "line_sequence_ratio": 0.842233,
+        "equal_line_ratio_smaller": 0.997636,
+        "nonempty_lines": [
+          378185,
+          276244
+        ],
+        "change_blocks": 10,
+        "candidate_episode_span": [
+          1,
+          1836
+        ],
+        "reference_episode_span": [
+          1,
+          1309
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅎ/회귀의 전설 1-1309 3부 완결.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅎ/회귀의 전설 1-1836완-현251115.txt"
+      }
+    },
+    {
+      "delete_file_id": "8fcd7927-61b0-4ba9-a6ff-8ad042fdd986",
+      "keep_file_id": "b4edc657-e485-4f53-a1fd-cd0066db484d",
+      "delete_expected_sha256": "8551cf3466c990d097b37fb10a5c52da5511b94dd1322a29a46a0a4741dd54ea",
+      "keep_expected_sha256": "7bb455a8a0c96d4fbc5a467f51900c50f0cf4cb6d2b26c30df9d0b4a8ddfb355",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2254,
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          1026957,
+          1026939
+        ],
+        "normalized_length_delta_ratio": 0.000018,
+        "line_sequence_ratio": 0.999944,
+        "equal_line_ratio_smaller": 0.999972,
+        "nonempty_lines": [
+          35605,
+          35603
+        ],
+        "change_blocks": 2,
+        "candidate_episode_span": [
+          1,
+          200
+        ],
+        "reference_episode_span": [
+          1,
+          201
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄷ/대마도사 엔지니어 [ⓒ푸달] 0-200 完.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄷ/대마도사 엔지니어 1-201完 [푸달].txt"
+      }
+    },
+    {
+      "delete_file_id": "b76a9daa-817c-41ea-979c-416bcb38300a",
+      "keep_file_id": "d0e988c8-aafc-4c3f-b34e-fab59397e7a9",
+      "delete_expected_sha256": "3a572618df9938166f0843f9ace244a5020694ea2ba88a35de9d76181ffa817d",
+      "keep_expected_sha256": "f4a885161ab07df73e6d28f08d96b7b09cf4b6c8084e5ea6d0b6612889f2f45a",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2263,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          3850524,
+          4987829
+        ],
+        "normalized_length_delta_ratio": 0.228016,
+        "line_sequence_ratio": 0.867201,
+        "equal_line_ratio_smaller": 0.999619,
+        "nonempty_lines": [
+          83951,
+          109589
+        ],
+        "change_blocks": 31,
+        "candidate_episode_span": [
+          1,
+          31
+        ],
+        "reference_episode_span": [
+          1,
+          1047
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄱ/군림천하(개정판) 1-31권.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄱ/군림천하 1-1047(개정판)(完, 후기 포함)@용대운.txt"
+      }
+    },
+    {
+      "delete_file_id": "8ba372e9-b600-4d31-bfd6-007f7674388e",
+      "keep_file_id": "278c034a-bc6a-427c-a02d-55e84d00f103",
+      "delete_expected_sha256": "6b6f2028d4acf779a19fe3d847105d0238c80f943bc413386ab567ce7204db3e",
+      "keep_expected_sha256": "3675d31d8a439b6e4b50ed3480aa716772f390de32af845b95e015596af3bc6d",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2269,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1766962,
+          1716116
+        ],
+        "normalized_length_delta_ratio": 0.028776,
+        "line_sequence_ratio": 0.984217,
+        "equal_line_ratio_smaller": 0.999985,
+        "nonempty_lines": [
+          70697,
+          68502
+        ],
+        "change_blocks": 3,
+        "candidate_episode_span": [
+          1,
+          351
+        ],
+        "reference_episode_span": [
+          1,
+          340
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅊ/착한 일을 하면 복을 받음¿ 1-340 完 [세르페].txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅊ/착한 일을 하면 복을 받음¿ 1-351(본편 및 외전 完, 후기 및 Q&A 포함)@세르페.txt"
+      }
+    },
+    {
+      "delete_file_id": "b3a9f175-3419-45cb-94ce-caf101cf84ca",
+      "keep_file_id": "1cd3bf70-e891-427c-bdad-70a309647cb7",
+      "delete_expected_sha256": "0183f2fdb1e1501b579ccb933423fba86facf5c6192785573363fbb518e9b726",
+      "keep_expected_sha256": "1c1bbdfa665087077404f3a26b1e6fb7be60c0f0f5fb251de87e7e203a31d1b5",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2292,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1506420,
+          1023545
+        ],
+        "normalized_length_delta_ratio": 0.320545,
+        "line_sequence_ratio": 0.815484,
+        "equal_line_ratio_smaller": 0.999904,
+        "nonempty_lines": [
+          60812,
+          41873
+        ],
+        "change_blocks": 47,
+        "candidate_episode_span": [
+          1,
+          342
+        ],
+        "reference_episode_span": [
+          1,
+          43
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/숫자/8클래스 마법사의 회귀 1부 및 외전(完), 2부 1-43[류송].txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/숫자/8클래스 마법사의 회귀@류송 1-342 완결.txt"
+      }
+    },
+    {
+      "delete_file_id": "7c214f30-6184-49df-86c3-9bbb22a14682",
+      "keep_file_id": "7f8d69a8-007c-485f-b5d4-6087907e467f",
+      "delete_expected_sha256": "505eba9dd1a0a6cddf25fca200b295510a659f126bce940c6f1cce00efda5b09",
+      "keep_expected_sha256": "f1ac8e182e39300a4a9725ccb6eb4833a2f40842d3a7c5401110e0abea801a65",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2323,
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          526099,
+          3582747
+        ],
+        "normalized_length_delta_ratio": 0.853158,
+        "line_sequence_ratio": 0.258865,
+        "equal_line_ratio_smaller": 1,
+        "nonempty_lines": [
+          12903,
+          86786
+        ],
+        "change_blocks": 1,
+        "candidate_episode_span": [
+          638,
+          738
+        ],
+        "reference_episode_span": [
+          1,
+          738
+        ],
+        "span_relation": "nested",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㄴ/뉴비세스 메이커 2부 638-738 [르딘].txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㄴ/뉴비세스 메이커 2T -738 [르딘]/[르딘] 뉴비세스 메이커 1부 1-637_2부 638-738 @연재중.txt"
+      }
+    },
+    {
+      "delete_file_id": "4419e864-cf40-4c52-b909-553ece61a8ed",
+      "keep_file_id": "2d607706-b3a5-4edc-92df-c51457bc8670",
+      "delete_expected_sha256": "08834ab54ab91a86dd7ae66f512bdc33e54e8a1060380202b542033bd206937c",
+      "keep_expected_sha256": "c20c494964c0e4988f50a3d0d166f3f59ac25314a33da8119ffb70d0aab342d5",
+      "reason": "v1_4_0_strong_same_span_review_cleanup",
+      "classification": "manual_strong_same_span",
+      "selection_policy": "current_choose_keep",
+      "evidence": {
+        "review_id": 2324,
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1488877,
+          1488255
+        ],
+        "normalized_length_delta_ratio": 0.000418,
+        "line_sequence_ratio": 0.995716,
+        "equal_line_ratio_smaller": 0.995723,
+        "nonempty_lines": [
+          73887,
+          73886
+        ],
+        "change_blocks": 315,
+        "candidate_episode_span": [
+          1,
+          307
+        ],
+        "reference_episode_span": [
+          1,
+          307
+        ],
+        "span_relation": "same",
+        "delete_path_at_audit": "/Users/twkim/Documents/txt_house/ㅎ/훈수로 메이저리거 [ⓒ예성] 1-307 完.txt",
+        "keep_path_at_audit": "/Users/twkim/Documents/txt_house/ㅎ/훈수로 메이저리거@예성 1-307완.txt"
+      }
+    }
+  ],
+  "restore_distinct": [],
+  "preserve_relationships": [],
+  "preserved_unresolved": [
+    {
+      "review_id": 2084,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅂ/북경의 신룡 [ⓒ운찬] 1-304 完.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅂ/북경의 신룡 001-304 完.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1364315,
+          1367921
+        ],
+        "normalized_length_delta_ratio": 0.002636,
+        "line_sequence_ratio": 0.898129,
+        "equal_line_ratio_smaller": 0.898208,
+        "nonempty_lines": [
+          51339,
+          51330
+        ],
+        "change_blocks": 2885,
+        "candidate_episode_span": [
+          1,
+          304
+        ],
+        "reference_episode_span": [
+          1,
+          304
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2114,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅇ/안 보이는 투명츄 1부 1-258완.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅇ/안 보이는 투명츄 1-540 (완, 외전포함) 19금 .txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1136088,
+          2379921
+        ],
+        "normalized_length_delta_ratio": 0.522636,
+        "line_sequence_ratio": 0.592468,
+        "equal_line_ratio_smaller": 0.889882,
+        "nonempty_lines": [
+          45424,
+          91029
+        ],
+        "change_blocks": 4303,
+        "candidate_episode_span": [
+          1,
+          258
+        ],
+        "reference_episode_span": [
+          1,
+          540
+        ],
+        "span_relation": "nested"
+      }
+    },
+    {
+      "review_id": 2127,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅂ/분명 2인자입니다만？ 0-285 외전 포함 완.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅂ/분명 2인자입니다만 1-280 완.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1510586,
+          1471599
+        ],
+        "normalized_length_delta_ratio": 0.025809,
+        "line_sequence_ratio": 0.96786,
+        "equal_line_ratio_smaller": 0.977821,
+        "nonempty_lines": [
+          64008,
+          62717
+        ],
+        "change_blocks": 1178,
+        "candidate_episode_span": [
+          1,
+          285
+        ],
+        "reference_episode_span": [
+          1,
+          280
+        ],
+        "span_relation": "nested"
+      }
+    },
+    {
+      "review_id": 2134,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅊ/천재는 평범하게 살기로 했더338완 [자손e].txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅊ/천재는 평범하게 살기로 했더 [ⓒ자손e] 1-338 完.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1707230,
+          1708541
+        ],
+        "normalized_length_delta_ratio": 0.000767,
+        "line_sequence_ratio": 0.979253,
+        "equal_line_ratio_smaller": 0.982041,
+        "nonempty_lines": [
+          61992,
+          61641
+        ],
+        "change_blocks": 838,
+        "candidate_episode_span": [
+          1,
+          338
+        ],
+        "reference_episode_span": [
+          1,
+          338
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2147,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅎ/황혼을쫓는늑대  1 147 완.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅎ/황혼을 쫓는 늑대 001-147 (완).txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          634626,
+          637548
+        ],
+        "normalized_length_delta_ratio": 0.004583,
+        "line_sequence_ratio": 0.979022,
+        "equal_line_ratio_smaller": 0.97906,
+        "nonempty_lines": [
+          12894,
+          12895
+        ],
+        "change_blocks": 233,
+        "candidate_episode_span": [
+          1,
+          147
+        ],
+        "reference_episode_span": [
+          1,
+          147
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2151,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅌ/탑스타의 초집중 [ⓒ아마기슈] 001-201 完↗.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅌ/탑스타의 초집중 1-201화 完 [아마기슈].txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          858560,
+          843891
+        ],
+        "normalized_length_delta_ratio": 0.017086,
+        "line_sequence_ratio": 0.95922,
+        "equal_line_ratio_smaller": 0.968808,
+        "nonempty_lines": [
+          30411,
+          29815
+        ],
+        "change_blocks": 779,
+        "candidate_episode_span": [
+          1,
+          201
+        ],
+        "reference_episode_span": [
+          1,
+          201
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2155,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅂ/뱅퀴어 더 드래곤 [ⓒYAGI] 1-183 完.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅂ/뱅퀴어 더 드래곤 1-183 완결 (번역후기, 원작자 후기).txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1149627,
+          1168879
+        ],
+        "normalized_length_delta_ratio": 0.01647,
+        "line_sequence_ratio": 0.922891,
+        "equal_line_ratio_smaller": 0.928489,
+        "nonempty_lines": [
+          45755,
+          46310
+        ],
+        "change_blocks": 2922,
+        "candidate_episode_span": [
+          1,
+          183
+        ],
+        "reference_episode_span": [
+          1,
+          183
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2158,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅅ/신들의 중고나라 [ⓒ두파치타파] 1-154 完.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅅ/신들의 중고나라 001-154 완.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          798339,
+          795117
+        ],
+        "normalized_length_delta_ratio": 0.004036,
+        "line_sequence_ratio": 0.910769,
+        "equal_line_ratio_smaller": 0.911328,
+        "nonempty_lines": [
+          37521,
+          37475
+        ],
+        "change_blocks": 2980,
+        "candidate_episode_span": [
+          1,
+          154
+        ],
+        "reference_episode_span": [
+          1,
+          154
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2174,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅊ/천하제일인의 소꿉친구 1-1328 1&2부완.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅊ/천하제일인의 소꿉친구 0-541 1부 완.txt",
+      "evidence": {
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          6352386,
+          2873626
+        ],
+        "normalized_length_delta_ratio": 0.54763,
+        "line_sequence_ratio": 0.601005,
+        "equal_line_ratio_smaller": 0.988839,
+        "nonempty_lines": [
+          351166,
+          153306
+        ],
+        "change_blocks": 973,
+        "candidate_episode_span": [
+          1,
+          1328
+        ],
+        "reference_episode_span": [
+          1,
+          541
+        ],
+        "span_relation": "nested"
+      }
+    },
+    {
+      "review_id": 2186,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅁ/민간군사기업 블랙 레벨 1~128 (완).txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅁ/민간군사기업 블랙 레벨 001-128 (완).txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          619049,
+          610025
+        ],
+        "normalized_length_delta_ratio": 0.014577,
+        "line_sequence_ratio": 0.96963,
+        "equal_line_ratio_smaller": 0.977438,
+        "nonempty_lines": [
+          11484,
+          11302
+        ],
+        "change_blocks": 129,
+        "candidate_episode_span": [
+          1,
+          128
+        ],
+        "reference_episode_span": [
+          1,
+          128
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2198,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㄷ/데이크 1-140 완@족발(문피아).txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㄷ/데이크 001-140 (완).txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          780811,
+          1564104
+        ],
+        "normalized_length_delta_ratio": 0.500793,
+        "line_sequence_ratio": 0.65585,
+        "equal_line_ratio_smaller": 0.971143,
+        "nonempty_lines": [
+          14693,
+          28820
+        ],
+        "change_blocks": 141,
+        "candidate_episode_span": [
+          1,
+          140
+        ],
+        "reference_episode_span": [
+          1,
+          140
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2238,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅇ/여배우가 사랑하는 천재작가 [ⓒ빅스톤] 001-204 完↗.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅇ/여배우가 사랑하는 천재작가 1-204(본편 完), 1-31(외전 完)@빅스톤.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          978629,
+          1112898
+        ],
+        "normalized_length_delta_ratio": 0.120648,
+        "line_sequence_ratio": 0.915179,
+        "equal_line_ratio_smaller": 0.979112,
+        "nonempty_lines": [
+          39401,
+          44906
+        ],
+        "change_blocks": 205,
+        "candidate_episode_span": [
+          1,
+          204
+        ],
+        "reference_episode_span": [
+          1,
+          204
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2250,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㄱ/경애하는 수령동지 1-330 외전 1-32 완-판250717.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㄱ/경애하는 수령동지 001-350 완결(후일담, 외전 5장 포함).txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          1907752,
+          1847777
+        ],
+        "normalized_length_delta_ratio": 0.031438,
+        "line_sequence_ratio": 0.954823,
+        "equal_line_ratio_smaller": 0.974985,
+        "nonempty_lines": [
+          33415,
+          32061
+        ],
+        "change_blocks": 725,
+        "candidate_episode_span": [
+          1,
+          330
+        ],
+        "reference_episode_span": [
+          1,
+          350
+        ],
+        "span_relation": "nested"
+      }
+    },
+    {
+      "review_id": 2259,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅁ/매니저로 인생 역전 [ⓒ테리빈스] 001-150完 (ㅎㅅㅇ).txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅁ/매니저로 인생 역전 1-150 完.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          635638,
+          629335
+        ],
+        "normalized_length_delta_ratio": 0.009916,
+        "line_sequence_ratio": 0.852145,
+        "equal_line_ratio_smaller": 0.857416,
+        "nonempty_lines": [
+          25454,
+          25143
+        ],
+        "change_blocks": 2501,
+        "candidate_episode_span": [
+          1,
+          150
+        ],
+        "reference_episode_span": [
+          1,
+          150
+        ],
+        "span_relation": "same"
+      }
+    },
+    {
+      "review_id": 2289,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㅎ/화산귀환 1~1920 2부 완결-무251124.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㅎ/화산귀환 1-1753.txt",
+      "evidence": {
+        "source_classification": "contained_version",
+        "normalized_lengths": [
+          8566988,
+          7812147
+        ],
+        "normalized_length_delta_ratio": 0.08811,
+        "line_sequence_ratio": 0.81441,
+        "equal_line_ratio_smaller": 0.852625,
+        "nonempty_lines": [
+          337006,
+          308092
+        ],
+        "change_blocks": 22917,
+        "candidate_episode_span": [
+          1,
+          1920
+        ],
+        "reference_episode_span": [
+          1,
+          1753
+        ],
+        "span_relation": "nested"
+      }
+    },
+    {
+      "review_id": 2299,
+      "reason": "below_strong_same_span_threshold",
+      "candidate_path": "/Users/twkim/Documents/txt_house/ㄷ/대책 없는 영주의 아들이 되었다 1-181(完, 에필 포함)@협행마.txt",
+      "reference_path": "/Users/twkim/Documents/txt_house/ㄷ/대책 없는 영주의 아들이 되었다 1-181 완-판251115.txt",
+      "evidence": {
+        "source_classification": "longer_unresolved",
+        "normalized_lengths": [
+          872227,
+          874615
+        ],
+        "normalized_length_delta_ratio": 0.00273,
+        "line_sequence_ratio": 0.926777,
+        "equal_line_ratio_smaller": 0.926831,
+        "nonempty_lines": [
+          34072,
+          34076
+        ],
+        "change_blocks": 2224,
+        "candidate_episode_span": [
+          1,
+          181
+        ],
+        "reference_episode_span": [
+          1,
+          181
+        ],
+        "span_relation": "same"
+      }
+    }
+  ]
+}

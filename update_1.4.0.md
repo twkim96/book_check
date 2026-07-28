@@ -172,3 +172,61 @@
   - index generation `bfc1bce1fce64492a558efe2e89c3654`
     (`2026-07-28T14:13:45+09:00`)
   - 실제 bytes purge 없음. 모든 66권은 `txt_temp/trash_bin` 아래 복구 가능.
+
+## 6. 강한 동일 검토 큐 후속 정리
+
+사용자 확인 부담을 줄이기 위해 현재 active house-house TXT review 중 같은 core title이며 회차가
+같거나 한쪽 구간이 다른 쪽에 완전히 포함되는 40관계를 다시 전수 비교했다. 양쪽 작가가 모두 있고
+서로 다른 관계, managed/protected 관계, 분리·부분겹침 회차는 분석 전에 제외했다.
+
+- 강한 동일 기준:
+  - 작은 판본의 공백 정규화 비어 있지 않은 줄이 큰 판본에 같은 순서로 99% 이상 일치
+  - 동일 회차 판본은 normalized 길이 차이가 5% 이하
+  - 완전 중첩 회차 판본은 길이 차이 제한 없이 작은 판본의 99% 이상 포함을 요구
+- keep 선택은 새 휴리스틱이 아니라 현재 `backend.deduplicator.choose_keep` 순서를 그대로 적용:
+  회차 범위, 5%를 넘는 본문 길이 차이, 완결 표기, 짧은 파일명, 사전순.
+- 강한 동일 24관계(동일 회차 14, 완전 중첩 회차 10)를 격리 대상으로 확정했다.
+- 기준 미달 16관계는 오탐 방지를 위해 그대로 보존했다.
+
+실행 plan:
+
+`/Users/twkim/Documents/GitHub/python/test/file_check/manual_duplicate_plan_strong_review_queue_20260728_v1_4_0.json`
+
+- `sha256=250613ad836acef89ee494359982ff8a9b81872e47369799c40f61629dd177f2`
+- 각 항목에 review ID, 양쪽 current raw SHA, 회차, normalized 길이, line coverage와 keep 정책 기록
+- dry-run: explicit delete 24, restore 0, blocked 0
+
+실제 실행 report:
+
+`/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_151753_432742.json`
+
+- `sha256=7af297d50abde709501a602324db752c752c8a5ab2c9092cdca6d785cb89fa7e`
+- discard run `actual-a6cbe783-a058-4651-b0d7-7fba826df376`
+- operations 3690~3713, `user_quarantine committed` 24건, blocked 0
+- source 24개 모두 inactive quarantine, keep 24개 모두 active house
+- DB backups:
+  - `.dedup_state/backups/before_review_resolution_20260728_151754_467674_0dee6eb2.sqlite3`
+  - `.dedup_state/backups/before_review_resolution_20260728_151804_018696_b660f372.sqlite3`
+- intent report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/manual_house_cleanup_1_4_0_20260728_151753_433463.json`
+  (`sha256=365ac90f4b2e9e1f51b9443714b7ae58e94f5412785e4decc7c729fa81181ea5`)
+
+정리 후 warm 재감사:
+
+`/Users/twkim/Documents/txt_temp/dedup_logs/dedup_20260728_152115_034418.json`
+
+- `sha256=bb61c68f444b21a38c7b33bc2eab8d38ba5f625aee27ae4832c96058c426193d`
+- 지원 도서 16,759개, 실제 disk = DB = index
+- auditor 후보 2,622쌍, fingerprint hit 16,742 / miss 0, pair hit 2,622 / miss 0,
+  actual read 0
+- 추가 최신판 교체 0, exact mutation 0, suspect 이동 0, warning 0
+- 같은 기준 정밀 재계산에서 추가 강한 동일·완전중첩 관계 0, 기준 미달 보존 16
+- index generation `e0624ea1200d4f68891da3cdf35096f0`
+  (`2026-07-28T15:18:37+09:00`)
+- Doctor 0, active run 0, unfinished operation 0
+- 실제 bytes purge 없음. 이번 24권도 `txt_temp/trash_bin/user_discard_quarantine`에서 복구 가능.
+
+이 후속 작업은 현재 큐를 정리한 SHA-bound 수동 plan이며 runtime의 same-span 자동 판정 범위를
+확장하지 않았다. active keep과 SHA가 다른 과거 discard 판본이 다시 입고되면 이전 처분을 file ID
+사이에 자동 승계하지 않으므로 다시 warning 대상이 될 수 있다. 반대로 active keep과 raw/normalized
+본문이 완전히 같은 재입고 파일은 기존 exact 로직으로 자동 격리된다.
