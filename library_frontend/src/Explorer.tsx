@@ -131,7 +131,7 @@ function relatedBasisLabel(bases: string[]): string {
     if (basis === "same_core_title") return "같은 core title";
     if (basis === "decision:same_content") return "같은 내용 판정";
     if (basis === "decision:same_work_distinct_variant") return "같은 작품·다른 판본";
-    if (basis === "decision:distinct_work") return "제목만 같은 다른 작품 판정";
+    if (basis === "decision:distinct_work") return "서로 다른 작품 판정";
     if (basis.startsWith("review:")) return `중복 검토 관계(${basis.slice(7)})`;
     return basis;
   });
