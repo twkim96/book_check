@@ -78,11 +78,17 @@ FINGERPRINT_VERSION = "5"
 # ``_analysis_policy_hash`` so existing 1.4.2 fingerprints keep the exact same
 # cache key while pair-decision changes follow PAIR_POLICY_VERSION separately.
 FINGERPRINT_POLICY_VERSION = "1.4.2"
+# ``fingerprints.normalizer_version`` is a legacy compatibility column for
+# body normalization, not the filename/core-title parser.  Keep it frozen for
+# a title-only NORMALIZER_VERSION bump so 100+ GiB of valid body fingerprints
+# are not invalidated.
+FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # Pair classification/evidence also has its own compatibility lifetime. 1.4.5
-# changes cache execution, not pair meaning, so existing 1.4.2 pair rows remain
-# valid while AUDITOR_VERSION follows the shipped application release.
+# changed cache execution and 1.4.6 changes only filename/core parsing, so the
+# existing 1.4.2 pair rows remain valid while AUDITOR_VERSION follows releases.
 PAIR_POLICY_VERSION = "1.4.2"
-AUDITOR_VERSION = "1.4.5"
+PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
+AUDITOR_VERSION = "1.4.6"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -1147,7 +1153,7 @@ class PersistentAuditCache:
                 self.canonical_paths[entry.path],
                 entry.size,
                 entry.mtime_ns,
-                NORMALIZER_VERSION,
+                FINGERPRINT_NORMALIZER_COMPAT_VERSION,
                 self._identity_fingerprint_version(current),
                 self.analysis_policy_hash,
                 current.st_dev,
@@ -1194,7 +1200,7 @@ class PersistentAuditCache:
                 WHERE f.active = 1 AND fp.normalizer_version = ?
                   AND fp.analysis_policy_hash = ?
                 """,
-                (NORMALIZER_VERSION, self.analysis_policy_hash),
+                (FINGERPRINT_NORMALIZER_COMPAT_VERSION, self.analysis_policy_hash),
             ).fetchall()
         }
         analyses = {}
@@ -1260,7 +1266,7 @@ class PersistentAuditCache:
                     self.canonical_paths[entry.path],
                     analysis.size,
                     analysis.mtime_ns,
-                    NORMALIZER_VERSION,
+                    FINGERPRINT_NORMALIZER_COMPAT_VERSION,
                     self._identity_fingerprint_version(current),
                     self.analysis_policy_hash,
                     current.st_dev,
@@ -1519,7 +1525,7 @@ def load_persisted_analyses_readonly(
             WHERE f.active = 1 AND fp.normalizer_version = ?
               AND fp.analysis_policy_hash = ?
             """,
-            (NORMALIZER_VERSION, analysis_policy_hash),
+            (FINGERPRINT_NORMALIZER_COMPAT_VERSION, analysis_policy_hash),
         ).fetchall()
     finally:
         conn.close()
@@ -1567,7 +1573,7 @@ def _pair_configuration_hash(config):
         # Preserve the legacy JSON field name and hash until pair semantics
         # change; the pair_cache column has the same compatibility lifetime.
         "auditor_version": PAIR_POLICY_VERSION,
-        "normalizer_version": NORMALIZER_VERSION,
+        "normalizer_version": PAIR_NORMALIZER_COMPAT_VERSION,
         "fingerprint_version": FINGERPRINT_VERSION,
         "anchor_chars": config.anchor_chars,
         "min_strong_chars": config.min_strong_chars,
@@ -1587,7 +1593,7 @@ def _analysis_policy_hash(config):
         # produces the exact pre-1.4.5 hash. Pair semantics are versioned by
         # ``_pair_configuration_hash`` instead.
         "auditor_version": FINGERPRINT_POLICY_VERSION,
-        "normalizer_version": NORMALIZER_VERSION,
+        "normalizer_version": FINGERPRINT_NORMALIZER_COMPAT_VERSION,
         "fingerprint_version": FINGERPRINT_VERSION,
         "anchor_chars": config.anchor_chars,
         "min_strong_chars": config.min_strong_chars,

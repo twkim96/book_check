@@ -62,6 +62,43 @@ def test_new_completion_prefix_is_removed_without_touching_real_numeric_title():
     assert analyze_name("작품명(작가명) 1-100 완.txt")["core_title"] == "작품명"
 
 
+def test_status_modifier_and_closed_source_prefixes_do_not_replace_real_title():
+    updated = "[갱신 19禁완) 마조 수녀와 음마 신부 0-134 완 [ txt + epub ].txt"
+    assert extract_readable_title(updated) == "마조 수녀와 음마 신부"
+    assert analyze_name(updated)["core_title"] == "마조수녀와음마신부"
+    assert analyze_name("나는 매달 치트키를 갱신할 수 있다 1-100 완.txt")[
+        "core_title"
+    ] == "나는매달치트키를갱신할수있다"
+
+    assert analyze_name(
+        "CSS [백덕수] 데뷔 못 하면 죽는 병 걸림 1-644 完.epub"
+    )["core_title"] == "데뷔못하면죽는병걸림"
+    assert analyze_name(
+        "판 [백덕수] 괴담에 떨어져도 출근을 해야 하는구나 1-371 완.epub"
+    )["core_title"] == "괴담에떨어져도출근을해야하는구나"
+    assert analyze_name("CSS 완벽 가이드 1권.epub")["core_title"] == "css완벽가이드"
+
+
+def test_title_internal_numbers_are_not_mistaken_for_metadata_cut_points():
+    expected = {
+        "Lv2부터 치트였던 전직 용사 후보의 유유자적 이세계 라이프 01권.epub":
+            "lv2부터치트였던전직용사후보의유유자적이세계라이프",
+        "재벌은 1968부터 1-250 완.txt": "재벌은1968부터",
+        "k200 장갑차.txt": "k200장갑차",
+        "24／7 1권 [이내리].txt": "247",
+        "글밈 -2회차-드래곤은-유희를-즐긴다-1-201-완.txt":
+            "2회차드래곤은유희를즐긴다",
+        "어게인1997@삽자루(19N) -134(완).txt": "어게인1997",
+        "좀비묵시록 82-08 001-449 完.txt": "좀비묵시록8208",
+    }
+    assert {name: analyze_name(name)["core_title"] for name in expected} == expected
+
+    # 기존 붙임 메타 표기는 새 경계에서도 계속 잘린다.
+    assert analyze_name("환마전 1부완.txt")["core_title"] == "환마전"
+    assert analyze_name("헝거게임 3부작 完.txt")["core_title"] == "헝거게임"
+    assert analyze_name("안갯길에 사는 사람들2권합완.txt")["core_title"] == "안갯길에사는사람들"
+
+
 def test_single_character_noise_tag_does_not_hide_real_trailing_author():
     name = (
         "노 게임·노 라이프 (게이머 남매는 한 턴 쉬겠다는데요) "

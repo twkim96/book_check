@@ -33,7 +33,7 @@ SOURCE_SITE_TAG_RE = re.compile(
 
 # normalizer 규칙 버전. 핵심 추출 로직(core_title/author/max_number/...)이 바뀌면
 # bump 한다. file_index.json에 함께 기록되어 stale index 감지에 사용된다.
-NORMALIZER_VERSION = "1.3.0"
+NORMALIZER_VERSION = "1.3.1"
 
 # 사용자가 제목 교정 화면에서 ``[[19금]]``처럼 표시한 문자열은 제목의
 # 실제 일부로 취급한다. 이 표시는 temp 운반 중에만 남고 house 입고 파일명에서는
@@ -96,6 +96,10 @@ PREFIX_NOISE_WORDS = [
     "모음집",
     "요청",
     "재업",
+    # 실제 본문 첫 줄이 ``2회차 드래곤은 유희를 즐긴다``인 legacy 파일에서
+    # 확인된 배포처 접두사. 일반 상태어와 달리 실파일 근거가 있는 닫힌 규칙이다.
+    "글밈",
+    "꾸롶",
 ]
 
 AUTHOR_NOISE_KEYWORDS = {
@@ -554,11 +558,24 @@ _META_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _KNOWN_NUMERIC_META_RE = re.compile(r"(?:판|현)\d{6}|제\d+판", re.IGNORECASE)
+_POST_STATUS_MODIFIER = r"(?:갱신|업데이트|업뎃|재업(?:로드)?|수정(?:본)?|교체|추가)"
 _LEADING_POST_STATUS_RE = re.compile(
     r"^\s*[\[\({【]?\s*"
+    r"(?:"
+    r"(?:" + _POST_STATUS_MODIFIER + r"\s*)*"
     r"(?:(?:신작\s*)?(?:완결|完結|완|完)|"
-    r"19\s*(?:禁|금|N|n)\s*(?:완결|完結|완|完)?)"
+    r"19\s*(?:禁|금|N|n)\s*(?:완결|完結|완|完)?)|"
+    r"(?:" + _POST_STATUS_MODIFIER + r"\s*)+"
+    r")"
     r"\s*[\)\]\}】〉》:：,.\\\-_/]+\s*",
+    re.IGNORECASE,
+)
+# 실제 house 파일과 EPUB OPF 제목으로 확인한 운반/변환 접두사. ``CSS``나 ``판``은
+# 정상 제목 단어가 될 수도 있으므로 단독으로 지우지 않고, 바로 뒤에 [명시 작가]와
+# 별도 제목+좌표가 모두 있을 때만 닫힌 source wrapper로 인정한다.
+_LEADING_SOURCE_AUTHOR_TITLE_RE = re.compile(
+    r"^\s*(?:꾸롶|CSS|판)\s+"
+    r"(?=\[[^\[\]]{1,50}\]\s+.{2,}?\d+\s*(?:[~\-]|(?:화|회|권|장|편|부)))",
     re.IGNORECASE,
 )
 _ATTACHED_TITLE_PAREN_RE = re.compile(
@@ -927,6 +944,8 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
             base,
         )
 
+    base = _LEADING_SOURCE_AUTHOR_TITLE_RE.sub("", base, count=1)
+
     # 콜론 분리: "메인: 부제"에서 부제 쪽 검색어 길이가 충분하면 부제를 코어로 본다.
     # (JS extractReadableTitle과 동기화)
     if prefer_colon_subtitle:
@@ -953,18 +972,31 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
     # NOTE: 단일 단위 매칭에서 `회`는 제외한다. `2회차`, `3회차` 등 의미상 회차 표기에
     # 들어가 제목을 과하게 잘라버리는 부작용이 있다. 진짜 회차 표기는 `1-N화` / `N권`
     # 패턴이 보통이다.
+    # 단일 단위 뒤에 한글/영문이 바로 붙었다면 무조건 회차가 아니다. 다만 실데이터에
+    # 존재하는 ``1부완``, ``3부작``, ``2권합완`` 같은 닫힌 메타 접미사만 허용한다.
+    # 이 경계가 ``Lv2부터``의 ``2부``와 ``k200 장갑차``의 ``200 장``을 제목으로
+    # 되돌리면서 기존 붙임 메타 표기는 그대로 자른다.
+    attached_meta_suffix = (
+        r"(?=$|[^가-힣A-Za-z\u3400-\u9fff\uf900-\ufaff]|"
+        r"(?:완결|完結|완|完|終|종|외전|外傳|外伝|번외|특외|부외|후일담|"
+        r"에필로그|에필|본편|포함|미포함|공금|텍본|합(?:본|완)?|"
+        r"작(?=\s|$)|누락|중복|수정|추가|부족|까지))"
+    )
     cut_patterns = [
         r"\d+(?:\.\d+)+\s*권",
         r"\d+\s*권\s*[~\-]\s*\d+\s*권",
         r"\d+\s*(?:화|권|부|회|장|편)\s*[~\-]\s*\d+\s*(?:화|권|부|회|장|편)?",
         r"\d+\s*[~\-]\s*\d+",
         # 범위 구분자가 공백으로 치환된 변형: '1 325화' → '1'부터 컷(같은 작품의 다른 표기).
-        r"\d+\s+\d+\s*(?:화|권|부|장|편)",
+        # 단, ``24／7 1권``처럼 첫 숫자 앞이 제목 속 슬래시/소수점이면 두 숫자를
+        # 하나의 공백 범위로 합치지 않고 뒤의 실제 ``1권``만 자른다.
+        r"(?<![\d./／\\])\d+\s+\d+\s*(?:화|권|부|장|편)",
         # 완료 표지가 있는 단위 없는 공백 범위: '1 125 완' → 두 숫자를 모두 컷.
-        r"\d+\s+\d+\s*(?:완결|完結|완|完|終)",
+        r"(?<![\d./／\\])\d+\s+\d+\s*(?:완결|完結|완|完|終)",
         # 하이픈+숫자만 떨어져 남은 회차 꼬리: '… -379' (작가 태그 제거 후 흔함).
-        r"[~\-]\s*\d+",
-        r"\d+\s*(?:화|권|부|장|편)",
+        # ``-2회차-작품명``은 숫자가 아니라 실제 제목의 시작이므로 제외한다.
+        r"[~\-]\s*\d+(?!\d|\s*회차)",
+        r"\d+\s*(?:화|권|부|장|편)" + attached_meta_suffix,
         r"(?<![가-힣A-Za-z])(?:완결|完結|완|完|終|종)(?![가-힣A-Za-z])",
         r"\d+\s*(?:완결|完結|완|完|終)",
         r"본편|本編|외전|外傳|外伝|(?<![가-힣A-Za-z])外(?![가-힣A-Za-z])",
@@ -974,6 +1006,21 @@ def _extract_readable_title(filename, *, prefer_colon_subtitle):
     # 걸려 제목을 통째로 날리지 않도록, 컷 앞에 실제 제목 글자가 있는 첫 매치에서 자른다.
     for m in cut_re.finditer(base):
         if _compact_search(base[:m.start()]):
+            # 제목 속 내려가는 숫자 표기를 회차 범위로 삼키지 않는다.
+            # - ``어게인1997 ... -134``: 1997은 제목, -134만 회차 꼬리
+            # - ``좀비묵시록 82-08 001-449``: 82-08은 제목, 뒤 범위가 회차
+            # 반면 ``토지 3-1부``처럼 뒤에 실제 부 단위가 붙은 좌표는 기존 컷을 유지한다.
+            plain_range = re.fullmatch(
+                r"(\d+)\s*([~\-])\s*(\d+)", m.group(0)
+            )
+            if plain_range is not None:
+                start, end = int(plain_range.group(1)), int(plain_range.group(3))
+                if start > end:
+                    if start >= 1000:
+                        base = base[:m.start() + plain_range.start(2)]
+                        break
+                    if re.search(r"\d+\s*[~\-]\s*\d+", base[m.end():]):
+                        continue
             base = base[:m.start()]
             break
 

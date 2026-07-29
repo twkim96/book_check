@@ -335,8 +335,10 @@ def test_corrupt_epub_candidate_makes_audit_incomplete(tmp_path):
 def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
     assert duplicate_auditor.FINGERPRINT_POLICY_VERSION == "1.4.2"
+    assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
     assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.2"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.5"
+    assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.6"
 
 
 def _txt_cache_fixture(tmp_path):
@@ -374,6 +376,16 @@ def test_release_fingerprint_and_pair_cache_versions_are_independent(
     assert warm.stats["fingerprint_cache_misses"] == 0
     assert warm.stats["pair_cache_hits"] == 1
     assert warm.stats["actual_read_bytes"] == 0
+
+    monkeypatch.setattr(duplicate_auditor, "NORMALIZER_VERSION", "1.3.2")
+    filename_parser_changed = duplicate_auditor.run_audit(args)
+
+    assert duplicate_auditor._analysis_policy_hash(args) == analysis_hash
+    assert duplicate_auditor._pair_configuration_hash(args) == pair_hash
+    assert filename_parser_changed.stats["fingerprint_cache_hits"] == 2
+    assert filename_parser_changed.stats["fingerprint_cache_misses"] == 0
+    assert filename_parser_changed.stats["pair_cache_hits"] == 1
+    assert filename_parser_changed.stats["actual_read_bytes"] == 0
 
     monkeypatch.setattr(duplicate_auditor, "PAIR_POLICY_VERSION", "1.4.3")
     pair_changed = duplicate_auditor.run_audit(args)
