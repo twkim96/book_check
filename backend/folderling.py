@@ -152,6 +152,16 @@ def should_skip_source_item(item):
     return should_exclude_dir(item)
 
 
+def legacy_pass_items(pass_dir):
+    """Return reviewable legacy pass entries, excluding Finder metadata."""
+    if not os.path.isdir(pass_dir):
+        return []
+    return [
+        name for name in sorted(os.listdir(pass_dir))
+        if not should_exclude_file(name)
+    ]
+
+
 def is_unpack_source_dir(name):
     """Recognize the explicit unpack inbox and legacy ``___*`` wrappers."""
     normalized = normalize_nfc(name).strip()
@@ -1342,22 +1352,20 @@ def _process_items_authorized(
             "pending index deployment needs review: " + pending_review[0]["error"]
         )
 
-    legacy_pass_count = 0
-    if os.path.isdir(pass_dir):
-        legacy_pass_count = len(os.listdir(pass_dir))
-        if legacy_pass_count:
-            print(
-                f"⚠️ legacy pass/ 항목 {legacy_pass_count}개는 자동 입고하지 않습니다. "
-                "dedup_decisions.py로 pair 판정을 등록하세요."
-            )
-            emit_folderling_event(
-                event_callback,
-                "legacy_pass_skipped",
-                status="needs_review",
-                item_count=legacy_pass_count,
-                source_path=os.path.abspath(pass_dir),
-                reason="legacy_pass_requires_pair_decision",
-            )
+    legacy_pass_count = len(legacy_pass_items(pass_dir))
+    if legacy_pass_count:
+        print(
+            f"⚠️ legacy pass/ 항목 {legacy_pass_count}개는 자동 입고하지 않습니다. "
+            "dedup_decisions.py로 pair 판정을 등록하세요."
+        )
+        emit_folderling_event(
+            event_callback,
+            "legacy_pass_skipped",
+            status="needs_review",
+            item_count=legacy_pass_count,
+            source_path=os.path.abspath(pass_dir),
+            reason="legacy_pass_requires_pair_decision",
+        )
 
     # ``unpack``과 기존 ``___*`` 묶음은 dedup/auditor에는 일반 temp 파일로
     # 참여하고, 아래 intake 단계에서 지원 파일만 개별 항목으로 펼쳐 입고한다.
@@ -1438,6 +1446,10 @@ def _process_items_authorized(
             if key not in {"pure_plan", "write_surfaces"}
         },
     )
+    blocked_intake_paths = {
+        normalize_nfc(os.path.abspath(os.fspath(path)))
+        for path in dedup_summary.get("blocked_intake_paths", ())
+    }
 
     # ── 2단계: 폴더링 (temp에 남아있는 파일을 house로 이동) ──
     print("=" * 60)
@@ -1471,6 +1483,25 @@ def _process_items_authorized(
         for item_index, (item, src_path, is_pass) in enumerate(
             tqdm(items, desc="분류 및 이동 중"), start=1
         ):
+            if (
+                not is_pass
+                and normalize_nfc(os.path.abspath(src_path)) in blocked_intake_paths
+            ):
+                skipped_count += 1
+                f_log.write(
+                    f"[{get_now()}] 중복 관계가 여러 관리 작품과 충돌하여 입고 차단: "
+                    f"{src_path}\n"
+                )
+                emit_folderling_event(
+                    event_callback,
+                    "intake_item",
+                    status="needs_review",
+                    index=item_index,
+                    total=item_total,
+                    path=src_path,
+                    reason="managed_duplicate_identity_conflict",
+                )
+                continue
             if not is_pass and should_skip_source_item(item):
                 excluded_count += 1
                 emit_folderling_event(

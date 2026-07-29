@@ -949,7 +949,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.4.1"
+        duplicate_auditor.AUDITOR_VERSION == "1.4.2"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -1013,16 +1013,6 @@ def build_auditor_suspect_groups(
     parent = {}
     incident = defaultdict(set)
 
-    def coordinate_veto(left, right):
-        import decision_store
-
-        def view(entry):
-            if "part_num" in entry:
-                return entry
-            return decision_store.coordinate_fields_from_name(entry["name"])
-
-        return None if decision_store.coordinates_compatible(view(left), view(right)) else "coordinate_conflict"
-
     def identity_veto(left, right):
         if left.get("assignment_state") == "managed" and right.get("assignment_state") == "managed":
             if left.get("work_bucket_id") != right.get("work_bucket_id"):
@@ -1046,8 +1036,6 @@ def build_auditor_suspect_groups(
         right_members = [key for key in parent if find(key) == right_root]
         for left_key in left_members:
             for right_key in right_members:
-                if coordinate_veto(by_source_rel[left_key], by_source_rel[right_key]):
-                    return False
                 if identity_veto(by_source_rel[left_key], by_source_rel[right_key]):
                     return False
         parent[right_root] = left_root
@@ -1073,9 +1061,11 @@ def build_auditor_suspect_groups(
                 entry["char_count"] = length
         if len(sides) != 2:
             continue
-        veto = coordinate_veto(sides[0][1], sides[1][1]) or identity_veto(
-            sides[0][1], sides[1][1]
-        )
+        # A current normalized TXT hash or canonical EPUB content hash is
+        # stronger evidence than filename coordinates.  Coordinate checks stay
+        # on probabilistic/contained paths, but must not retain byte-equivalent
+        # content merely because one filename says ``완결`` or ``외전``.
+        veto = identity_veto(sides[0][1], sides[1][1])
         if veto:
             if blocked_relations is not None:
                 blocked_relations.append({
@@ -1130,18 +1120,14 @@ def build_auditor_suspect_groups(
                 key=lambda entry: (entry.get("source") != "house", entry.get("rel_path", "")),
             )[0]
         else:
-            keep = choose_keep(members)
+            keep = choose_keep_exact(members)
         move_entries = []
+        same_house_entries = []
         classifications = set()
         component_blocked = (
-            len(managed_house_representatives) != 1
+            len(managed_house_representatives) > 1
             or
             len(protected) > 1
-            or any(
-                entry.get("source") == "house"
-                and entry.get("assignment_state") != "managed"
-                for entry in members
-            )
             or any(not entry.get("mutation_eligible", True) for entry in members)
         )
         for key in keys:
@@ -1149,10 +1135,11 @@ def build_auditor_suspect_groups(
             classifications.update(incident[key])
             if entry is keep:
                 continue
-            # Only a new temp candidate may move automatically. House-house is
-            # review-only even when text-equivalent.
-            if not component_blocked and entry.get("source") == "temp":
-                move_entries.append(entry)
+            if not component_blocked:
+                if entry.get("source") == "temp":
+                    move_entries.append(entry)
+                elif entry.get("source") == "house" and not entry.get("protected"):
+                    same_house_entries.append(entry)
         authors = sorted({entry["author"] for entry in members if entry.get("author")})
         groups.append({
             "origin": "auditor_aux",
@@ -1160,7 +1147,7 @@ def build_auditor_suspect_groups(
             "keep": keep,
             "entries": members,
             "move_entries": move_entries,
-            "same_house_entries": [],
+            "same_house_entries": same_house_entries,
             "warning_entries": [],
             "authors": authors,
             "distinct_authors": any(_authors_conflict(keep, entry) for entry in members if entry is not keep),
@@ -1316,9 +1303,16 @@ def enrich_entries_from_state_db(entries, state_db_path, read_only=False):
             WHERE f.active = 1
             """
         ).fetchall()
-        by_path = {os.path.abspath(row["canonical_path"]): row for row in rows}
+        # macOS commonly exposes an on-disk filename in NFD while SQLite keeps
+        # the reconciled canonical path in NFC.  ``abspath`` alone therefore
+        # misses the very temp row that the auditor just created, leaving its
+        # file_id unset and turning a proven duplicate into report-only intake.
+        by_path = {
+            decision_store.canonicalize_path(row["canonical_path"]): row
+            for row in rows
+        }
         for entry in entries:
-            row = by_path.get(os.path.abspath(entry["path"]))
+            row = by_path.get(decision_store.canonicalize_path(entry["path"]))
             if row is None:
                 continue
             entry.update({
@@ -1365,16 +1359,6 @@ def _managed_exact_records(
     try:
         for group in exact_groups:
             keep = group["keep"]
-            all_entries = [keep, *group["duplicates"]]
-            coordinate_rows = [
-                decision_store.coordinate_fields_from_name(entry["name"])
-                for entry in all_entries
-            ]
-            group_coordinate_conflict = any(
-                not decision_store.coordinates_compatible(left, right)
-                for index, left in enumerate(coordinate_rows)
-                for right in coordinate_rows[index + 1:]
-            )
             for entry in group["duplicates"]:
                 record = {
                     "action": "exact_quarantine",
@@ -1413,7 +1397,6 @@ def _managed_exact_records(
                         not entry.get("mutation_eligible", True)
                         and entry_state not in {"legacy_unresolved", "decision_required"}
                     )
-                    or group_coordinate_conflict
                     or (
                         entry.get("source") == "house"
                         and entry_state not in {
@@ -1421,10 +1404,6 @@ def _managed_exact_records(
                         }
                     )
                     or managed_relation_conflict
-                    or not decision_store.coordinates_compatible(
-                        decision_store.coordinate_fields_from_name(entry["name"]),
-                        decision_store.coordinate_fields_from_name(keep["name"]),
-                    )
                 ):
                     record["action"] = "managed_report_only"
                     records.append(record)
@@ -1657,7 +1636,7 @@ def _managed_auditor_queue_records(
             return
         if not _auditor_relation_queue_eligible(classification, entry, reference):
             return
-        if not decision_store.coordinates_compatible(
+        if classification not in AUDITOR_STRONG_CLASSES and not decision_store.coordinates_compatible(
             decision_store.coordinate_fields_from_name(entry["name"]),
             decision_store.coordinate_fields_from_name(reference["name"]),
         ):
@@ -1702,7 +1681,7 @@ def _managed_auditor_queue_records(
             return
         if not _auditor_relation_queue_eligible(classification, entry, reference):
             return
-        if not decision_store.coordinates_compatible(
+        if classification not in AUDITOR_STRONG_CLASSES and not decision_store.coordinates_compatible(
             decision_store.coordinate_fields_from_name(entry["name"]),
             decision_store.coordinate_fields_from_name(reference["name"]),
         ):
@@ -1753,6 +1732,8 @@ def _managed_auditor_queue_records(
             classification = group.get("classification", "text_equivalent")
             for entry in group.get("move_entries", []):
                 queue_temp(entry, reference, classification, suspected_dir, "moved")
+            for entry in group.get("same_house_entries", []):
+                queue_house(entry, reference, classification, suspected_dir, "moved")
 
         # A complete normalized prefix plus a strictly wider episode span is a
         # normal latest-version replacement, not a human-review exception.
@@ -2062,7 +2043,7 @@ def _managed_auditor_queue_records(
             house_entry = right if temp_entry is left else left
             if not temp_entry.get("mutation_eligible", True):
                 continue
-            if not decision_store.coordinates_compatible(
+            if classification not in AUDITOR_STRONG_CLASSES and not decision_store.coordinates_compatible(
                 decision_store.coordinate_fields_from_name(temp_entry["name"]),
                 decision_store.coordinate_fields_from_name(house_entry["name"]),
             ):
@@ -2086,13 +2067,22 @@ def _managed_auditor_queue_records(
                     houses.append(house_entry)
                     seen_house.add(house_entry["path"])
 
+            strong_relations = [
+                item for item in relations
+                if item[0]["classification"] in AUDITOR_STRONG_CLASSES
+            ]
             protected_or_managed = [
                 entry for entry in houses
                 if entry.get("protected") or entry.get("representative")
                 or entry.get("assignment_state") != "unassigned"
                 or house_incidence[entry["path"]] > 1
             ]
-            if protected_or_managed:
+            if strong_relations:
+                # Exact normalized TXT/EPUB content is already fully proven;
+                # preserve an established house copy instead of allowing a
+                # cosmetic incoming filename to replace it.
+                keep = choose_keep_exact(houses)
+            elif protected_or_managed:
                 keep = choose_keep(protected_or_managed)
             else:
                 keep = choose_keep([temp_entry, *houses])
@@ -2113,12 +2103,13 @@ def _managed_auditor_queue_records(
                     relation for relation, _, house_entry in relations
                     if house_entry["path"] == keep["path"]
                 )
+                is_strong = selected["classification"] in AUDITOR_STRONG_CLASSES
                 queue_temp(
                     temp_entry,
                     keep,
                     selected["classification"],
-                    warning_dir,
-                    "warning",
+                    suspected_dir if is_strong else warning_dir,
+                    "moved" if is_strong else "warning",
                 )
     finally:
         conn.close()
@@ -2582,6 +2573,11 @@ def _clean_duplicates_impl(
     managed_report_only_records = [
         record for record in exact_records if record.get("action") == "managed_report_only"
     ]
+    blocked_intake_paths = sorted({
+        record["entry"]["path"]
+        for record in managed_report_only_records
+        if record.get("entry", {}).get("source") == "temp"
+    })
     exact_mutation_records = [
         record for record in exact_records
         if record.get("action") not in {"legacy_report_only", "managed_report_only"}
@@ -2621,6 +2617,8 @@ def _clean_duplicates_impl(
         "exact_mutation_count": len(exact_mutation_records),
         "legacy_report_only_count": len(legacy_report_only_records),
         "managed_report_only_count": len(managed_report_only_records),
+        "managed_temp_report_only_count": len(blocked_intake_paths),
+        "blocked_intake_paths": blocked_intake_paths,
         "multi_representative_conflict_count": len(multi_representative_paths),
         "suspect_group_count": len(suspect_groups),
         "suspect_move_count": len(moved_records),

@@ -249,7 +249,7 @@ def test_folderling_volume_target_rejects_duplicate_coordinate(tmp_path):
         conn.close()
 
 
-def test_folderling_volume_target_rejects_missing_author_for_authored_work(tmp_path):
+def test_folderling_volume_target_allows_missing_author_for_authored_work(tmp_path):
     house = tmp_path / "house"
     temp = tmp_path / "temp"
     house.mkdir()
@@ -271,10 +271,35 @@ def test_folderling_volume_target_rejects_missing_author_for_authored_work(tmp_p
     finally:
         conn.close()
 
-    assert decision == {
-        "status": "no_target",
-        "reason": "source_author_missing_for_authored_work",
-    }
+    assert decision["status"] == "target"
+    assert Path(decision["target_folder"]) == house / "ㅂ" / "별빛 연대기"
+
+
+def test_folderling_volume_target_rejects_two_explicit_authors(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add(
+            conn,
+            house / "ㅂ" / "별빛 연대기" / "별빛 연대기 1권 [한작가].epub",
+            "house",
+        )
+        incoming = _add(
+            conn, temp / "별빛 연대기 2권 [다른작가].epub", "temp"
+        )
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming["file_id"],
+            house_root=house,
+        )
+    finally:
+        conn.close()
+
+    assert decision == {"status": "no_target", "reason": "author_conflict"}
 
 
 def test_folderling_volume_target_requires_existing_work_folder(tmp_path):
@@ -435,6 +460,16 @@ def test_bare_and_explicit_same_volume_are_coordinate_conflict(tmp_path):
     assert decision["coordinate_num"] == 5
 
 
+def test_numbered_side_stories_have_distinct_canonical_coordinates():
+    first = decision_store.coordinate_fields_from_name("블랙 라벨 외전 1.epub")
+    second = decision_store.coordinate_fields_from_name("블랙 라벨 외전 2.epub")
+
+    assert first["coordinate_symbol"] == second["coordinate_symbol"] == "side_story"
+    assert first["coordinate_sort_key"] == 201
+    assert second["coordinate_sort_key"] == 202
+    assert decision_store.coordinates_compatible(first, second) is False
+
+
 def test_new_contiguous_ebook_batch_creates_one_work_folder(tmp_path):
     house = tmp_path / "house"
     temp = tmp_path / "temp"
@@ -486,6 +521,135 @@ def test_new_contiguous_ebook_batch_creates_one_work_folder(tmp_path):
         conn.close()
 
     assert {path.parent for path in destinations} == {target}
+
+
+def test_new_anonymous_ebook_batch_creates_one_work_folder(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    names = [f"무명 연대기 {number}권.epub" for number in (1, 2, 3)]
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        incoming = [_add(conn, temp / name, "temp") for name in names]
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    destinations = [
+        Path(move_to_house(
+            str(temp / name), str(house), str(house / "_최근"), name,
+            StringIO(), "", state_db_path=str(state_db), run_id=run_id,
+        ))
+        for name in names
+    ]
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        rows = conn.execute(
+            "SELECT v.work_bucket_id FROM files f JOIN variants v "
+            "ON v.variant_id=f.variant_id WHERE f.file_id IN (?, ?, ?)",
+            tuple(row["file_id"] for row in incoming),
+        ).fetchall()
+        assert len({row["work_bucket_id"] for row in rows}) == 1
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert {path.parent for path in destinations} == {house / "ㅁ" / "무명 연대기"}
+
+
+def test_same_core_episode_compilation_does_not_block_new_volume_folder(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add(conn, house / "ㅍ" / "판타지 연대기 1-150 완결.epub", "house")
+        incoming = [
+            _add(conn, temp / f"판타지 연대기 {number}권.epub", "temp")
+            for number in (1, 2)
+        ]
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming[0]["file_id"],
+            house_root=house,
+            new_group_parent=house / "ㅍ",
+        )
+    finally:
+        conn.close()
+
+    assert decision["status"] == "target"
+    assert Path(decision["target_folder"]) == house / "ㅍ" / "판타지 연대기"
+
+
+def test_part_volume_coordinates_are_distinct_and_route_to_same_folder(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    target = house / "ㅊ" / "천마군림"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add(conn, target / "천마군림 1부 1권.epub", "house")
+        incoming = _add(conn, temp / "천마군림 2부 1권.epub", "temp")
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming["file_id"],
+            house_root=house,
+        )
+    finally:
+        conn.close()
+
+    assert decision["status"] == "target"
+    assert Path(decision["target_folder"]) == target
+
+
+def test_new_part_volume_batch_creates_one_work_folder(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    names = [
+        f"천마군림 {part}부 {volume}권.epub"
+        for part in (1, 2) for volume in (1, 2)
+    ]
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        incoming = [_add(conn, temp / name, "temp") for name in names]
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    destinations = [
+        Path(move_to_house(
+            str(temp / name), str(house), str(house / "_최근"), name,
+            StringIO(), "", state_db_path=str(state_db), run_id=run_id,
+        ))
+        for name in names
+    ]
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        rows = conn.execute(
+            "SELECT f.part_num, f.volume_num, v.work_bucket_id FROM files f "
+            "JOIN variants v ON v.variant_id=f.variant_id "
+            "WHERE f.file_id IN (?, ?, ?, ?)",
+            tuple(row["file_id"] for row in incoming),
+        ).fetchall()
+        assert {(row["part_num"], row["volume_num"]) for row in rows} == {
+            (1, 1), (1, 2), (2, 1), (2, 2),
+        }
+        assert len({row["work_bucket_id"] for row in rows}) == 1
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert {path.parent for path in destinations} == {house / "ㅊ" / "천마군림"}
 
 
 def test_managed_volume_cohort_routes_despite_unmanaged_same_core_compilation(tmp_path):

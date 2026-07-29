@@ -33,10 +33,75 @@ def _within(path: Path, root: Path) -> bool:
 def _coordinate_key(row: Mapping[str, object]):
     kind = row["coordinate_kind"]
     if kind == "volume":
-        return kind, int(row["volume_num"]), int(row["volume_den"] or 1)
+        part = (
+            (int(row["part_num"]), int(row["part_den"] or 1))
+            if row.get("part_num") is not None else None
+        )
+        volume = (int(row["volume_num"]), int(row["volume_den"] or 1))
+        return kind, part, volume
     if kind == "part":
-        return kind, int(row["part_num"]), int(row["part_den"] or 1)
+        return kind, (int(row["part_num"]), int(row["part_den"] or 1)), None
     return None
+
+
+def _contiguous_integer_values(values) -> bool:
+    values = sorted(values)
+    return bool(values) and values == list(range(values[0], values[-1] + 1))
+
+
+def _coordinates_form_contiguous_batch(rows: Sequence[Mapping[str, object]]) -> bool:
+    """Accept ordinary volumes, part-only sets, and part+volume sets.
+
+    A compound coordinate such as ``2부 1권`` is a distinct book position,
+    not a duplicate of ``1부 1권``.  Every observed per-part volume run still
+    has to be contiguous so a loose handful of unrelated files does not create
+    a work folder automatically.
+    """
+
+    kinds = {row.get("coordinate_kind") for row in rows}
+    if kinds == {"part"}:
+        if any(int(row.get("part_den") or 1) != 1 for row in rows):
+            return False
+        return _contiguous_integer_values(int(row["part_num"]) for row in rows)
+    if kinds != {"volume"}:
+        return False
+
+    has_part = {row.get("part_num") is not None for row in rows}
+    if len(has_part) > 1:
+        return False
+    by_part = {}
+    for row in rows:
+        if int(row.get("volume_den") or 1) != 1:
+            return False
+        part = None
+        if row.get("part_num") is not None:
+            if int(row.get("part_den") or 1) != 1:
+                return False
+            part = int(row["part_num"])
+        by_part.setdefault(part, []).append(int(row["volume_num"]))
+    if any(not _contiguous_integer_values(values) for values in by_part.values()):
+        return False
+    part_numbers = [part for part in by_part if part is not None]
+    return not part_numbers or _contiguous_integer_values(part_numbers)
+
+
+def _coordinate_response(row: Mapping[str, object]) -> dict:
+    kind = str(row["coordinate_kind"])
+    if kind == "volume":
+        number = int(row["volume_num"])
+        denominator = int(row["volume_den"] or 1)
+    else:
+        number = int(row["part_num"])
+        denominator = int(row["part_den"] or 1)
+    return {
+        "coordinate_kind": kind,
+        "coordinate_num": number,
+        "coordinate_den": denominator,
+        "part_num": row.get("part_num"),
+        "part_den": row.get("part_den"),
+        "volume_num": row.get("volume_num"),
+        "volume_den": row.get("volume_den"),
+    }
 
 
 def classify_folderling_volume_target(
@@ -85,34 +150,12 @@ def classify_folderling_volume_target(
     if source_coordinate is None:
         return no_target("missing_coordinate")
 
-    existing = [
-        {
-            **dict(row),
-            "author": decision_store.build_file_analysis(
-                Path(str(row["canonical_path"])).name
-            )["author"],
-        }
-        for row in conn.execute(
-            """
-            SELECT f.*, fa.readable_title, fa.author, fa.disambig, v.work_bucket_id
-            FROM files AS f
-            JOIN file_analysis AS fa ON fa.file_id = f.file_id
-            LEFT JOIN variants AS v ON v.variant_id = f.variant_id
-            WHERE f.active = 1 AND f.source = 'house' AND fa.core_title = ?
-            ORDER BY f.canonical_path
-            """,
-            (source["core_title"],),
-        ).fetchall()
-    ]
-    if not existing:
+    def classify_new_batch():
         if new_group_parent is None:
             return no_target("no_existing_core")
         source_path = Path(str(source["canonical_path"]))
         if source_path.suffix.lower() not in {".epub", ".pdf"}:
             return no_target("new_group_requires_ebook")
-        source_author = str(source.get("author") or "").strip()
-        if not source_author:
-            return no_target("new_group_requires_author")
         peers = []
         for row in conn.execute(
             "SELECT * FROM files WHERE active = 1 AND source = 'temp' "
@@ -130,11 +173,14 @@ def classify_folderling_volume_target(
             peers.append(peer)
         if len(peers) < 2:
             return no_target("new_group_requires_multiple_volumes")
-        authors = {str(row.get("author") or "").strip() for row in peers}
-        if authors != {source_author}:
+        authors = {
+            str(row.get("author") or "").strip()
+            for row in peers if str(row.get("author") or "").strip()
+        }
+        if len(authors) > 1:
             return no_target("new_group_author_conflict")
         if any(
-            row["coordinate_kind"] != "volume"
+            row["coordinate_kind"] not in {"volume", "part"}
             or row["span_ambiguous"]
             or int(row.get("disambig") or 1) > 1
             for row in peers
@@ -143,15 +189,7 @@ def classify_folderling_volume_target(
         peer_coordinates = [_coordinate_key(row) for row in peers]
         if None in peer_coordinates or len(peer_coordinates) != len(set(peer_coordinates)):
             return no_target("new_group_duplicate_coordinate")
-        integer_volumes = sorted(
-            coordinate[1]
-            for coordinate in peer_coordinates
-            if coordinate[0] == "volume" and coordinate[2] == 1
-        )
-        if (
-            len(integer_volumes) != len(peer_coordinates)
-            or integer_volumes != list(range(integer_volumes[0], integer_volumes[-1] + 1))
-        ):
+        if not _coordinates_form_contiguous_batch(peers):
             return no_target("new_group_requires_contiguous_volumes")
         display_title = str(source["readable_title"] or source["core_title"]).strip()
         if not display_title or Path(display_title).name != display_title:
@@ -172,11 +210,63 @@ def classify_folderling_volume_target(
             "new_batch": True,
             "batch_file_ids": [str(row["file_id"]) for row in peers],
         }
+
+    existing = [
+        {
+            **dict(row),
+            "author": decision_store.build_file_analysis(
+                Path(str(row["canonical_path"])).name
+            )["author"],
+        }
+        for row in conn.execute(
+            """
+            SELECT f.*, fa.readable_title, fa.author, fa.disambig, v.work_bucket_id
+            FROM files AS f
+            JOIN file_analysis AS fa ON fa.file_id = f.file_id
+            LEFT JOIN variants AS v ON v.variant_id = f.variant_id
+            WHERE f.active = 1 AND f.source = 'house' AND fa.core_title = ?
+            ORDER BY f.canonical_path
+            """,
+            (source["core_title"],),
+        ).fetchall()
+    ]
+    if not existing:
+        return classify_new_batch()
+
+    explicit_authors = {
+        str(row.get("author") or "").strip()
+        for row in [source, *existing]
+        if str(row.get("author") or "").strip()
+    }
+    if len(explicit_authors) > 1:
+        return no_target("author_conflict")
+
+    same_kind_existing = [
+        row for row in existing
+        if row["coordinate_kind"] == source["coordinate_kind"]
+    ]
+    if not same_kind_existing:
+        # A same-title episode compilation is not a volume coordinate and must
+        # not prevent a coherent loose ebook batch from getting its own folder.
+        unrelated_book_coordinates = [
+            row for row in existing
+            if row["coordinate_kind"] not in {None, "episode"}
+        ]
+        if unrelated_book_coordinates:
+            return no_target("existing_coordinate_shape_conflict")
+        return classify_new_batch()
     # 같은 core에 과거 미관리 합본이 섞여 있어도 하나의 managed work가
     # 일관된 권수 폴더를 이루면 그 집합을 라우팅 기준으로 삼는다. 다만
     # 같은 좌표의 미관리 파일은 아래 필터 전에 충돌로 잡아 중복 검사를
     # 우회하지 못하게 한다.
-    all_existing = existing
+    all_existing = [
+        row for row in existing
+        if row["coordinate_kind"] == source["coordinate_kind"]
+        or (
+            row["coordinate_kind"] == "symbol"
+            and row["coordinate_symbol"] == "side_story"
+        )
+    ]
     coordinate_matches = [
         row for row in all_existing
         if row["coordinate_kind"] == source["coordinate_kind"]
@@ -188,9 +278,7 @@ def classify_folderling_volume_target(
             "reason": "existing_same_coordinate",
             "core_title": str(source["core_title"]),
             "display_title": str(source["readable_title"] or source["core_title"]),
-            "coordinate_kind": source_coordinate[0],
-            "coordinate_num": source_coordinate[1],
-            "coordinate_den": source_coordinate[2],
+            **_coordinate_response(source),
             "conflicting_file_ids": [str(row["file_id"]) for row in coordinate_matches],
             "conflicting_paths": [str(row["canonical_path"]) for row in coordinate_matches],
         }
@@ -227,8 +315,6 @@ def classify_folderling_volume_target(
         return no_target("existing_coordinate_missing")
     authors = {str(row["author"]) for row in existing if row["author"]}
     source_author = str(source.get("author") or "").strip()
-    if authors and not source_author:
-        return no_target("source_author_missing_for_authored_work")
     if source_author:
         authors.add(source_author)
     if len(authors) > 1:

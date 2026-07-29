@@ -4,6 +4,7 @@ import os
 import decision_store
 import deduplicator
 import duplicate_auditor
+import folderling
 from normalizer import (
     analyze_name,
     extract_catalog_query_title,
@@ -23,6 +24,15 @@ def test_synthetic_title_rules_keep_markers_and_ranges_separate():
     assert info["effective_max"] == 250
     assert info["complete"] is True
     assert has_pass_marker("합성연재물 1-250화 완〔P〕.txt") is True
+
+
+def test_legacy_pass_ignores_finder_metadata(tmp_path):
+    pass_dir = tmp_path / "pass"
+    pass_dir.mkdir()
+    (pass_dir / ".DS_Store").write_bytes(b"finder metadata")
+    (pass_dir / "검토할 도서.txt").write_text("본문", encoding="utf-8")
+
+    assert folderling.legacy_pass_items(pass_dir) == ["검토할 도서.txt"]
 
 
 def test_space_separated_completed_range_does_not_leak_into_core_title():
@@ -59,6 +69,14 @@ def test_single_character_noise_tag_does_not_hide_real_trailing_author():
     )
     assert analyze_name(name)["author"] == "카미야 유우"
     assert analyze_name("노 게임 노 라이프 1권 (카미야 유우).epub")["author"] == "카미야 유우"
+
+
+def test_trailing_author_wins_over_earlier_status_parenthesis():
+    name = (
+        "창고와 진달래와 다크서클 5권 (1부 完) "
+        "#공금 #교금 #갠소 [연역].epub"
+    )
+    assert analyze_name(name)["author"] == "연역"
 
 
 def test_user_title_literal_preserves_real_noise_word_without_becoming_metadata():

@@ -402,16 +402,20 @@ def _without_extension(filename):
 
 
 def _bracket_tokens(text):
-    patterns = [
-        r"\[(.*?)\]",
-        r"\((.*?)\)",
-        r"【(.*?)】",
-        r"\{(.*?)\}",
-    ]
+    # Preserve textual order across bracket *types*.  Collecting every square
+    # bracket first and every parenthesis second made ``(1부 完) ... [연역]``
+    # look as though the status parenthesis followed the real trailing author.
+    pattern = re.compile(
+        r"\[([^\[\]]*?)\]|\(([^()]*?)\)|【([^【】]*?)】|\{([^{}]*?)\}"
+    )
     tokens = []
-    for pattern in patterns:
-        tokens.extend(token.strip() for token in re.findall(pattern, text))
-    return [token for token in tokens if token]
+    for match in pattern.finditer(text):
+        token = next(
+            (value for value in match.groups() if value is not None), ""
+        ).strip()
+        if token:
+            tokens.append(token)
+    return tokens
 
 
 def _compact_token(text):

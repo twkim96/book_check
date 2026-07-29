@@ -159,7 +159,7 @@ def test_preview_can_resolve_duplicate_coordinate_by_selection(tmp_path):
         tmp_path,
         [
             "ㅅ/선택 작품 1권.txt",
-            "ㅅ/선택 작품 1권.epub",
+            "ㅅ/선택 작품 01권.txt",
             "ㅅ/선택 작품 2권.txt",
         ],
     )

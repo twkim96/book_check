@@ -56,15 +56,16 @@ def test_volume_inventory_classifies_without_mutating_files(tmp_path):
     assert listing["total"] == 6
     assert listing["summary"] == {
         "already_grouped": 1,
-        "auto_ready": 3,
+        "auto_ready": 4,
         "excluded": 1,
-        "review_required": 1,
+        "review_required": 0,
     }
     assert cases["우주도서"]["classification"] == "auto_ready"
     assert cases["도시이야기"]["classification"] == "already_grouped"
-    assert cases["중복작품"]["blocked_reasons"] == ["duplicate_coordinate"]
+    assert cases["중복작품"]["blocked_reasons"] == []
+    assert cases["중복작품"]["parallel_format_coordinates"] == ["1권"]
     assert all(
-        item["issues"] == ["duplicate_coordinate"]
+        item["issues"] == []
         and item["same_coordinate_count"] == 2
         for item in cases["중복작품"]["items"]
     )
@@ -193,6 +194,101 @@ def test_volume_and_side_story_are_a_compatible_group(tmp_path):
     assert {item["author"] for item in case["items"]} == {"한작가"}
     assert {item["coordinate"] for item in case["items"]} == {"1권", "2권", "side_story"}
     assert all(item["issues"] == [] for item in case["items"])
+
+
+def test_part_volume_coordinates_do_not_collapse_across_parts(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for name in (
+            "천마군림 1부 1권.epub",
+            "천마군림 1부 2권.epub",
+            "천마군림 2부 1권.epub",
+            "천마군림 2부 3권.epub",
+        ):
+            _add_file(conn, house / "ㅊ" / name)
+    finally:
+        conn.close()
+
+    listing = list_volume_cases(
+        state_db, house_dir=house, search="천마군림", limit=10
+    )
+    [case] = listing["items"]
+
+    assert case["classification"] == "auto_ready"
+    assert case["duplicate_coordinates"] == []
+    assert case["missing_coordinates"] == ["2부 2권"]
+    assert {item["coordinate"] for item in case["items"]} == {
+        "1부 1권", "1부 2권", "2부 1권", "2부 3권",
+    }
+
+
+def test_numbered_side_stories_are_distinct_coordinates(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add_file(conn, house / "ㅂ" / "블랙 라벨 외전 1.epub")
+        _add_file(conn, house / "ㅂ" / "블랙 라벨 외전 2.epub")
+    finally:
+        conn.close()
+
+    [case] = list_volume_cases(
+        state_db, house_dir=house, search="블랙 라벨", limit=10
+    )["items"]
+
+    assert case["classification"] == "auto_ready"
+    assert case["duplicate_coordinates"] == []
+    assert {item["coordinate"] for item in case["items"]} == {"외전 1", "외전 2"}
+
+
+def test_epub_and_pdf_at_same_volume_are_parallel_formats(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for volume in (1, 2):
+            _add_file(conn, house / "ㅂ" / f"병행 작품 {volume}권.epub")
+            _add_file(conn, house / "ㅂ" / f"병행 작품 {volume}권.pdf")
+    finally:
+        conn.close()
+
+    [case] = list_volume_cases(
+        state_db, house_dir=house, search="병행 작품", limit=10
+    )["items"]
+
+    assert case["classification"] == "auto_ready"
+    assert case["duplicate_coordinates"] == []
+    assert case["parallel_format_coordinates"] == ["1권", "2권"]
+
+
+def test_volume_cohort_ignores_same_core_serial_compilation(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for volume in (1, 2, 3):
+            _add_file(
+                conn,
+                house / "ㄷ" / "두 번 사는 랭커" /
+                f"두 번 사는 랭커 {volume}권.epub",
+            )
+        _add_file(conn, house / "ㄷ" / "두 번 사는 랭커 1-100화 2부.txt")
+    finally:
+        conn.close()
+
+    [case] = list_volume_cases(
+        state_db, house_dir=house, search="두 번 사는 랭커", limit=10
+    )["items"]
+
+    assert case["classification"] == "already_grouped"
+    assert case["file_count"] == 3
+    assert case["coordinate_kinds"] == ["volume"]
 
 
 def test_volume_preview_reuses_existing_group_folder(tmp_path):

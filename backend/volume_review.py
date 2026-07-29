@@ -61,14 +61,38 @@ def _coordinate(row: Mapping[str, object]) -> tuple[tuple, str, object]:
     kind = row["coordinate_kind"]
     if kind == "volume":
         value = Fraction(int(row["volume_num"]), int(row["volume_den"] or 1))
-        label = f"{value.numerator}권" if value.denominator == 1 else f"{float(value):g}권"
-        return (0, value), label, (kind, value.numerator, value.denominator)
+        volume_label = (
+            f"{value.numerator}권"
+            if value.denominator == 1 else f"{float(value):g}권"
+        )
+        part = None
+        if row.get("part_num") is not None:
+            part = Fraction(int(row["part_num"]), int(row["part_den"] or 1))
+        part_label = ""
+        if part is not None:
+            part_label = (
+                f"{part.numerator}부 "
+                if part.denominator == 1 else f"{float(part):g}부 "
+            )
+        label = part_label + volume_label
+        part_key = (
+            (part.numerator, part.denominator) if part is not None else None
+        )
+        return (
+            (0, 0 if part is None else 1, part or Fraction(0), value),
+            label,
+            (kind, part_key, value.numerator, value.denominator),
+        )
     if kind == "part":
         value = Fraction(int(row["part_num"]), int(row["part_den"] or 1))
         label = f"{value.numerator}부" if value.denominator == 1 else f"{float(value):g}부"
         return (1, value), label, (kind, value.numerator, value.denominator)
     symbol = str(row["coordinate_symbol"] or row["coordinate_raw"] or "미상")
-    return (2, int(row["coordinate_sort_key"] or 0), symbol), symbol, (kind, symbol)
+    sort_key = int(row["coordinate_sort_key"] or 0)
+    label = symbol
+    if symbol == "side_story" and sort_key > 200:
+        label = f"외전 {sort_key - 200}"
+    return (2, sort_key, symbol), label, (kind, symbol, sort_key)
 
 
 def _safe_folder_name(value: str) -> str:
@@ -168,8 +192,12 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
             {
                 **dict(row),
                 # Re-evaluate with the current parser so the review screen does
-                # not wait for a full scanner pass after an author-rule fix.
+                # not wait for a full scanner pass after an author/coordinate
+                # rule fix.
                 "author": extract_author(str(row["analyzed_name"])),
+                **decision_store.coordinate_fields_from_name(
+                    str(row["analyzed_name"])
+                ),
             }
             for row in rows
         ]
@@ -177,37 +205,43 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
         conn.close()
 
 
-def _is_parallel_side_story_formats(rows: Sequence[Mapping[str, object]]) -> bool:
-    """Return whether one completed side story is stored in multiple formats."""
+def _is_parallel_coordinate_formats(rows: Sequence[Mapping[str, object]]) -> bool:
+    """Return whether one coordinate is intentionally stored in distinct formats."""
 
-    if len(rows) < 2 or any(
-        row["coordinate_kind"] != "symbol"
-        or row["coordinate_symbol"] != "side_story"
-        or not bool(row["complete"])
-        or int(row["effective_max"] or 0) <= 0
-        for row in rows
-    ):
+    if len(rows) < 2:
         return False
-    stems = {
-        unicodedata.normalize(
-            "NFC", Path(str(row["canonical_path"])).stem
-        ).casefold()
-        for row in rows
-    }
     extensions = {
         Path(str(row["canonical_path"])).suffix.lower() for row in rows
     }
-    coverage = {
-        (int(row["effective_max"]), str(row["unit"] or "")) for row in rows
-    }
-    authors = {str(row["author"] or "") for row in rows}
-    return (
-        len(stems) == 1
-        and len(extensions) == len(rows)
-        and "" not in extensions
-        and len(coverage) == 1
-        and len(authors) == 1
-    )
+    authors = {str(row["author"]) for row in rows if row["author"]}
+    if len(extensions) != len(rows) or "" in extensions or len(authors) > 1:
+        return False
+
+    # Preserve the stricter legacy side-story rule: an unnumbered completed
+    # side story needs matching coverage as well as matching stems.  Ordinary
+    # numbered volumes already share an exact canonical coordinate, so one file
+    # per extension is enough to identify EPUB/PDF parallel storage.
+    if all(
+        row["coordinate_kind"] == "symbol"
+        and row["coordinate_symbol"] == "side_story"
+        for row in rows
+    ):
+        stems = {
+            unicodedata.normalize(
+                "NFC", Path(str(row["canonical_path"])).stem
+            ).casefold()
+            for row in rows
+        }
+        coverage = {
+            (int(row["effective_max"]), str(row["unit"] or ""))
+            for row in rows
+        }
+        return (
+            all(bool(row["complete"]) and int(row["effective_max"] or 0) > 0 for row in rows)
+            and len(stems) == 1
+            and len(coverage) == 1
+        )
+    return all(row["coordinate_kind"] in {"volume", "part"} for row in rows)
 
 
 def _has_incompatible_coordinate_kinds(rows: Sequence[Mapping[str, object]]) -> bool:
@@ -219,6 +253,12 @@ def _has_incompatible_coordinate_kinds(rows: Sequence[Mapping[str, object]]) -> 
         if row["coordinate_kind"] != "symbol"
     }
     if len(main_kinds) > 1:
+        return True
+    volume_part_modes = {
+        row.get("part_num") is not None
+        for row in rows if row["coordinate_kind"] == "volume"
+    }
+    if len(volume_part_modes) > 1:
         return True
     return any(
         row["coordinate_kind"] == "symbol"
@@ -282,7 +322,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     parallel_format_keys = {
         key
         for key in repeated_coordinate_keys
-        if _is_parallel_side_story_formats(rows_by_coordinate[key])
+        if _is_parallel_coordinate_formats(rows_by_coordinate[key])
     }
     conflicting_coordinate_keys = repeated_coordinate_keys - parallel_format_keys
     duplicate_coordinates = sorted(
@@ -339,15 +379,30 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     )
     missing_coordinates = []
     if kinds == {"volume"}:
-        values = {
-            Fraction(int(row["volume_num"]), int(row["volume_den"] or 1)) for row in rows
-        }
-        if values and all(value.denominator == 1 for value in values):
-            maximum = max(int(value) for value in values)
-            if maximum <= 500:
-                missing_coordinates = [
-                    f"{number}권" for number in range(1, maximum + 1) if Fraction(number) not in values
-                ]
+        values_by_part = defaultdict(set)
+        for row in rows:
+            part = (
+                Fraction(int(row["part_num"]), int(row["part_den"] or 1))
+                if row.get("part_num") is not None else None
+            )
+            values_by_part[part].add(
+                Fraction(int(row["volume_num"]), int(row["volume_den"] or 1))
+            )
+        for part, values in sorted(
+            values_by_part.items(), key=lambda item: item[0] or Fraction(0)
+        ):
+            if values and all(value.denominator == 1 for value in values):
+                maximum = max(int(value) for value in values)
+                if maximum <= 500:
+                    prefix = "" if part is None else (
+                        f"{part.numerator}부 "
+                        if part.denominator == 1 else f"{float(part):g}부 "
+                    )
+                    missing_coordinates.extend(
+                        f"{prefix}{number}권"
+                        for number in range(1, maximum + 1)
+                        if Fraction(number) not in values
+                    )
 
     incompatible_coordinate_kinds = _has_incompatible_coordinate_kinds(rows)
     for item in items:
@@ -447,11 +502,28 @@ def analyze_volume_cases(state_db: Path, *, house_dir: Path) -> list[dict]:
     groups: dict[str, list[Mapping[str, object]]] = defaultdict(list)
     for row in _load_volume_rows(state_db):
         groups[str(row["core_title"])].append(row)
-    return [
-        _case_from_rows(core_title, rows, Path(house_dir))
-        for core_title, rows in groups.items()
-        if len(rows) >= 2
-    ]
+    cases = []
+    for core_title, rows in groups.items():
+        # A web-serialization compilation can share a core title with a full
+        # volume set without belonging to that set's folder coordinates.  When
+        # a real multi-volume cohort exists, inventory and folder planning use
+        # the cohort plus its side stories and leave the compilation untouched.
+        volume_rows = [row for row in rows if row["coordinate_kind"] == "volume"]
+        part_rows = [row for row in rows if row["coordinate_kind"] == "part"]
+        side_rows = [
+            row for row in rows
+            if row["coordinate_kind"] == "symbol"
+            and row["coordinate_symbol"] == "side_story"
+        ]
+        if len(volume_rows) >= 2:
+            selected = [*volume_rows, *side_rows]
+        elif len(part_rows) >= 2:
+            selected = [*part_rows, *side_rows]
+        else:
+            selected = rows
+        if len(selected) >= 2:
+            cases.append(_case_from_rows(core_title, selected, Path(house_dir)))
+    return cases
 
 
 def list_volume_cases(

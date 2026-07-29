@@ -458,10 +458,22 @@ def test_execute_restores_false_positive_and_records_distinct_work(
     conn = decision_store.connect_state_db(state_db)
     try:
         restored = conn.execute(
-            "SELECT source, active FROM files WHERE file_id = ?",
+            "SELECT source, active, size, mtime_ns, ctime_ns FROM files WHERE file_id = ?",
             (restore["file_id"],),
         ).fetchone()
-        assert restored[:] == ("house", 1)
+        assert restored["source"] == "house"
+        assert restored["active"] == 1
+        analysis = conn.execute(
+            """
+            SELECT analyzed_name, analyzed_size, analyzed_mtime_ns, analyzed_ctime_ns
+            FROM file_analysis WHERE file_id = ?
+            """,
+            (restore["file_id"],),
+        ).fetchone()
+        assert analysis["analyzed_name"] == "오탐 후보.txt"
+        assert analysis["analyzed_size"] == restored["size"]
+        assert analysis["analyzed_mtime_ns"] == restored["mtime_ns"]
+        assert analysis["analyzed_ctime_ns"] == restored["ctime_ns"]
         verdict = conn.execute(
             "SELECT verdict FROM decisions WHERE active = 1"
         ).fetchone()[0]

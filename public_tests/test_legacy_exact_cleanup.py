@@ -1,4 +1,5 @@
 from pathlib import Path
+import unicodedata
 
 import pytest
 
@@ -128,6 +129,90 @@ def test_unassigned_temp_exact_is_quarantined_against_unassigned_house_keep(tmp_
     assert Path(record["dest_path"]).is_file()
     assert Path(keep["canonical_path"]).is_file()
     assert not Path(duplicate["canonical_path"]).exists()
+
+
+def test_state_enrichment_matches_macos_nfd_path_to_nfc_db_row(tmp_path):
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    physical = tmp_path / unicodedata.normalize("NFD", "한글 제목.txt")
+    physical.write_bytes(b"same")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            row = decision_store.reconcile_file_metadata(conn, physical, source="temp")
+    finally:
+        conn.close()
+
+    entry = {"path": str(physical)}
+    deduplicator.enrich_entries_from_state_db([entry], str(state_db))
+
+    assert entry["file_id"] == row["file_id"]
+    assert entry["assignment_state"] == "unassigned"
+
+
+def test_raw_exact_ignores_conflicting_filename_coordinates(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "작품 1권.epub", "house")
+        duplicate = _add(conn, temp / "다른표기 9권.epub", "temp")
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert record["action"] == "exact_quarantine"
+    assert Path(record["dest_path"]).is_file()
+
+
+def test_raw_exact_can_finalize_a_queue_hold(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "보관본 1권.epub", "house")
+        queued = _add(
+            conn,
+            temp / "trash_bin" / "warning" / "volume_coordinate_conflicts" /
+            "보류본 1권.epub",
+            "queue",
+        )
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET assignment_state='decision_required' WHERE file_id=?",
+                (queued["file_id"],),
+            )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        result = dedup_mutations.exact_quarantine(
+            conn,
+            source_file_id=queued["file_id"],
+            keep_file_id=keep["file_id"],
+            quarantine_dir=temp / "trash_bin" / "exact_quarantine",
+            run_id=run_id,
+        )
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+    assert Path(result["dest_path"]).is_file()
+    assert not Path(queued["canonical_path"]).exists()
 
 
 def test_unassigned_house_exact_duplicate_is_cleaned_by_same_pipeline(tmp_path):

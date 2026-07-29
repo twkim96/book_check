@@ -35,10 +35,11 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.1)
+## 동일 작품 자동 중복 정리 계약 (1.4.2)
 
-구현 범위, 실자료 전체 적용 결과, 무결성 장애의 원인과 복구 근거는
-[`update_1.4.1.md`](update_1.4.1.md)에 함께 기록합니다.
+1.4.1의 순서형 본문 계약과 1.4.2의 강한 EPUB/입고·시리즈 보정, 실자료 전체 적용 결과는
+각각 [`update_1.4.1.md`](update_1.4.1.md),
+[`update_1.4.2.md`](update_1.4.2.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -58,7 +59,28 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이미 house에 두 판본이 함께 남아 있어도 같은 현재 증거가 성립하면 긴 판본만 남깁니다. 실제 bytes를
 바로 삭제하지 않으며, 격리 파일과 operation journal로 복구할 수 있습니다.
 
-1.4.1에는 서로 보완하는 두 자동 확정 경로가 있습니다.
+### 1.4.2 강한 동일성 우선 계약
+
+다음 증거는 제목·회차·완결·외전 표기보다 강합니다. 현재 두 파일을 mutation 직전에 다시 읽어
+같음이 재확인되면 신규 temp뿐 아니라 과거 house-house 중복도 자동으로 복구 가능한 격리에 보냅니다.
+
+1. 원시 파일 전체 SHA-256이 같음
+2. TXT 정규화 본문 SHA-256 또는 EPUB의 모든 내부 member 이름·내용 SHA-256이 같음
+3. EPUB의 읽기 payload가 같고 차이가 Calibre bookmark와 OPF의 제목·UUID·수정일 같은 설명
+   metadata뿐임. 이 경우에도 manifest, spine 순서, navigation, 본문, 이미지, CSS 등 실제 읽기
+   자원은 전부 같아야 합니다.
+
+원시 SHA가 같으면 파일명의 `1권`/`9권`, `완결`/`외전` 같은 좌표 충돌 때문에 보관하지 않습니다.
+읽기 payload 동일 EPUB도 `warning`이 아니라 `suspected_duplicates`로 자동 격리합니다. 단, 보호 파일,
+서로 다른 managed work/variant에 이미 사람 결정으로 연결된 파일, 하나의 입력이 여러 managed 대표와
+동시에 같아지는 관계는 자동 처리하지 않습니다. 이 예외에서는 입고 자체도 차단하여 중복 파일이
+house로 흘러들어가지 않게 합니다.
+
+macOS의 NFD 파일명과 DB의 NFC canonical path는 같은 경로로 연결합니다. Finder에서 파일을 열거나
+이름 편집창에 들어간 뒤 시각 metadata가 바뀐 경우에도 시각만으로 keep을 정하지 않고, 현재 bytes와
+본문/EPUB payload를 다시 읽어 결정합니다.
+
+강한 동일성으로 확정되지 않은 TXT 판본에는 1.4.1의 서로 보완하는 두 자동 확정 경로가 있습니다.
 
 1. **엄격한 포함판 경로(1.4.0 유지)**: 같은 단위·시작 회차에서 더 큰 종료 회차가 선언되고,
    짧은 전체 본문이 긴 본문의 정규화 접두 SHA와 같거나 본문 전역의 고유 앵커 5개가 같은
@@ -131,6 +153,15 @@ auditor report에는 이 자동 재시도를 적용하지 않습니다.
 - 순서형 본문 일치가 90% 이상 95% 미만이거나 연속 불일치 구간이 너무 큼
 - decode 실패, EPUB 구조 오류처럼 현재 본문 증거를 만들 수 없음
 
+위 목록의 좌표·작가 조건은 포함판/95%처럼 확률적 판본 추론에 적용됩니다. 현재 원시 SHA, TXT
+정규화 SHA, EPUB strict/reading-payload SHA가 완전히 같은 경우에는 1.4.2 강한 동일성 계약이 먼저
+적용됩니다.
+
+같은 current fingerprint pair에 과거의 약한 open review가 있어도 새 auditor가 더 강한 판정을
+증명하면 classification과 evidence를 현재 결과로 갱신합니다. 예를 들어 과거 `metadata_only`였던
+EPUB이 reading-payload 검사로 `epub_equivalent`가 되면, 사람 검토에 계속 남기지 않고 같은 실행의
+강한 중복 mutation 대상으로 사용합니다.
+
 엄격한 포함판 교체는 dedup JSON의 `contained_upgrade_count`와 `status=superseded`에, 순서형
 자동 격리는 `ordered_body_quarantine_count`와 `status=ordered_duplicate`에 기록합니다. 후자는
 양쪽 normalized SHA-256, 전체·일치 글자 수, 일치율, 최대 연속 불일치, 좌표 모드, house ingest
@@ -140,7 +171,29 @@ operation ID, quarantine operation ID와 최종 `trash_bin/ordered_body_duplicat
 이 정책을 수정할 때는 반드시 `public_tests/test_contained_version_upgrade.py`와
 `public_tests/test_ordered_body_dedup_1_4_1.py`의 동일 좌표·중첩·외전 합계·회차/권 교차·95% 경계·
 연속 개정·작가 충돌·managed variant 보존 회귀를 함께 변경하고, README에 자동/수동 경계가 왜
-바뀌는지 명시해야 합니다.
+바뀌는지 명시해야 합니다. 원시/정규화/EPUB payload 경계를 바꿀 때는
+`public_tests/test_legacy_exact_cleanup.py`, `public_tests/test_epub_duplicate_audit.py`,
+`public_tests/test_strong_equivalent_autocleanup_1_4_2.py`도 함께 검증해야 합니다.
+
+## 권별·부별 시리즈 폴더 계약 (1.4.2)
+
+- `1부 1권`과 `2부 1권`은 서로 다른 복합 좌표입니다. 부 번호를 버리고 권 번호만 비교하지 않습니다.
+- `외전 1`, `외전 2`는 서로 다른 외전 좌표입니다.
+- EPUB·PDF·TXT처럼 확장자가 서로 다른 동일 권은 중복 파일명이 아니라 병행 포맷으로 보존할 수
+  있습니다. 같은 확장자의 동일 권이 둘이면 strong dedup 증거를 먼저 확인하고, 내용이 다를 때만
+  예외 판본 검토로 남깁니다.
+- 같은 core의 웹연재 합본이 있어도 실제 권별 cohort가 2권 이상이면 그 cohort만 시리즈 폴더 판정에
+  사용합니다. 합본은 임의로 권별 폴더에 섞거나 삭제하지 않습니다.
+- 작가는 양쪽에 모두 명시되어 서로 다를 때만 폴더 자동화를 차단합니다. 한쪽 또는 양쪽의 작가
+  누락은 정상 입력으로 취급합니다.
+- 새 EPUB/PDF 권별 묶음은 좌표가 중복되지 않고 각 부의 권수가 연속이면 처음 입고부터 작품 폴더를
+  만듭니다. 이후 권은 같은 managed work의 기존 폴더로 들어갑니다.
+- 검토 큐에서 house로 복원·수용한 파일은 새 경로의 `file_analysis` identity를 같은 operation에서
+  갱신합니다. 따라서 바로 이어지는 시리즈 판정에서도 새 권이 누락되지 않습니다.
+
+시리즈 폴더 분석과 실제 이동은 `public_tests/test_folderling_volume_auto.py`,
+`public_tests/test_volume_review.py`, `public_tests/test_volume_group_apply.py`의 복합 좌표, 병행 포맷,
+합본 공존, 작가 누락, staging/journal 회귀를 함께 통과해야 합니다.
 
 ## 구조
 
@@ -480,7 +533,8 @@ Doctor도 남은 활성 판정 모순을 `active_decision_relation_conflict`로 
 파일 탐색기는 fingerprint가 없어도 백업 이후 자동 준비하는 격리 API를 그대로 사용할 수 있습니다.
 exact keep은 protected 비대표보다 대표를 우선하며 0바이트 동일 파일도 exact 판정에 포함합니다. Folderling
 결과는 검토 큐·report-only·legacy pass·실제 skipped 입력을 `review_required_count`로 합쳐 UI에서 단순
-성공과 구분합니다. 예상된 관리 폴더 제외 항목은 별도 `excluded_count`로만 기록합니다.
+성공과 구분합니다. legacy pass 집계는 `.DS_Store` 같은 Finder metadata를 제외합니다. 예상된 관리
+폴더 제외 항목은 별도 `excluded_count`로만 기록합니다.
 
 이번 버전에는 디렉터리 입고 전체를 하나의 operation group으로 resume하는 재설계, 두 index surface를
 한 generation manifest로 묶는 변경, 후보 그래프 조기 cap, strong-component 자료구조 변경, Doctor·hash·

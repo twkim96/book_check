@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unicodedata
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -880,6 +881,193 @@ def inspect_epub_content(
             file_evidence=_identity(after, raw_sha),
             content_sha256=digest.hexdigest(),
             member_count=len(infos),
+            uncompressed_size=uncompressed_size,
+        )
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+_EPUB_READING_STATE_MEMBERS = frozenset({
+    "meta-inf/calibre_bookmarks.txt",
+})
+
+
+def _canonical_opf_reading_structure(raw: bytes) -> bytes:
+    """Canonicalize the OPF package while excluding descriptive metadata.
+
+    Title, UUID, modification date and editor-version changes do not alter the
+    readable book.  Manifest membership, spine order, guide/bindings and every
+    other package structure remain part of the proof.
+    """
+
+    root = ElementTree.fromstring(raw)
+
+    def local_name(value):
+        return str(value).rsplit("}", 1)[-1]
+
+    if local_name(root.tag) != "package":
+        raise RuntimeError("EPUB OPF root is not package")
+
+    def canonical(node, *, package_root=False):
+        attributes = []
+        for key, value in node.attrib.items():
+            if package_root and local_name(key) == "unique-identifier":
+                continue
+            attributes.append((
+                unicodedata.normalize("NFC", str(key)),
+                unicodedata.normalize("NFC", str(value)).strip(),
+            ))
+        children = [
+            canonical(child)
+            for child in list(node)
+            if not (package_root and local_name(child.tag) == "metadata")
+        ]
+        return (
+            unicodedata.normalize("NFC", str(node.tag)),
+            sorted(attributes),
+            unicodedata.normalize("NFC", str(node.text or "")).strip(),
+            children,
+        )
+
+    return json.dumps(
+        canonical(root, package_root=True),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def inspect_epub_reading_payload(
+    path,
+    *,
+    max_members=10_000,
+    max_file_bytes=None,
+    max_uncompressed_bytes=1024 * 1024 * 1024,
+    budget=None,
+):
+    """Hash the complete readable EPUB payload, ignoring known reading state.
+
+    This is a secondary equality proof for archives whose strict content hash
+    differs.  It ignores only Calibre bookmark state and descriptive OPF
+    metadata; all reading resources, images, styles, navigation and spine
+    structure must remain identical.
+    """
+
+    parent_fd, fd, _ = _open_regular_nofollow(path)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"source is not a regular file: {path}")
+        if max_file_bytes is not None and before.st_size > int(max_file_bytes):
+            raise RuntimeError(
+                f"EPUB file limit exceeded: {before.st_size}>{int(max_file_bytes)}"
+            )
+        if budget is not None:
+            budget.reserve_pass(before.st_size)
+        raw_sha = _hash_fd(fd)
+        if budget is not None:
+            budget.consume(before.st_size)
+        os.lseek(fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(fd), "rb", closefd=True) as stream:
+            with zipfile.ZipFile(stream) as archive:
+                infos = [info for info in archive.infolist() if not info.is_dir()]
+                if len(infos) > int(max_members):
+                    raise RuntimeError(
+                        f"EPUB member limit exceeded: {len(infos)}>{max_members}"
+                    )
+                normalized_names = [
+                    unicodedata.normalize("NFC", info.filename) for info in infos
+                ]
+                if len(normalized_names) != len(set(normalized_names)):
+                    raise RuntimeError("EPUB contains duplicate normalized member names")
+                uncompressed_size = sum(int(info.file_size) for info in infos)
+                if uncompressed_size > int(max_uncompressed_bytes):
+                    raise RuntimeError(
+                        "EPUB uncompressed limit exceeded: "
+                        f"{uncompressed_size}>{max_uncompressed_bytes}"
+                    )
+                if budget is not None:
+                    budget.reserve_pass(uncompressed_size)
+
+                digest = hashlib.sha256()
+                included_members = 0
+                ordered = sorted(zip(normalized_names, infos), key=lambda item: item[0])
+                for normalized_name, info in ordered:
+                    if info.flag_bits & 0x1:
+                        raise RuntimeError("encrypted EPUB member is unsupported")
+                    member_mode = (info.external_attr >> 16) & 0o170000
+                    if member_mode == stat.S_IFLNK:
+                        raise RuntimeError("EPUB symlink member is unsupported")
+                    folded_name = normalized_name.casefold()
+                    if folded_name in _EPUB_READING_STATE_MEMBERS:
+                        consumed = 0
+                        with archive.open(info, "r") as member:
+                            while True:
+                                chunk = member.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                consumed += len(chunk)
+                                if budget is not None:
+                                    budget.consume(len(chunk))
+                        if consumed != int(info.file_size):
+                            raise RuntimeError(
+                                f"EPUB member size changed while read: {normalized_name}"
+                            )
+                        continue
+                    name_bytes = normalized_name.encode("utf-8", "surrogatepass")
+                    digest.update(struct.pack(">Q", len(name_bytes)))
+                    digest.update(name_bytes)
+                    if folded_name.endswith(".opf"):
+                        if int(info.file_size) > 16 * 1024 * 1024:
+                            raise RuntimeError("EPUB OPF member exceeds structural limit")
+                        with archive.open(info, "r") as member:
+                            raw = member.read()
+                        if len(raw) != int(info.file_size):
+                            raise RuntimeError(
+                                f"EPUB member size changed while read: {normalized_name}"
+                            )
+                        if budget is not None:
+                            budget.consume(len(raw))
+                        payload = _canonical_opf_reading_structure(raw)
+                        digest.update(struct.pack(">Q", len(payload)))
+                        digest.update(payload)
+                    else:
+                        digest.update(struct.pack(">Q", int(info.file_size)))
+                        consumed = 0
+                        with archive.open(info, "r") as member:
+                            while True:
+                                chunk = member.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                consumed += len(chunk)
+                                if budget is not None:
+                                    budget.consume(len(chunk))
+                                digest.update(chunk)
+                        if consumed != int(info.file_size):
+                            raise RuntimeError(
+                                f"EPUB member size changed while read: {normalized_name}"
+                            )
+                    included_members += 1
+
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_ctime_ns,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_ctime_ns,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise SourceIdentityChanged(f"source changed during EPUB payload hash: {path}")
+        return EpubContentEvidence(
+            file_evidence=_identity(after, raw_sha),
+            content_sha256=digest.hexdigest(),
+            member_count=included_members,
             uncompressed_size=uncompressed_size,
         )
     finally:

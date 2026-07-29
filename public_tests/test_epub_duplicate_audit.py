@@ -16,6 +16,25 @@ def _write_epub(path, body, *, compression, timestamp):
         archive.writestr(info, body)
 
 
+def _write_metadata_repacked_epub(path, *, title, bookmark=False, reverse_spine=False):
+    opf = f"""<?xml version='1.0' encoding='utf-8'?>
+<package version='2.0' unique-identifier='BookId'
+ xmlns='http://www.idpf.org/2007/opf'
+ xmlns:dc='http://purl.org/dc/elements/1.1/'>
+  <metadata><dc:identifier id='BookId'>urn:uuid:test</dc:identifier>
+    <dc:title>{title}</dc:title><dc:date>2026-07-28</dc:date></metadata>
+  <manifest><item id='one' href='one.xhtml' media-type='application/xhtml+xml'/>
+    <item id='two' href='two.xhtml' media-type='application/xhtml+xml'/></manifest>
+  <spine>{"<itemref idref='two'/><itemref idref='one'/>" if reverse_spine else "<itemref idref='one'/><itemref idref='two'/>"}</spine>
+</package>""".encode("utf-8")
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/one.xhtml", b"same first chapter")
+        archive.writestr("OEBPS/two.xhtml", b"same second chapter")
+        if bookmark:
+            archive.writestr("META-INF/calibre_bookmarks.txt", b"reading position")
+
+
 def _write_index(path, house, names):
     path.write_text(json.dumps({
         "version": 2,
@@ -88,6 +107,143 @@ def test_repacked_epub_is_compared_by_internal_content(tmp_path):
         and event["completed"] == event["total"] == 1
         for event in progress_events
     )
+
+
+def test_epub_reading_payload_ignores_only_metadata_and_bookmark_state(tmp_path):
+    first = tmp_path / "first.epub"
+    second = tmp_path / "second.epub"
+    reordered = tmp_path / "reordered.epub"
+    _write_metadata_repacked_epub(first, title="표시 제목 A")
+    _write_metadata_repacked_epub(second, title="표시 제목 B", bookmark=True)
+    _write_metadata_repacked_epub(
+        reordered, title="표시 제목 B", bookmark=True, reverse_spine=True
+    )
+
+    strict_first = mutation_io.inspect_epub_content(first)
+    strict_second = mutation_io.inspect_epub_content(second)
+    payload_first = mutation_io.inspect_epub_reading_payload(first)
+    payload_second = mutation_io.inspect_epub_reading_payload(second)
+    payload_reordered = mutation_io.inspect_epub_reading_payload(reordered)
+
+    assert strict_first.content_sha256 != strict_second.content_sha256
+    assert payload_first.content_sha256 == payload_second.content_sha256
+    assert payload_first.content_sha256 != payload_reordered.content_sha256
+
+
+def test_auditor_classifies_metadata_only_epub_repack_as_equivalent(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["메타 재포장 작품 1권.epub", "메타 재포장 작품 01권.epub"]
+    _write_metadata_repacked_epub(house / names[0], title="작품")
+    _write_metadata_repacked_epub(
+        house / names[1], title="작품 1", bookmark=True
+    )
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+
+    report = duplicate_auditor.run_audit(_args(index, house, temp))
+
+    assert report.completed is True
+    assert report.results[0]["classification"] == "epub_equivalent"
+    assert report.results[0]["evidence"]["epub_equivalence_mode"] == "reading_payload"
+
+
+def test_open_review_is_refreshed_when_same_fingerprints_gain_stronger_proof(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["검토 갱신 작품 3권.epub", "검토 갱신 작품 03권.epub"]
+    _write_metadata_repacked_epub(house / names[0], title="검토 갱신 작품")
+    _write_metadata_repacked_epub(
+        house / names[1], title="검토 갱신 작품 3", bookmark=True
+    )
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+    state_db = tmp_path / "state.sqlite3"
+    def audit_args():
+        return _general_args(
+            index, house, temp,
+            "--house-only", "--same-coordinate-only", "--state-db", str(state_db),
+        )
+
+    initial = duplicate_auditor.run_audit(audit_args())
+    assert initial.results[0]["classification"] == "epub_equivalent"
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        row = conn.execute(
+            "SELECT review_id FROM review_items "
+            "WHERE state IN ('pending', 'deferred')"
+        ).fetchone()
+        assert row is not None
+        conn.execute(
+            """
+            UPDATE review_items
+            SET classification = 'metadata_only',
+                evidence_json = '{"epub_reading_payload_error":"body_budget_exhausted"}'
+            WHERE review_id = ?
+            """,
+            (row["review_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    refreshed = duplicate_auditor.run_audit(audit_args())
+
+    assert refreshed.results[0]["classification"] == "epub_equivalent"
+    assert refreshed.stats["pair_cache_hits"] == 1
+    assert refreshed.stats["review_items_refreshed"] == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        rows = conn.execute(
+            """
+            SELECT classification, evidence_json FROM review_items
+            WHERE state IN ('pending', 'deferred')
+            """
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["classification"] == "epub_equivalent"
+        assert json.loads(rows[0]["evidence_json"])["epub_equivalence_mode"] == \
+            "reading_payload"
+    finally:
+        conn.close()
+
+
+def test_epub_payload_budget_deferral_is_not_cached_as_metadata_only(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["예산 재포장 작품 1권.epub", "예산 재포장 작품 01권.epub"]
+    _write_metadata_repacked_epub(house / names[0], title="작품")
+    _write_metadata_repacked_epub(
+        house / names[1], title="작품 1", bookmark=True
+    )
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+    state_db = tmp_path / "state.sqlite3"
+
+    limited = duplicate_auditor.run_audit(_general_args(
+        index, house, temp,
+        "--house-only", "--same-coordinate-only",
+        "--state-db", str(state_db), "--max-read-bytes", "4KiB",
+    ))
+
+    assert limited.completed is False
+    assert "body_budget_exhausted" in limited.stop_reasons
+    assert limited.results[0]["classification"] == "body_budget_exhausted"
+
+    retried = duplicate_auditor.run_audit(_general_args(
+        index, house, temp,
+        "--house-only", "--same-coordinate-only", "--state-db", str(state_db),
+    ))
+
+    assert retried.completed is True
+    assert retried.results[0]["classification"] == "epub_equivalent"
+    assert retried.results[0]["evidence"]["epub_equivalence_mode"] == "reading_payload"
 
 
 def test_candidate_file_limit_fails_closed_before_unbounded_read(tmp_path):
@@ -178,7 +334,7 @@ def test_corrupt_epub_candidate_makes_audit_incomplete(tmp_path):
 
 def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.1"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.2"
 
 
 def test_full_sweep_backfills_cross_core_txt_and_warm_run_reuses_cache(tmp_path):

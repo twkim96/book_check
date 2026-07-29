@@ -55,7 +55,11 @@ from text_preview import (
     read_normalized_line_sequence,
 )
 from project_paths import FILE_INDEX, HOUSE_DIR, TEMP_DIR
-from mutation_io import inspect_epub_content, inspect_regular_file
+from mutation_io import (
+    inspect_epub_content,
+    inspect_epub_reading_payload,
+    inspect_regular_file,
+)
 from review_noise import (
     different_core_titles,
     distinct_terminal_epub_volumes,
@@ -69,7 +73,7 @@ MAX_ESTIMATED_READ_PASSES = 6
 # v2: BOM UTF-16 LE/BE strict 판독을 fingerprint 의미에 포함한다.
 # 판독 규칙이 바뀌면 기존 decode_lossy 결과를 재사용하지 않도록 반드시 올린다.
 FINGERPRINT_VERSION = "5"
-AUDITOR_VERSION = "1.4.1"
+AUDITOR_VERSION = "1.4.2"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -1330,16 +1334,41 @@ class PersistentAuditCache:
         candidate_entry, candidate_file = next(item for item in pair if item[1] != reference_file)
         candidate_fp = self.fingerprint_ids[candidate_entry.path]
         reference_fp = self.fingerprint_ids[reference_entry.path]
+        evidence_json = json.dumps(
+            result.evidence, ensure_ascii=False, sort_keys=True
+        )
         existing = self.conn.execute(
             """
-            SELECT 1 FROM review_items
+            SELECT review_id, classification, evidence_json FROM review_items
             WHERE candidate_file_id = ? AND reference_file_id = ?
               AND left_fingerprint_id = ? AND right_fingerprint_id = ?
+              AND state IN ('pending', 'deferred')
             LIMIT 1
             """,
             (candidate_file, reference_file, candidate_fp, reference_fp),
         ).fetchone()
         if existing:
+            # Pair-cache contracts can become stronger without changing the
+            # underlying file fingerprints (for example, metadata_only ->
+            # epub_equivalent after a reading-payload rule upgrade).  Keeping
+            # the stale classification makes the mutation phase unable to find
+            # the strong review row even though the current auditor report has
+            # already proved equivalence.  Preserve the review identity/state
+            # but refresh its current classification and evidence.
+            if (
+                existing["classification"] != result.classification
+                or (existing["evidence_json"] or "") != evidence_json
+            ):
+                self.conn.execute(
+                    """
+                    UPDATE review_items
+                    SET classification = ?, evidence_json = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE review_id = ? AND state IN ('pending', 'deferred')
+                    """,
+                    (result.classification, evidence_json, existing["review_id"]),
+                )
+                self.stats["review_items_refreshed"] += 1
             return
         if self.store.human_disposition_suppresses_review(
             self.conn,
@@ -1374,7 +1403,7 @@ class PersistentAuditCache:
                 candidate_fp,
                 reference_fp,
                 result.classification,
-                json.dumps(result.evidence, ensure_ascii=False, sort_keys=True),
+                evidence_json,
             ),
         )
         self.stats["review_items_created"] += 1
@@ -1456,6 +1485,9 @@ def _pair_configuration_hash(config):
         "anchor_chars": config.anchor_chars,
         "min_strong_chars": config.min_strong_chars,
         "max_file_bytes": config.max_file_bytes,
+        # Pair-only semantic contract. Keep this outside the fingerprint policy
+        # so a retry/cache correction does not rebuild every base fingerprint.
+        "epub_reading_payload_contract": "same-edition+opf-metadata+calibre-bookmark-v3",
     }
     payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -1723,6 +1755,43 @@ def _ordered_author_tokens(value):
     }
 
 
+def _epub_reading_payload_candidate(candidate):
+    """Bound metadata-insensitive EPUB reads to the same declared edition."""
+
+    left, right = candidate.left, candidate.right
+    if (
+        left.ext != ".epub"
+        or right.ext != ".epub"
+        or not left.core_title
+        or normalize_nfc(left.core_title).casefold()
+        != normalize_nfc(right.core_title).casefold()
+        or left.span_ambiguous
+        or right.span_ambiguous
+    ):
+        return False
+    left_authors = _ordered_author_tokens(left.author)
+    right_authors = _ordered_author_tokens(right.author)
+    if left_authors and right_authors and not (left_authors & right_authors):
+        return False
+    if left.volume_number is not None or right.volume_number is not None:
+        return (
+            left.volume_number is not None
+            and right.volume_number is not None
+            and left.volume_number == right.volume_number
+        )
+    left_span = (left.start_number, left.end_number)
+    right_span = (right.start_number, right.end_number)
+    if None not in (*left_span, *right_span):
+        return left_span == right_span
+    if left.is_side_story or right.is_side_story:
+        return (
+            left.is_side_story
+            and right.is_side_story
+            and left.effective_max == right.effective_max
+        )
+    return left_span == right_span == (None, None)
+
+
 def _ordered_body_relation(candidate):
     left, right = candidate.left, candidate.right
     if left.ext != ".txt" or right.ext != ".txt":
@@ -1932,6 +2001,7 @@ def analyze_candidates(
     )
 
     deep_pairs = []
+    epub_payload_cache = {}
     if candidates:
         _emit_audit_progress(config, "pair_classification", 0, len(candidates), budget)
     for candidate_index, candidate in enumerate(candidates, start=1):
@@ -1982,9 +2052,74 @@ def analyze_candidates(
                     candidate, "epub_equivalent", evidence
                 )
             else:
-                results[candidate.pair_id] = _basic_result(
-                    candidate, "metadata_only", evidence
-                )
+                if not _epub_reading_payload_candidate(candidate):
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, "metadata_only", evidence
+                    )
+                    continue
+                payloads = []
+                payload_error = None
+                for entry in (candidate.left, candidate.right):
+                    try:
+                        payload = epub_payload_cache.get(entry.path)
+                        if payload is None:
+                            payload_kwargs = {
+                                "max_file_bytes": config.max_file_bytes,
+                                "budget": budget,
+                            }
+                            max_uncompressed = getattr(
+                                config, "max_epub_uncompressed_bytes", None
+                            )
+                            if max_uncompressed is not None:
+                                payload_kwargs["max_uncompressed_bytes"] = max_uncompressed
+                            payload = inspect_epub_reading_payload(
+                                entry.path, **payload_kwargs
+                            )
+                            if (
+                                payload.file_evidence.dev,
+                                payload.file_evidence.ino,
+                                payload.file_evidence.ctime_ns,
+                                payload.file_evidence.size,
+                                payload.file_evidence.mtime_ns,
+                            ) != _entry_identity(entry):
+                                raise StaleInputDuringAnalysis(entry.path)
+                            epub_payload_cache[entry.path] = payload
+                        payloads.append(payload)
+                    except BodyBudgetExceeded:
+                        stop_reasons.append("body_budget_exhausted")
+                        payload_error = "body_budget_exhausted"
+                        break
+                    except (StaleInputDuringAnalysis, OSError):
+                        stop_reasons.append("stale_input")
+                        payload_error = "stale_input"
+                        break
+                    except (RuntimeError, zipfile.BadZipFile) as exc:
+                        payload_error = str(exc)
+                        break
+                if len(payloads) == 2:
+                    evidence.update({
+                        "epub_equivalence_mode": "reading_payload",
+                        "left_reading_payload_sha256": payloads[0].content_sha256,
+                        "right_reading_payload_sha256": payloads[1].content_sha256,
+                    })
+                elif payload_error:
+                    evidence["epub_reading_payload_error"] = payload_error
+                if payload_error in {"body_budget_exhausted", "stale_input"}:
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, payload_error, evidence
+                    )
+                    continue
+                if (
+                    len(payloads) == 2
+                    and payloads[0].content_sha256 == payloads[1].content_sha256
+                ):
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, "epub_equivalent", evidence
+                    )
+                else:
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, "metadata_only", evidence
+                    )
             continue
         if candidate.left.ext != ".txt" or candidate.right.ext != ".txt":
             results[candidate.pair_id] = _basic_result(candidate, "metadata_only")
@@ -2595,6 +2730,9 @@ def run_audit(args):
         "pair_cache_hits": persistent_stats.get("pair_cache_hits", 0),
         "pair_cache_misses": persistent_stats.get("pair_cache_misses", 0),
         "review_items_created": persistent_stats.get("review_items_created", 0),
+        "review_items_refreshed": persistent_stats.get(
+            "review_items_refreshed", 0
+        ),
         "distinct_volume_reviews_suppressed": persistent_stats.get(
             "distinct_volume_reviews_suppressed", 0
         ),

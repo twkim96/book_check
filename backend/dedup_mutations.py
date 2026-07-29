@@ -1,5 +1,6 @@
 """Journaled filesystem mutations for managed dedup mode."""
 
+import json
 import re
 import unicodedata
 from pathlib import Path
@@ -13,6 +14,7 @@ from mutation_io import (
     ensure_directory_nofollow,
     inspect_contained_text,
     inspect_epub_content,
+    inspect_epub_reading_payload,
     inspect_ordered_text,
     inspect_regular_file,
     inspect_normalized_text,
@@ -176,6 +178,7 @@ def user_queue_restore(conn, *, file_id, run_id):
             source_evidence,
             guard=guard,
         )
+        moved_stat = destination.lstat()
         with decision_store.transaction(conn):
             conn.execute(
                 """
@@ -188,6 +191,9 @@ def user_queue_restore(conn, *, file_id, run_id):
                     destination_evidence.ctime_ns, destination_evidence.size,
                     destination_evidence.mtime_ns, file_id,
                 ),
+            )
+            decision_store.upsert_file_analysis(
+                conn, file_id, destination, stat_result=moved_stat
             )
             conn.execute(
                 """
@@ -270,6 +276,7 @@ def user_queue_accept_to_house(
             source_evidence,
             guard=guard,
         )
+        moved_stat = destination.lstat()
         with decision_store.transaction(conn):
             conn.execute(
                 """
@@ -292,6 +299,9 @@ def user_queue_accept_to_house(
                     coordinates["episode_end"], coordinates["coordinate_raw"],
                     coordinates["span_ambiguous"], file_id,
                 ),
+            )
+            decision_store.upsert_file_analysis(
+                conn, file_id, destination, stat_result=moved_stat
             )
             conn.execute(
                 """
@@ -369,17 +379,43 @@ def house_review_move(
             ):
                 raise RuntimeError("house cleanup normalized SHA revalidation failed")
         elif classification in EPUB_EQUAL_CLASSES:
-            move_epub = inspect_epub_content(move_path)
-            keep_epub = inspect_epub_content(keep_path)
+            try:
+                review_evidence = json.loads(review["evidence_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                review_evidence = {}
+            reading_payload = (
+                review_evidence.get("epub_equivalence_mode") == "reading_payload"
+            )
+            inspect_epub = (
+                inspect_epub_reading_payload if reading_payload else inspect_epub_content
+            )
+            move_epub = inspect_epub(move_path)
+            keep_epub = inspect_epub(keep_path)
             move_evidence = move_epub.file_evidence
             keep_evidence = keep_epub.file_evidence
-            if (
-                not move["normalized_sha256"]
-                or move["normalized_sha256"] != keep["normalized_sha256"]
-                or move_epub.content_sha256 != keep_epub.content_sha256
-                or move_epub.content_sha256 != move["normalized_sha256"]
-                or keep_epub.content_sha256 != keep["normalized_sha256"]
-            ):
+            if reading_payload:
+                expected_payloads = {
+                    review["candidate_file_id"]: review_evidence.get(
+                        "left_reading_payload_sha256"
+                    ),
+                    review["reference_file_id"]: review_evidence.get(
+                        "right_reading_payload_sha256"
+                    ),
+                }
+                payload_valid = (
+                    move_epub.content_sha256 == expected_payloads.get(move_file_id)
+                    and keep_epub.content_sha256 == expected_payloads.get(keep_file_id)
+                    and move_epub.content_sha256 == keep_epub.content_sha256
+                )
+            else:
+                payload_valid = (
+                    move["normalized_sha256"]
+                    and move["normalized_sha256"] == keep["normalized_sha256"]
+                    and move_epub.content_sha256 == keep_epub.content_sha256
+                    and move_epub.content_sha256 == move["normalized_sha256"]
+                    and keep_epub.content_sha256 == keep["normalized_sha256"]
+                )
+            if not payload_valid:
                 raise RuntimeError("house cleanup EPUB SHA revalidation failed")
         else:
             move_evidence = inspect_regular_file(move_path)
@@ -733,7 +769,7 @@ def _exact_quarantine(
     # remain identity-bound instead of weakening the mutation contract.
     source = _ensure_intake_fingerprint(conn, source)
     keep = _ensure_intake_fingerprint(conn, keep)
-    source_root = "temp_root" if source["source"] == "temp" else "house_root"
+    source_root = "house_root" if source["source"] == "house" else "temp_root"
     decision_store.assert_actual_run_path(actual_run, source["canonical_path"], source_root)
     decision_store.assert_actual_run_path(actual_run, keep["canonical_path"], "house_root")
     decision_store.assert_actual_run_path(actual_run, quarantine_dir, "temp_root")
@@ -761,9 +797,6 @@ def _exact_quarantine(
             or source["variant_id"] != keep["variant_id"]
         ):
             raise RuntimeError("managed exact files belong to different variants")
-    if not decision_store.coordinates_compatible(source, keep):
-        raise RuntimeError("exact files have incompatible canonical coordinates")
-
     # Recompute both raw hashes immediately before the move. Cached hashes are
     # also checked so stale/corrupt cache cannot authorize a logical deletion.
     source_evidence = inspect_regular_file(source_path)
@@ -1674,13 +1707,13 @@ def _queue_candidate(
     )
     if not managed_reference and not allow_unassigned_reference:
         raise RuntimeError("queue reference must be a managed representative")
-    if not decision_store.coordinates_compatible(candidate, reference):
+    if classification not in STRONG_QUEUE_CLASSES and not decision_store.coordinates_compatible(candidate, reference):
         raise RuntimeError("queue pair has incompatible canonical coordinates")
 
     review = conn.execute(
         """
         SELECT candidate_file_id, reference_file_id, left_fingerprint_id,
-               right_fingerprint_id, classification, state
+               right_fingerprint_id, classification, state, evidence_json
         FROM review_items WHERE review_id = ?
         """,
         (review_id,),
@@ -1713,17 +1746,36 @@ def _queue_candidate(
         source_evidence = candidate_evidence
     elif strong:
         if classification in EPUB_EQUAL_CLASSES:
-            candidate_epub = inspect_epub_content(candidate_path)
-            reference_epub = inspect_epub_content(reference["canonical_path"])
+            try:
+                review_evidence = json.loads(review["evidence_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                review_evidence = {}
+            reading_payload = (
+                review_evidence.get("epub_equivalence_mode") == "reading_payload"
+            )
+            inspect_epub = (
+                inspect_epub_reading_payload if reading_payload else inspect_epub_content
+            )
+            candidate_epub = inspect_epub(candidate_path)
+            reference_epub = inspect_epub(reference["canonical_path"])
             candidate_evidence = candidate_epub.file_evidence
             reference_evidence = reference_epub.file_evidence
-            if (
-                not candidate["normalized_sha256"]
-                or candidate["normalized_sha256"] != reference["normalized_sha256"]
-                or candidate_epub.content_sha256 != reference_epub.content_sha256
-                or candidate_epub.content_sha256 != candidate["normalized_sha256"]
-                or reference_epub.content_sha256 != reference["normalized_sha256"]
-            ):
+            if reading_payload:
+                payload_valid = (
+                    candidate_epub.content_sha256
+                    == review_evidence.get("left_reading_payload_sha256")
+                    == reference_epub.content_sha256
+                    == review_evidence.get("right_reading_payload_sha256")
+                )
+            else:
+                payload_valid = (
+                    candidate["normalized_sha256"]
+                    and candidate["normalized_sha256"] == reference["normalized_sha256"]
+                    and candidate_epub.content_sha256 == reference_epub.content_sha256
+                    and candidate_epub.content_sha256 == candidate["normalized_sha256"]
+                    and reference_epub.content_sha256 == reference["normalized_sha256"]
+                )
+            if not payload_valid:
                 raise RuntimeError("strong queue EPUB SHA-256 revalidation failed")
             source_evidence = candidate_evidence
         else:
@@ -1740,7 +1792,7 @@ def _queue_candidate(
             ):
                 raise RuntimeError("strong queue current normalized SHA-256 revalidation failed")
             source_evidence = candidate_evidence
-    action = "suspected_move" if strong and managed_reference else "warning_move"
+    action = "suspected_move" if strong else "warning_move"
     destination = _unique_destination(queue_dir, candidate_path.name)
     source_evidence = source_evidence or inspect_regular_file(candidate_path)
     decision_store.assert_manifest_source(

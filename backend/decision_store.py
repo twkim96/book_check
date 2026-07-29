@@ -1927,7 +1927,15 @@ def coordinate_fields_from_name(name: str) -> dict:
         )
     elif info["is_side_story"]:
         symbol, sort_key = canonical_symbol("외전")
-        coordinate_raw = "외전"
+        numbered_side_story = re.search(
+            r"(?:외전|후일담)\s*(\d+)\s*$", stem
+        )
+        if numbered_side_story is not None:
+            side_number = int(numbered_side_story.group(1))
+            sort_key += side_number
+            coordinate_raw = f"외전 {side_number}"
+        else:
+            coordinate_raw = "외전"
 
     if symbol is not None:
         coordinate_kind = "symbol"
@@ -1971,6 +1979,14 @@ def coordinates_compatible(left, right) -> bool:
     if left["coordinate_symbol"] != right["coordinate_symbol"]:
         if left["coordinate_symbol"] is not None or right["coordinate_symbol"] is not None:
             return False
+    if (
+        left["coordinate_symbol"] is not None
+        and right["coordinate_symbol"] is not None
+        and left["coordinate_sort_key"] is not None
+        and right["coordinate_sort_key"] is not None
+        and left["coordinate_sort_key"] != right["coordinate_sort_key"]
+    ):
+        return False
     if None not in (
         left["episode_start"], left["episode_end"],
         right["episode_start"], right["episode_end"],
