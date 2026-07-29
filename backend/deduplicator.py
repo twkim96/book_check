@@ -1013,7 +1013,24 @@ def build_auditor_suspect_groups(
     parent = {}
     incident = defaultdict(set)
 
+    def coordinates_compatible(left, right):
+        relation = classify_dedup_coordinate_relation(
+            left.get("name", ""), right.get("name", ""),
+            left_span_ambiguous=bool(left.get("span_ambiguous")),
+            right_span_ambiguous=bool(right.get("span_ambiguous")),
+        )
+        if relation is not None:
+            return True
+        import decision_store
+
+        return decision_store.coordinates_compatible(
+            decision_store.coordinate_fields_from_name(left.get("name", "")),
+            decision_store.coordinate_fields_from_name(right.get("name", "")),
+        )
+
     def identity_veto(left, right):
+        if not coordinates_compatible(left, right):
+            return "coordinate_conflict"
         if left.get("assignment_state") == "managed" and right.get("assignment_state") == "managed":
             if left.get("work_bucket_id") != right.get("work_bucket_id"):
                 return "distinct_work"
@@ -1061,10 +1078,9 @@ def build_auditor_suspect_groups(
                 entry["char_count"] = length
         if len(sides) != 2:
             continue
-        # A current normalized TXT hash or canonical EPUB content hash is
-        # stronger evidence than filename coordinates.  Coordinate checks stay
-        # on probabilistic/contained paths, but must not retain byte-equivalent
-        # content merely because one filename says ``완결`` or ``외전``.
+        # Strong body evidence may bridge nested episode spans, side-story
+        # redistribution and 1-N episode/volume editions.  It must not bridge
+        # explicit sibling volumes (1권 vs 2권) or disjoint episode ranges.
         veto = identity_veto(sides[0][1], sides[1][1])
         if veto:
             if blocked_relations is not None:
@@ -1128,6 +1144,7 @@ def build_auditor_suspect_groups(
             len(managed_house_representatives) > 1
             or
             len(protected) > 1
+            or not any(entry.get("source") == "house" for entry in members)
             or any(not entry.get("mutation_eligible", True) for entry in members)
         )
         for key in keys:
@@ -1359,6 +1376,32 @@ def _managed_exact_records(
     try:
         for group in exact_groups:
             keep = group["keep"]
+            component_members = [keep, *group["duplicates"]]
+
+            def pair_coordinates_compatible(left, right):
+                left_core = analyze_name(left.get("name", "")).get("core_title")
+                right_core = analyze_name(right.get("name", "")).get("core_title")
+                if left_core and right_core and left_core != right_core:
+                    return True
+                relation = classify_dedup_coordinate_relation(
+                    left.get("name", ""), right.get("name", ""),
+                    left_span_ambiguous=bool(left.get("span_ambiguous")),
+                    right_span_ambiguous=bool(right.get("span_ambiguous")),
+                )
+                return relation is not None or decision_store.coordinates_compatible(
+                    decision_store.coordinate_fields_from_name(
+                        left.get("name", "")
+                    ),
+                    decision_store.coordinate_fields_from_name(
+                        right.get("name", "")
+                    ),
+                )
+
+            component_coordinate_conflict = any(
+                not pair_coordinates_compatible(left, right)
+                for index, left in enumerate(component_members)
+                for right in component_members[index + 1:]
+            )
             for entry in group["duplicates"]:
                 record = {
                     "action": "exact_quarantine",
@@ -1378,9 +1421,18 @@ def _managed_exact_records(
                         or entry.get("variant_id") != keep.get("variant_id")
                     )
                 )
+                coordinate_conflict = (
+                    component_coordinate_conflict
+                    or not pair_coordinates_compatible(entry, keep)
+                )
                 if entry.get("path") in blocked_candidates:
                     record["action"] = "managed_report_only"
                     record["reason"] = "multi_representative_conflict"
+                    records.append(record)
+                    continue
+                if coordinate_conflict:
+                    record["action"] = "managed_report_only"
+                    record["reason"] = "incompatible_canonical_coordinates"
                     records.append(record)
                     continue
                 if (
@@ -1623,6 +1675,7 @@ def _managed_auditor_queue_records(
         OrderedBodyMatchNotProven,
         apply_contained_upgrade,
         apply_ordered_body_quarantine,
+        apply_strong_equivalent_quarantine,
         house_review_move,
         queue_candidate,
     )
@@ -1659,19 +1712,32 @@ def _managed_auditor_queue_records(
             "status": status,
             "classification": classification,
             "review_id": review_id,
+            "final_quarantine": classification in AUDITOR_STRONG_CLASSES,
         }
         if not dry_run:
-            result = queue_candidate(
-                conn,
-                candidate_file_id=entry["file_id"],
-                reference_file_id=reference["file_id"],
-                classification=classification,
-                queue_dir=destination,
-                run_id=actual_run_id,
-                review_id=review_id,
-                allow_unassigned_reference=True,
-            )
-            record["dest_path"] = result["dest_path"]
+            if classification in AUDITOR_STRONG_CLASSES:
+                result = apply_strong_equivalent_quarantine(
+                    conn,
+                    review_id=review_id,
+                    discard_file_id=entry["file_id"],
+                    keep_file_id=reference["file_id"],
+                    classification=classification,
+                    quarantine_dir=strong_dir,
+                    run_id=actual_run_id,
+                )
+                record["dest_path"] = result["dest_path"]
+            else:
+                result = queue_candidate(
+                    conn,
+                    candidate_file_id=entry["file_id"],
+                    reference_file_id=reference["file_id"],
+                    classification=classification,
+                    queue_dir=destination,
+                    run_id=actual_run_id,
+                    review_id=review_id,
+                    allow_unassigned_reference=True,
+                )
+                record["dest_path"] = result["dest_path"]
             record["operation_id"] = result["operation_id"]
         records.append(record)
         queued_paths.add(entry["path"])
@@ -1706,24 +1772,40 @@ def _managed_auditor_queue_records(
             "status": status,
             "classification": classification,
             "review_id": review_id,
+            "final_quarantine": classification in AUDITOR_STRONG_CLASSES,
         }
         if not dry_run:
-            result = house_review_move(
-                conn,
-                review_id=review_id,
-                move_file_id=entry["file_id"],
-                keep_file_id=reference["file_id"],
-                classification=classification,
-                queue_dir=destination,
-                run_id=actual_run_id,
-            )
-            record["dest_path"] = result["destination"]
+            if classification in AUDITOR_STRONG_CLASSES:
+                result = apply_strong_equivalent_quarantine(
+                    conn,
+                    review_id=review_id,
+                    discard_file_id=entry["file_id"],
+                    keep_file_id=reference["file_id"],
+                    classification=classification,
+                    quarantine_dir=strong_dir,
+                    run_id=actual_run_id,
+                )
+                record["dest_path"] = result["dest_path"]
+            else:
+                result = house_review_move(
+                    conn,
+                    review_id=review_id,
+                    move_file_id=entry["file_id"],
+                    keep_file_id=reference["file_id"],
+                    classification=classification,
+                    queue_dir=destination,
+                    run_id=actual_run_id,
+                )
+                record["dest_path"] = result["destination"]
             record["operation_id"] = result["operation_id"]
         records.append(record)
         queued_paths.add(entry["path"])
 
     try:
         suspected_dir = os.path.join(temp_dir, "trash_bin", "suspected_duplicates")
+        strong_dir = os.path.join(
+            temp_dir, "trash_bin", "strong_equivalent_duplicates"
+        )
         warning_dir = os.path.join(temp_dir, "trash_bin", "warning")
         superseded_dir = os.path.join(temp_dir, "trash_bin", "superseded_versions")
         ordered_dir = os.path.join(temp_dir, "trash_bin", "ordered_body_duplicates")
@@ -2542,6 +2624,12 @@ def _clean_duplicates_impl(
     # status='moved'만 중복 큐 이동으로 집계. 'warning' 보류는 따로 센다.
     # 본문 same 확정 중복(suspected_duplicates로 이동).
     moved_records = [r for r in suspect_move_records if r.get("status") == "moved"]
+    strong_quarantine_records = [
+        r for r in moved_records if r.get("final_quarantine")
+    ]
+    review_moved_records = [
+        r for r in moved_records if not r.get("final_quarantine")
+    ]
     # 애매 + 작가 충돌(author_conflicts로 이동, 사람 판별).
     author_review_records = [r for r in suspect_move_records if r.get("status") == "author_review"]
     # 애매 보류: 출처와 무관하게 warning 검토 큐로 이동.
@@ -2557,9 +2645,9 @@ def _clean_duplicates_impl(
         if r.get("status") == "metadata_only"
     ]
     author_conflict_count = len(author_review_records)
-    same_author_count = len(moved_records)
+    same_author_count = len(review_moved_records)
     review_queue_move_count = (
-        len(moved_records) + len(author_review_records) +
+        len(review_moved_records) + len(author_review_records) +
         len([r for r in warning_records if r.get("status") == "warning"]) +
         len([r for r in metadata_only_records if r.get("status") == "metadata_only"])
     )
@@ -2622,6 +2710,7 @@ def _clean_duplicates_impl(
         "multi_representative_conflict_count": len(multi_representative_paths),
         "suspect_group_count": len(suspect_groups),
         "suspect_move_count": len(moved_records),
+        "strong_equivalent_quarantine_count": len(strong_quarantine_records),
         "review_queue_move_count": review_queue_move_count,
         "warning_count": len(warning_records),
         "contained_upgrade_count": len(superseded_records),
@@ -2677,9 +2766,15 @@ def _clean_duplicates_impl(
         print(f"→ auditor report-only 직접 관계: {len(auditor_relations)}개")
         print(f"→ 좌표/identity 차단 strong 관계: {len(blocked_strong_relations)}개")
     if move_suspects:
-        print(
-            f"→ 중복 확정 이동(suspected): {len(moved_records)}개"
-        )
+        if strong_quarantine_records:
+            print(
+                "→ 강한 동일 본문 최종 격리: "
+                f"{len(strong_quarantine_records)}개 (복구 가능)"
+            )
+        if review_moved_records:
+            print(
+                f"→ 중복 의심 검토 큐 이동: {len(review_moved_records)}개"
+            )
         if author_review_records:
             print(f"→ 작가 충돌 큐(author_conflicts): {len(author_review_records)}개 (사람 판별)")
         if warning_records:
@@ -2702,7 +2797,10 @@ def _clean_duplicates_impl(
         print("📝 pure-plan: DB/index/report write 없음")
     else:
         print("⚠️ 구조화 검토 보고서를 저장하지 못했습니다.")
-    print("✨ 중복/검토 큐 정리 완료. (검토 큐는 자동 삭제 아님. 판정은 dedup_decisions.py, 복원은 restore_suspects.py)\n")
+    print(
+        "✨ 중복 정리 완료. (강한 동일성은 복구 가능한 최종 quarantine, "
+        "나머지 검토 큐는 자동 삭제 아님)\n"
+    )
     return summary
 
 

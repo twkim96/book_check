@@ -193,38 +193,198 @@ def _validate_purge_candidate(conn, row):
     if any(value is None for value in parent_values):
         raise RuntimeError("legacy quarantine has no owned destination evidence")
     parent_evidence = FileEvidence(*parent_values)
-    if not evidence_matches(quarantine_evidence, parent_evidence):
-        raise RuntimeError(f"quarantine journal ownership is stale: {quarantine}")
+    parent_identity_matches = evidence_matches(
+        quarantine_evidence, parent_evidence
+    )
 
     quarantined_fp = conn.execute(
         "SELECT raw_sha256 FROM fingerprints WHERE fingerprint_id = ? AND file_id = ?",
         (row["expected_fingerprint_id"], row["file_id"]),
     ).fetchone()
     if (
-        quarantined_fp is None or not quarantined_fp["raw_sha256"]
-        or quarantined_fp["raw_sha256"] != quarantine_evidence.sha256
+        quarantined_fp is not None
+        and quarantined_fp["raw_sha256"]
+        and quarantined_fp["raw_sha256"] != quarantine_evidence.sha256
     ):
         raise RuntimeError("purge quarantined fingerprint evidence is stale")
+
+    # An old quarantine may have lost its original keep through later library
+    # cleanup.  A user-approved cleanup can bind it to a freshly inspected
+    # current keep.  The child operation must belong to a committed, hashed
+    # 1.4.4 plan group and both endpoint identities are rechecked from disk.
+    revalidation = conn.execute(
+        """
+        SELECT child.*, keep.canonical_path AS keep_path,
+               keep.source AS keep_source, keep.active AS keep_active,
+               keep.current_fingerprint_id AS keep_current_fingerprint_id,
+               keep.dev AS keep_dev, keep.ino AS keep_ino,
+               keep.ctime_ns AS keep_ctime_ns, keep.size AS keep_size,
+               keep.mtime_ns AS keep_mtime_ns,
+               og.action AS group_action, og.state AS group_state,
+               og.plan_sha256 AS group_plan_sha256
+        FROM operations AS child
+        JOIN files AS keep ON keep.file_id = child.keep_file_id
+        JOIN operation_groups AS og ON og.group_id = child.operation_group_id
+        WHERE child.parent_operation_id = ?
+          AND child.action = 'user_approved_purge_revalidation'
+          AND child.state = 'committed'
+        ORDER BY child.operation_id DESC LIMIT 1
+        """,
+        (row["operation_id"],),
+    ).fetchone()
+    if revalidation is not None:
+        source_owned = (
+            revalidation["source_path"] == str(quarantine)
+            and revalidation["file_id"] == row["file_id"]
+            and revalidation["source_dev"] == quarantine_evidence.dev
+            and revalidation["source_ino"] == quarantine_evidence.ino
+            and revalidation["source_ctime_ns"] == quarantine_evidence.ctime_ns
+            and revalidation["expected_size"] == quarantine_evidence.size
+            and revalidation["expected_mtime_ns"] == quarantine_evidence.mtime_ns
+            and revalidation["source_sha256"] == quarantine_evidence.sha256
+        )
+        keep_path = Path(revalidation["keep_path"])
+        if keep_path.is_symlink() or not keep_path.is_file():
+            raise RuntimeError("user purge revalidated keep path is stale")
+        keep_evidence = inspect_regular_file(keep_path)
+        current_keep = (
+            revalidation["keep_dev"], revalidation["keep_ino"],
+            revalidation["keep_ctime_ns"], revalidation["keep_size"],
+            revalidation["keep_mtime_ns"],
+        )
+        actual_keep = (
+            keep_evidence.dev, keep_evidence.ino, keep_evidence.ctime_ns,
+            keep_evidence.size, keep_evidence.mtime_ns,
+        )
+        recorded_keep = (
+            revalidation["destination_dev"],
+            revalidation["destination_ino"],
+            revalidation["destination_ctime_ns"],
+            revalidation["destination_size"],
+            revalidation["destination_mtime_ns"],
+            revalidation["destination_sha256"],
+        )
+        if (
+            not source_owned
+            or revalidation["group_action"]
+            != "quarantine_cleanup_1_4_4_revalidation"
+            or revalidation["group_state"] != "committed"
+            or not revalidation["group_plan_sha256"]
+            or not revalidation["keep_active"]
+            or revalidation["keep_source"] != "house"
+            or revalidation["keep_current_fingerprint_id"]
+            != revalidation["expected_keep_fingerprint_id"]
+            or current_keep != actual_keep
+            or recorded_keep != (*actual_keep, keep_evidence.sha256)
+        ):
+            raise RuntimeError("user purge revalidation evidence is stale")
+        return quarantine, quarantine_evidence, keep_path
+
+    if not parent_identity_matches:
+        raise RuntimeError(
+            f"quarantine journal ownership is stale: {quarantine}"
+        )
+
+    # Exact quarantine already proved byte identity at mutation time.  A later
+    # rescan, filename edit, or series-folder relocation may legitimately give
+    # the surviving house file a new fingerprint ID or leave it unassigned.
+    # Purge therefore re-proves the only property that matters for data
+    # retention: an active current house file still contains the exact bytes.
+    # Managed/representative identity is intentionally irrelevant here.
+    if row["action"] == "exact_quarantine":
+        def current_exact_copy(file_row):
+            if (
+                file_row is None
+                or not file_row["active"]
+                or file_row["source"] != "house"
+            ):
+                return False
+            path = Path(file_row["canonical_path"])
+            if path.is_symlink() or not path.is_file():
+                return False
+            evidence = inspect_regular_file(path)
+            expected_identity = (
+                file_row["dev"], file_row["ino"], file_row["ctime_ns"],
+                file_row["size"], file_row["mtime_ns"],
+            )
+            actual_identity = (
+                evidence.dev, evidence.ino, evidence.ctime_ns,
+                evidence.size, evidence.mtime_ns,
+            )
+            return (
+                expected_identity == actual_identity
+                and evidence.sha256 == quarantine_evidence.sha256
+            )
+
+        keep = conn.execute(
+            """
+            SELECT file_id, canonical_path, source, active,
+                   dev, ino, ctime_ns, size, mtime_ns
+            FROM files WHERE file_id = ?
+            """,
+            (row["keep_file_id"],),
+        ).fetchone()
+        if current_exact_copy(keep):
+            return quarantine, parent_evidence, Path(keep["canonical_path"])
+
+        # The original keep can itself be superseded later.  Follow only a
+        # current raw-SHA fingerprint to another active house copy, then hash
+        # that copy from disk before accepting it.  The index is merely a
+        # candidate locator; it is never the final proof.
+        replacements = conn.execute(
+            """
+            SELECT f.file_id, f.canonical_path, f.source, f.active,
+                   f.dev, f.ino, f.ctime_ns, f.size, f.mtime_ns
+            FROM files AS f
+            JOIN fingerprints AS fp
+              ON fp.fingerprint_id = f.current_fingerprint_id
+            WHERE f.active = 1 AND f.source = 'house'
+              AND fp.raw_sha256 = ?
+            ORDER BY f.canonical_path
+            """,
+            (quarantine_evidence.sha256,),
+        ).fetchall()
+        replacement = next(
+            (candidate for candidate in replacements if current_exact_copy(candidate)),
+            None,
+        )
+        if replacement is not None:
+            return (
+                quarantine,
+                parent_evidence,
+                Path(replacement["canonical_path"]),
+            )
+        raise RuntimeError("purge exact house byte copy is missing or stale")
 
     # user_quarantine records an explicit human discard, not byte equality.
     # A paired keep must remain the exact approved snapshot; a standalone
     # action-inbox discard has no keep and is authorized by the two explicit
     # approvals (placing it in delete, then running purge) plus owned evidence.
     if row["action"] == "user_quarantine":
+        # decode-lossy/EPUB fingerprints may intentionally omit raw_sha256.
+        # The committed user_quarantine journal still owns a full source and
+        # destination SHA-256, checked above against the current bytes.
         if row["keep_file_id"] is not None:
             keep = conn.execute(
                 """
                 SELECT f.canonical_path, f.active, f.current_fingerprint_id,
-                       f.dev, f.ino, f.ctime_ns, f.size, f.mtime_ns
-                FROM files AS f WHERE f.file_id = ?
+                       f.source, f.dev, f.ino, f.ctime_ns, f.size, f.mtime_ns,
+                       current_fp.raw_sha256 AS current_raw_sha256,
+                       expected_fp.raw_sha256 AS expected_raw_sha256
+                FROM files AS f
+                LEFT JOIN fingerprints AS current_fp
+                  ON current_fp.fingerprint_id = f.current_fingerprint_id
+                LEFT JOIN fingerprints AS expected_fp
+                  ON expected_fp.fingerprint_id = ?
+                WHERE f.file_id = ?
                 """,
-                (row["keep_file_id"],),
+                (row["expected_keep_fingerprint_id"], row["keep_file_id"]),
             ).fetchone()
             if (
                 keep is None or not keep["active"]
-                or keep["current_fingerprint_id"] != row["expected_keep_fingerprint_id"]
+                or keep["source"] != "house"
             ):
-                raise RuntimeError("user purge keep file is missing or fingerprint-stale")
+                raise RuntimeError("user purge keep file is missing or outside house")
             keep_evidence = inspect_regular_file(keep["canonical_path"])
             expected_keep = (
                 keep["dev"], keep["ino"], keep["ctime_ns"],
@@ -236,7 +396,20 @@ def _validate_purge_candidate(conn, row):
             )
             if expected_keep != actual_keep:
                 raise RuntimeError("user purge keep snapshot is stale")
-        return quarantine, parent_evidence
+            if keep["current_fingerprint_id"] != row["expected_keep_fingerprint_id"]:
+                if (
+                    not keep["expected_raw_sha256"]
+                    or keep["current_raw_sha256"] != keep["expected_raw_sha256"]
+                    or keep_evidence.sha256 != keep["expected_raw_sha256"]
+                ):
+                    raise RuntimeError(
+                        "user purge keep content changed after quarantine"
+                    )
+            return quarantine, parent_evidence, Path(keep["canonical_path"])
+        return quarantine, parent_evidence, None
+
+    if quarantined_fp is None or not quarantined_fp["raw_sha256"]:
+        raise RuntimeError("purge quarantined fingerprint evidence is stale")
 
     keep = conn.execute(
         """
@@ -284,7 +457,7 @@ def _validate_purge_candidate(conn, row):
         ).fetchone()
         if decision is None:
             raise RuntimeError("human quarantine decision is no longer active")
-        return quarantine, parent_evidence
+        return quarantine, parent_evidence, keep_path
 
     if quarantined_fp is None or not quarantined_fp["raw_sha256"] or not keep["raw_sha256"]:
         raise RuntimeError("purge raw fingerprint evidence is missing")
@@ -297,7 +470,7 @@ def _validate_purge_candidate(conn, row):
         or keep_hash != keep["raw_sha256"]
     ):
         raise RuntimeError("purge byte identity revalidation failed")
-    return quarantine, parent_evidence
+    return quarantine, parent_evidence, keep_path
 
 
 def _execute_purge(conn, older_than_days):
@@ -311,7 +484,7 @@ def _execute_purge(conn, older_than_days):
     purge_run_id = f"purge-{uuid.uuid4()}"
     purge_operations = []
     with decision_store.transaction(conn):
-        for row, (path, evidence) in zip(candidates, validated):
+        for row, (path, evidence, _keep_path) in zip(candidates, validated):
             purge_operations.append(decision_store.create_operation(
                 conn,
                 run_id=purge_run_id,
@@ -331,10 +504,10 @@ def _execute_purge(conn, older_than_days):
             ))
     purged = []
     from mutation_io import unlink_owned
-    for row, (path, evidence), purge_operation_id in zip(
+    for row, (path, evidence, _keep_path), purge_operation_id in zip(
         candidates, validated, purge_operations
     ):
-        _, current_evidence = _validate_purge_candidate(conn, row)
+        _, current_evidence, _ = _validate_purge_candidate(conn, row)
         unlink_owned(path, expected=evidence)
         with decision_store.transaction(conn):
             decision_store.transition_operation(conn, purge_operation_id, "fs_done")

@@ -118,7 +118,7 @@ def test_index_failure_marks_actual_run_failed(tmp_path, monkeypatch):
     fixture["conn"].close()
     monkeypatch.setattr(
         run_house_cleanup_once,
-        "house_review_move",
+        "apply_strong_equivalent_quarantine",
         lambda *args, **kwargs: {"operation_id": 1},
     )
     monkeypatch.setattr(
@@ -259,7 +259,7 @@ def test_house_cleanup_terminal_failure_keeps_intent(
     calls = []
     monkeypatch.setattr(
         run_house_cleanup_once,
-        "house_review_move",
+        "apply_strong_equivalent_quarantine",
         lambda *args, **kwargs: calls.append(kwargs) or {"operation_id": 7},
     )
     monkeypatch.setattr(

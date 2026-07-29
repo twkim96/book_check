@@ -447,6 +447,7 @@ def _quarantine_origin(conn, operation_id: int):
 def restore_preview(
     state_db: Path, *, house_dir: Path, operation_id: int,
     reference_file_id: str | None, verdict: str, note: str = "",
+    destination_rel: str | None = None,
 ) -> dict:
     if verdict not in RESTORE_VERDICTS:
         raise ValueError("restore verdict must preserve distinct content")
@@ -461,11 +462,29 @@ def restore_preview(
         if origin["file_active"] or origin["file_source"] != "quarantine":
             blockers.append("file_not_quarantined")
         quarantine_path = Path(origin["quarantine_path"] or origin["dest_path"] or "")
-        destination = Path(origin["source_path"]).resolve()
-        try:
-            destination.relative_to(Path(house_dir).resolve())
-        except ValueError:
-            blockers.append("original_path_outside_house")
+        house_root = Path(house_dir).resolve()
+        if destination_rel is None:
+            destination = Path(origin["source_path"]).resolve()
+            try:
+                destination.relative_to(house_root)
+            except ValueError:
+                blockers.append("original_path_outside_house")
+        else:
+            relative = Path(str(destination_rel).strip())
+            if (
+                not str(destination_rel).strip()
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or not relative.parts
+            ):
+                blockers.append("invalid_explicit_destination")
+                destination = house_root
+            else:
+                destination = (house_root / relative).resolve()
+                try:
+                    destination.relative_to(house_root)
+                except ValueError:
+                    blockers.append("explicit_destination_outside_house")
         if not quarantine_path.is_file() or quarantine_path.is_symlink():
             blockers.append("quarantine_bytes_missing")
         else:
@@ -499,7 +518,9 @@ def restore_preview(
             "fingerprint_id": origin["file_fingerprint_id"],
             "reference_file_id": reference_file_id,
             "reference_fingerprint_id": reference["current_fingerprint_id"] if reference else None,
-            "verdict": verdict, "destination": str(destination), "note": note.strip(),
+            "verdict": verdict, "destination": str(destination),
+            "destination_rel": str(destination_rel).strip() if destination_rel is not None else None,
+            "note": note.strip(),
         }
         return {
             "version": "1.3.2", "kind": "quarantine_restore", "item_count": 1,
@@ -623,12 +644,14 @@ def apply_restore(
     state_db: Path, *, house_dir: Path, temp_dir: Path, index_path: Path,
     operation_id: int, reference_file_id: str | None, verdict: str, note: str,
     confirm_count: int, confirm_plan_sha256: str, progress=None,
+    destination_rel: str | None = None,
 ) -> dict:
     from library_review import _refresh_review_index
     with mutation_lock_for_roots(house_dir, temp_dir, "quarantine-restore-1.3.2"):
         plan = restore_preview(
             state_db, house_dir=house_dir, operation_id=operation_id,
             reference_file_id=reference_file_id, verdict=verdict, note=note,
+            destination_rel=destination_rel,
         )
         if not plan["apply_available"]:
             raise RuntimeError("restore plan is blocked: " + ",".join(plan["blocked_reasons"]))
@@ -722,23 +745,20 @@ def purge_preview(state_db: Path, *, operation_ids: Sequence[int]) -> dict:
                 size = 0
             else:
                 evidence = inspect_regular_file(path)
-                expected = (row["parent_dev"], row["parent_ino"], row["parent_ctime_ns"],
-                            row["parent_size"], row["parent_mtime_ns"], row["parent_sha256"])
-                actual = (evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size,
-                          evidence.mtime_ns, evidence.sha256)
-                if expected != actual:
-                    item_blockers.append("quarantine_identity_stale")
                 size = evidence.size
-                if not item_blockers:
-                    try:
-                        _validate_purge_candidate(conn, row)
-                    except RuntimeError as exc:
-                        item_blockers.append(f"safety_revalidation_failed:{exc}")
+                try:
+                    _, _, validated_keep_path = _validate_purge_candidate(conn, row)
+                except RuntimeError as exc:
+                    item_blockers.append(f"safety_revalidation_failed:{exc}")
             blockers.extend(f"{row['operation_id']}:{value}" for value in item_blockers)
             total_size += size
             items.append({"operation_id": row["operation_id"], "file_id": row["file_id"],
                           "name": path.name, "path": str(path), "size": size,
-                          "keep_path": row["keep_path"],
+                          "keep_path": (
+                              str(validated_keep_path)
+                              if not item_blockers and validated_keep_path is not None
+                              else row["keep_path"]
+                          ),
                           "age_days": max(0, int((datetime.now().timestamp() - path.stat().st_mtime) // 86400)) if path.is_file() else None,
                           "blocked_reasons": item_blockers})
         payload = {"operation_ids": selected, "items": [(item["operation_id"], item["size"]) for item in items]}

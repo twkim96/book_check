@@ -2062,6 +2062,11 @@ def _process_items_authorized(
     print("=" * 60)
     if dedup_summary:
         print(
+            "  강한 동일성: TXT/EPUB 현재 본문 재검증 후 "
+            f"{dedup_summary.get('strong_equivalent_quarantine_count', 0)}개 "
+            "최종 복구 가능 격리"
+        )
+        print(
             f"  중복/검토 큐: 정확 중복 {dedup_summary['exact_count']}개, "
             f"검토 큐 {dedup_summary.get('review_queue_move_count', dedup_summary['suspect_move_count'])}개 격리 "
             f"(같은 작가/미상 {dedup_summary.get('same_author_count', 0)}, "

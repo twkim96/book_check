@@ -13,6 +13,7 @@ REVIEW_QUEUE_NAMES = (
     "exact_quarantine",
     "exact_duplicates",
     "suspected_duplicates",
+    "strong_equivalent_duplicates",
     "author_conflicts",
     "ordered_body_duplicates",
     "warning",

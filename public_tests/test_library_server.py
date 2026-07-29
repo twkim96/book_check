@@ -61,6 +61,7 @@ def _server_fixture(tmp_path):
         index_path=index,
         runtime_dir=runtime,
         frontend_dist=frontend,
+        project_root=tmp_path,
     )
     app.config.update(TESTING=True)
     return app, row["file_id"]

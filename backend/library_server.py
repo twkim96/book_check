@@ -86,7 +86,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.3"
+SERVER_VERSION = "1.4.4"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -512,7 +512,8 @@ def create_app(
             config.state_db, house_dir=config.house_dir, temp_dir=config.temp_dir,
             index_path=config.index_path, operation_id=payload["operation_id"],
             reference_file_id=payload.get("reference_file_id"), verdict=payload["verdict"],
-            note=payload.get("note", ""), confirm_count=payload["confirm_count"],
+            note=payload.get("note", ""), destination_rel=payload.get("destination_rel"),
+            confirm_count=payload["confirm_count"],
             confirm_plan_sha256=payload["confirm_plan_sha256"],
             progress=lambda current, total, name: progress(
                 current, total, f"격리 복원 {current:,}/{total:,}: {name}"
@@ -951,6 +952,7 @@ def create_app(
             operation_id=int(body.get("operation_id", -1)),
             reference_file_id=(str(body["reference_file_id"]) if body.get("reference_file_id") else None),
             verdict=str(body.get("verdict") or ""), note=str(body.get("note") or ""),
+            destination_rel=(str(body["destination_rel"]) if body.get("destination_rel") else None),
         )})
 
     @app.post("/api/management/quarantine/restore/apply")
@@ -960,6 +962,7 @@ def create_app(
             "operation_id": int(body.get("operation_id", -1)),
             "reference_file_id": str(body["reference_file_id"]) if body.get("reference_file_id") else None,
             "verdict": str(body.get("verdict") or ""), "note": str(body.get("note") or ""),
+            "destination_rel": str(body["destination_rel"]) if body.get("destination_rel") else None,
             "confirm_count": int(body.get("confirm_count", -1)),
             "confirm_plan_sha256": str(body.get("confirm_plan_sha256") or ""),
         })

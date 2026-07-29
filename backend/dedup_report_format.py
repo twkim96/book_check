@@ -44,6 +44,8 @@ def dedup_report_summary_line(payload: Mapping[str, Any]) -> str:
         f"정확 중복 {exact_action} {summary.get('exact_mutation_count', exact_count)}개 | "
         f"legacy report-only {summary.get('legacy_report_only_count', 0)}개 | "
         f"managed report-only {summary.get('managed_report_only_count', 0)}개 | "
+        "강한 동일 본문 최종 격리 "
+        f"{summary.get('strong_equivalent_quarantine_count', 0)}개 | "
         f"검토 큐 그룹 {suspect_group_count}개 | "
         f"검토 큐 이동 {summary.get('review_queue_move_count', suspect_move_count)}개 "
         f"(같은 작가/미상 {summary.get('same_author_count', 0)}, "
@@ -71,7 +73,11 @@ def render_dedup_report_text(payload: Mapping[str, Any]) -> str:
     output = StringIO()
     output.write("[중복/검토 큐 정리 로그]\n")
     output.write("완전 중복은 raw SHA 재검증 뒤 quarantine으로 논리 삭제하며 즉시 unlink하지 않습니다.\n")
-    output.write("검토 큐는 핵심 제목이 같아 사람 검토가 필요한 항목입니다. 자동 삭제 대상이 아닙니다.\n")
+    output.write(
+        "TXT 정규화 본문 또는 EPUB 읽기 payload가 같은 강한 동일 판본은 "
+        "복구 가능한 최종 quarantine으로 자동 격리합니다.\n"
+    )
+    output.write("그 밖의 검토 큐는 사람 검토가 필요하며 자동 삭제 대상이 아닙니다.\n")
     output.write("- 별개 작품/판본 판정은 dedup_decisions.py에 기록하세요. pass/는 판정 입력이 아닙니다.\n")
     output.write("- 잘못 이동된 경우 restore_suspects.py --dry-run 으로 먼저 확인 후 --run 으로 복원하세요.\n\n")
     output.write("======================================================================\n")
@@ -128,8 +134,18 @@ def render_dedup_report_text(payload: Mapping[str, Any]) -> str:
                 if entry.get("path") == keep.get("path"):
                     continue
                 path = entry.get("path")
-                if path in paths_by_status.get("moved", set()):
-                    marker = "[중복 확정 → suspected]"
+                moved_record = next(
+                    (
+                        record for record in suspect_move_records
+                        if record.get("status") == "moved"
+                        and (record.get("entry") or {}).get("path") == path
+                    ),
+                    None,
+                )
+                if moved_record and moved_record.get("final_quarantine"):
+                    marker = "[강한 동일 본문 → 최종 복구 가능 격리]"
+                elif moved_record:
+                    marker = "[중복 의심 → 검토 큐]"
                 elif path in paths_by_status.get("author_review", set()):
                     marker = "[애매·작가충돌 → author_conflicts]"
                 elif path in paths_by_status.get("warning", set()):

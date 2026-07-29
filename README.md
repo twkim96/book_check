@@ -35,12 +35,14 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.2)
+## 동일 작품 자동 중복 정리 계약 (1.4.4)
 
-1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음 결과는
+1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
+1.4.4의 강한 동일성 최종 격리·격리 수명주기 결과는
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
-[`update_1.4.3.md`](update_1.4.3.md)에 기록합니다.
+[`update_1.4.3.md`](update_1.4.3.md),
+[`update_1.4.4.md`](update_1.4.4.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -60,7 +62,7 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이미 house에 두 판본이 함께 남아 있어도 같은 현재 증거가 성립하면 긴 판본만 남깁니다. 실제 bytes를
 바로 삭제하지 않으며, 격리 파일과 operation journal로 복구할 수 있습니다.
 
-### 1.4.2 강한 동일성 우선 계약
+### 1.4.4 강한 동일성 최종 격리 계약
 
 다음 증거는 제목·회차·완결·외전 표기보다 강합니다. 현재 두 파일을 mutation 직전에 다시 읽어
 같음이 재확인되면 신규 temp뿐 아니라 과거 house-house 중복도 자동으로 복구 가능한 격리에 보냅니다.
@@ -71,15 +73,31 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
    metadata뿐임. 이 경우에도 manifest, spine 순서, navigation, 본문, 이미지, CSS 등 실제 읽기
    자원은 전부 같아야 합니다.
 
-원시 SHA가 같으면 파일명의 `1권`/`9권`, `완결`/`외전` 같은 좌표 충돌 때문에 보관하지 않습니다.
-읽기 payload 동일 EPUB도 `warning`이 아니라 `suspected_duplicates`로 자동 격리합니다. 단, 보호 파일,
-서로 다른 managed work/variant에 이미 사람 결정으로 연결된 파일, 하나의 입력이 여러 managed 대표와
-동시에 같아지는 관계는 자동 처리하지 않습니다. 이 예외에서는 입고 자체도 차단하여 중복 파일이
-house로 흘러들어가지 않게 합니다.
+TXT 정규화 본문 또는 EPUB strict/reading payload가 같은 파일은 이제 사람 검토용
+`suspected_duplicates`에 머물지 않습니다. mutation 직전 현재 파일을 다시 읽어 같음이 확인되면
+`trash_bin/strong_equivalent_duplicates`의 **최종 복구 가능 quarantine**으로 이동하고 DB에는
+`user_quarantine` journal을 남깁니다. `review_queue_move_count`에는 포함하지 않으며
+`strong_equivalent_quarantine_count`로 별도 집계합니다.
+
+강한 본문 증거도 명시적인 **같은 작품의 서로 다른 분권 좌표**를 합치지는 않습니다. 같은 core의
+`1권`과 `2권`, `1-100`과 `105-200`처럼 서로 다른 형제 권·분할 구간은 중복이 아니라 시리즈 구성일
+수 있으므로 자동 격리를 차단합니다. 반면 `1-100`과 `1-150`, `1-150`과
+`1-130 외전 1-20`, `1-150화`와 `1-9권`처럼 기존에 허용한 중첩·외전 총량·회차판/단행본판 관계는
+현재 본문 증거가 같으면 자동 처리합니다. 좌표가 없는 합본이 `1권`과 `2권` 양쪽을 이어 하나의
+동일성 component로 만드는 것도 pairwise 좌표 검사로 차단합니다.
+
+서로 다른 core의 파일이 원시 바이트 전체까지 같은 legacy exact 사례는 이름이 잘못 붙은 같은 파일로
+처리할 수 있습니다. 단, 같은 core에서 명시적 형제 권 좌표가 충돌하면 원시 SHA가 같아도 report-only로
+남겨 도서 소실을 우선 방지합니다. 보호 파일, 서로 다른 managed work/variant에 이미 사람 결정으로
+연결된 파일, 하나의 입력이 여러 managed 대표와 동시에 같아지는 관계, house 대표 없이 temp 파일끼리만
+같은 관계도 자동 처리하지 않습니다.
 
 macOS의 NFD 파일명과 DB의 NFC canonical path는 같은 경로로 연결합니다. Finder에서 파일을 열거나
-이름 편집창에 들어간 뒤 시각 metadata가 바뀐 경우에도 시각만으로 keep을 정하지 않고, 현재 bytes와
-본문/EPUB payload를 다시 읽어 결정합니다.
+이름 편집창에 들어간 뒤 inode·mtime·ctime이 바뀐 경우에도 시각만으로 keep을 정하지 않고, 현재
+bytes와 본문/EPUB payload를 다시 읽어 결정합니다. 오래된 quarantine을 영구 삭제할 때도 과거
+fingerprint ID나 대표 assignment가 그대로인지 요구하지 않습니다. exact 격리는 현재 house의 원본
+바이트 사본을 다시 해시하고, 사람 승인 격리는 승인 계획 SHA·현재 manifest·양쪽 현재 SHA-256을 묶은
+`user_approved_purge_revalidation` journal이 있을 때만 metadata drift를 허용합니다.
 
 강한 동일성으로 확정되지 않은 TXT 판본에는 1.4.1의 서로 보완하는 두 자동 확정 경로가 있습니다.
 
@@ -155,8 +173,8 @@ auditor report에는 이 자동 재시도를 적용하지 않습니다.
 - decode 실패, EPUB 구조 오류처럼 현재 본문 증거를 만들 수 없음
 
 위 목록의 좌표·작가 조건은 포함판/95%처럼 확률적 판본 추론에 적용됩니다. 현재 원시 SHA, TXT
-정규화 SHA, EPUB strict/reading-payload SHA가 완전히 같은 경우에는 1.4.2 강한 동일성 계약이 먼저
-적용됩니다.
+정규화 SHA, EPUB strict/reading-payload SHA가 완전히 같은 경우에는 1.4.4 강한 동일성 계약이 먼저
+적용되지만, 같은 core의 명시적 형제 권·서로 떨어진 분할 회차 차단은 이 경우에도 유지됩니다.
 
 같은 current fingerprint pair에 과거의 약한 open review가 있어도 새 auditor가 더 강한 판정을
 증명하면 classification과 evidence를 현재 결과로 갱신합니다. 예를 들어 과거 `metadata_only`였던
@@ -175,6 +193,35 @@ operation ID, quarantine operation ID와 최종 `trash_bin/ordered_body_duplicat
 바뀌는지 명시해야 합니다. 원시/정규화/EPUB payload 경계를 바꿀 때는
 `public_tests/test_legacy_exact_cleanup.py`, `public_tests/test_epub_duplicate_audit.py`,
 `public_tests/test_strong_equivalent_autocleanup_1_4_2.py`도 함께 검증해야 합니다.
+
+### 1.4.4 격리 수명주기와 전수 정리
+
+복구 가능한 quarantine과 영구 삭제는 별도 단계입니다. 자동 중복 판정은 파일을 즉시 unlink하지 않고
+항상 quarantine journal을 먼저 만듭니다. 영구 삭제는 사용자가 선택한 plan SHA를 명시적으로 승인한
+뒤 다음을 다시 만족해야 합니다.
+
+1. 격리 파일의 현재 SHA-256이 원래 journal 또는 plan-bound 재승인 journal과 같습니다.
+2. 남길 파일이 현재 house에 활성 상태로 있고, DB identity와 실제 파일 identity가 같습니다.
+3. exact 격리는 남길 현재 house 파일의 전체 raw SHA가 격리 파일과 다시 같습니다.
+4. 오래된 사람 승인 격리의 대표가 이동·교체됐다면 현재 keep과 격리를 같은 actual manifest에서 읽고
+   승인 plan SHA를 가진 committed operation group으로 다시 묶습니다.
+5. 삭제 직전 백업과 manifest를 만들고, 각 unlink를 독립 `quarantine_purge` operation으로 기록합니다.
+6. 종료 조건은 `PRAGMA integrity_check=ok`, Doctor 0, 선택한 quarantine 잔여 0입니다.
+
+2026-07-29 전수 감사에서는
+[`quarantine_cleanup_plan_20260729_v1_4_4.json`](quarantine_cleanup_plan_20260729_v1_4_4.json)의
+SHA `a23b9e42ddd3b273d1ae0224ac0b1b4d384d0417316b17de0e08af95d78fadd5`를 승인해 다음을 적용했습니다.
+
+- 별개 작품·고유 외전·90% 미만 판본 20권 복원
+- 더 긴 판본 3건 대표 교체
+- 검토 큐 50권 전부 판정(47권 중복 격리, 2권 대표 채택, DB 밖 1권 중복 격리)
+- 격리 2,248개, 8,445,820,651바이트 영구 삭제
+- 이미 실체가 없던 과거 격리 2건을 별도 승인 group으로 정합화
+- 최종 `txt_temp/trash_bin` 일반 파일 0개, Doctor 0, integrity check `ok`
+
+실행 도구는 `backend/cleanup_quarantine_1_4_4.py`, 감사 계획 생성기는
+`backend/build_quarantine_cleanup_plan_1_4_4.py`입니다. 실행 결과 원본은
+`txt_temp/dedup_logs/quarantine_cleanup_1_4_4_20260729_143535_894414.json`에 남습니다.
 
 ## 권별·부별·회차 분할 시리즈 폴더 계약 (1.4.3)
 

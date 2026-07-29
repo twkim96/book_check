@@ -97,10 +97,12 @@ def test_repacked_incoming_epub_is_automatically_quarantined(tmp_path):
 
     assert summary["exact_mutation_count"] == 0
     assert summary["suspect_move_count"] == 1
+    assert summary["strong_equivalent_quarantine_count"] == 1
+    assert summary["review_queue_move_count"] == 0
     assert summary["warning_count"] == 0
     assert (house / "신검의 계약자들 001-151 (완).epub").is_file()
     assert not (temp / "신검의 계약자들 ep001-151 (완) noPic ver.epub").exists()
-    assert len(list((temp / "trash_bin" / "suspected_duplicates").glob("*.epub"))) == 1
+    assert len(list((temp / "trash_bin" / "strong_equivalent_duplicates").glob("*.epub"))) == 1
 
     conn = decision_store.connect_state_db(state_db)
     try:
@@ -119,9 +121,11 @@ def test_repacked_house_epub_pair_is_automatically_reduced_to_one(tmp_path):
     summary = _run(house, temp, state_db, index_path)
 
     assert summary["suspect_move_count"] == 1
+    assert summary["strong_equivalent_quarantine_count"] == 1
+    assert summary["review_queue_move_count"] == 0
     assert summary["warning_count"] == 0
     assert sum((house / name).is_file() for name in names) == 1
-    assert len(list((temp / "trash_bin" / "suspected_duplicates").glob("*.epub"))) == 1
+    assert len(list((temp / "trash_bin" / "strong_equivalent_duplicates").glob("*.epub"))) == 1
 
     conn = decision_store.connect_state_db(state_db)
     try:
@@ -160,10 +164,12 @@ def test_metadata_only_epub_repack_is_revalidated_and_quarantined(tmp_path):
     summary = _run(house, temp, state_db, index_path)
 
     assert summary["suspect_move_count"] == 1
+    assert summary["strong_equivalent_quarantine_count"] == 1
+    assert summary["review_queue_move_count"] == 0
     assert summary["warning_count"] == 0
     assert existing.is_file()
     assert not incoming.exists()
-    assert len(list((temp / "trash_bin" / "suspected_duplicates").glob("*.epub"))) == 1
+    assert len(list((temp / "trash_bin" / "strong_equivalent_duplicates").glob("*.epub"))) == 1
     conn = decision_store.connect_state_db(state_db)
     try:
         assert decision_store.doctor_issues(conn) == []
@@ -201,9 +207,11 @@ def test_metadata_only_house_epub_repack_is_revalidated_and_reduced(tmp_path):
     summary = _run(house, temp, state_db, index_path)
 
     assert summary["suspect_move_count"] == 1
+    assert summary["strong_equivalent_quarantine_count"] == 1
+    assert summary["review_queue_move_count"] == 0
     assert summary["warning_count"] == 0
     assert sum(path.is_file() for path in (first, second)) == 1
-    assert len(list((temp / "trash_bin" / "suspected_duplicates").glob("*.epub"))) == 1
+    assert len(list((temp / "trash_bin" / "strong_equivalent_duplicates").glob("*.epub"))) == 1
     conn = decision_store.connect_state_db(state_db)
     try:
         assert decision_store.doctor_issues(conn) == []

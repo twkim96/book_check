@@ -13,7 +13,11 @@ from pathlib import Path
 
 import decision_store
 import folderling
-from dedup_mutations import HUMAN_REVIEW_CLASSES, house_review_move
+from dedup_mutations import (
+    HUMAN_REVIEW_CLASSES,
+    apply_strong_equivalent_quarantine,
+    house_review_move,
+)
 from deduplicator import get_better_entry
 from mutation_io import (
     ensure_directory_nofollow,
@@ -282,12 +286,28 @@ def run(
                         if plan["classification"] in {"text_equivalent", "epub_equivalent"}
                         else "house_cleanup_warning"
                     )
-                result = house_review_move(
-                    conn, review_id=plan["review_id"],
-                    move_file_id=plan["move_file_id"], keep_file_id=plan["keep_file_id"],
-                    classification=plan["classification"],
-                    queue_dir=Path(temp) / "trash_bin" / queue_name, run_id=run_id,
-                )
+                if plan["classification"] in EXACT_EQUIVALENT:
+                    result = apply_strong_equivalent_quarantine(
+                        conn,
+                        review_id=plan["review_id"],
+                        discard_file_id=plan["move_file_id"],
+                        keep_file_id=plan["keep_file_id"],
+                        classification=plan["classification"],
+                        quarantine_dir=(
+                            Path(temp) / "trash_bin" /
+                            "strong_equivalent_duplicates"
+                        ),
+                        run_id=run_id,
+                    )
+                else:
+                    result = house_review_move(
+                        conn, review_id=plan["review_id"],
+                        move_file_id=plan["move_file_id"],
+                        keep_file_id=plan["keep_file_id"],
+                        classification=plan["classification"],
+                        queue_dir=Path(temp) / "trash_bin" / queue_name,
+                        run_id=run_id,
+                    )
                 moved.append({**plan, **result})
             index_ok = folderling.generate_file_list(
                 [house], str(FILE_LIST),

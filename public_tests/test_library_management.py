@@ -4,7 +4,11 @@ from pathlib import Path
 import pytest
 
 import decision_store
-from dedup_mutations import _ensure_intake_fingerprint, _file_state
+from dedup_mutations import (
+    _ensure_intake_fingerprint,
+    _file_state,
+    record_user_approved_purge_revalidation,
+)
 from library_management import (
     apply_purge,
     apply_quarantine,
@@ -241,6 +245,74 @@ def test_selected_quarantine_purge_confirms_plan_and_releases_only_selected_byte
         ).fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_user_approved_revalidation_binds_old_quarantine_to_current_keep(tmp_path):
+    state_db, house, temp, index, paths, ids = _fixture(tmp_path)
+    plan = quarantine_preview(
+        state_db, temp_dir=temp, source_file_id=ids[0], keep_file_id=ids[1]
+    )
+    quarantined = apply_quarantine(
+        state_db, house_dir=house, temp_dir=temp, index_path=index,
+        source_file_id=ids[0], keep_file_id=ids[1],
+        confirm_count=1, confirm_plan_sha256=plan["plan_sha256"],
+    )
+
+    Path(quarantined["dest_path"]).touch()
+    paths[1].write_text("현재 감사에서 다시 승인한 다른 대표 본문", encoding="utf-8")
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, paths[1], source="house")
+        _ensure_intake_fingerprint(conn, _file_state(conn, ids[1]))
+    finally:
+        conn.close()
+    blocked = purge_preview(state_db, operation_ids=[quarantined["operation_id"]])
+    assert blocked["apply_available"] is False
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        backup = decision_store.backup_state_db(
+            conn, state_db.parent / "before-revalidation.sqlite3"
+        )
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+    run_id, manifest_path = decision_store.prepare_actual_run(
+        state_db, house, temp,
+        manifest_paths=[quarantined["dest_path"], paths[1]],
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            group_id = decision_store.create_operation_group(
+                conn, run_id=run_id,
+                action="quarantine_cleanup_1_4_4_revalidation",
+                plan_sha256="fixture-plan", item_count=1,
+                manifest_path=manifest_path,
+                source_manifest_json='{"fixture":true}',
+            )
+        record_user_approved_purge_revalidation(
+            conn,
+            origin_operation_id=quarantined["operation_id"],
+            keep_file_id=ids[1], run_id=run_id,
+            operation_group_id=group_id,
+        )
+        with decision_store.transaction(conn):
+            decision_store.transition_operation_group(conn, group_id, "fs_done")
+            decision_store.transition_operation_group(conn, group_id, "db_done")
+            decision_store.transition_operation_group(conn, group_id, "committed")
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
+
+    refreshed = purge_preview(
+        state_db, operation_ids=[quarantined["operation_id"]]
+    )
+    assert refreshed["apply_available"] is True
+    assert refreshed["items"][0]["keep_path"] == str(paths[1])
 
 
 def test_interrupted_restore_rolls_bytes_back_to_quarantine(tmp_path, monkeypatch):

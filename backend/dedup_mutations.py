@@ -21,6 +21,7 @@ from mutation_io import (
     mutation_lock,
 )
 from text_preview import ordered_body_coverage_sufficient
+from normalizer import analyze_name
 
 
 STRONG_QUEUE_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
@@ -477,6 +478,119 @@ def house_review_move(
         return {"operation_id": operation_id, "destination": str(destination)}
 
 
+def apply_strong_equivalent_quarantine(
+    conn,
+    *,
+    review_id,
+    discard_file_id,
+    keep_file_id,
+    classification,
+    quarantine_dir,
+    run_id,
+):
+    """Finalize a revalidated TXT/EPUB equivalent as recoverable quarantine."""
+    if classification not in STRONG_QUEUE_CLASSES:
+        raise ValueError("strong-equivalent quarantine requires a strong class")
+    discard = _file_state(conn, discard_file_id)
+    keep = _file_state(conn, keep_file_id)
+    if discard_file_id == keep_file_id:
+        raise ValueError("strong-equivalent endpoints must differ")
+    if discard["source"] not in {"house", "temp", "queue"}:
+        raise RuntimeError("strong-equivalent discard source is unsupported")
+    if keep["source"] != "house":
+        raise RuntimeError("strong-equivalent keep must be an active house file")
+    if discard["protected"] or discard["representative"]:
+        raise RuntimeError("strong-equivalent discard is protected")
+
+    review = conn.execute(
+        "SELECT * FROM review_items WHERE review_id = ?", (review_id,)
+    ).fetchone()
+    if (
+        review is None
+        or review["classification"] != classification
+        or review["state"] not in {"pending", "deferred"}
+        or {review["candidate_file_id"], review["reference_file_id"]}
+        != {discard_file_id, keep_file_id}
+    ):
+        raise RuntimeError("strong-equivalent review is missing or stale")
+    expected_fingerprints = {
+        review["candidate_file_id"]: review["left_fingerprint_id"],
+        review["reference_file_id"]: review["right_fingerprint_id"],
+    }
+    if (
+        discard["current_fingerprint_id"]
+        != expected_fingerprints[discard_file_id]
+        or keep["current_fingerprint_id"] != expected_fingerprints[keep_file_id]
+    ):
+        raise RuntimeError("strong-equivalent fingerprint changed")
+
+    discard_path = Path(discard["canonical_path"])
+    keep_path = Path(keep["canonical_path"])
+    if classification == "text_equivalent":
+        discard_evidence, discard_normalized = inspect_normalized_text(discard_path)
+        keep_evidence, keep_normalized = inspect_normalized_text(keep_path)
+        if (
+            not discard["normalized_sha256"]
+            or discard["normalized_sha256"] != keep["normalized_sha256"]
+            or discard_normalized != keep_normalized
+            or discard_normalized != discard["normalized_sha256"]
+        ):
+            raise RuntimeError("strong TXT normalized SHA-256 revalidation failed")
+    else:
+        try:
+            review_evidence = json.loads(review["evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            review_evidence = {}
+        reading_payload = (
+            review_evidence.get("epub_equivalence_mode") == "reading_payload"
+        )
+        inspect_epub = (
+            inspect_epub_reading_payload if reading_payload else inspect_epub_content
+        )
+        discard_epub = inspect_epub(discard_path)
+        keep_epub = inspect_epub(keep_path)
+        discard_evidence = discard_epub.file_evidence
+        keep_evidence = keep_epub.file_evidence
+        if reading_payload:
+            expected_payloads = {
+                review["candidate_file_id"]: review_evidence.get(
+                    "left_reading_payload_sha256"
+                ),
+                review["reference_file_id"]: review_evidence.get(
+                    "right_reading_payload_sha256"
+                ),
+            }
+            payload_valid = (
+                discard_epub.content_sha256
+                == expected_payloads.get(discard_file_id)
+                and keep_epub.content_sha256
+                == expected_payloads.get(keep_file_id)
+                and discard_epub.content_sha256 == keep_epub.content_sha256
+            )
+        else:
+            payload_valid = (
+                discard["normalized_sha256"]
+                and discard["normalized_sha256"] == keep["normalized_sha256"]
+                and discard_epub.content_sha256 == keep_epub.content_sha256
+                and discard_epub.content_sha256 == discard["normalized_sha256"]
+            )
+        if not payload_valid:
+            raise RuntimeError("strong EPUB payload revalidation failed")
+
+    if not evidence_matches(inspect_regular_file(discard_path), discard_evidence):
+        raise RuntimeError("strong-equivalent discard identity changed")
+    if not evidence_matches(inspect_regular_file(keep_path), keep_evidence):
+        raise RuntimeError("strong-equivalent keep identity changed")
+    return user_quarantine(
+        conn,
+        source_file_id=discard_file_id,
+        keep_file_id=keep_file_id,
+        quarantine_dir=quarantine_dir,
+        run_id=run_id,
+        reason=f"strong_{classification}_auto_duplicate",
+    )
+
+
 def ingest_to_house(
     conn, *, source_file_id, destination, run_id, routing=None,
     operation_group_id=None,
@@ -797,6 +911,24 @@ def _exact_quarantine(
             or source["variant_id"] != keep["variant_id"]
         ):
             raise RuntimeError("managed exact files belong to different variants")
+    coordinate_relation = classify_dedup_coordinate_relation(
+        source_path.name,
+        keep_path.name,
+        left_span_ambiguous=bool(source["span_ambiguous"]),
+        right_span_ambiguous=bool(keep["span_ambiguous"]),
+    )
+    same_core_title = (
+        analyze_name(source_path.name).get("core_title")
+        == analyze_name(keep_path.name).get("core_title")
+    )
+    if (
+        same_core_title
+        and coordinate_relation is None
+        and not decision_store.coordinates_compatible(
+            _coordinate_view(source), _coordinate_view(keep)
+        )
+    ):
+        raise RuntimeError("exact files have incompatible canonical coordinates")
     # Recompute both raw hashes immediately before the move. Cached hashes are
     # also checked so stale/corrupt cache cannot authorize a logical deletion.
     source_evidence = inspect_regular_file(source_path)
@@ -1004,7 +1136,10 @@ def user_quarantine(
                 if (
                     keep_origin is None
                     or keep_origin["run_id"] != run_id
-                    or keep_origin["action"] != "house_ingest"
+                    or keep_origin["action"] not in {
+                        "house_ingest", "user_queue_accept",
+                        "user_quarantine_restore",
+                    }
                     or keep_origin["state"] != "committed"
                     or keep_origin["file_id"] != keep_file_id
                     or keep_origin["dest_path"] != str(keep_path)
@@ -1104,6 +1239,117 @@ def user_quarantine(
             "source_file_id": source_file_id,
             "keep_file_id": keep_file_id,
             "dest_path": str(destination),
+        }
+
+
+def record_user_approved_purge_revalidation(
+    conn,
+    *,
+    origin_operation_id,
+    keep_file_id,
+    run_id,
+    operation_group_id,
+):
+    """Record fresh owned evidence for an explicitly reviewed old quarantine.
+
+    This operation does not move bytes.  It binds the still-owned quarantine
+    snapshot to a current active house reference so a later irreversible purge
+    does not rely on stale fingerprint IDs or a superseded original keep.
+    """
+    with mutation_lock(conn, f"user_purge_revalidation:{run_id}", run_id=run_id):
+        actual_run = decision_store.assert_active_actual_run(conn, run_id)
+        origin = conn.execute(
+            """
+            SELECT o.*, f.canonical_path AS file_path, f.source AS file_source,
+                   f.active AS file_active,
+                   f.current_fingerprint_id AS file_fingerprint_id
+            FROM operations AS o
+            JOIN files AS f ON f.file_id = o.file_id
+            WHERE o.operation_id = ?
+            """,
+            (int(origin_operation_id),),
+        ).fetchone()
+        if (
+            origin is None
+            or origin["action"] not in {"user_quarantine", "exact_quarantine"}
+            or origin["state"] != "committed"
+            or origin["purged_at"] is not None
+            or origin["file_active"]
+            or origin["file_source"] != "quarantine"
+        ):
+            raise RuntimeError("purge revalidation requires a live quarantine")
+        group = conn.execute(
+            "SELECT action, state FROM operation_groups WHERE group_id = ?",
+            (int(operation_group_id),),
+        ).fetchone()
+        if (
+            group is None
+            or group["action"] != "quarantine_cleanup_1_4_4_revalidation"
+            or group["state"] != "planned"
+        ):
+            raise RuntimeError("purge revalidation requires its approved plan group")
+        keep = _file_state(conn, keep_file_id)
+        if keep["source"] != "house" or keep_file_id == origin["file_id"]:
+            raise RuntimeError("purge revalidation keep must be another house file")
+
+        quarantine_path = Path(origin["quarantine_path"] or origin["dest_path"] or "")
+        keep_path = Path(keep["canonical_path"])
+        quarantine_evidence = inspect_regular_file(quarantine_path)
+        keep_evidence = inspect_regular_file(keep_path)
+        # Finder/open-in-place activity and later folder maintenance may change
+        # inode/ctime/mtime without changing the book bytes.  The current
+        # actual-run manifest owns the fresh identity, while the old journal
+        # only needs to prove that it originally owned the same path/content.
+        if (
+            origin["file_path"] != str(quarantine_path)
+            or origin["destination_sha256"] != quarantine_evidence.sha256
+            or origin["destination_size"] != quarantine_evidence.size
+        ):
+            raise RuntimeError("purge revalidation quarantine ownership is stale")
+        decision_store.assert_actual_run_path(
+            actual_run, quarantine_path, "temp_root"
+        )
+        decision_store.assert_manifest_source(
+            actual_run, quarantine_path, "temp_root", quarantine_evidence
+        )
+        decision_store.assert_actual_run_path(actual_run, keep_path, "house_root")
+        decision_store.assert_manifest_source(
+            actual_run, keep_path, "house_root", keep_evidence
+        )
+
+        with decision_store.transaction(conn):
+            operation_id = decision_store.create_operation(
+                conn,
+                run_id=run_id,
+                action="user_approved_purge_revalidation",
+                source_path=str(quarantine_path),
+                dest_path=str(keep_path),
+                file_id=origin["file_id"],
+                keep_file_id=keep_file_id,
+                expected_size=quarantine_evidence.size,
+                expected_mtime_ns=quarantine_evidence.mtime_ns,
+                expected_fingerprint_id=origin["file_fingerprint_id"],
+                expected_keep_fingerprint_id=keep["current_fingerprint_id"],
+                parent_operation_id=origin["operation_id"],
+                operation_group_id=operation_group_id,
+                source_dev=quarantine_evidence.dev,
+                source_ino=quarantine_evidence.ino,
+                source_ctime_ns=quarantine_evidence.ctime_ns,
+                source_sha256=quarantine_evidence.sha256,
+            )
+            decision_store.record_operation_destination(
+                conn, operation_id, keep_evidence
+            )
+            decision_store.transition_operation(conn, operation_id, "fs_done")
+            decision_store.transition_operation(conn, operation_id, "db_done")
+            decision_store.transition_operation(conn, operation_id, "committed")
+        return {
+            "operation_id": operation_id,
+            "origin_operation_id": int(origin_operation_id),
+            "file_id": origin["file_id"],
+            "keep_file_id": keep_file_id,
+            "quarantine_path": str(quarantine_path),
+            "keep_path": str(keep_path),
         }
 
 
