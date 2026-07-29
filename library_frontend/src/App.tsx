@@ -820,6 +820,7 @@ const volumeBlockerLabels: Record<string, string> = {
   source_missing_or_not_regular: "원본 파일 누락 또는 링크",
   source_identity_stale: "원본 파일 상태 변경",
   source_folder_contains_unselected_files: "기존 폴더에 선택하지 않은 파일 또는 부속 파일 존재",
+  side_story_requires_two_main_coordinates: "외전 자동 묶기에는 서로 다른 본편 좌표가 두 개 이상 필요",
   no_files_to_move: "이미 결과 폴더에 정리됨"
 };
 
@@ -830,6 +831,7 @@ function VolumeClassBadge({ value }: { value: VolumeClassification }) {
 const volumeCoordinateLabels: Record<string, string> = {
   volume: "권",
   part: "부",
+  episode: "회차 분할본",
   symbol: "외전/부속"
 };
 
@@ -911,9 +913,9 @@ function VolumeReview() {
   return (
     <>
       <PageHeader
-        eyebrow="VOLUME GROUPING · 1.2.9"
+        eyebrow="SERIES GROUPING · 1.4.3"
         title="분권·다권본 묶기"
-        description="권·부·상중하 좌표와 기존 폴더를 분석합니다. 선택한 파일은 staging 검증과 journal 기록 후 한 작품 폴더로 이동합니다."
+        description="권·부·회차 분할본과 기존 폴더를 분석합니다. Folderling은 안전한 전체 후보를 자동 적용하고, 단일 본편+외전·외전끼리 관계만 승인 대기로 남깁니다."
         action={<span className="readonly-pill">STAGING + JOURNAL</span>}
       />
       {jobNotice && <div className="inline-notice"><span>{jobNotice.message}</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
@@ -1003,6 +1005,7 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
   const [selected, setSelected] = useState(() => new Set(value.items.map((item) => item.file_id)));
   const [folderName, setFolderName] = useState(value.target_folder_name);
   const [allowDuplicateCoordinates, setAllowDuplicateCoordinates] = useState(false);
+  const [allowRiskySideStory, setAllowRiskySideStory] = useState(false);
   const [preview, setPreview] = useState<VolumePreview>();
   const [busy, setBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
@@ -1025,7 +1028,8 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
         source_revision: value.source_revision,
         selected_file_ids: [...selected],
         target_folder_name: folderName,
-        allow_duplicate_coordinates: allowDuplicateCoordinates
+        allow_duplicate_coordinates: allowDuplicateCoordinates,
+        allow_side_story_without_two_main_coordinates: allowRiskySideStory
       }));
       setConfirmed(false);
     } catch (reason) {
@@ -1047,6 +1051,7 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
         selected_file_ids: preview.selected_file_ids,
         target_folder_name: preview.target_folder_name,
         allow_duplicate_coordinates: preview.allow_duplicate_coordinates,
+        allow_side_story_without_two_main_coordinates: preview.allow_side_story_without_two_main_coordinates,
         confirm_count: preview.item_count,
         confirm_plan_sha256: preview.plan_sha256
       });
@@ -1117,6 +1122,14 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
           setConfirmed(false);
         }} />
         <span><strong>같은 좌표 파일도 서로 다른 판본으로 함께 보관</strong><small>중복 격리에서 동일 파일로 확정되지 않은 파일만 대상으로, 삭제하지 않고 같은 작품 폴더의 별도 variant로 연결합니다.</small></span>
+      </label>}
+      {value.blocked_reasons.includes("side_story_requires_two_main_coordinates") && <label className="volume-override">
+        <input type="checkbox" checked={allowRiskySideStory} onChange={(event) => {
+          setAllowRiskySideStory(event.target.checked);
+          setPreview(undefined);
+          setConfirmed(false);
+        }} />
+        <span><strong>단일 본편+외전 또는 외전끼리 관계를 직접 승인</strong><small>자동 규칙이 의도적으로 보류한 예외입니다. 실제로 한 작품임을 확인한 경우에만 같은 폴더로 묶습니다.</small></span>
       </label>}
       {error && <div className="inline-error">{error}</div>}
       {preview && <div className="volume-tree">

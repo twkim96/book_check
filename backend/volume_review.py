@@ -1,4 +1,4 @@
-"""Read-only 1.2.9 volume-group inventory and review plans."""
+"""Series-folder inventory, automatic plans, and approved mutations."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
@@ -17,7 +18,7 @@ from typing import Mapping, Optional, Sequence
 
 import decision_store
 from mutation_io import mutation_lock_for_roots
-from normalizer import extract_author, get_chosung
+from normalizer import NORMALIZER_VERSION, extract_author, get_chosung, normalize_nfc
 from volume_group_mutations import (
     cleanup_staging,
     merge_staged_volume_group,
@@ -26,7 +27,7 @@ from volume_group_mutations import (
 )
 
 
-VOLUME_KINDS = frozenset({"volume", "part", "symbol"})
+VOLUME_KINDS = frozenset({"volume", "part", "episode", "symbol"})
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
 CLASSIFICATIONS = frozenset(
     {"all", "auto_ready", "review_required", "already_grouped", "excluded"}
@@ -37,6 +38,51 @@ _CLASS_ORDER = {
     "already_grouped": 2,
     "excluded": 3,
 }
+_VOLUME_CASE_CACHE_CONDITION = threading.Condition()
+_VOLUME_CASE_CACHE: dict[tuple[str, str], dict] = {}
+_VOLUME_CASE_INFLIGHT: set[tuple[str, str]] = set()
+
+
+def _volume_case_cache_key(state_db: Path, house_dir: Path) -> tuple[str, str]:
+    return (
+        str(Path(state_db).expanduser().resolve()),
+        str(Path(house_dir).expanduser().resolve()),
+    )
+
+
+def _state_db_revision_signature(state_db: Path) -> tuple:
+    """Return a cheap revision signal that also observes uncheckpointed WAL writes."""
+
+    state_db = Path(state_db).expanduser().resolve()
+    signature = []
+    for index, path in enumerate((state_db, Path(str(state_db) + "-wal"))):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            signature.append(None)
+        else:
+            if index == 1 and stat.st_size == 0:
+                # SQLite may create/remove an empty WAL while opening a reader.
+                # It carries no committed revision and must not invalidate cache.
+                signature.append(None)
+                continue
+            signature.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+    return tuple(signature)
+
+
+def invalidate_volume_case_cache(
+    state_db: Optional[Path] = None, *, house_dir: Optional[Path] = None
+) -> None:
+    """Drop cached listing data after a known mutation or in tests."""
+
+    with _VOLUME_CASE_CACHE_CONDITION:
+        if state_db is None or house_dir is None:
+            _VOLUME_CASE_CACHE.clear()
+        else:
+            _VOLUME_CASE_CACHE.pop(
+                _volume_case_cache_key(state_db, house_dir), None
+            )
+        _VOLUME_CASE_CACHE_CONDITION.notify_all()
 
 
 def _encode_cursor(offset: int) -> str:
@@ -87,12 +133,20 @@ def _coordinate(row: Mapping[str, object]) -> tuple[tuple, str, object]:
         value = Fraction(int(row["part_num"]), int(row["part_den"] or 1))
         label = f"{value.numerator}부" if value.denominator == 1 else f"{float(value):g}부"
         return (1, value), label, (kind, value.numerator, value.denominator)
+    if kind == "episode":
+        start = int(row["episode_start"])
+        end = int(row["episode_end"])
+        unit = str(row.get("unit") or "회차")
+        if unit == "미상":
+            unit = "회차"
+        label = f"{start}{unit}" if start == end else f"{start}~{end}{unit}"
+        return (2, start, end, unit), label, (kind, start, end, unit)
     symbol = str(row["coordinate_symbol"] or row["coordinate_raw"] or "미상")
     sort_key = int(row["coordinate_sort_key"] or 0)
     label = symbol
     if symbol == "side_story" and sort_key > 200:
         label = f"외전 {sort_key - 200}"
-    return (2, sort_key, symbol), label, (kind, symbol, sort_key)
+    return (3, sort_key, symbol), label, (kind, symbol, sort_key)
 
 
 def _safe_folder_name(value: str) -> str:
@@ -149,6 +203,8 @@ def _source_revision(rows: Sequence[Mapping[str, object]]) -> str:
             "volume_num": row["volume_num"],
             "volume_den": row["volume_den"],
             "coordinate_symbol": row["coordinate_symbol"],
+            "episode_start": row["episode_start"],
+            "episode_end": row["episode_end"],
             "author": row["author"],
             "effective_max": row["effective_max"],
             "unit": row["unit"],
@@ -174,9 +230,12 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
                    f.coordinate_kind, f.part_num, f.part_den,
                    f.volume_num, f.volume_den, f.coordinate_symbol,
                    f.coordinate_sort_key, f.coordinate_raw, f.span_ambiguous,
+                   f.episode_start, f.episode_end,
                    fa.analyzed_name, fa.core_title, fa.readable_title,
                    fa.author, fa.disambig, fa.effective_max, fa.unit,
                    fa.complete, fa.updated_at AS analysis_updated_at,
+                   fa.normalizer_version AS analysis_normalizer_version,
+                   fa.analyzed_size, fa.analyzed_mtime_ns, fa.analyzed_ctime_ns,
                    v.work_bucket_id,
                    CASE WHEN rep.file_id IS NULL THEN 0 ELSE 1 END AS representative
             FROM files AS f
@@ -184,23 +243,36 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
             LEFT JOIN variants AS v ON v.variant_id = f.variant_id
             LEFT JOIN representatives AS rep ON rep.file_id = f.file_id
             WHERE f.active = 1 AND f.source = 'house'
-              AND f.coordinate_kind IN ('volume', 'part', 'symbol')
+              AND f.coordinate_kind IN ('volume', 'part', 'episode', 'symbol')
             ORDER BY fa.core_title COLLATE NOCASE, f.canonical_path COLLATE NOCASE
             """
         ).fetchall()
-        return [
-            {
-                **dict(row),
-                # Re-evaluate with the current parser so the review screen does
-                # not wait for a full scanner pass after an author/coordinate
-                # rule fix.
-                "author": extract_author(str(row["analyzed_name"])),
-                **decision_store.coordinate_fields_from_name(
-                    str(row["analyzed_name"])
-                ),
-            }
-            for row in rows
-        ]
+        current_rows = []
+        for row in rows:
+            item = dict(row)
+            path_name = normalize_nfc(Path(str(row["canonical_path"])).name)
+            analysis_is_current = (
+                row["analysis_normalizer_version"] == NORMALIZER_VERSION
+                and row["analyzed_name"] == path_name
+                and row["analyzed_size"] == row["size"]
+                and row["analyzed_mtime_ns"] == row["mtime_ns"]
+                and (
+                    row["analyzed_ctime_ns"] is None
+                    or row["analyzed_ctime_ns"] == row["ctime_ns"]
+                )
+            )
+            if not analysis_is_current:
+                # Scanner를 기다릴 수 없는 stale 행만 현재 parser로 보정한다.
+                # 정상 행은 DB에 저장된 같은-version 결과를 사용해 목록 조회가
+                # 16k 파일 전체를 매번 재파싱하지 않게 한다.
+                item.update(
+                    author=extract_author(str(row["analyzed_name"])),
+                    **decision_store.coordinate_fields_from_name(
+                        str(row["analyzed_name"])
+                    ),
+                )
+            current_rows.append(item)
+        return current_rows
     finally:
         conn.close()
 
@@ -241,7 +313,10 @@ def _is_parallel_coordinate_formats(rows: Sequence[Mapping[str, object]]) -> boo
             and len(stems) == 1
             and len(coverage) == 1
         )
-    return all(row["coordinate_kind"] in {"volume", "part"} for row in rows)
+    return all(
+        row["coordinate_kind"] in {"volume", "part", "episode"}
+        for row in rows
+    )
 
 
 def _has_incompatible_coordinate_kinds(rows: Sequence[Mapping[str, object]]) -> bool:
@@ -343,6 +418,21 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         if len(relative.parts) > 1:
             deep_parents.append(parent)
     already_grouped = len(parent_paths) == 1 and bool(deep_parents)
+    main_coordinate_keys = {
+        position
+        for row in rows
+        if (position := _series_position(row)) is not None
+    }
+    has_side_story = any(
+        row["coordinate_kind"] == "symbol"
+        and row["coordinate_symbol"] == "side_story"
+        for row in rows
+    )
+    side_story_requires_review = (
+        not already_grouped
+        and has_side_story
+        and len(main_coordinate_keys) < 2
+    )
 
     # A user may deliberately keep two different EPUB variants at the same
     # volume coordinate.  Once every file is safely linked to one managed work
@@ -420,6 +510,8 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
             item_issues.append("work_conflict")
         if item["span_ambiguous"]:
             item_issues.append("ambiguous_coordinate")
+        if side_story_requires_review:
+            item_issues.append("side_story_requires_two_main_coordinates")
         item["same_coordinate_count"] = coordinate_counts[coordinate_key]
         item["issues"] = item_issues
     items.sort(key=lambda item: (item["_sort_key"], item["name"], item["file_id"]))
@@ -448,6 +540,8 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         blockers.append("ambiguous_coordinate")
     if outside_house:
         blockers.append("source_outside_house")
+    if side_story_requires_review:
+        blockers.append("side_story_requires_two_main_coordinates")
 
     if "non_title_core" in blockers:
         classification = "excluded"
@@ -459,7 +553,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         classification = "auto_ready"
 
     target_name = _safe_folder_name(display_title)
-    if already_grouped:
+    if len(deep_parents) == 1:
         target_path = deep_parents[0]
         target_name = target_path.name
     else:
@@ -482,6 +576,8 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
         "parent_count": len(parent_paths),
         "parents": sorted(parents),
         "coordinate_kinds": sorted(kinds),
+        "main_coordinate_count": len(main_coordinate_keys),
+        "has_side_story": has_side_story,
         "coordinate_range": [items[0]["coordinate"], items[-1]["coordinate"]],
         "duplicate_coordinates": duplicate_coordinates,
         "approved_duplicate_coordinates": approved_duplicate_coordinates,
@@ -498,32 +594,152 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     }
 
 
-def analyze_volume_cases(state_db: Path, *, house_dir: Path) -> list[dict]:
+def _series_position(row: Mapping[str, object]) -> tuple | None:
+    """Return the coordinate that proves this file is a separate series part.
+
+    Episode compilations are separate parts only when their *start* differs.
+    ``1-200.txt`` and ``1-200.epub`` (or ``1-180`` and ``1-200``) are parallel
+    editions of one book, not a two-part series.  Volumes and parts use their
+    explicit rational coordinate; upper/middle/lower symbols use their symbol.
+    """
+
+    kind = row["coordinate_kind"]
+    if kind == "episode":
+        start = row.get("episode_start")
+        if start is None:
+            return None
+        # 배포본에 따라 서문/프롤로그를 0화 또는 1화로 세지만 둘 다
+        # 작품 처음부터 시작하는 동일 좌표다.
+        return (kind, max(1, int(start)))
+    if kind == "volume":
+        number = row.get("volume_num")
+        if number is None:
+            return None
+        return (
+            kind,
+            int(row["part_num"]) if row.get("part_num") is not None else None,
+            int(row.get("part_den") or 1),
+            int(number),
+            int(row.get("volume_den") or 1),
+        )
+    if kind == "part":
+        number = row.get("part_num")
+        return (
+            kind,
+            int(number),
+            int(row.get("part_den") or 1),
+        ) if number is not None else None
+    if kind == "symbol" and row.get("coordinate_symbol") != "side_story":
+        symbol = row.get("coordinate_symbol")
+        return (
+            kind,
+            str(symbol),
+            int(row.get("coordinate_sort_key") or 0),
+        ) if symbol else None
+    return None
+
+
+def _select_distinct_series_rows(
+    rows: Sequence[Mapping[str, object]],
+) -> list[Mapping[str, object]]:
+    """Select only a cohort proven by two distinct main positions."""
+
+    side_rows = [
+        row for row in rows
+        if row["coordinate_kind"] == "symbol"
+        and row.get("coordinate_symbol") == "side_story"
+    ]
+    for kind in ("volume", "part", "episode", "symbol"):
+        cohort = [
+            row for row in rows
+            if row["coordinate_kind"] == kind
+            and not (
+                kind == "symbol"
+                and row.get("coordinate_symbol") == "side_story"
+            )
+        ]
+        positions = {
+            position
+            for row in cohort
+            if (position := _series_position(row)) is not None
+        }
+        if len(positions) >= 2:
+            return [*cohort, *side_rows]
+    return []
+
+
+def _select_series_rows(rows: Sequence[Mapping[str, object]]) -> list[Mapping[str, object]]:
+    """Select a real multi-position cohort, or only a risky side-story case."""
+
+    selected = _select_distinct_series_rows(rows)
+    if selected:
+        return selected
+
+    # 단권+외전 또는 외전끼리는 기존 계약대로 사람 검토 대상으로 남긴다.
+    # 외전이 없는 동일 시작점/동일 권의 병행 판본은 분권 화면에서 제외한다.
+    side_rows = [
+        row for row in rows
+        if row["coordinate_kind"] == "symbol"
+        and row.get("coordinate_symbol") == "side_story"
+    ]
+    if side_rows and len(rows) >= 2:
+        return list(rows)
+    return []
+
+
+def _analyze_volume_cases_uncached(state_db: Path, *, house_dir: Path) -> list[dict]:
     groups: dict[str, list[Mapping[str, object]]] = defaultdict(list)
     for row in _load_volume_rows(state_db):
         groups[str(row["core_title"])].append(row)
     cases = []
     for core_title, rows in groups.items():
-        # A web-serialization compilation can share a core title with a full
-        # volume set without belonging to that set's folder coordinates.  When
-        # a real multi-volume cohort exists, inventory and folder planning use
-        # the cohort plus its side stories and leave the compilation untouched.
-        volume_rows = [row for row in rows if row["coordinate_kind"] == "volume"]
-        part_rows = [row for row in rows if row["coordinate_kind"] == "part"]
-        side_rows = [
-            row for row in rows
-            if row["coordinate_kind"] == "symbol"
-            and row["coordinate_symbol"] == "side_story"
-        ]
-        if len(volume_rows) >= 2:
-            selected = [*volume_rows, *side_rows]
-        elif len(part_rows) >= 2:
-            selected = [*part_rows, *side_rows]
-        else:
-            selected = rows
+        # A compilation or parallel TXT/EPUB edition can share a core title
+        # without being a separate series part.  At least two distinct main
+        # positions are required; episode ranges specifically need different
+        # starts.  Risky side-story relationships remain reviewable.
+        selected = _select_series_rows(rows)
         if len(selected) >= 2:
             cases.append(_case_from_rows(core_title, selected, Path(house_dir)))
     return cases
+
+
+def analyze_volume_cases(state_db: Path, *, house_dir: Path) -> list[dict]:
+    """Return revision-bound cases while coalescing identical concurrent reads."""
+
+    key = _volume_case_cache_key(state_db, house_dir)
+    signature = _state_db_revision_signature(Path(state_db))
+    while True:
+        with _VOLUME_CASE_CACHE_CONDITION:
+            cached = _VOLUME_CASE_CACHE.get(key)
+            if (
+                cached is not None
+                and cached["signature"] == signature
+            ):
+                return list(cached["cases"])
+            if key not in _VOLUME_CASE_INFLIGHT:
+                _VOLUME_CASE_INFLIGHT.add(key)
+                break
+            _VOLUME_CASE_CACHE_CONDITION.wait(timeout=10.0)
+        signature = _state_db_revision_signature(Path(state_db))
+
+    try:
+        cases = _analyze_volume_cases_uncached(state_db, house_dir=house_dir)
+        final_signature = _state_db_revision_signature(Path(state_db))
+    except BaseException:
+        with _VOLUME_CASE_CACHE_CONDITION:
+            _VOLUME_CASE_INFLIGHT.discard(key)
+            _VOLUME_CASE_CACHE_CONDITION.notify_all()
+        raise
+
+    with _VOLUME_CASE_CACHE_CONDITION:
+        _VOLUME_CASE_INFLIGHT.discard(key)
+        if final_signature == signature:
+            _VOLUME_CASE_CACHE[key] = {
+                "signature": final_signature,
+                "cases": tuple(cases),
+            }
+        _VOLUME_CASE_CACHE_CONDITION.notify_all()
+    return list(cases)
 
 
 def list_volume_cases(
@@ -642,6 +858,7 @@ def preview_volume_group(
     selected_file_ids: Optional[Sequence[str]] = None,
     target_folder_name: Optional[str] = None,
     allow_duplicate_coordinates: bool = False,
+    allow_side_story_without_two_main_coordinates: bool = False,
 ) -> dict:
     case = get_volume_case(state_db, house_dir=house_dir, case_id=case_id)
     selected = set(
@@ -664,6 +881,12 @@ def preview_volume_group(
     blockers = list(selected_case["blocked_reasons"] if selected_case else [])
     if allow_duplicate_coordinates:
         blockers = [reason for reason in blockers if reason != "duplicate_coordinate"]
+    if allow_side_story_without_two_main_coordinates:
+        blockers = [
+            reason
+            for reason in blockers
+            if reason != "side_story_requires_two_main_coordinates"
+        ]
     if source_revision != case["source_revision"]:
         blockers.append("source_revision_stale")
     if len(items) < 2:
@@ -677,12 +900,9 @@ def preview_volume_group(
     filenames = [unicodedata.normalize("NFC", item["name"]).casefold() for item in items]
     if len(filenames) != len(set(filenames)):
         blockers.append("target_filename_collision")
-    if (
-        selected_case is not None
-        and target_folder_name is None
-        and selected_case["classification"] == "already_grouped"
-    ):
+    if selected_case is not None and target_folder_name is None:
         destination_root = Path(selected_case["target_folder_path"])
+        folder_name = destination_root.name
     else:
         destination_root = Path(house_dir).resolve() / get_chosung(folder_name[0]) / folder_name
     if destination_root.is_symlink() or (
@@ -722,6 +942,9 @@ def preview_volume_group(
         "selected_file_ids": [item["file_id"] for item in items],
         "target_folder_name": folder_name,
         "allow_duplicate_coordinates": bool(allow_duplicate_coordinates),
+        "allow_side_story_without_two_main_coordinates": bool(
+            allow_side_story_without_two_main_coordinates
+        ),
         "destination_root": str(destination_root),
         "tree": tree,
         "moved_count": moved_count,
@@ -755,6 +978,7 @@ def apply_volume_plan(
     selected_file_ids: Optional[Sequence[str]],
     target_folder_name: Optional[str],
     allow_duplicate_coordinates: bool = False,
+    allow_side_story_without_two_main_coordinates: bool = False,
     confirm_count: int,
     confirm_plan_sha256: str,
     progress=None,
@@ -764,7 +988,7 @@ def apply_volume_plan(
     state_db = Path(state_db).expanduser().resolve()
     house_dir = Path(house_dir).expanduser().resolve()
     temp_dir = Path(temp_dir).expanduser().resolve()
-    with mutation_lock_for_roots(house_dir, temp_dir, "volume-group-merge-1.2.9"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "volume-group-merge-1.4.3"):
         plan = preview_volume_group(
             state_db,
             house_dir=house_dir,
@@ -773,6 +997,9 @@ def apply_volume_plan(
             selected_file_ids=selected_file_ids,
             target_folder_name=target_folder_name,
             allow_duplicate_coordinates=allow_duplicate_coordinates,
+            allow_side_story_without_two_main_coordinates=(
+                allow_side_story_without_two_main_coordinates
+            ),
         )
         if not plan["apply_available"]:
             raise RuntimeError(
@@ -819,6 +1046,7 @@ def apply_volume_plan(
                     destination_root=Path(plan["destination_root"]),
                     display_title=plan["target_folder_name"],
                     run_id=run_id,
+                    relationship_origin="human_decision",
                     progress=progress,
                 )
                 decision_store.finish_actual_run(conn, run_id, success=True)
@@ -867,4 +1095,113 @@ def apply_volume_plan(
         }
         if maintenance_warnings:
             response["maintenance_warnings"] = maintenance_warnings
+        invalidate_volume_case_cache(state_db, house_dir=house_dir)
         return response
+
+
+def apply_auto_ready_volume_groups(
+    state_db: Path,
+    *,
+    house_dir: Path,
+    temp_dir: Path,
+    run_id: str,
+    progress=None,
+) -> dict:
+    """Apply every currently safe loose series group inside one Folderling run.
+
+    This intentionally has no affected-title filter.  A run repairs the complete
+    historical ``auto_ready`` backlog as well as groups made eligible by files
+    ingested earlier in that same run.  Risky side-story-only and single-main
+    plus side-story relationships stay in ``review_required`` and are never
+    overridden here.
+    """
+
+    state_db = Path(state_db).expanduser().resolve()
+    house_dir = Path(house_dir).expanduser().resolve()
+    temp_dir = Path(temp_dir).expanduser().resolve()
+    initial_cases = analyze_volume_cases(state_db, house_dir=house_dir)
+    candidates = [
+        case for case in initial_cases if case["classification"] == "auto_ready"
+    ]
+    applied = []
+    moved = []
+    removed_empty_folders = []
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.assert_active_actual_run(conn, run_id)
+        for case_index, case in enumerate(candidates, start=1):
+            case_id = case["case_id"]
+            selected_file_ids = [item["file_id"] for item in case["items"]]
+            destination_root = Path(case["target_folder_path"])
+            staging_root = (
+                temp_dir / ".volume_group_staging" / run_id / case_id[:16]
+            )
+            staged = []
+            try:
+                staged = stage_volume_sources(
+                    conn,
+                    file_ids=selected_file_ids,
+                    staging_root=staging_root,
+                    run_id=run_id,
+                )
+                result = merge_staged_volume_group(
+                    conn,
+                    staged=staged,
+                    destination_root=destination_root,
+                    display_title=case["display_title"],
+                    run_id=run_id,
+                    relationship_origin="strong_match",
+                    progress=(
+                        None
+                        if progress is None
+                        else lambda item_index, item_total, name: progress(
+                            case_index,
+                            len(candidates),
+                            item_index,
+                            item_total,
+                            name,
+                        )
+                    ),
+                )
+            except BaseException:
+                if staged:
+                    cleanup_staging(staged, staging_root)
+                raise
+
+            cleanup_staging(staged, staging_root)
+            removed = remove_empty_source_folders(
+                [item["source_path"] for item in staged],
+                house_root=house_dir,
+                destination_root=destination_root,
+            )
+            removed_empty_folders.extend(removed)
+            moved.extend(result["moved"])
+            applied.append(
+                {
+                    "case_id": case_id,
+                    "core_title": case["core_title"],
+                    "display_title": case["display_title"],
+                    "destination_root": str(destination_root),
+                    "file_count": len(selected_file_ids),
+                    "moved_count": len(result["moved"]),
+                    "work_bucket_id": result["work_bucket_id"],
+                }
+            )
+    finally:
+        conn.close()
+
+    invalidate_volume_case_cache(state_db, house_dir=house_dir)
+    remaining = analyze_volume_cases(state_db, house_dir=house_dir)
+    summary = Counter(case["classification"] for case in remaining)
+    return {
+        "candidate_count": len(candidates),
+        "applied_count": len(applied),
+        "moved_count": len(moved),
+        "applied": applied,
+        "moved": moved,
+        "removed_empty_folders": removed_empty_folders,
+        "remaining_summary": {
+            key: summary.get(key, 0)
+            for key in sorted(CLASSIFICATIONS - {"all"})
+        },
+    }

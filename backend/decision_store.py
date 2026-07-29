@@ -1662,6 +1662,47 @@ def assert_manifest_source(run, path, root_field, evidence) -> None:
         raise RuntimeError(f"actual run manifest source identity is stale: {candidate}")
 
 
+def assert_manifest_or_same_run_house_source(
+    conn: sqlite3.Connection, run, path, evidence
+) -> None:
+    """Authorize an original house file or an exact house result of this run.
+
+    Folderling captures its manifest before review actions and temp intake.  Its
+    final series pass must therefore be able to consume a file that a committed
+    operation in the *same* still-active run just placed in house.  The fallback
+    is deliberately narrow: exact destination path, exact durable destination
+    identity/SHA, a small allowlist of house-producing actions, and the same
+    run_id are all required.  A stale original manifest entry is never accepted
+    merely because the pathname still exists.
+    """
+
+    try:
+        assert_manifest_source(run, path, "house_root", evidence)
+        return
+    except RuntimeError as manifest_error:
+        if not str(manifest_error).startswith(
+            "actual run manifest does not authorize source:"
+        ):
+            raise
+        candidate = str(Path(canonicalize_path(path)))
+        rows = conn.execute(
+            """
+            SELECT * FROM operations
+            WHERE run_id = ? AND state = 'committed' AND dest_path = ?
+              AND action IN ('house_ingest', 'user_queue_accept', 'user_queue_restore')
+            ORDER BY operation_id DESC
+            """,
+            (run["run_id"], candidate),
+        ).fetchall()
+        from mutation_io import evidence_matches
+
+        for row in rows:
+            expected = _operation_evidence(row, "destination")
+            if expected is not None and evidence_matches(evidence, expected):
+                return
+        raise manifest_error
+
+
 def _actual_run_for_operation(conn, run_id):
     row = conn.execute("SELECT * FROM actual_runs WHERE run_id = ?", (run_id,)).fetchone()
     if row is None:

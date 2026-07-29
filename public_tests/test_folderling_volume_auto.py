@@ -2,7 +2,7 @@ from io import StringIO
 from pathlib import Path
 
 import decision_store
-from folderling import move_to_house
+from folderling import move_to_house, retarget_owned_recent_link
 from library_work_management import alias_preview, apply_alias
 from volume_group_mutations import (
     classify_folderling_volume_target,
@@ -10,6 +10,7 @@ from volume_group_mutations import (
     link_volume_relationships,
     suggest_folderling_volume_target,
 )
+from volume_review import apply_auto_ready_volume_groups, list_volume_cases
 
 
 def _add(conn, path, source):
@@ -88,6 +89,120 @@ def test_folderling_auto_adds_non_overlapping_volume_to_existing_group(tmp_path)
     assert Path(destination).parent == house / "ㅂ" / "별빛 연대기"
     assert "volume-auto" in log.getvalue()
     assert all(row["file_id"] for row in existing + [incoming])
+
+
+def test_full_auto_pass_groups_loose_existing_and_same_run_intake(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add(conn, house / "ㅍ" / "판타지 소설 1권.txt", "house")
+        _add(conn, temp / "판타지 소설 2권.epub", "temp")
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    loose_destination = move_to_house(
+        str(temp / "판타지 소설 2권.epub"),
+        str(house),
+        str(house / "_최근"),
+        "판타지 소설 2권.epub",
+        StringIO(),
+        "",
+        state_db_path=str(state_db),
+        run_id=run_id,
+    )
+    assert Path(loose_destination).parent == house / "ㅍ"
+
+    result = apply_auto_ready_volume_groups(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        run_id=run_id,
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        rows = conn.execute(
+            "SELECT canonical_path, assignment_origin, variant_id "
+            "FROM files WHERE active = 1 ORDER BY canonical_path"
+        ).fetchall()
+        assert {Path(row["canonical_path"]).parent for row in rows} == {
+            house / "ㅍ" / "판타지 소설"
+        }
+        assert all(row["assignment_origin"] == "strong_match" for row in rows)
+        assert all(row["variant_id"] is not None for row in rows)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert result["candidate_count"] == result["applied_count"] == 1
+    assert result["moved_count"] == 2
+    assert result["remaining_summary"]["auto_ready"] == 0
+    assert result["remaining_summary"]["already_grouped"] == 1
+
+
+def test_episode_split_backlog_is_auto_grouped_but_side_only_is_not(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for name in ("연속 작품 1-100화.txt", "연속 작품 105-200화.txt"):
+            _add(conn, house / "ㅇ" / name, "house")
+        for name in ("외전 작품 외전 1.txt", "외전 작품 외전 2.epub"):
+            _add(conn, house / "ㅇ" / name, "house")
+    finally:
+        conn.close()
+
+    before = list_volume_cases(state_db, house_dir=house, limit=20)
+    assert before["summary"]["auto_ready"] == 1
+    assert before["summary"]["review_required"] == 1
+    run_id = _approve(state_db, house, temp)
+    result = apply_auto_ready_volume_groups(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        run_id=run_id,
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
+
+    assert (house / "ㅇ" / "연속 작품").is_dir()
+    assert not (house / "ㅇ" / "외전 작품").exists()
+    assert result["applied_count"] == 1
+    assert result["remaining_summary"]["review_required"] == 1
+
+
+def test_recent_link_retarget_requires_exact_old_destination(tmp_path):
+    recent = tmp_path / "recent"
+    recent.mkdir()
+    source = tmp_path / "house" / "작품 1권.txt"
+    destination = tmp_path / "house" / "작품" / source.name
+    foreign = tmp_path / "house" / "다른 곳" / source.name
+    source.parent.mkdir()
+    destination.parent.mkdir()
+    foreign.parent.mkdir()
+    source.write_text("source", encoding="utf-8")
+    destination.write_text("destination", encoding="utf-8")
+    foreign.write_text("foreign", encoding="utf-8")
+    link = recent / source.name
+    link.symlink_to(source)
+
+    assert retarget_owned_recent_link(recent, source, destination) == "retargeted"
+    assert link.resolve() == destination.resolve()
+    assert retarget_owned_recent_link(recent, source, foreign) == "preserved"
+    assert link.resolve() == destination.resolve()
+    link.unlink()
+    assert retarget_owned_recent_link(recent, source, destination) == "missing"
 
 
 def test_human_alias_route_precedes_volume_and_links_incoming_file(tmp_path):

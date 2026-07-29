@@ -91,6 +91,29 @@ def recent_link_matches_destination(link_path, dst_path):
     )
 
 
+def retarget_owned_recent_link(recent_dir, source_path, destination_path):
+    """Atomically retarget only a recent symlink proven to name ``source_path``."""
+
+    link_path = os.path.join(recent_dir, os.path.basename(source_path))
+    if not os.path.lexists(link_path):
+        return "missing"
+    if not recent_link_matches_destination(link_path, source_path):
+        return "preserved"
+    temporary = os.path.join(
+        recent_dir,
+        f".folderling-retarget-{os.getpid()}-{time.time_ns()}",
+    )
+    if os.path.lexists(temporary):
+        raise RuntimeError(f"unexpected recent retarget path exists: {temporary}")
+    try:
+        os.symlink(os.path.abspath(destination_path), temporary)
+        os.replace(temporary, link_path)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+    return "retargeted"
+
+
 def create_recent_link(dst_path, clean_name, recent_dir):
     """최근 파일에 대한 심볼릭 링크 생성"""
     from mutation_io import ensure_directory_nofollow
@@ -1791,6 +1814,89 @@ def _process_items_authorized(
         time.perf_counter() - stage_started_at, 6
     )
 
+    # ── 3단계: 전체 시리즈 자동 묶기 ──
+    # 이번 intake에서 건드린 제목만 보지 않는다. 과거부터 loose 상태였던
+    # auto_ready 전체를 같은 actual run의 manifest/journal 아래 정리한다.
+    print()
+    print("=" * 60)
+    print("📚 3단계: 전체 시리즈 자동 묶기")
+    print("=" * 60)
+    emit_folderling_event(
+        event_callback,
+        "series_group_start",
+        status="running",
+        scope="all_auto_ready",
+    )
+    stage_started_at = time.perf_counter()
+    from volume_review import apply_auto_ready_volume_groups
+
+    def series_progress(case_index, case_total, item_index, item_total, name):
+        emit_folderling_event(
+            event_callback,
+            "series_group_item",
+            status="running",
+            case_index=case_index,
+            case_total=case_total,
+            item_index=item_index,
+            item_total=item_total,
+            source_name=name,
+        )
+
+    auto_volume_summary = apply_auto_ready_volume_groups(
+        state_db_path,
+        house_dir=dst_dir,
+        temp_dir=src_dir,
+        run_id=actual_run_id,
+        progress=series_progress,
+    )
+    auto_volume_moved = auto_volume_summary.pop("moved")
+    # Per-file evidence is already durable in operations and success.log.  Do
+    # not duplicate thousands of records into the web job/event payload.
+    auto_volume_summary.pop("applied", None)
+    recent_retargeted_count = 0
+    recent_preserved_count = 0
+    with open(success_log, "a", encoding="utf-8") as s_log:
+        for moved in auto_volume_moved:
+            recent_status = retarget_owned_recent_link(
+                recent_dir,
+                moved["source_path"],
+                moved["destination"],
+            )
+            if recent_status == "retargeted":
+                recent_retargeted_count += 1
+            elif recent_status == "preserved":
+                recent_preserved_count += 1
+            s_log.write(
+                f"[{get_now()}] [series-auto] {moved['source_path']} -> "
+                f"{moved['destination']} | recent={recent_status}\n"
+            )
+    performance_metrics["series_group_seconds"] = round(
+        time.perf_counter() - stage_started_at, 6
+    )
+    emit_folderling_event(
+        event_callback,
+        "series_group_result",
+        status=(
+            "needs_review"
+            if auto_volume_summary["remaining_summary"].get("review_required", 0)
+            else "succeeded"
+        ),
+        scope="all_auto_ready",
+        recent_retargeted_count=recent_retargeted_count,
+        recent_preserved_count=recent_preserved_count,
+        **auto_volume_summary,
+    )
+    print(
+        "✅ 시리즈 자동 묶기: "
+        f"{auto_volume_summary['applied_count']}개 작품, "
+        f"{auto_volume_summary['moved_count']}개 파일 이동"
+    )
+    if auto_volume_summary["remaining_summary"].get("review_required", 0):
+        print(
+            "  - 사람 승인 필요: "
+            f"{auto_volume_summary['remaining_summary']['review_required']}개 관계"
+        )
+
     cleanup_recent_links(recent_dir, max_days=30)
 
     print(f"✅ 폴더링 완료: 입고 {move_count}개")
@@ -1810,10 +1916,10 @@ def _process_items_authorized(
     print(f"→ 로그 파일({script_dir} 위치)을 확인하세요.")
     print("  - success.log / fail.log")
 
-    # ── 3단계: 인덱스 갱신 ──
+    # ── 4단계: 인덱스 갱신 ──
     print()
     print("=" * 60)
-    print("🔄 3단계: 인덱스 갱신")
+    print("🔄 4단계: 인덱스 갱신")
     print("=" * 60)
     emit_folderling_event(
         event_callback,
@@ -1970,6 +2076,11 @@ def _process_items_authorized(
             f"{dedup_summary.get('ordered_body_quarantine_count', 0)}개 자동 격리"
         )
     print(f"  폴더링  : 입고 {move_count}개, pass {pass_count}개")
+    print(
+        "  시리즈  : 작품 "
+        f"{auto_volume_summary['applied_count']}개 자동 묶기, "
+        f"파일 {auto_volume_summary['moved_count']}개 이동"
+    )
     print(f"  좌표 충돌: warning 보류 {volume_conflict_hold_count}개")
     print(
         "  unpack   : 부속 삭제 "
@@ -2000,6 +2111,9 @@ def _process_items_authorized(
         "empty_dir_cleanup_count": empty_dir_cleanup_count,
         "failure_count": failure_count,
         "volume_conflict_hold_count": volume_conflict_hold_count,
+        "auto_volume_summary": auto_volume_summary,
+        "recent_retargeted_count": recent_retargeted_count,
+        "recent_preserved_count": recent_preserved_count,
         "unpack_cleanup_results": unpack_cleanup_results,
         "unpack_cleanup_issue_count": unpack_cleanup_issue_count,
         "unpack_discarded_file_count": unpack_discarded_file_count,
@@ -2017,6 +2131,9 @@ def _process_items_authorized(
         + unpack_cleanup_issue_count
         + legacy_pass_count
         + skipped_count
+        + int(
+            auto_volume_summary["remaining_summary"].get("review_required", 0)
+        )
     )
     performance_metrics["authorized_total_seconds"] = round(
         time.perf_counter() - workflow_started_at, 6

@@ -553,8 +553,8 @@ def stage_volume_sources(
                     actual_run, source_path, "house_root"
                 )
                 source_evidence = inspect_regular_file(source_path)
-                decision_store.assert_manifest_source(
-                    actual_run, source_path, "house_root", source_evidence
+                decision_store.assert_manifest_or_same_run_house_source(
+                    conn, actual_run, source_path, source_evidence
                 )
                 stage_path = staging_root / f"{index:04d}_{source_path.name}"
                 copied = copy_no_clobber(
@@ -694,6 +694,7 @@ def merge_staged_volume_group(
     destination_root: Path,
     display_title: str,
     run_id: str,
+    relationship_origin: str = "human_decision",
     progress=None,
 ) -> dict:
     """Move a fully staged group and commit all DB rows in one transaction."""
@@ -776,7 +777,7 @@ def merge_staged_volume_group(
                 conn,
                 file_ids=[record["file_id"] for record in staged],
                 display_title=display_title,
-                origin="human_decision",
+                origin=relationship_origin,
             )
             work_id = relationship["work_bucket_id"]
             variants = relationship["variant_ids"]

@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -85,7 +86,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.2"
+SERVER_VERSION = "1.4.3"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -710,6 +711,7 @@ def create_app(
     app.config["library_server_config"] = config
     app.extensions["library_state_db_readonly_keeper"] = readonly_keeper
     app.extensions["library_review_registry"] = registry
+    app.extensions["library_volume_provider"] = volume_provider
     app.extensions["library_job_runner"] = runner
     app.extensions["library_service_registry"] = services
     appearance_path = config.runtime_dir / "appearance.json"
@@ -1420,6 +1422,9 @@ def create_app(
             "selected_file_ids": body.get("selected_file_ids"),
             "target_folder_name": body.get("target_folder_name"),
             "allow_duplicate_coordinates": body.get("allow_duplicate_coordinates") is True,
+            "allow_side_story_without_two_main_coordinates": (
+                body.get("allow_side_story_without_two_main_coordinates") is True
+            ),
             "confirm_count": confirm_count,
             "confirm_plan_sha256": confirm_sha,
         }
@@ -1588,6 +1593,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         frontend_dist=Path(args.frontend_dist),
         project_root=Path(args.project_root),
     )
+
+    def prewarm_volume_listing() -> None:
+        try:
+            app.extensions["library_volume_provider"].list_cases(limit=1)
+        except Exception:
+            # Startup/health must remain available even if the optional cache
+            # warm-up cannot read a temporarily busy database.
+            return
+
+    threading.Thread(
+        target=prewarm_volume_listing,
+        name="volume-list-prewarm",
+        daemon=True,
+    ).start()
     if args.server == "flask":
         app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     else:

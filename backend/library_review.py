@@ -248,6 +248,9 @@ class VolumeGroupProvider:
             allow_duplicate_coordinates=(
                 payload.get("allow_duplicate_coordinates") is True
             ),
+            allow_side_story_without_two_main_coordinates=(
+                payload.get("allow_side_story_without_two_main_coordinates") is True
+            ),
         )
 
     def apply_plan(
@@ -275,6 +278,9 @@ class VolumeGroupProvider:
             ),
             allow_duplicate_coordinates=(
                 payload.get("allow_duplicate_coordinates") is True
+            ),
+            allow_side_story_without_two_main_coordinates=(
+                payload.get("allow_side_story_without_two_main_coordinates") is True
             ),
             confirm_count=confirm_count,
             confirm_plan_sha256=confirm_plan_sha256,

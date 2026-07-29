@@ -116,6 +116,8 @@ export interface VolumeCase {
   parent_count: number;
   parents: string[];
   coordinate_kinds: string[];
+  main_coordinate_count: number;
+  has_side_story: boolean;
   coordinate_range: [string, string];
   duplicate_coordinates: string[];
   approved_duplicate_coordinates: string[];
@@ -152,6 +154,7 @@ export interface VolumePreview {
   selected_file_ids: string[];
   target_folder_name: string;
   allow_duplicate_coordinates: boolean;
+  allow_side_story_without_two_main_coordinates: boolean;
   destination_root: string;
   tree: string[];
   moved_count: number;
