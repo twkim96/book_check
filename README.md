@@ -35,14 +35,15 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.4)
+## 동일 작품 자동 중복 정리 계약 (1.4.5)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
-1.4.4의 강한 동일성 최종 격리·격리 수명주기 결과는
+1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
-[`update_1.4.4.md`](update_1.4.4.md)에 기록합니다.
+[`update_1.4.4.md`](update_1.4.4.md),
+[`update_1.4.5.md`](update_1.4.5.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -222,6 +223,43 @@ SHA `a23b9e42ddd3b273d1ae0224ac0b1b4d384d0417316b17de0e08af95d78fadd5`를 승인
 실행 도구는 `backend/cleanup_quarantine_1_4_4.py`, 감사 계획 생성기는
 `backend/build_quarantine_cleanup_plan_1_4_4.py`입니다. 실행 결과 원본은
 `txt_temp/dedup_logs/quarantine_cleanup_1_4_4_20260729_143535_894414.json`에 남습니다.
+
+### 1.4.5 house cleanup 안전선과 감사 cache 계약
+
+일상 Folderling과 `run_house_cleanup_once.py`의 기본 `queueable` scope에서 현재
+`text_equivalent`/`epub_equivalent`가 증명되면 1.4.4 계약대로 자동 최종 quarantine합니다. 반면
+`all-pending`은 사람이 미결 관계 전체를 훑기 위한 확장 scope이지 자동 격리 권한을 넓히는 옵션이
+아닙니다. 이 scope의 strong 관계도 `house_human_review`로만 이동합니다. 두 scope 모두 다음 안전선을
+동일하게 강제하며, 옵션으로 우회할 수 없습니다.
+
+- 명시적 형제 권·분할 회차 좌표가 충돌하거나 범위가 모호하면 이동하지 않습니다.
+- `legacy_unresolved`/`decision_required` 파일은 자동 처리하지 않습니다.
+- 양쪽이 managed라면 같은 variant에 속할 때만 하나의 중복 component로 처리합니다.
+- 보호 대표를 포함한 weak 관계는 자동 처리하지 않습니다.
+
+strong과 weak review가 한 chain에 섞이면 strong component를 먼저 하나의 최종 대표로 축약합니다.
+그 뒤 `near_identical` 같은 weak 관계의 endpoint를 그 최종 대표로 다시 연결하고, 원 review ID·원 pair·
+최종 pair를 새 evidence에 남긴 뒤 사람 큐 이동을 시작합니다. 따라서 weak 파일이 큐에 들어간 다음
+그 비교 대상이 후속 strong 격리로 사라져 판정 근거가 고아가 되는 순서는 허용하지 않습니다.
+
+본문 fingerprint와 pair 판정 cache는 서로 다른 버전 계약을 사용합니다.
+
+- `FINGERPRINT_POLICY_VERSION`과 `FINGERPRINT_VERSION`은 TXT 정규화 또는 EPUB 내용 fingerprint의
+  의미가 실제로 바뀔 때만 올립니다.
+- `PAIR_POLICY_VERSION`은 후보 pair 분류·evidence 정책 버전입니다. 이것만 바뀌면 pair cache만 새로
+  계산하고 기존 fingerprint는 그대로 재사용합니다.
+- `AUDITOR_VERSION`은 배포 버전입니다. 1.4.5는 기존 1.4.2 fingerprint·pair policy hash를 정확히
+  유지하므로 버전 표시와 cache 실행 방식 변경만으로 house 전체 본문이나 pair를 다시 계산하지 않습니다.
+
+감사 시작 시 active house 경로·identity·`file_analysis`를 한 번에 읽습니다. 파일명, 크기,
+mtime/ctime, inode/device, normalizer projection이 모두 현재인 house 파일은 `last_seen_at`을 포함한
+UPDATE를 하지 않고, 신규·변경·projection stale 파일만 `reconcile_file_metadata()`로 갱신합니다.
+Scanner가 실제 관측 시각의 소유자이며 warm auditor는 변하지 않은 1만여 행을 writer transaction으로
+다시 쓰지 않습니다.
+
+순서형 본문 비교가 읽은 `NormalizedLineSequence`는 파일별 남은 비교 참조 수를 계산해 마지막 사용
+직후 cache에서 해제합니다. 감사 통계에는 ordered-body cache peak/final item·추정 byte·eviction 수와
+프로세스 peak RSS를 남깁니다. I/O 예산과 별개로 모든 시퀀스를 감사 종료까지 붙잡아 두지 않습니다.
 
 ## 권별·부별·회차 분할 시리즈 폴더 계약 (1.4.3)
 

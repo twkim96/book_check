@@ -421,6 +421,12 @@ def test_unchanged_ordered_pair_reuses_pair_cache_without_body_reads(tmp_path):
     )
 
     assert first.results[0]["classification"] == "ordered_body_match"
+    assert first.stats["ordered_body_cache_peak_items"] == 2
+    assert first.stats["ordered_body_cache_peak_bytes"] > 0
+    assert first.stats["ordered_body_cache_evictions"] == 2
+    assert first.stats["ordered_body_cache_final_items"] == 0
+    assert first.stats["ordered_body_cache_final_bytes"] == 0
+    assert first.stats["audit_peak_rss_bytes"] > 0
     assert second.results[0]["classification"] == "ordered_body_match"
     assert second.stats["pair_cache_hits"] == 1
     assert second.stats["actual_read_bytes"] == 0

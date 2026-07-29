@@ -65,6 +65,38 @@ def _protected_exact_pair(tmp_path):
     }
 
 
+def _house_review_graph(tmp_path, names, relations):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / "state.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    rows = {}
+    for name, body in names.items():
+        path = house / name
+        path.write_text(body, encoding="utf-8")
+        with decision_store.transaction(conn):
+            row = decision_store.reconcile_file_metadata(
+                conn, path, source="house"
+            )
+        dedup_mutations.refresh_user_approved_snapshot(conn, row["file_id"])
+        rows[name] = row
+    review_ids = []
+    for left, right, classification in relations:
+        review_ids.append(decision_store.add_review_item(
+            conn,
+            candidate_file_id=rows[left]["file_id"],
+            reference_file_id=rows[right]["file_id"],
+            classification=classification,
+            evidence_json=json.dumps({"fixture_relation": [left, right]}),
+        ))
+    return {
+        "conn": conn, "state_db": state_db, "house": house, "temp": temp,
+        "rows": rows, "review_ids": review_ids,
+    }
+
+
 def test_exact_plan_preserves_protected_representative_and_review_evidence(tmp_path):
     fixture = _protected_exact_pair(tmp_path)
     try:
@@ -83,6 +115,198 @@ def test_exact_plan_preserves_protected_representative_and_review_evidence(tmp_p
     assert plans[0]["review_evidence"] == {"raw_match": True}
     assert plans[0]["left_fingerprint_id"] == review["left_fingerprint_id"]
     assert plans[0]["right_fingerprint_id"] == review["right_fingerprint_id"]
+
+
+def test_all_pending_cannot_cross_explicit_sibling_volume_coordinates(tmp_path):
+    fixture = _house_review_graph(
+        tmp_path,
+        {"형제 작품 1권.txt": "같은 본문", "형제 작품 2권.txt": "같은 본문"},
+        [("형제 작품 1권.txt", "형제 작품 2권.txt", "text_equivalent")],
+    )
+    try:
+        assert run_house_cleanup_once.build_plan(
+            fixture["conn"], scope="queueable"
+        ) == []
+        assert run_house_cleanup_once.build_plan(
+            fixture["conn"], scope="all-pending"
+        ) == []
+    finally:
+        fixture["conn"].close()
+
+
+def test_all_pending_cannot_cross_managed_variant_identity(tmp_path):
+    fixture = _house_review_graph(
+        tmp_path,
+        {"관리 작품 A.txt": "같은 본문", "관리 작품 B.txt": "같은 본문"},
+        [("관리 작품 A.txt", "관리 작품 B.txt", "text_equivalent")],
+    )
+    with decision_store.transaction(fixture["conn"]):
+        work_id = fixture["conn"].execute(
+            "INSERT INTO works(display_title) VALUES ('관리 작품')"
+        ).lastrowid
+        variant_ids = [
+            fixture["conn"].execute(
+                "INSERT INTO variants(work_bucket_id, variant_kind) "
+                "VALUES (?, 'other')", (work_id,)
+            ).lastrowid
+            for _ in range(2)
+        ]
+        for row, variant_id in zip(fixture["rows"].values(), variant_ids):
+            fixture["conn"].execute(
+                "UPDATE files SET assignment_state='managed', "
+                "assignment_origin='human_decision', variant_id=? "
+                "WHERE file_id=?", (variant_id, row["file_id"])
+            )
+    try:
+        assert run_house_cleanup_once.build_plan(
+            fixture["conn"], scope="all-pending"
+        ) == []
+    finally:
+        fixture["conn"].close()
+
+
+def test_all_pending_strong_relation_uses_human_review_queue(tmp_path, monkeypatch):
+    fixture = _house_review_graph(
+        tmp_path,
+        {
+            "안전 작품 1-100.txt": "같은 본문",
+            "안전 작품 1-100 완.txt": "같은 본문",
+        },
+        [("안전 작품 1-100.txt", "안전 작품 1-100 완.txt", "text_equivalent")],
+    )
+    fixture["conn"].close()
+    calls = []
+    monkeypatch.setattr(
+        run_house_cleanup_once,
+        "apply_strong_equivalent_quarantine",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("all-pending strong must not final-quarantine")
+        ),
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once,
+        "house_review_move",
+        lambda *args, **kwargs: calls.append(kwargs) or {
+            "operation_id": 1, "destination": str(kwargs["queue_dir"] / "queued.txt")
+        },
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once.folderling, "generate_file_list", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once.folderling, "sync_house_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once.folderling, "sync_extension_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once, "_prune_folderling_backups", lambda *a, **k: None
+    )
+
+    run_house_cleanup_once.run(
+        fixture["state_db"], fixture["house"], fixture["temp"],
+        execute=True, scope="all-pending",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["classification"] == "text_equivalent"
+    assert calls[0]["queue_dir"].name == "house_human_review"
+
+
+def test_mixed_component_rebinds_weak_edge_to_strong_representative(
+    tmp_path, monkeypatch,
+):
+    names = {
+        "연결 작품 1-100.txt": "짧은 다른 본문",
+        "연결 작품 1-200.txt": "같은 강한 본문",
+        "연결 작품 1-300.txt": "같은 강한 본문",
+    }
+    fixture = _house_review_graph(
+        tmp_path,
+        names,
+        [
+            ("연결 작품 1-100.txt", "연결 작품 1-200.txt", "near_identical"),
+            ("연결 작품 1-200.txt", "연결 작품 1-300.txt", "text_equivalent"),
+        ],
+    )
+    plans = run_house_cleanup_once.build_plan(fixture["conn"])
+    assert [plan["phase"] for plan in plans] == ["strong", "weak"]
+    assert plans[0]["move_file_id"] == fixture["rows"]["연결 작품 1-200.txt"]["file_id"]
+    assert plans[0]["keep_file_id"] == fixture["rows"]["연결 작품 1-300.txt"]["file_id"]
+    assert plans[1]["move_file_id"] == fixture["rows"]["연결 작품 1-100.txt"]["file_id"]
+    assert plans[1]["keep_file_id"] == fixture["rows"]["연결 작품 1-300.txt"]["file_id"]
+    assert plans[1]["review_rebind_required"] is True
+    source_review_id = plans[1]["source_review_id"]
+    fixture["conn"].close()
+
+    calls = []
+
+    def quarantine_and_supersede(conn, *args, **kwargs):
+        calls.append(("strong", kwargs))
+        with decision_store.transaction(conn):
+            decision_store.supersede_open_reviews_for_file(
+                conn,
+                kwargs["discard_file_id"],
+                reason="test_strong_quarantine",
+            )
+        return {"operation_id": 10, "dest_path": "strong"}
+
+    monkeypatch.setattr(
+        run_house_cleanup_once,
+        "apply_strong_equivalent_quarantine",
+        quarantine_and_supersede,
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once,
+        "house_review_move",
+        lambda *args, **kwargs: calls.append(("weak", kwargs)) or {
+            "operation_id": 11, "destination": "weak"
+        },
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once.folderling, "generate_file_list", lambda *a, **k: True
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once.folderling, "sync_house_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once.folderling, "sync_extension_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        run_house_cleanup_once, "_prune_folderling_backups", lambda *a, **k: None
+    )
+
+    run_house_cleanup_once.run(
+        fixture["state_db"], fixture["house"], fixture["temp"], execute=True
+    )
+
+    assert [kind for kind, _kwargs in calls] == ["strong", "weak"]
+    assert calls[1][1]["keep_file_id"] == fixture["rows"]["연결 작품 1-300.txt"]["file_id"]
+    assert calls[1][1]["review_id"] != source_review_id
+    conn = decision_store.connect_state_db_readonly(fixture["state_db"])
+    try:
+        rebound = conn.execute(
+            "SELECT candidate_file_id, reference_file_id, state, evidence_json "
+            "FROM review_items WHERE review_id = ?",
+            (calls[1][1]["review_id"],),
+        ).fetchone()
+        source_state = conn.execute(
+            "SELECT state FROM review_items WHERE review_id = ?",
+            (source_review_id,),
+        ).fetchone()["state"]
+    finally:
+        conn.close()
+    assert {
+        rebound["candidate_file_id"], rebound["reference_file_id"]
+    } == {
+        fixture["rows"]["연결 작품 1-100.txt"]["file_id"],
+        fixture["rows"]["연결 작품 1-300.txt"]["file_id"],
+    }
+    assert source_state == "superseded"
+    assert rebound["state"] == "pending"
+    assert json.loads(rebound["evidence_json"])["strong_component_rebind"][
+        "source_review_id"
+    ] == source_review_id
 
 
 def test_protected_exact_component_does_not_absorb_weak_neighbor(tmp_path):

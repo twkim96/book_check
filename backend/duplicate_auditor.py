@@ -73,7 +73,16 @@ MAX_ESTIMATED_READ_PASSES = 6
 # v2: BOM UTF-16 LE/BE strict 판독을 fingerprint 의미에 포함한다.
 # 판독 규칙이 바뀌면 기존 decode_lossy 결과를 재사용하지 않도록 반드시 올린다.
 FINGERPRINT_VERSION = "5"
-AUDITOR_VERSION = "1.4.2"
+# Keep this frozen until text/EPUB normalization semantics actually change.
+# The legacy ``auditor_version`` JSON field name is retained in
+# ``_analysis_policy_hash`` so existing 1.4.2 fingerprints keep the exact same
+# cache key while pair-decision changes follow PAIR_POLICY_VERSION separately.
+FINGERPRINT_POLICY_VERSION = "1.4.2"
+# Pair classification/evidence also has its own compatibility lifetime. 1.4.5
+# changes cache execution, not pair meaning, so existing 1.4.2 pair rows remain
+# valid while AUDITOR_VERSION follows the shipped application release.
+PAIR_POLICY_VERSION = "1.4.2"
+AUDITOR_VERSION = "1.4.5"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -925,6 +934,17 @@ def _snapshot_changes(snapshot):
     return changed
 
 
+def _peak_rss_bytes():
+    """Return process peak RSS using platform-correct resource units."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except (ImportError, OSError, ValueError):
+        return None
+    return int(peak if sys.platform == "darwin" else peak * 1024)
+
+
 def _without_changed_inputs(candidates, results, changed):
     changed_paths = {item["path"] for item in changed}
     if not changed_paths:
@@ -965,16 +985,81 @@ class PersistentAuditCache:
         self.pending_identities = {}
         self.raw_sha_cache = {}
         self.stats = Counter()
-        with decision_store.transaction(self.conn):
-            for entry in entries:
-                row = decision_store.reconcile_file_metadata(
-                    self.conn,
-                    entry.path,
-                    source=entry.source,
-                    legacy_marker=entry.pass_recheck or entry.disambig > 1,
+        reconcile_started = time.monotonic()
+        rows_by_path = {
+            row["canonical_path"]: row
+            for row in self.conn.execute(
+                """
+                SELECT
+                    f.*,
+                    fa.file_id AS analysis_file_id,
+                    fa.normalizer_version AS analysis_normalizer_version,
+                    fa.analyzed_name AS analysis_analyzed_name,
+                    fa.analyzed_size AS analysis_analyzed_size,
+                    fa.analyzed_mtime_ns AS analysis_analyzed_mtime_ns,
+                    fa.analyzed_ctime_ns AS analysis_analyzed_ctime_ns
+                FROM files AS f
+                LEFT JOIN file_analysis AS fa ON fa.file_id = f.file_id
+                WHERE f.active = 1 AND f.source IN ('house', 'temp')
+                """
+            )
+        }
+        pending = []
+        for entry in entries:
+            canonical_path = decision_store.canonicalize_path(entry.path)
+            row = rows_by_path.get(canonical_path)
+            legacy_marker = entry.pass_recheck or entry.disambig > 1
+            identity_current = bool(
+                row is not None
+                and row["active"] == 1
+                and row["source"] == entry.source
+                and row["size"] == entry.size
+                and row["mtime_ns"] == entry.mtime_ns
+                and row["dev"] is not None
+                and row["dev"] == entry.dev
+                and row["ino"] is not None
+                and row["ino"] == entry.ino
+                and row["ctime_ns"] is not None
+                and row["ctime_ns"] == entry.ctime_ns
+                and not (
+                    legacy_marker and row["assignment_state"] == "unassigned"
                 )
+            )
+            analysis_current = bool(
+                entry.source == "house"
+                and row is not None
+                and row["analysis_file_id"] is not None
+                and row["analysis_normalizer_version"] == NORMALIZER_VERSION
+                and row["analysis_analyzed_name"] == Path(canonical_path).name
+                and row["analysis_analyzed_size"] == entry.size
+                and row["analysis_analyzed_mtime_ns"] == entry.mtime_ns
+                and (
+                    row["analysis_analyzed_ctime_ns"] is None
+                    or row["analysis_analyzed_ctime_ns"] == entry.ctime_ns
+                )
+            )
+            if identity_current and analysis_current:
                 self.file_ids[entry.path] = row["file_id"]
-                self.canonical_paths[entry.path] = row["canonical_path"]
+                self.canonical_paths[entry.path] = canonical_path
+                self.stats["metadata_reconcile_skips"] += 1
+            else:
+                pending.append(entry)
+
+        if pending:
+            with decision_store.transaction(self.conn):
+                for entry in pending:
+                    row = decision_store.reconcile_file_metadata(
+                        self.conn,
+                        entry.path,
+                        source=entry.source,
+                        legacy_marker=entry.pass_recheck or entry.disambig > 1,
+                    )
+                    self.file_ids[entry.path] = row["file_id"]
+                    self.canonical_paths[entry.path] = row["canonical_path"]
+                    self.stats["metadata_reconcile_writes"] += 1
+        self.stats["metadata_reconcile_seconds"] = round(
+            time.monotonic() - reconcile_started, 6
+        )
 
     def close(self):
         self.conn.close()
@@ -1214,7 +1299,7 @@ class PersistentAuditCache:
             WHERE left_fingerprint_id = ? AND right_fingerprint_id = ?
               AND auditor_version = ? AND configuration_hash = ? AND completed = 1
             """,
-            (left_id, right_id, AUDITOR_VERSION, self.configuration_hash),
+            (left_id, right_id, PAIR_POLICY_VERSION, self.configuration_hash),
         ).fetchone()
         if row is None:
             self.stats["pair_cache_misses"] += 1
@@ -1260,7 +1345,7 @@ class PersistentAuditCache:
                     (
                         left_id,
                         right_id,
-                        AUDITOR_VERSION,
+                        PAIR_POLICY_VERSION,
                         self.configuration_hash,
                         result.classification,
                         json.dumps(result.evidence, ensure_ascii=False, sort_keys=True),
@@ -1479,7 +1564,9 @@ def load_persisted_analyses_readonly(
 
 def _pair_configuration_hash(config):
     relevant = {
-        "auditor_version": AUDITOR_VERSION,
+        # Preserve the legacy JSON field name and hash until pair semantics
+        # change; the pair_cache column has the same compatibility lifetime.
+        "auditor_version": PAIR_POLICY_VERSION,
         "normalizer_version": NORMALIZER_VERSION,
         "fingerprint_version": FINGERPRINT_VERSION,
         "anchor_chars": config.anchor_chars,
@@ -1496,7 +1583,10 @@ def _pair_configuration_hash(config):
 def _analysis_policy_hash(config):
     """Hash fingerprint semantics, excluding one-run resource/candidate caps."""
     relevant = {
-        "auditor_version": AUDITOR_VERSION,
+        # Keep the legacy field name and frozen 1.4.2 value so this policy
+        # produces the exact pre-1.4.5 hash. Pair semantics are versioned by
+        # ``_pair_configuration_hash`` instead.
+        "auditor_version": FINGERPRINT_POLICY_VERSION,
         "normalizer_version": NORMALIZER_VERSION,
         "fingerprint_version": FINGERPRINT_VERSION,
         "anchor_chars": config.anchor_chars,
@@ -1870,6 +1960,18 @@ def _exact_ordered_coverage(source_analysis, target_analysis):
     )
 
 
+def _normalized_sequence_retained_bytes(sequence):
+    """Approximate the Python heap retained by one ordered-body sequence."""
+    return int(
+        sys.getsizeof(sequence)
+        + sys.getsizeof(sequence.path)
+        + sys.getsizeof(sequence.lines)
+        + sys.getsizeof(sequence.weights)
+        + sum(sys.getsizeof(line) for line in sequence.lines)
+        + sum(sys.getsizeof(weight) for weight in sequence.weights)
+    )
+
+
 def _apply_ordered_body_classification(
     candidates,
     results,
@@ -1877,12 +1979,41 @@ def _apply_ordered_body_classification(
     config,
     budget,
     stop_reasons,
+    runtime_stats=None,
 ):
     """Promote eligible same-core editions only after a complete ordered proof."""
+    runtime_stats = runtime_stats if runtime_stats is not None else Counter()
     results_by_id = {result.pair_id: result for result in results}
+    remaining_uses = Counter()
+    for candidate in candidates:
+        result = results_by_id.get(candidate.pair_id)
+        if result is None or result.evidence.get("ordered_body_checked"):
+            continue
+        if _ordered_body_relation(candidate) is None:
+            continue
+        left_analysis = analyses.get(candidate.left.path)
+        right_analysis = analyses.get(candidate.right.path)
+        if (
+            left_analysis is None
+            or right_analysis is None
+            or left_analysis.status != "ok"
+            or right_analysis.status != "ok"
+            or (
+                left_analysis.normalized_sha256
+                and left_analysis.normalized_sha256
+                == right_analysis.normalized_sha256
+            )
+        ):
+            continue
+        remaining_uses[candidate.left.path] += 1
+        remaining_uses[candidate.right.path] += 1
+
     line_cache = {}
+    line_cache_bytes = {}
+    retained_bytes = 0
 
     def sequence(entry, analysis):
+        nonlocal retained_bytes
         cached = line_cache.get(entry.path)
         if cached is not None:
             return cached
@@ -1893,7 +2024,30 @@ def _apply_ordered_body_classification(
             max_file_bytes=config.max_file_bytes,
         )
         line_cache[entry.path] = loaded
+        loaded_bytes = _normalized_sequence_retained_bytes(loaded)
+        line_cache_bytes[entry.path] = loaded_bytes
+        retained_bytes += loaded_bytes
+        runtime_stats["ordered_body_cache_peak_items"] = max(
+            runtime_stats.get("ordered_body_cache_peak_items", 0),
+            len(line_cache),
+        )
+        runtime_stats["ordered_body_cache_peak_bytes"] = max(
+            runtime_stats.get("ordered_body_cache_peak_bytes", 0),
+            retained_bytes,
+        )
         return loaded
+
+    def release(entry):
+        nonlocal retained_bytes
+        if entry.path not in remaining_uses:
+            return
+        remaining_uses[entry.path] -= 1
+        if remaining_uses[entry.path] > 0:
+            return
+        del remaining_uses[entry.path]
+        if line_cache.pop(entry.path, None) is not None:
+            retained_bytes -= line_cache_bytes.pop(entry.path, 0)
+            runtime_stats["ordered_body_cache_evictions"] += 1
 
     for candidate in candidates:
         result = results_by_id.get(candidate.pair_id)
@@ -1931,10 +2085,14 @@ def _apply_ordered_body_classification(
             ):
                 proof = _exact_ordered_coverage(source_analysis, target_analysis)
             else:
-                proof = ordered_body_coverage(
-                    sequence(source_entry, source_analysis),
-                    sequence(target_entry, target_analysis),
-                )
+                try:
+                    proof = ordered_body_coverage(
+                        sequence(source_entry, source_analysis),
+                        sequence(target_entry, target_analysis),
+                    )
+                finally:
+                    release(source_entry)
+                    release(target_entry)
         except BodyBudgetExceeded:
             result.classification = "body_budget_exhausted"
             result.evidence["ordered_body_checked"] = False
@@ -1965,6 +2123,8 @@ def _apply_ordered_body_classification(
             not in {"text_equivalent", "contained_exact", "contained_version", "near_identical"}
         ):
             result.classification = "ordered_body_review"
+    runtime_stats["ordered_body_cache_final_items"] = len(line_cache)
+    runtime_stats["ordered_body_cache_final_bytes"] = retained_bytes
     return [
         results_by_id[candidate.pair_id]
         for candidate in candidates
@@ -1974,7 +2134,7 @@ def _apply_ordered_body_classification(
 
 def analyze_candidates(
     candidates, config, coverage, stop_reasons, persistent=None,
-    preloaded_analyses=None, budget=None, cache=None,
+    preloaded_analyses=None, budget=None, cache=None, runtime_stats=None,
 ):
     results = {}
     budget = budget or ReadBudget(max_bytes=config.max_read_bytes)
@@ -2282,6 +2442,7 @@ def analyze_candidates(
         config,
         budget,
         stop_reasons,
+        runtime_stats=runtime_stats,
     )
     return ordered_results, budget, cache, stop_reasons
 
@@ -2326,6 +2487,7 @@ def run_audit(args):
     sweep_stats = Counter()
     managed_fingerprint_stats = Counter()
     temp_fingerprint_stats = Counter()
+    runtime_stats = Counter()
     sweep_read_bytes = 0
     managed_preparation_read_bytes = 0
     temp_preparation_read_bytes = 0
@@ -2553,6 +2715,7 @@ def run_audit(args):
             preloaded_analyses=preloaded_analyses,
             budget=main_budget,
             cache=main_cache,
+            runtime_stats=runtime_stats,
         )
         # Candidate analysis may have created the first current-version
         # fingerprints for house files selected by title rules. Re-run the
@@ -2591,6 +2754,7 @@ def run_audit(args):
                         preloaded_analyses=preloaded_analyses,
                         budget=budget,
                         cache=cache,
+                        runtime_stats=runtime_stats,
                     )
                 )
                 results.extend(extra_results)
@@ -2727,6 +2891,15 @@ def run_audit(args):
             "fingerprint_cache_peek_misses", 0
         ),
         "fingerprint_stale_inputs": persistent_stats.get("fingerprint_stale_inputs", 0),
+        "metadata_reconcile_skips": persistent_stats.get(
+            "metadata_reconcile_skips", 0
+        ),
+        "metadata_reconcile_writes": persistent_stats.get(
+            "metadata_reconcile_writes", 0
+        ),
+        "metadata_reconcile_seconds": persistent_stats.get(
+            "metadata_reconcile_seconds", 0
+        ),
         "pair_cache_hits": persistent_stats.get("pair_cache_hits", 0),
         "pair_cache_misses": persistent_stats.get("pair_cache_misses", 0),
         "review_items_created": persistent_stats.get("review_items_created", 0),
@@ -2748,6 +2921,22 @@ def run_audit(args):
         "human_disposition_cache_hits": persistent_stats.get(
             "human_disposition_cache_hits", 0
         ),
+        "ordered_body_cache_peak_items": runtime_stats.get(
+            "ordered_body_cache_peak_items", 0
+        ),
+        "ordered_body_cache_peak_bytes": runtime_stats.get(
+            "ordered_body_cache_peak_bytes", 0
+        ),
+        "ordered_body_cache_evictions": runtime_stats.get(
+            "ordered_body_cache_evictions", 0
+        ),
+        "ordered_body_cache_final_items": runtime_stats.get(
+            "ordered_body_cache_final_items", 0
+        ),
+        "ordered_body_cache_final_bytes": runtime_stats.get(
+            "ordered_body_cache_final_bytes", 0
+        ),
+        "audit_peak_rss_bytes": _peak_rss_bytes(),
         "input_changes": changed,
         **posting_stats,
     }

@@ -71,6 +71,107 @@ QUEUEABLE = {
 EXACT_EQUIVALENT = {"text_equivalent", "epub_equivalent"}
 
 
+def _managed_identity_compatible(left, right):
+    """Fail closed when persisted work/variant identity forbids a merge."""
+    blocked_states = {"legacy_unresolved", "decision_required"}
+    if (
+        left["assignment_state"] in blocked_states
+        or right["assignment_state"] in blocked_states
+    ):
+        return False
+    if (
+        left["assignment_state"] == "managed"
+        and right["assignment_state"] == "managed"
+    ):
+        return bool(
+            left["variant_id"] is not None
+            and left["variant_id"] == right["variant_id"]
+        )
+    return True
+
+
+def _materialize_component_rebound_reviews(conn, plans):
+    """Bind weak evidence to the surviving strong-component representatives."""
+    for plan in plans:
+        if not plan.get("review_rebind_required"):
+            continue
+        source = conn.execute(
+            "SELECT * FROM review_items WHERE review_id = ?",
+            (plan["source_review_id"],),
+        ).fetchone()
+        if (
+            source is None
+            or source["state"] not in {"pending", "deferred"}
+            or source["classification"] != plan["classification"]
+            or {
+                source["candidate_file_id"], source["reference_file_id"]
+            } != set(plan["source_pair_file_ids"])
+        ):
+            raise RuntimeError("component rebind source review is stale")
+        move = conn.execute(
+            "SELECT current_fingerprint_id FROM files "
+            "WHERE file_id = ? AND active = 1 AND source = 'house'",
+            (plan["move_file_id"],),
+        ).fetchone()
+        keep = conn.execute(
+            "SELECT current_fingerprint_id FROM files "
+            "WHERE file_id = ? AND active = 1 AND source = 'house'",
+            (plan["keep_file_id"],),
+        ).fetchone()
+        if (
+            move is None
+            or keep is None
+            or move["current_fingerprint_id"] is None
+            or keep["current_fingerprint_id"] is None
+        ):
+            raise RuntimeError("component rebind endpoint is not current")
+        existing = conn.execute(
+            """
+            SELECT review_id, evidence_json FROM review_items
+            WHERE state IN ('pending', 'deferred') AND classification = ?
+              AND (
+                (candidate_file_id = ? AND reference_file_id = ?
+                 AND left_fingerprint_id = ? AND right_fingerprint_id = ?)
+                OR
+                (candidate_file_id = ? AND reference_file_id = ?
+                 AND left_fingerprint_id = ? AND right_fingerprint_id = ?)
+              )
+            ORDER BY review_id DESC LIMIT 1
+            """,
+            (
+                plan["classification"],
+                plan["move_file_id"], plan["keep_file_id"],
+                move["current_fingerprint_id"], keep["current_fingerprint_id"],
+                plan["keep_file_id"], plan["move_file_id"],
+                keep["current_fingerprint_id"], move["current_fingerprint_id"],
+            ),
+        ).fetchone()
+        if existing is not None:
+            review_id = existing["review_id"]
+        else:
+            evidence = dict(plan.get("review_evidence") or {})
+            evidence["strong_component_rebind"] = {
+                "version": "1.4.5",
+                "source_review_id": plan["source_review_id"],
+                "source_pair_file_ids": list(plan["source_pair_file_ids"]),
+                "final_pair_file_ids": [
+                    plan["move_file_id"], plan["keep_file_id"]
+                ],
+            }
+            review_id = decision_store.add_review_item(
+                conn,
+                candidate_file_id=plan["move_file_id"],
+                reference_file_id=plan["keep_file_id"],
+                classification=plan["classification"],
+                evidence_json=json.dumps(
+                    evidence, ensure_ascii=False, sort_keys=True
+                ),
+            )
+            plan["review_evidence"] = evidence
+        plan["review_id"] = review_id
+        plan["rebound_review_id"] = review_id
+
+
 def build_plan(conn, scope="queueable", review_ids=None):
     if scope not in {"queueable", "all-pending"}:
         raise ValueError(f"unknown house review scope: {scope}")
@@ -102,7 +203,7 @@ def build_plan(conn, scope="queueable", review_ids=None):
         tuple(params),
     ).fetchall()
     files = {}
-    edges = defaultdict(list)
+    edge_records = []
     for row in rows:
         right_row = conn.execute(
             "SELECT * FROM files WHERE file_id = ?", (row["r_file_id"],)
@@ -114,18 +215,15 @@ def build_plan(conn, scope="queueable", review_ids=None):
             continue
         if not row["active"] or not right["active"]:
             continue
-        if scope == "queueable":
-            if (
-                (row["protected"] or right["protected"])
-                and row["classification"] not in EXACT_EQUIVALENT
-            ):
-                continue
-            if row["assignment_state"] in {"legacy_unresolved", "decision_required"}:
-                continue
-            if right.get("assignment_state") in {"legacy_unresolved", "decision_required"}:
-                continue
-            if not decision_store.coordinates_compatible(row, right):
-                continue
+        if (
+            (row["protected"] or right["protected"])
+            and row["classification"] not in EXACT_EQUIVALENT
+        ):
+            continue
+        if not _managed_identity_compatible(row, right):
+            continue
+        if not decision_store.coordinates_compatible(row, right):
+            continue
         left_entry, right_entry = _entry(row), _entry(right)
         files[left_entry["file_id"]] = left_entry
         files[right_entry["file_id"]] = right_entry
@@ -141,35 +239,119 @@ def build_plan(conn, scope="queueable", review_ids=None):
             "left_fingerprint_id": row["left_fingerprint_id"],
             "right_fingerprint_id": row["right_fingerprint_id"],
             "review_evidence": review_evidence,
+            "left_file_id": left_entry["file_id"],
+            "right_file_id": right_entry["file_id"],
         }
-        edges[left_entry["file_id"]].append((right_entry["file_id"], edge))
-        edges[right_entry["file_id"]].append((left_entry["file_id"], edge))
+        edge_records.append((left_entry["file_id"], right_entry["file_id"], edge))
 
-    protected_exact_nodes = {
-        file_id for file_id, item in files.items() if item["protected"]
-    }
-    queue = deque(protected_exact_nodes)
-    while queue:
-        node = queue.popleft()
-        for neighbor, edge in edges[node]:
-            if (
-                edge["classification"] in EXACT_EQUIVALENT
-                and neighbor not in protected_exact_nodes
+    union_parent = {file_id: file_id for file_id in files}
+
+    def find(node):
+        while union_parent[node] != node:
+            union_parent[node] = union_parent[union_parent[node]]
+            node = union_parent[node]
+        return node
+
+    def union(left, right):
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            union_parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    strong_adjacency = defaultdict(list)
+    for left, right, edge in edge_records:
+        if edge["classification"] not in EXACT_EQUIVALENT:
+            continue
+        union(left, right)
+        strong_adjacency[left].append((right, edge))
+        strong_adjacency[right].append((left, edge))
+
+    strong_components = defaultdict(list)
+    for file_id in files:
+        strong_components[find(file_id)].append(file_id)
+
+    representative = {}
+    representative_protected = {}
+    strong_plans = []
+
+    def plan_record(edge, move_id, keep_id, component_keep, phase):
+        record = {
+            **edge,
+            "phase": phase,
+            "keep_file_id": keep_id,
+            "move_file_id": move_id,
+            "component_keep": component_keep,
+            "keep": files[keep_id]["path"],
+            "move": files[move_id]["path"],
+        }
+        source_pair = (edge["left_file_id"], edge["right_file_id"])
+        if set(source_pair) != {move_id, keep_id}:
+            record["source_review_id"] = edge["review_id"]
+            record["source_pair_file_ids"] = source_pair
+            record["review_rebind_required"] = True
+        else:
+            record["review_rebind_required"] = False
+        return record
+
+    for component in sorted(strong_components.values(), key=lambda value: min(value)):
+        protected = [node for node in component if files[node]["protected"]]
+        if len(protected) > 1:
+            for node in component:
+                representative[node] = node
+                representative_protected[node] = True
+            continue
+        keep = files[protected[0]] if protected else files[component[0]]
+        if not protected:
+            for node in component[1:]:
+                keep = _better_house_entry(keep, files[node])
+        root = keep["file_id"]
+        for node in component:
+            representative[node] = root
+        representative_protected[root] = bool(protected)
+        if len(component) < 2:
+            continue
+        parent = {root: None}
+        parent_edge = {}
+        depth = {root: 0}
+        queue = deque([root])
+        while queue:
+            node = queue.popleft()
+            for neighbor, edge in sorted(
+                strong_adjacency[node],
+                key=lambda value: (value[0], value[1]["review_id"]),
             ):
-                protected_exact_nodes.add(neighbor)
+                if neighbor in parent:
+                    continue
+                parent[neighbor] = node
+                parent_edge[neighbor] = edge
+                depth[neighbor] = depth[node] + 1
                 queue.append(neighbor)
+        for node in sorted(
+            (value for value in component if value != root),
+            key=lambda value: (-depth[value], value),
+        ):
+            strong_plans.append(plan_record(
+                parent_edge[node], node, parent[node], keep["path"], "strong"
+            ))
 
-    def edge_allowed(left, right, edge):
-        return (
-            edge["classification"] in EXACT_EQUIVALENT
-            or (
-                left not in protected_exact_nodes
-                and right not in protected_exact_nodes
-            )
-        )
+    weak_adjacency = defaultdict(list)
+    for left, right, edge in edge_records:
+        if edge["classification"] in EXACT_EQUIVALENT:
+            continue
+        mapped_left = representative[left]
+        mapped_right = representative[right]
+        if mapped_left == mapped_right:
+            continue
+        if (
+            representative_protected.get(mapped_left, False)
+            or representative_protected.get(mapped_right, False)
+        ):
+            continue
+        weak_adjacency[mapped_left].append((mapped_right, edge))
+        weak_adjacency[mapped_right].append((mapped_left, edge))
 
+    weak_plans = []
     seen = set()
-    for start in sorted(files):
+    for start in sorted(weak_adjacency):
         if start in seen:
             continue
         component = []
@@ -181,16 +363,14 @@ def build_plan(conn, scope="queueable", review_ids=None):
             seen.add(node)
             component.append(node)
             stack.extend(
-                neighbor for neighbor, edge in edges[node]
-                if neighbor not in seen and edge_allowed(node, neighbor, edge)
+                neighbor for neighbor, _edge in weak_adjacency[node]
+                if neighbor not in seen
             )
         if len(component) < 2:
             continue
-        protected = [files[node] for node in component if files[node]["protected"]]
-        keep = protected[0] if protected else files[component[0]]
-        candidates = protected[1:] if protected else [files[node] for node in component[1:]]
-        for candidate in candidates:
-            keep = _better_house_entry(keep, candidate)
+        keep = files[component[0]]
+        for node in component[1:]:
+            keep = _better_house_entry(keep, files[node])
         root = keep["file_id"]
         parent = {root: None}
         parent_edge = {}
@@ -198,23 +378,24 @@ def build_plan(conn, scope="queueable", review_ids=None):
         queue = deque([root])
         while queue:
             node = queue.popleft()
-            for neighbor, edge in edges[node]:
-                if neighbor in parent or not edge_allowed(node, neighbor, edge):
+            for neighbor, edge in sorted(
+                weak_adjacency[node],
+                key=lambda value: (value[0], value[1]["review_id"]),
+            ):
+                if neighbor in parent:
                     continue
                 parent[neighbor] = node
                 parent_edge[neighbor] = edge
                 depth[neighbor] = depth[node] + 1
                 queue.append(neighbor)
-        for node in sorted((n for n in component if n != root), key=lambda n: -depth[n]):
-            if files[node]["protected"]:
-                continue
-            plans.append({
-                **parent_edge[node],
-                "keep_file_id": parent[node], "move_file_id": node,
-                "component_keep": keep["path"], "keep": files[parent[node]]["path"],
-                "move": files[node]["path"],
-            })
-    return plans
+        for node in sorted(
+            (value for value in component if value != root),
+            key=lambda value: (-depth[value], value),
+        ):
+            weak_plans.append(plan_record(
+                parent_edge[node], node, parent[node], keep["path"], "weak"
+            ))
+    return [*strong_plans, *weak_plans]
 
 
 def run(
@@ -277,6 +458,7 @@ def run(
         moved = []
         run_finished = False
         try:
+            _materialize_component_rebound_reviews(conn, plans)
             for plan in plans:
                 if scope == "all-pending":
                     queue_name = "house_human_review"
@@ -286,7 +468,10 @@ def run(
                         if plan["classification"] in {"text_equivalent", "epub_equivalent"}
                         else "house_cleanup_warning"
                     )
-                if plan["classification"] in EXACT_EQUIVALENT:
+                if (
+                    scope != "all-pending"
+                    and plan["classification"] in EXACT_EQUIVALENT
+                ):
                     result = apply_strong_equivalent_quarantine(
                         conn,
                         review_id=plan["review_id"],

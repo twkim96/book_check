@@ -334,7 +334,104 @@ def test_corrupt_epub_candidate_makes_audit_incomplete(tmp_path):
 
 def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.2"
+    assert duplicate_auditor.FINGERPRINT_POLICY_VERSION == "1.4.2"
+    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.2"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.5"
+
+
+def _txt_cache_fixture(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["정책 캐시 1-100.txt", "정책 캐시 1-100 완.txt"]
+    body = "fingerprint policy 본문입니다. " * 500
+    for name in names:
+        (house / name).write_text(body, encoding="utf-8")
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+    state_db = tmp_path / "state.sqlite3"
+    return house, temp, index, state_db
+
+
+def test_release_fingerprint_and_pair_cache_versions_are_independent(
+    tmp_path, monkeypatch,
+):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    analysis_hash = duplicate_auditor._analysis_policy_hash(args)
+    pair_hash = duplicate_auditor._pair_configuration_hash(args)
+    duplicate_auditor.run_audit(args)
+
+    monkeypatch.setattr(duplicate_auditor, "AUDITOR_VERSION", "1.4.6")
+    warm = duplicate_auditor.run_audit(args)
+
+    assert duplicate_auditor._analysis_policy_hash(args) == analysis_hash
+    assert duplicate_auditor._pair_configuration_hash(args) == pair_hash
+    assert warm.stats["fingerprint_cache_hits"] == 2
+    assert warm.stats["fingerprint_cache_misses"] == 0
+    assert warm.stats["pair_cache_hits"] == 1
+    assert warm.stats["actual_read_bytes"] == 0
+
+    monkeypatch.setattr(duplicate_auditor, "PAIR_POLICY_VERSION", "1.4.3")
+    pair_changed = duplicate_auditor.run_audit(args)
+
+    assert duplicate_auditor._analysis_policy_hash(args) == analysis_hash
+    assert duplicate_auditor._pair_configuration_hash(args) != pair_hash
+    assert pair_changed.stats["fingerprint_cache_hits"] == 2
+    assert pair_changed.stats["fingerprint_cache_misses"] == 0
+    assert pair_changed.stats["pair_cache_hits"] == 0
+    assert pair_changed.stats["actual_read_bytes"] == 0
+
+
+def test_warm_audit_skips_unchanged_house_metadata_reconcile(
+    tmp_path, monkeypatch,
+):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    cold = duplicate_auditor.run_audit(args)
+    calls = []
+    original = decision_store.reconcile_file_metadata
+
+    def tracked_reconcile(*call_args, **call_kwargs):
+        calls.append(call_args[1])
+        return original(*call_args, **call_kwargs)
+
+    monkeypatch.setattr(
+        decision_store, "reconcile_file_metadata", tracked_reconcile
+    )
+    warm = duplicate_auditor.run_audit(args)
+
+    assert cold.stats["metadata_reconcile_writes"] == 2
+    assert warm.stats["metadata_reconcile_skips"] == 2
+    assert warm.stats["metadata_reconcile_writes"] == 0
+    assert calls == []
+
+
+def test_warm_audit_reconciles_only_the_changed_house_entry(tmp_path):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    duplicate_auditor.run_audit(args)
+    names = sorted(path.name for path in house.iterdir())
+    changed = house / names[-1]
+    changed.write_text(
+        changed.read_text(encoding="utf-8") + "변경 본문",
+        encoding="utf-8",
+    )
+    _write_index(index, house, names)
+
+    refreshed = duplicate_auditor.run_audit(args)
+
+    assert refreshed.stats["metadata_reconcile_skips"] == 1
+    assert refreshed.stats["metadata_reconcile_writes"] == 1
+    assert refreshed.stats["fingerprint_cache_hits"] == 1
+    assert refreshed.stats["fingerprint_cache_misses"] == 1
 
 
 def test_full_sweep_backfills_cross_core_txt_and_warm_run_reuses_cache(tmp_path):

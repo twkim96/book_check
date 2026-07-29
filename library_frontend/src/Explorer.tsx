@@ -146,7 +146,7 @@ export function CatalogTabs({ active }: { active: CatalogTab }) {
 
 function Header({ title, description }: { title: string; description: string }) {
   return <header className="page-header">
-    <div><span className="eyebrow">LIBRARY MANAGEMENT · 1.4.1</span><h1>{title}</h1><p>{description}</p></div>
+    <div><span className="eyebrow">LIBRARY MANAGEMENT · 1.4.5</span><h1>{title}</h1><p>{description}</p></div>
     <span className="readonly-pill">PLAN → CONFIRM</span>
   </header>;
 }
