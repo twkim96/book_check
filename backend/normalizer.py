@@ -559,13 +559,18 @@ _META_SUFFIX_RE = re.compile(
 )
 _KNOWN_NUMERIC_META_RE = re.compile(r"(?:판|현)\d{6}|제\d+판", re.IGNORECASE)
 _POST_STATUS_MODIFIER = r"(?:갱신|업데이트|업뎃|재업(?:로드)?|수정(?:본)?|교체|추가)"
+_CLOSED_POST_STATUS_MODIFIER = r"(?:신규|신작)"
+_ANY_POST_STATUS_MODIFIER = (
+    r"(?:" + _CLOSED_POST_STATUS_MODIFIER + r"|" + _POST_STATUS_MODIFIER + r")"
+)
 _LEADING_POST_STATUS_RE = re.compile(
     r"^\s*[\[\({【]?\s*"
     r"(?:"
-    r"(?:" + _POST_STATUS_MODIFIER + r"\s*)*"
+    r"(?:" + _ANY_POST_STATUS_MODIFIER + r"\s*)*"
     r"(?:(?:신작\s*)?(?:완결|完結|완|完)|"
     r"19\s*(?:禁|금|N|n)\s*(?:완결|完結|완|完)?)|"
-    r"(?:" + _POST_STATUS_MODIFIER + r"\s*)+"
+    r"(?:" + _POST_STATUS_MODIFIER + r"\s*)+|"
+    r"(?:" + _CLOSED_POST_STATUS_MODIFIER + r")\s*(?=[\)\]\}】〉》])"
     r")"
     r"\s*[\)\]\}】〉》:：,.\\\-_/]+\s*",
     re.IGNORECASE,

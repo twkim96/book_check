@@ -43,8 +43,13 @@ house 전수 검토에서는 같은 구조의 추가 오류도 확인했다.
 
 ### 상태 접두사
 
-`갱신`, `업데이트`, `업뎃`, `재업/재업로드`, `수정/수정본`, `교체`, `추가`는 선두 상태표시와 닫는
-구두점 문맥에서만 제거한다. 일반 제목 중간의 같은 단어는 보존한다.
+`신규`, `신작`, `갱신`, `업데이트`, `업뎃`, `재업/재업로드`, `수정/수정본`, `교체`, `추가`는 선두
+상태표시와 닫는 구두점 문맥에서만 제거한다. 일반 제목 중간의 같은 단어는 보존한다.
+
+후속 hotfix는 `신규 19禁완) 사랑을 먹고 자라는 마법소녀`와 `신작) 일러스트로 일인군단`을 같은
+닫힌 상태표시로 처리한다. `회귀한 신규교사`, `신작을 쓰는 천재 작가`는 보존하고,
+`(신작-떠따) 치타는 웃고있다`처럼 `신작` 뒤에 복합 태그가 이어지면 `신작-`만 부분 절단하지 않는다.
+hotfix 전후 active house 17,616개 raw parser 결과를 비교한 `core_title` 변화는 0개다.
 
 ### 운반 접두사
 
@@ -166,10 +171,41 @@ Scanner catalog rekey 결과는 9 key migration, 성공 플랫폼 metadata 1건 
 별도 2GiB 예산 안에서 완료했다. 기존 cache hit 2,606건과 fingerprint miss 0은 제목 버전 상승으로
 호환 cache가 무효화되지 않았음을 보여 준다.
 
+### cache-writing full fingerprint sweep
+
+후속 유지보수는 공용 house/temp 잠금과 SQLite online backup 아래 current-policy cache 부채를 실제로
+backfill했다.
+
+- 사전 Doctor/미완료 operation/active actual run: `0/0/0`
+- 백업:
+  `.dedup_state/backups/before_full_fingerprint_sweep_1_4_6_20260729_233536_457654.sqlite3`
+  (`sha256=a9a08ec1f7268f823a6c889b703c27f2b2dfd37a2656ac56a570e71e3759ec57`)
+- sweep 전 current-policy hit: 2,606/17,580
+- 처리: TXT 12,293 + EPUB 2,681 = 14,974파일
+- 새로 지속된 fingerprint: 14,973, 최종 hit 17,579/17,580
+- 진행 로그 기준 fingerprint read 83.29GiB, 정밀 비교 282쌍 2.23GiB
+- `deep_check_deferred`: 5 → 0, input change 0
+
+strict full sweep의 `completed=false`는 cache backfill 실패가 아니라 안전하게 fingerprint를 만들 수 없는
+실파일 70개 때문이다. 기존 TXT 69개는 `decode_lossy`이며, 남은 EPUB
+`고대산거종전일상 1-363화 完난독화,원본특수폰트 [수운계].epub`은 ZIP 안에 같은
+`OEBPS/content.opf`가 8번 들어 있어 `EPUB contains duplicate normalized member names`로 fail-closed했다.
+중복 증거의 기준 OPF를 임의 선택하지 않는다.
+
+- JSON report:
+  `/Users/twkim/Documents/txt_temp/dedup_logs/strong_candidates_20260729_235657_528241.json`
+- execution log:
+  `.dedup_state/reports/full_fingerprint_sweep_1_4_6_execution_20260730_000350.json`
+
+실제 일상 경로와 같은 cache-writing warm 감사는 11.391초, 본문 read 0, fingerprint hit 17,579,
+pair-cache hit 3,244, `completed=true`, stop reason/input change 없음으로 끝났다. 따라서 malformed/손실 파일을
+억지로 성공 처리하지 않으면서도 구세대 cache 때문에 전체 후보 본문을 다시 읽던 문제와
+`deep_check_deferred`는 해소됐다. 도서 이동·이름 변경·격리·삭제는 0건이다.
+
 ## 최종 검증
 
-- `pytest -q`: **781 passed in 27.27s** (최종 재실행)
-- Python/Chrome fixture: **45 passed**, parity **33 cases**
+- `pytest -q`: **783 passed in 19.60s** (최종 재실행)
+- Python/Chrome fixture: **47 passed**, parity **35 cases**
 - `compileall backend public_tests`: 통과
 - `library_frontend npm run build`: 통과 (`file-check-library-ui@1.4.6`)
 - `PRAGMA integrity_check`: `ok`
@@ -177,3 +213,5 @@ Scanner catalog rekey 결과는 9 key migration, 성공 플랫폼 metadata 1건 
 - 미완료 operation/group/actual run: 0/0/0
 - index generation validation: 통과
 - 전용 PM2 `server-control--book_check`만 재시작, `/health` database `ok`, version `1.4.6`
+- 재시작된 서버 `/api/review/titles/preview`에서 `신작) 일러스트로 일인군단` →
+  `일러스트로일인군단` 확인

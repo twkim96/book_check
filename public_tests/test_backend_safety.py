@@ -66,9 +66,23 @@ def test_status_modifier_and_closed_source_prefixes_do_not_replace_real_title():
     updated = "[갱신 19禁완) 마조 수녀와 음마 신부 0-134 완 [ txt + epub ].txt"
     assert extract_readable_title(updated) == "마조 수녀와 음마 신부"
     assert analyze_name(updated)["core_title"] == "마조수녀와음마신부"
+    new_post = "신규 19禁완) 사랑을 먹고 자라는 마법소녀 0-83 완 [ txt + epub ]"
+    assert extract_readable_title(new_post) == "사랑을 먹고 자라는 마법소녀"
+    assert analyze_name(new_post)["core_title"] == "사랑을먹고자라는마법소녀"
+    assert extract_readable_title("신작) 일러스트로 일인군단") == "일러스트로 일인군단"
+    assert analyze_name("신작) 일러스트로 일인군단")["core_title"] == "일러스트로일인군단"
     assert analyze_name("나는 매달 치트키를 갱신할 수 있다 1-100 완.txt")[
         "core_title"
     ] == "나는매달치트키를갱신할수있다"
+    assert analyze_name("회귀한 신규교사는 재능만렙 1-200 완.txt")[
+        "core_title"
+    ] == "회귀한신규교사는재능만렙"
+    assert analyze_name("신작을 쓰는 천재 작가 1-200 완.txt")[
+        "core_title"
+    ] == "신작을쓰는천재작가"
+    assert analyze_name("(신작-떠따) 치타는 웃고있다 완.txt")[
+        "core_title"
+    ] == "치타는웃고있다"
 
     assert analyze_name(
         "CSS [백덕수] 데뷔 못 하면 죽는 병 걸림 1-644 完.epub"
