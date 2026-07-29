@@ -391,7 +391,7 @@ function QuarantineRow({ item, selected, toggle, detail, restore }: {
 }
 
 function QuarantineCatalog() {
-  const [params, setParams] = useSearchParams(); const [listing, setListing] = useState<ExplorerQuarantineListing>(); const [error, setError] = useState(""); const [draft, setDraft] = useState(params.get("search") ?? ""); const search = params.get("search") ?? "", state = params.get("state") ?? "all", cursor = params.get("cursor") ?? "";
+  const [params, setParams] = useSearchParams(); const [listing, setListing] = useState<ExplorerQuarantineListing>(); const [error, setError] = useState(""); const [draft, setDraft] = useState(params.get("search") ?? ""); const search = params.get("search") ?? "", state = params.get("state") ?? "present", cursor = params.get("cursor") ?? "";
   const [selected, setSelected] = useState<number[]>([]); const [restore, setRestore] = useState<{ operationId: number; referenceId?: string | null }>(); const [purge, setPurge] = useState<number[]>(); const [detail, setDetail] = useState<ExplorerQuarantineListing["items"][number]>();
   const [jobNotice, setJobNotice] = useState<{ job: JobRecord; action: string }>();
   const load = () => { const query = new URLSearchParams({ search, state, limit: "50" }); if (cursor) query.set("cursor", cursor); api<ExplorerQuarantineListing>(`/api/explorer/quarantine?${query}`).then((value) => { setListing(value); setError(""); }).catch((reason) => setError(reason.message)); }; useEffect(load, [search, state, cursor]);

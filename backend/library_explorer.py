@@ -1000,6 +1000,9 @@ def quarantine_listing(
     if state not in {"all", "present", "missing", "untracked", "purged"}:
         raise ValueError("unknown quarantine state filter")
     trash = (Path(temp_dir) / "trash_bin").resolve()
+    all_actions = sorted(QUARANTINE_ACTIONS)
+    manageable_actions = sorted(MANAGEABLE_QUARANTINE_ACTIONS)
+    queue_actions = sorted(QUARANTINE_ACTIONS - MANAGEABLE_QUARANTINE_ACTIONS)
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
         operations = conn.execute(
@@ -1014,12 +1017,48 @@ def quarantine_listing(
             FROM operations AS o
             LEFT JOIN files AS f ON f.file_id = o.file_id
             LEFT JOIN files AS keep ON keep.file_id = o.keep_file_id
-            WHERE o.action IN ({}) AND o.state = 'committed'
+            WHERE o.action IN ({all_actions}) AND o.state = 'committed'
+              AND (
+                o.purged_at IS NOT NULL
+                OR (
+                  o.action IN ({manageable_actions})
+                  AND f.active = 0 AND f.source = 'quarantine'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM operations AS later
+                    WHERE later.file_id = o.file_id
+                      AND later.operation_id > o.operation_id
+                      AND later.action IN ({later_manageable_actions})
+                      AND later.state = 'committed'
+                  )
+                )
+                OR (
+                  o.action IN ({queue_actions})
+                  AND f.active = 1 AND f.source IN ('queue', 'quarantine')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM operations AS later
+                    WHERE later.file_id = o.file_id
+                      AND later.operation_id > o.operation_id
+                      AND later.action IN ({later_all_actions})
+                      AND later.state = 'committed'
+                  )
+                )
+              )
             ORDER BY o.operation_id DESC
-            """.format(",".join("?" for _ in QUARANTINE_ACTIONS)),
-            sorted(QUARANTINE_ACTIONS),
+            """.format(
+                all_actions=",".join("?" for _ in all_actions),
+                manageable_actions=",".join("?" for _ in manageable_actions),
+                later_manageable_actions=",".join("?" for _ in manageable_actions),
+                queue_actions=",".join("?" for _ in queue_actions),
+                later_all_actions=",".join("?" for _ in all_actions),
+            ),
+            [
+                *all_actions,
+                *manageable_actions,
+                *manageable_actions,
+                *queue_actions,
+                *all_actions,
+            ],
         ).fetchall()
-        related_by_source = _quarantine_related_files(conn, operations)
     finally:
         conn.close()
     items = []
@@ -1047,7 +1086,7 @@ def quarantine_listing(
             "size": stat.st_size if stat else None,
             "modified_at": stat.st_mtime if stat else None,
             "age_days": max(0, int((time.time() - stat.st_mtime) // 86400)) if stat else None,
-            "related_files": related_by_source.get(str(row["file_id"]), []),
+            "related_files": [],
             "tracked": True,
             "restore_available": item_state == "present" and row["action"] in MANAGEABLE_QUARANTINE_ACTIONS,
             "purge_available": item_state == "present" and row["action"] in MANAGEABLE_QUARANTINE_ACTIONS,
@@ -1107,9 +1146,22 @@ def quarantine_listing(
         ),
         reverse=True,
     )
-    return _page(
+    page = _page(
         items,
         offset=_offset(cursor),
         limit=_bounded_limit(limit, 200),
         extra={"search": search, "state": state, "summary": summary},
     )
+    tracked_items = [
+        item for item in page["items"]
+        if item.get("tracked") and item.get("file_id")
+    ]
+    if tracked_items:
+        conn = decision_store.connect_state_db_readonly(state_db)
+        try:
+            related_by_source = _quarantine_related_files(conn, tracked_items)
+        finally:
+            conn.close()
+        for item in tracked_items:
+            item["related_files"] = related_by_source.get(str(item["file_id"]), [])
+    return page

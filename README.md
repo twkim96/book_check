@@ -440,6 +440,11 @@ fingerprint가 갱신된 같은 파일쌍은 오래된 open review를 `supersede
   표지 같은 미등록 부속 파일을 구분
 - `격리`: committed operation과 실제 `txt_temp/trash_bin`을 대조해 보관·누락·미추적·삭제 이력을 구분
 
+1.4.4 전수 삭제 이후 격리 탭의 기본 조건은 `실제 보관`입니다. DB의 복원·수용·후속 격리 operation은
+감사 이력으로 보존하지만, 이미 해소된 과거 목적지 경로를 `파일 없음`인 현재 격리 항목으로 다시
+노출하지 않습니다. 영구 삭제된 항목은 `삭제 이력`을 명시적으로 선택했을 때만 보며, 현재 격리
+inventory와 삭제 journal을 섞지 않습니다.
+
 파일 두 개를 선택하면 core title, 작가, 권·부·회차 좌표, 크기, raw/normalized SHA와 기존 review·decision
 근거를 나란히 비교할 수 있습니다. 관계 판정, 격리, 복원, 이동, 영구 삭제 버튼은 미리보기만 표시하며
 1.3.1에서는 실행되지 않습니다. 제목 교정으로 퇴역한 `.dedup_state/retired_paths` 가상 경로도 실제

@@ -887,7 +887,7 @@ def create_app(
             config.state_db,
             config.temp_dir,
             search=request.args.get("search", ""),
-            state=request.args.get("state", "all"),
+            state=request.args.get("state", "present"),
             limit=request.args.get("limit", 50, type=int),
             cursor=request.args.get("cursor") or None,
         )})

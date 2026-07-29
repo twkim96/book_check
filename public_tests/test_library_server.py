@@ -486,6 +486,7 @@ def test_readonly_explorer_routes_expose_file_folder_and_quarantine(tmp_path):
 
     quarantine = client.get("/api/explorer/quarantine").get_json()["data"]
     assert quarantine["readonly"] is True
+    assert quarantine["state"] == "present"
     assert quarantine["total"] == 0
     assert client.get("/api/explorer/compare", query_string={"left": file_id}).status_code == 400
 

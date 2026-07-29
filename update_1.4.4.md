@@ -162,11 +162,17 @@ exact quarantine 영구 삭제는 과거 keep의 managed/representative 상태�
   - physical supported files: 17,612
   - file index entries: 17,877 (`_최근` alias 포함)
   - project/house/extension index SHA-256 일치:
-    `eb7a4a45a9d2c4ef18e08a37caf3191714ee58c2eb8702e76c4cc998e8ff2ea3`
+    `de0ee162fc51c8126984c0b34fb0e8ee8fb0078c40c46eda68788f831963d874`
+- 후속 전체 Scanner 작업 `42608cfc-3af6-4b5a-b775-6d7602181bcc` 성공
+  - 2026-07-29 15:18:42 KST 생성, house 파일 17,612개·폴더 265개
+  - 세 인덱스 동기화, integrity `ok`, Doctor 0, 미완료 operation 0
 - DB backup retention: 최근 10개 유지
 - 전체 테스트의 Scanner API fixture는 `project_root`도 임시 디렉터리로 격리한다. 과거 fixture가
   실제 `extension/file_index.json`을 1개 항목 테스트 인덱스로 덮어쓰던 문제를 수정했고, 전체
   테스트 전후 확장 인덱스 SHA가 위 값으로 유지되는 것을 확인했다.
+- 격리 카탈로그는 현재 파일을 소유한 최신 operation과 `purged_at` 삭제 journal만 투영한다. 복원·house
+  수용·후속 격리로 이미 해소된 옛 목적지 442건은 `파일 없음`에서 제외하고, 기본 화면을 `실제 보관`으로
+  변경했다. 전수 삭제 직후 운영 projection은 실제 보관 0, 파일 없음 0, 이력 없음 0, 삭제 이력 2,252다.
 
 ## 회귀 검증
 
@@ -181,7 +187,7 @@ exact quarantine 영구 삭제는 과거 keep의 managed/representative 상태�
 - quarantine cleanup 소형 end-to-end fixture
 
 - `PYTHONPYCACHEPREFIX=/tmp/file-check-pycache /opt/anaconda3/bin/pytest -q tests public_tests`
-  - **758 passed in 19.91s**
+  - **759 passed in 19.48s**
 - Python 변경 모듈 `py_compile`: 통과
 - `library_frontend` `npm run build`: 통과
   - `file-check-library-ui@1.4.4`

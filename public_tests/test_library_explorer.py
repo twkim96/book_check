@@ -260,6 +260,82 @@ def test_quarantine_explorer_lists_actionable_quarantine_before_review_queue(tmp
     assert queued["purge_available"] is False
 
 
+def test_quarantine_explorer_hides_resolved_operation_paths_from_missing(tmp_path):
+    state_db, _, temp, ids, _, quarantined, untracked = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        quarantine = conn.execute(
+            "SELECT operation_id, file_id, expected_size, expected_mtime_ns, "
+            "expected_fingerprint_id FROM operations "
+            "WHERE action = 'user_quarantine' ORDER BY operation_id DESC LIMIT 1"
+        ).fetchone()
+        active_fingerprint = conn.execute(
+            "SELECT current_fingerprint_id FROM files WHERE file_id = ?",
+            (ids[0],),
+        ).fetchone()[0]
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE operations SET purged_at = CURRENT_TIMESTAMP "
+                "WHERE operation_id = ?",
+                (quarantine["operation_id"],),
+            )
+            conn.execute(
+                """
+                INSERT INTO operations(
+                    run_id, action, source_path, dest_path, file_id,
+                    expected_size, expected_mtime_ns, expected_fingerprint_id, state
+                ) VALUES (
+                    'resolved-queue-history', 'house_review_move', ?, ?, ?, ?, ?, ?,
+                    'committed'
+                )
+                """,
+                (
+                    str(temp / "옛 입력.txt"), str(quarantined), quarantine["file_id"],
+                    quarantine["expected_size"], quarantine["expected_mtime_ns"],
+                    quarantine["expected_fingerprint_id"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO operations(
+                    run_id, action, source_path, dest_path, file_id,
+                    expected_size, expected_mtime_ns, expected_fingerprint_id, state
+                ) VALUES (
+                    'restored-quarantine-history', 'user_quarantine', ?, ?, ?, ?, ?, ?,
+                    'committed'
+                )
+                """,
+                (
+                    str(temp / "옛 house 위치.txt"),
+                    str(temp / "trash_bin" / "user_discard_quarantine" / "복원 완료.txt"),
+                    ids[0],
+                    quarantine["expected_size"], quarantine["expected_mtime_ns"],
+                    active_fingerprint,
+                ),
+            )
+    finally:
+        conn.close()
+    quarantined.unlink()
+
+    listing = quarantine_listing(state_db, temp)
+
+    assert listing["summary"] == {
+        "present": 0,
+        "missing": 0,
+        "untracked": 1,
+        "purged": 1,
+    }
+    assert listing["total"] == 2
+    assert {item["physical_state"] for item in listing["items"]} == {
+        "untracked", "purged"
+    }
+    assert quarantine_listing(state_db, temp, state="present")["total"] == 0
+    purged = quarantine_listing(state_db, temp, state="purged")
+    assert purged["total"] == 1
+    assert purged["items"][0]["path"] == str(quarantined.resolve())
+    assert untracked.is_file()
+
+
 def test_file_explorer_marks_retired_virtual_paths_as_history_only(tmp_path):
     state_db, house, temp, ids, *_ = _fixture(tmp_path)
     conn = decision_store.connect_state_db(state_db)
