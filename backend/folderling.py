@@ -1936,6 +1936,7 @@ def _process_items_authorized(
     index_ready = False
     index_error = None
     index_deployment_error = None
+    final_integrity_receipt = None
     stage_started_at = time.perf_counter()
     extension_index_json = os.path.join(script_dir, EXTENSION_INDEX_PATH)
     deployment_snapshot = None
@@ -1964,6 +1965,9 @@ def _process_items_authorized(
                 state_db_path,
                 allowed_active_run_id=actual_run_id,
                 temp_root=src_dir,
+            )
+            final_integrity_receipt = projection.pop(
+                "_state_integrity_receipt", None
             )
             if not projection["ok"]:
                 raise RuntimeError("DB snapshot index generation returned failure")
@@ -2171,6 +2175,9 @@ def _process_items_authorized(
         ),
         **result,
     )
+    # Same-process only; the outer terminal gate consumes and removes it before
+    # returning a public result.
+    result["_final_integrity_receipt"] = final_integrity_receipt
     return result
 
 
@@ -2270,11 +2277,19 @@ def _process_items_with_lock_held(
             conn.close()
         raise
     failure_count = int(result.get("failure_count", 0))
+    final_integrity_receipt = result.pop("_final_integrity_receipt", None)
+    reuse_final_integrity = decision_store.state_integrity_receipt_is_current(
+        final_integrity_receipt,
+        state_db_path,
+        run_id=actual_run_id,
+    )
     doctor_started_at = time.perf_counter()
     conn = decision_store.connect_state_db(state_db_path)
     try:
         final_issues = decision_store.doctor_issues(
-            conn, allowed_active_run_id=actual_run_id
+            conn,
+            allowed_active_run_id=actual_run_id,
+            check_integrity=not reuse_final_integrity,
         )
         result["final_doctor_issue_count"] = len(final_issues)
         result["final_doctor_first_issue"] = final_issues[0] if final_issues else None
@@ -2298,6 +2313,9 @@ def _process_items_with_lock_held(
         conn.close()
     result.setdefault("performance_metrics", {})["final_doctor_seconds"] = round(
         time.perf_counter() - doctor_started_at, 6
+    )
+    result["performance_metrics"]["final_integrity_receipt_reused"] = bool(
+        reuse_final_integrity
     )
     emit_folderling_event(
         event_callback,

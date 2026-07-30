@@ -481,6 +481,7 @@ def _build_verified_index_snapshot_from_state_db(
     *,
     allowed_active_run_id=None,
     verify_doctor=True,
+    issue_integrity_receipt=False,
 ):
     """Project the current index from journaled DB rows after a cheap path walk.
 
@@ -494,9 +495,21 @@ def _build_verified_index_snapshot_from_state_db(
     if not house_root.is_dir():
         raise IndexSnapshotStale(f"house root is missing: {house_root}")
 
-    conn = decision_store.connect_state_db(state_db_path)
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    integrity_receipt = None
     try:
         if verify_doctor:
+            if issue_integrity_receipt:
+                # Opening the first schema page can materialize SQLite's empty
+                # WAL sidecar even on a read-only connection. Prime that
+                # benign storage state before binding the Doctor receipt.
+                conn.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
+                # Capture the storage identity that Doctor is about to check.
+                # A writer committing anywhere during Doctor must invalidate
+                # this receipt rather than being stamped as newly validated.
+                integrity_receipt = decision_store.issue_state_integrity_receipt(
+                    state_db_path, run_id=allowed_active_run_id
+                )
             issues = decision_store.doctor_issues(
                 conn, allowed_active_run_id=allowed_active_run_id
             )
@@ -504,6 +517,14 @@ def _build_verified_index_snapshot_from_state_db(
                 raise IndexSnapshotStale(
                     f"doctor issues: {len(issues)} ({issues[0]['kind']})"
                 )
+            if issue_integrity_receipt and not (
+                decision_store.state_integrity_receipt_is_current(
+                    integrity_receipt,
+                    state_db_path,
+                    run_id=allowed_active_run_id,
+                )
+            ):
+                raise IndexSnapshotStale("state DB changed during final Doctor")
         rows = _state_projection_rows(conn)
     finally:
         conn.close()
@@ -646,8 +667,11 @@ def _build_verified_index_snapshot_from_state_db(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    return entries, revision, _VerifiedHouseInventory(
-        revision, str(house_root), auditor_inventory
+    return (
+        entries,
+        revision,
+        _VerifiedHouseInventory(revision, str(house_root), auditor_inventory),
+        integrity_receipt,
     )
 
 
@@ -659,7 +683,7 @@ def build_index_entries_from_state_db(
     verify_doctor=True,
 ):
     """Return the public projection while keeping run-local evidence private."""
-    entries, revision, _auditor_inventory = (
+    entries, revision, _auditor_inventory, _integrity_receipt = (
         _build_verified_index_snapshot_from_state_db(
             house_dir,
             state_db_path,
@@ -687,7 +711,7 @@ def validate_index_snapshot(
             raise IndexSnapshotStale("index is not a v2 payload")
         if payload.get("normalizer_version") != NORMALIZER_VERSION:
             raise IndexSnapshotStale("normalizer version changed")
-        entries, revision, auditor_inventory = (
+        entries, revision, auditor_inventory, _integrity_receipt = (
             _build_verified_index_snapshot_from_state_db(
                 house_dir,
                 state_db_path,
@@ -723,10 +747,15 @@ def _generate_file_list_from_state_db_unlocked(
     allowed_active_run_id=None,
 ):
     """Write final public indexes without a second Scanner reconciliation."""
-    entries, revision = build_index_entries_from_state_db(
-        house_dir,
-        state_db_path,
-        allowed_active_run_id=allowed_active_run_id,
+    import decision_store
+
+    entries, revision, _auditor_inventory, integrity_receipt = (
+        _build_verified_index_snapshot_from_state_db(
+            house_dir,
+            state_db_path,
+            allowed_active_run_id=allowed_active_run_id,
+            issue_integrity_receipt=True,
+        )
     )
     result = _write_index_surfaces(
         entries,
@@ -735,6 +764,7 @@ def _generate_file_list_from_state_db_unlocked(
         index_mode="state_db_projection",
         inventory_revision=revision,
     )
+    result["_state_integrity_receipt"] = integrity_receipt
     print(
         "\n✅ DB snapshot index 완료: "
         f"파일 {result['file_entry_count']}개, revision={revision[:12]}"

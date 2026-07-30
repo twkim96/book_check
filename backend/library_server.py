@@ -86,7 +86,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.9"
+SERVER_VERSION = "1.4.10"
 
 
 def _is_loopback_host(value: str | None) -> bool:

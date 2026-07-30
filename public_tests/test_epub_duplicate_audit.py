@@ -1,11 +1,14 @@
 import json
 import os
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import decision_store
 import duplicate_auditor
 import mutation_io
 import pytest
+from scanner import validate_index_generation  # prime wrapper before thread races
 from text_preview import ReadBudget
 
 
@@ -338,7 +341,7 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
     assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.2"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.9"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.10"
 
 
 def _txt_cache_fixture(tmp_path):
@@ -453,6 +456,235 @@ def test_warm_pair_cache_hit_does_not_rewrite_pair_row(tmp_path):
     assert warm.stats["pair_cache_writes"] == 0
     assert warm.stats["pair_cache_write_skips"] == 1
     assert warm.stats["review_item_sync_skips"] == 1
+
+
+def test_warm_review_repair_skips_file_replaced_after_snapshot(
+    tmp_path, monkeypatch,
+):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    duplicate_auditor.run_audit(args)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        conn.execute("DELETE FROM review_items")
+        conn.commit()
+    finally:
+        conn.close()
+
+    target = sorted(house.iterdir())[-1]
+    original_store = duplicate_auditor.PersistentAuditCache.store_pair_results
+    replaced = False
+
+    def replace_before_repair(cache, candidates, results):
+        nonlocal replaced
+        if not replaced:
+            before = target.stat()
+            replacement = target.with_suffix(".replacement")
+            replacement.write_bytes(target.read_bytes())
+            replacement.replace(target)
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            replaced = True
+        return original_store(cache, candidates, results)
+
+    monkeypatch.setattr(
+        duplicate_auditor.PersistentAuditCache,
+        "store_pair_results",
+        replace_before_repair,
+    )
+    warm = duplicate_auditor.run_audit(args)
+
+    assert replaced is True
+    assert warm.completed is False
+    assert "stale" in warm.stop_reasons
+    assert warm.results == []
+    assert warm.stats["review_item_stale_skips"] == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM review_items "
+            "WHERE state IN ('pending', 'deferred')"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_warm_review_sync_reverses_direction_for_new_managed_representative(tmp_path):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    duplicate_auditor.run_audit(args)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        original = conn.execute(
+            """
+            SELECT candidate_file_id, reference_file_id FROM review_items
+            WHERE state IN ('pending', 'deferred')
+            """
+        ).fetchone()
+        old_candidate = original["candidate_file_id"]
+        old_reference = original["reference_file_id"]
+        work_id = conn.execute(
+            "INSERT INTO works(display_title) VALUES ('방향 전환 작품')"
+        ).lastrowid
+        variant_id = conn.execute(
+            "INSERT INTO variants(work_bucket_id, variant_kind) VALUES (?, 'base')",
+            (work_id,),
+        ).lastrowid
+        conn.execute(
+            """
+            UPDATE files SET variant_id = ?, assignment_state = 'managed',
+                assignment_origin = 'human_decision', protected = 1
+            WHERE file_id = ?
+            """,
+            (variant_id, old_candidate),
+        )
+        conn.execute(
+            "INSERT INTO representatives(variant_id, file_id) VALUES (?, ?)",
+            (variant_id, old_candidate),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    warm = duplicate_auditor.run_audit(args)
+
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        current = conn.execute(
+            """
+            SELECT candidate_file_id, reference_file_id FROM review_items
+            WHERE state IN ('pending', 'deferred')
+            """
+        ).fetchall()
+        superseded = conn.execute(
+            "SELECT COUNT(*) FROM review_items WHERE state = 'superseded'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert len(current) == 1
+    assert current[0]["candidate_file_id"] == old_reference
+    assert current[0]["reference_file_id"] == old_candidate
+    assert superseded == 1
+    assert warm.stats["pair_cache_hits"] == 1
+    assert warm.stats["review_item_sync_skips"] == 0
+    assert warm.stats["stale_open_reviews_superseded"] == 1
+
+
+def test_concurrent_pair_cache_miss_converges_without_unique_failure(
+    tmp_path, monkeypatch,
+):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    base_args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    duplicate_auditor.run_audit(base_args)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        conn.execute("DELETE FROM review_items")
+        conn.execute("DELETE FROM pair_cache")
+        conn.commit()
+    finally:
+        conn.close()
+
+    barrier = threading.Barrier(2)
+    original_pair_result = duplicate_auditor.PersistentAuditCache.pair_result
+
+    def synchronize_misses(cache, candidate):
+        result = original_pair_result(cache, candidate)
+        if result is None:
+            barrier.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(
+        duplicate_auditor.PersistentAuditCache,
+        "pair_result",
+        synchronize_misses,
+    )
+
+    def audit_once():
+        return duplicate_auditor.run_audit(_general_args(
+            index, house, temp, "--house-only", "--state-db", str(state_db)
+        ))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports = [future.result(timeout=20) for future in (
+            executor.submit(audit_once), executor.submit(audit_once)
+        )]
+
+    assert all(report.completed for report in reports)
+    assert sum(
+        report.stats["pair_cache_concurrent_reuses"] for report in reports
+    ) == 1
+    assert sum(report.stats["pair_cache_writes"] for report in reports) == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM pair_cache").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM review_items "
+            "WHERE state IN ('pending', 'deferred')"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_concurrent_fingerprint_cache_miss_converges_without_unique_failure(
+    tmp_path, monkeypatch,
+):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            for path in sorted(house.iterdir()):
+                decision_store.reconcile_file_metadata(
+                    conn, path, source="house"
+                )
+    finally:
+        conn.close()
+
+    barrier = threading.Barrier(2)
+    original_analysis = duplicate_auditor.PersistentAuditCache.analysis
+
+    def synchronize_misses(cache, entry, **kwargs):
+        result = original_analysis(cache, entry, **kwargs)
+        if result is None:
+            barrier.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(
+        duplicate_auditor.PersistentAuditCache,
+        "analysis",
+        synchronize_misses,
+    )
+
+    def audit_once():
+        return duplicate_auditor.run_audit(_general_args(
+            index, house, temp, "--house-only", "--state-db", str(state_db)
+        ))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports = [future.result(timeout=20) for future in (
+            executor.submit(audit_once), executor.submit(audit_once)
+        )]
+
+    assert all(report.completed for report in reports)
+    assert sum(
+        report.stats["fingerprint_cache_writes"] for report in reports
+    ) == 2
+    assert sum(
+        report.stats["fingerprint_cache_concurrent_reuses"]
+        for report in reports
+    ) == 2
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT COUNT(*) FROM files WHERE current_fingerprint_id IS NOT NULL"
+        ).fetchone()[0] == 2
+    finally:
+        conn.close()
 
 
 def test_read_only_plan_reuses_pair_cache_without_loading_anchor_blobs(tmp_path):

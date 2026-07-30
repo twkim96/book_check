@@ -320,6 +320,11 @@ def _canonical_absolute(path):
     return Path(absolute_text)
 
 
+def canonical_absolute_path(path):
+    """Return a lexical absolute path with only stable macOS aliases folded."""
+    return _canonical_absolute(path)
+
+
 def _open_directory_nofollow(path, *, create=False, mode=0o755):
     """Open/create a directory one component at a time without following links."""
     parts = _canonical_absolute(path).parts
@@ -353,6 +358,16 @@ def ensure_directory_nofollow(path, *, mode=0o755):
     os.close(fd)
 
 
+@contextmanager
+def opened_directory_nofollow(path):
+    """Yield a pinned directory descriptor after rejecting every symlink component."""
+    fd = _open_directory_nofollow(path)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def _open_parent_nofollow(path, *, create=False):
     """Open every ancestor with openat/O_NOFOLLOW and return (parent_fd, leaf)."""
     absolute = _canonical_absolute(path)
@@ -373,6 +388,20 @@ def _open_regular_nofollow(path, flags=os.O_RDONLY):
         raise
 
 
+@contextmanager
+def opened_regular_file_nofollow(path, flags=os.O_RDONLY):
+    """Yield a pinned regular-file descriptor beneath no-follow ancestors."""
+    parent_fd, fd, _leaf = _open_regular_nofollow(path, flags=flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"source is not a regular file: {path}")
+        yield fd
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
 def inspect_regular_file(path) -> FileEvidence:
     parent_fd, fd, _ = _open_regular_nofollow(path)
     try:
@@ -383,6 +412,37 @@ def inspect_regular_file(path) -> FileEvidence:
     finally:
         os.close(fd)
         os.close(parent_fd)
+
+
+def inspect_regular_file_at(directory_fd: int, leaf: str) -> FileEvidence:
+    """Hash one owned leaf beneath an already pinned directory descriptor."""
+    if not isinstance(leaf, str) or leaf in {"", ".", ".."} or Path(leaf).name != leaf:
+        raise ValueError(f"expected a single file name, got: {leaf!r}")
+    fd = os.open(
+        leaf,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise RuntimeError(f"source is not an owned regular file: {leaf}")
+        sha256 = _hash_fd(fd)
+        after = os.fstat(fd)
+        before_identity = (
+            before.st_dev, before.st_ino, before.st_ctime_ns,
+            before.st_size, before.st_mtime_ns,
+        )
+        after_identity = (
+            after.st_dev, after.st_ino, after.st_ctime_ns,
+            after.st_size, after.st_mtime_ns,
+        )
+        if before_identity != after_identity:
+            raise SourceIdentityChanged(f"source changed while read: {leaf}")
+        return _identity(after, sha256)
+    finally:
+        os.close(fd)
 
 
 def read_json_with_evidence(path):

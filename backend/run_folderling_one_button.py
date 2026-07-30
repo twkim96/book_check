@@ -129,7 +129,12 @@ def run(
             )
         approval_started = False
         try:
-            conn = decision_store.initialize_state_db(state_db, migrate=True)
+            # The verified backup below performs its own full integrity check,
+            # followed by the preflight full Doctor before authorization. This
+            # open only needs to prove the current/migrated schema structure.
+            conn = decision_store.initialize_state_db(
+                state_db, migrate=True, check_integrity=False
+            )
             try:
                 # A user moves managed queue files into these inboxes outside the
                 # program.  Back up first, then bind those renames to the stable

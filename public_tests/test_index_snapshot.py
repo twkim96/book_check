@@ -6,6 +6,7 @@ import decision_store
 import deduplicator
 import duplicate_auditor
 import folderling
+import scanner
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_review import TitleCorrectionProvider
 from mutation_io import inspect_regular_file
@@ -52,10 +53,81 @@ def test_state_db_projection_matches_full_scanner(tmp_path):
         house, file_list, index, state_db
     )
     assert result["index_mode"] == "state_db_projection"
+    receipt = result.pop("_state_integrity_receipt")
+    assert decision_store.state_integrity_receipt_is_current(
+        receipt, state_db, run_id=None
+    )
     payload = json.loads(index.read_text(encoding="utf-8"))
     assert payload["entries"] == full
     assert payload["inventory_revision"] == revision
     assert validate_index_snapshot(house, index, state_db)["valid"] is True
+
+
+def test_projection_receipt_covers_doctor_identity_not_later_db_change(
+    tmp_path, monkeypatch
+):
+    state_db, house, _, file_list, index, _ = _fixture(tmp_path)
+    original_rows = scanner._state_projection_rows
+    changed = False
+
+    def change_db_after_doctor(conn):
+        nonlocal changed
+        if not changed:
+            writer = decision_store.connect_state_db(state_db)
+            try:
+                writer.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    ("changed-after-projection-doctor", "1"),
+                )
+                writer.commit()
+            finally:
+                writer.close()
+            changed = True
+        return original_rows(conn)
+
+    monkeypatch.setattr(scanner, "_state_projection_rows", change_db_after_doctor)
+
+    result = generate_file_list_from_state_db(
+        house, file_list, index, state_db
+    )
+    receipt = result.pop("_state_integrity_receipt")
+
+    assert changed is True
+    assert not decision_store.state_integrity_receipt_is_current(
+        receipt, state_db, run_id=None
+    )
+
+
+def test_projection_receipt_rejects_commit_after_doctor_before_return(
+    tmp_path, monkeypatch
+):
+    state_db, house, _, file_list, index, _ = _fixture(tmp_path)
+    original_doctor = decision_store.doctor_issues
+    changed = False
+
+    def doctor_then_change(conn, **kwargs):
+        nonlocal changed
+        issues = original_doctor(conn, **kwargs)
+        writer = decision_store.connect_state_db(state_db)
+        try:
+            writer.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?)",
+                ("changed-between-doctor-and-receipt", "1"),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+        changed = True
+        return issues
+
+    monkeypatch.setattr(decision_store, "doctor_issues", doctor_then_change)
+
+    with pytest.raises(scanner.IndexSnapshotStale, match="changed during final Doctor"):
+        generate_file_list_from_state_db(
+            house, file_list, index, state_db
+        )
+
+    assert changed is True
 
 
 def test_verified_snapshot_reuses_exact_auditor_entries_without_restat(
@@ -215,7 +287,7 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
         backup = decision_store.backup_state_db(
             conn, state_db.parent / "backups" / "before-folderling.sqlite3"
         )
-        decision_store.issue_actual_run_token(
+        decision_store.issue_prevalidated_actual_run_token(
             conn, str(backup), house_dir=house, temp_dir=temp
         )
     finally:
@@ -226,6 +298,14 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
 
     monkeypatch.setattr(folderling, "generate_file_list", unexpected_full_scan)
     monkeypatch.setattr(deduplicator, "generate_file_list", unexpected_full_scan)
+    validation_modes = []
+    original_validate = decision_store.validate_schema
+
+    def tracked_validate(conn, *, check_integrity=True):
+        validation_modes.append(check_integrity)
+        return original_validate(conn, check_integrity=check_integrity)
+
+    monkeypatch.setattr(decision_store, "validate_schema", tracked_validate)
     events = []
     result = folderling._process_items_with_lock_held(
         str(temp), str(house), str(script_dir), state_db_path=str(state_db),
@@ -234,6 +314,11 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
     assert result["failure_count"] == 0
     assert result["pre_index_mode"] == "verified_snapshot"
     assert result["index_mode"] == "state_db_projection"
+    # The preflight full Doctor ran while issuing the receipt above. Within the
+    # authorized pipeline, only mutation-before and final projection are full;
+    # readiness, receipt-bound auditor open, and terminal Doctor are structural.
+    assert validation_modes.count(True) == 2
+    assert validation_modes.count(False) >= 3
     assert (house / "ㅅ" / incoming.name).is_file()
     assert not incoming.exists()
     assert validate_index_snapshot(
@@ -256,6 +341,9 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
     assert intake["source_path"] == str(incoming)
     assert intake["destination_path"] == str(house / "ㅅ" / incoming.name)
     assert result["final_doctor_issue_count"] == 0
+    assert result["performance_metrics"][
+        "final_integrity_receipt_reused"
+    ] is True
     assert result["dedup_summary"]["auditor_metrics"][
         "house_inventory_source"
     ] == "verified_snapshot"

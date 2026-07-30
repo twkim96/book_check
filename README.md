@@ -35,12 +35,13 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.9)
+## 동일 작품 자동 중복 정리 계약 (1.4.10)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
 1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt,
-1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive 계약은
+1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive,
+1.4.10의 archive/review 경합·경로 안전 보강 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -49,7 +50,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.6.md`](update_1.4.6.md),
 [`update_1.4.7.md`](update_1.4.7.md),
 [`update_1.4.8.md`](update_1.4.8.md),
-[`update_1.4.9.md`](update_1.4.9.md)에 기록합니다.
+[`update_1.4.9.md`](update_1.4.9.md),
+[`update_1.4.10.md`](update_1.4.10.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -371,6 +373,53 @@ fallback은 기존 `file_index.json + current stat` 경로를 그대로 사용�
 이 버전은 범위를 의도적으로 백업 tier 1단계로 제한합니다. actual-run이 참조하는 백업과 manifest,
 hot DB의 과거 fingerprint/pair row, 고아로 보이는 `-wal/-shm`은 자동 삭제하거나 재작성하지 않습니다.
 그 증거의 참조·복구 계약을 별도 버전에서 먼저 정의하기 전에는 용량 절감을 이유로 건드리지 않습니다.
+또한 기존 hot retention은 완료 actual-run 백업을 cold object로 전환하지 않고 최신 10개 밖에서 직접
+정리하는 구세대 정책입니다. 1.4.10은 이를 “전체 장기 수명주기 완료”로 간주하지 않습니다. cold object
+ID와 actual-run 참조를 연결하고 retention도 같은 archive/restore 계약을 통과시키는 후속 schema 없이는,
+모든 참조를 무조건 보호해 실행마다 대형 SQLite 백업을 누적하거나 과거 참조를 임의로 바꾸지 않습니다.
+
+### 1.4.10 archive 경로와 warm review 경합 안전 계약
+
+1.4.10은 중복 판정 기준을 바꾸지 않고 1.4.7·1.4.9의 실행 경계를 보강합니다. 따라서
+fingerprint/pair policy `1.4.2`와 기존 본문 cache는 유지합니다.
+
+- `.dedup_state/backups` 자체가 symlink이면 plan 단계에서 즉시 중단합니다. 계획에는 symlink를 따라간
+  real path가 아니라 관리 루트 아래 lexical path를 기록하고, backup/cold archive의 모든 디렉터리
+  component와 source/archive 파일을 `openat + O_NOFOLLOW`로 다시 엽니다. 양쪽 경로를 `resolve()`해서
+  같다는 이유만으로 관리 루트 밖 파일을 읽거나 unlink하지 않습니다. 단, macOS가 같은 위치에 제공하는
+  `/var`↔`/private/var`, `/tmp`↔`/private/tmp`만 안정적 OS 별칭으로 정규화해 DB 참조가 표기 차이로
+  archive 대상에 다시 들어가지 않게 합니다.
+- gzip 객체만 fsync된 뒤 metadata 기록 전에 중단된 경우, 원본과 기존 gzip의 raw SHA-256·size가
+  정확히 같을 때만 metadata를 재구성하고 원래 절차를 재개합니다. gzip이 다르거나 symlink/hardlink면
+  원본을 보존하고 중단합니다.
+- metadata fsync 뒤에도 hot 원본을 지우기 직전 durable metadata를 no-follow로 다시 읽고 gzip 압축
+  SHA-256·size를 다시 해시합니다. 이 마지막 증거가 달라졌으면 source unlink를 하지 않습니다.
+- cold gzip과 metadata는 `cold_archive/backups` 디렉터리 FD를 임시파일 생성부터 `linkat` publish,
+  fsync와 source 소비 직전 재검증까지 계속 유지한 채 생성합니다. 도중에 cold root가 외부 symlink로
+  교체되면 외부에는 gzip/JSON을 쓰지 않고 hot source를 보존합니다.
+- `restore`는 `backups` 디렉터리 FD를 임시파일 생성부터 SQLite integrity, no-clobber link, directory
+  fsync와 최종 SHA 검증까지 계속 보유합니다. 도중에 관리 경로가 rename/symlink로 교체되면 고정 FD
+  아래 임시파일과 부분 복원본을 정리하고, 교체된 외부 디렉터리에는 아무 파일도 쓰지 않습니다.
+- warm pair cache hit가 open review를 복구할 때는 repair 대상 양쪽의 현재 filesystem identity와 DB의
+  current fingerprint를 다시 확인합니다. stale이면 pending review를 만들거나 갱신하지 않습니다.
+- open review 동기화는 정렬된 fingerprint만 보지 않습니다. 현재 representative → protected → managed →
+  house → 경로 순위로 candidate/reference 방향을 다시 계산하고, 방향이 바뀌면 과거 open row를
+  supersede한 뒤 새 방향으로 하나만 만듭니다.
+- 같은 pair cache miss를 두 auditor가 동시에 계산해도 `ON CONFLICT DO NOTHING`으로 한 canonical row에
+  수렴합니다. 늦은 실행은 먼저 커밋된 completed row를 다시 읽어 review를 동기화하며 UNIQUE 오류로
+  전체 감사를 실패시키지 않습니다.
+- 같은 fingerprint miss를 두 standalone auditor가 동시에 계산해도 immutable fingerprint unique key에
+  `ON CONFLICT DO NOTHING`으로 수렴합니다. 늦은 실행은 canonical fingerprint를 다시 읽고 본문 증거가
+  같은지 확인한 뒤 그 ID를 사용하며, 증거가 다르면 조용히 섞지 않고 감사를 중단합니다.
+
+Folderling의 full SQLite integrity 검사는 preflight, 첫 mutation 직전, 최종 DB projection의 세 안전
+경계에 유지합니다. 현재 schema를 여는 동작과 preflight receipt에 묶인 auditor 초기화는 structural
+validation만 수행합니다. 최종 projection은 read-only SQLite가 만들 수 있는 빈 WAL을 먼저 안정화한 뒤
+receipt를 발급하고, full Doctor를 실행한 다음 같은 receipt가 여전히 current인지 확인합니다. 따라서
+Doctor 도중 또는 반환 직후 commit도 새 검증 증거로 덮어쓰지 않습니다. 이후 DB row projection·house
+walk·index publication 동안 DB main/WAL/journal identity가 바뀌어도 terminal Doctor가 receipt 재사용을
+거부합니다. 파일 Doctor·schema·미완료 operation 검사는 항상 다시 수행하며, storage identity나 run ID가
+다르면 즉시 full integrity 검사로 돌아갑니다.
 
 ## 권별·부별·회차 분할 시리즈 폴더 계약 (1.4.3)
 

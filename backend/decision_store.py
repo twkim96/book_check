@@ -57,6 +57,7 @@ _ACTUAL_RUN_TRANSITIONS = {
 }
 
 _PREFLIGHT_RECEIPT_SECRET = object()
+_STATE_INTEGRITY_RECEIPT_SECRET = object()
 _PREFLIGHT_VALIDATION_RECEIPTS = {}
 _PREFLIGHT_VALIDATION_RECEIPT_LIMIT = 32
 
@@ -70,6 +71,16 @@ class _PreflightValidationReceipt:
         self.house_root = house_root
         self.temp_root = temp_root
         self.secret = _PREFLIGHT_RECEIPT_SECRET
+
+
+class _StateIntegrityReceipt:
+    __slots__ = ("run_id", "state_db", "storage_identity", "secret")
+
+    def __init__(self, run_id, state_db, storage_identity):
+        self.run_id = run_id
+        self.state_db = state_db
+        self.storage_identity = storage_identity
+        self.secret = _STATE_INTEGRITY_RECEIPT_SECRET
 
 
 def _connection_main_path(conn):
@@ -622,7 +633,10 @@ def connect_state_db_readonly(
 
 
 def initialize_state_db(
-    path: os.PathLike | str, *, migrate: bool = False
+    path: os.PathLike | str,
+    *,
+    migrate: bool = False,
+    check_integrity: bool = True,
 ) -> sqlite3.Connection:
     """Open/create the state DB; upgrade an existing DB only with explicit consent.
 
@@ -1075,7 +1089,7 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 15")
         conn.commit()
         version = 15
-    validate_schema(conn)
+    validate_schema(conn, check_integrity=check_integrity)
     return conn
 
 
@@ -1177,6 +1191,50 @@ def validate_schema(
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise RuntimeError(f"integrity_check failed: {integrity}")
+
+
+def _state_db_storage_identity(path: os.PathLike | str) -> tuple:
+    db_path = Path(path).expanduser().resolve()
+
+    def identity(candidate: Path):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"state DB storage path is not regular: {candidate}")
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_ctime_ns,
+            info.st_size,
+            info.st_mtime_ns,
+        )
+
+    return tuple(
+        (suffix, identity(Path(f"{db_path}{suffix}")))
+        for suffix in ("", "-wal", "-journal")
+    )
+
+
+def issue_state_integrity_receipt(path, *, run_id):
+    """Bind a just-completed full integrity check to unchanged DB storage."""
+    state_db = str(Path(path).expanduser().resolve())
+    return _StateIntegrityReceipt(
+        run_id, state_db, _state_db_storage_identity(state_db)
+    )
+
+
+def state_integrity_receipt_is_current(receipt, path, *, run_id) -> bool:
+    """Return whether a same-process full-check receipt still covers this DB."""
+    state_db = str(Path(path).expanduser().resolve())
+    return bool(
+        isinstance(receipt, _StateIntegrityReceipt)
+        and receipt.secret is _STATE_INTEGRITY_RECEIPT_SECRET
+        and receipt.run_id == run_id
+        and receipt.state_db == state_db
+        and receipt.storage_identity == _state_db_storage_identity(state_db)
+    )
 
 
 def _validated_receipt_run_id(

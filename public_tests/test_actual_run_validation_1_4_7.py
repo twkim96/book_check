@@ -1,4 +1,5 @@
 import decision_store
+import duplicate_auditor
 
 
 def _approved_run(tmp_path, *, prevalidated=False):
@@ -80,3 +81,84 @@ def test_prevalidated_receipt_skips_only_matching_readiness_doctor(
     else:
         raise AssertionError("forged preflight receipt must fail closed")
     assert calls == [1]
+
+
+def test_receipt_bound_auditor_initialization_uses_structural_validation(
+    tmp_path, monkeypatch,
+):
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    conn.close()
+    calls = []
+    original = decision_store.validate_schema
+
+    def tracked_validate(conn, *, check_integrity=True):
+        calls.append(check_integrity)
+        return original(conn, check_integrity=check_integrity)
+
+    monkeypatch.setattr(decision_store, "validate_schema", tracked_validate)
+    cache = duplicate_auditor.PersistentAuditCache(
+        state_db,
+        [],
+        "pair-config",
+        "analysis-config",
+        trust_entry_identity=True,
+    )
+    cache.close()
+
+    assert calls == [False]
+
+
+def test_standalone_auditor_initialization_keeps_full_integrity_validation(
+    tmp_path, monkeypatch,
+):
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    conn.close()
+    calls = []
+    original = decision_store.validate_schema
+
+    def tracked_validate(conn, *, check_integrity=True):
+        calls.append(check_integrity)
+        return original(conn, check_integrity=check_integrity)
+
+    monkeypatch.setattr(decision_store, "validate_schema", tracked_validate)
+    cache = duplicate_auditor.PersistentAuditCache(
+        state_db,
+        [],
+        "pair-config",
+        "analysis-config",
+        trust_entry_identity=False,
+    )
+    cache.close()
+
+    assert calls == [True]
+
+
+def test_state_integrity_receipt_requires_unchanged_main_and_wal_storage(tmp_path):
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    conn.close()
+    receipt = decision_store.issue_state_integrity_receipt(
+        state_db, run_id="run-1"
+    )
+
+    assert decision_store.state_integrity_receipt_is_current(
+        receipt, state_db, run_id="run-1"
+    )
+    assert not decision_store.state_integrity_receipt_is_current(
+        receipt, state_db, run_id="different-run"
+    )
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('receipt-change', '1')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert not decision_store.state_integrity_receipt_is_current(
+        receipt, state_db, run_id="run-1"
+    )

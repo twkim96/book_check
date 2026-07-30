@@ -85,11 +85,11 @@ FINGERPRINT_POLICY_VERSION = "1.4.2"
 FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # Pair classification/evidence also has its own compatibility lifetime. 1.4.5
 # changed cache execution, 1.4.6 changed only filename/core parsing, and
-# 1.4.7-1.4.9 change cache/inventory/state-archive access only. Existing 1.4.2 pair rows
+# 1.4.7-1.4.10 change cache/inventory/state-archive access only. Existing 1.4.2 pair rows
 # therefore remain valid while AUDITOR_VERSION follows releases.
 PAIR_POLICY_VERSION = "1.4.2"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.9"
+AUDITOR_VERSION = "1.4.10"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -1066,7 +1066,13 @@ class PersistentAuditCache:
         import decision_store
 
         self.store = decision_store
-        self.conn = decision_store.initialize_state_db(state_db_path)
+        # A verified run-local house inventory is issued only after the
+        # one-button preflight full Doctor. Preserve full validation for
+        # standalone auditors, but do not scan the same 700+ MiB DB again for
+        # this receipt-bound initialization.
+        self.conn = decision_store.initialize_state_db(
+            state_db_path, check_integrity=not trust_entry_identity
+        )
         self.configuration_hash = configuration_hash
         self.analysis_policy_hash = analysis_policy_hash or configuration_hash
         self.trust_entry_identity = bool(trust_entry_identity)
@@ -1375,6 +1381,8 @@ class PersistentAuditCache:
         # maintenance budget under the same semantic fingerprint version.
         if analysis.status in {"oversize_deferred", "normalization_deferred"}:
             return
+        canonical_path = self.canonical_paths[entry.path]
+        fingerprint_version = self._identity_fingerprint_version(current)
         with self.store.transaction(self.conn):
             cursor = self.conn.execute(
                 """
@@ -1386,14 +1394,18 @@ class PersistentAuditCache:
                     normalized_length, encoding, status, front_anchor, tail_anchor,
                     anchors_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    file_id, canonical_path, size, mtime_ns,
+                    normalizer_version, fingerprint_version
+                ) DO NOTHING
                 """,
                 (
                     file_id,
-                    self.canonical_paths[entry.path],
+                    canonical_path,
                     analysis.size,
                     analysis.mtime_ns,
                     FINGERPRINT_NORMALIZER_COMPAT_VERSION,
-                    self._identity_fingerprint_version(current),
+                    fingerprint_version,
                     self.analysis_policy_hash,
                     current.st_dev,
                     current.st_ino,
@@ -1411,13 +1423,64 @@ class PersistentAuditCache:
                     ),
                 ),
             )
-            fingerprint_id = cursor.lastrowid
+            if cursor.rowcount == 1:
+                fingerprint_id = cursor.lastrowid
+                self.stats["fingerprint_cache_writes"] += 1
+            else:
+                stored = self.conn.execute(
+                    """
+                    SELECT * FROM fingerprints
+                    WHERE file_id = ? AND canonical_path = ?
+                      AND size = ? AND mtime_ns = ?
+                      AND normalizer_version = ? AND fingerprint_version = ?
+                      AND analysis_policy_hash = ?
+                      AND dev = ? AND ino = ? AND ctime_ns = ?
+                    """,
+                    (
+                        file_id,
+                        canonical_path,
+                        analysis.size,
+                        analysis.mtime_ns,
+                        FINGERPRINT_NORMALIZER_COMPAT_VERSION,
+                        fingerprint_version,
+                        self.analysis_policy_hash,
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_ctime_ns,
+                    ),
+                ).fetchone()
+                if stored is None:
+                    raise RuntimeError(
+                        "fingerprint cache conflict did not converge to a current row"
+                    )
+                stored_analysis = self._text_analysis_from_row(entry, stored)
+                comparable = lambda value: (
+                    value.size,
+                    value.mtime_ns,
+                    value.encoding,
+                    value.lossy,
+                    value.error,
+                    value.raw_sha256,
+                    value.normalized_sha256,
+                    value.normalized_length,
+                    value.front_anchor,
+                    value.tail_anchor,
+                    value.status,
+                )
+                if comparable(stored_analysis) != comparable(analysis):
+                    raise RuntimeError(
+                        "fingerprint cache conflict has different content evidence"
+                    )
+                analysis = stored_analysis
+                fingerprint_id = stored["fingerprint_id"]
+                self.stats["fingerprint_cache_concurrent_reuses"] += 1
             self.conn.execute(
                 "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ?",
                 (fingerprint_id, file_id),
             )
         self.fingerprint_ids[entry.path] = fingerprint_id
         self.deferred_detail_paths.discard(entry.path)
+        return analysis
 
     def analysis_with_details(self, entry, analysis):
         """Load large anchor columns only when an uncached TXT pair needs them."""
@@ -1473,6 +1536,94 @@ class PersistentAuditCache:
         self.cache_hit_pair_ids.add(candidate.pair_id)
         return result
 
+    def _load_review_states(self, file_ids=None):
+        file_ids = None if file_ids is None else tuple(dict.fromkeys(file_ids))
+        if file_ids == ():
+            return {}
+        batches = (None,) if file_ids is None else tuple(
+            file_ids[offset:offset + 500]
+            for offset in range(0, len(file_ids), 500)
+        )
+        representative_ids = {
+            row["file_id"]
+            for row in self.conn.execute(
+                "SELECT DISTINCT file_id FROM representatives"
+            )
+        }
+        states = {}
+        for batch in batches:
+            where = "WHERE f.active = 1"
+            parameters = ()
+            if batch is not None:
+                where += " AND f.file_id IN (" + ",".join("?" for _ in batch) + ")"
+                parameters = batch
+            rows = self.conn.execute(
+                f"""
+                SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns,
+                       f.dev, f.ino, f.ctime_ns, f.current_fingerprint_id,
+                       f.assignment_state, f.protected
+                FROM files AS f
+                {where}
+                """,
+                parameters,
+            )
+            for row in rows:
+                state = dict(row)
+                state["representative"] = int(row["file_id"] in representative_ids)
+                states[row["file_id"]] = state
+        return states
+
+    def _review_direction(self, candidate, rows):
+        left_file = self.file_ids.get(candidate.left.path)
+        right_file = self.file_ids.get(candidate.right.path)
+        if left_file is None or right_file is None or left_file == right_file:
+            return None
+
+        def state_is_current(entry, file_id):
+            row = rows.get(file_id)
+            return bool(
+                row is not None
+                and row["canonical_path"] == self.canonical_paths.get(entry.path)
+                and row["current_fingerprint_id"]
+                == self.fingerprint_ids.get(entry.path)
+                and (
+                    row["dev"], row["ino"], row["ctime_ns"],
+                    row["size"], row["mtime_ns"],
+                ) == _entry_identity(entry)
+            )
+
+        if not (
+            state_is_current(candidate.left, left_file)
+            and state_is_current(candidate.right, right_file)
+        ):
+            return None
+
+        def reference_rank(entry, file_id):
+            row = rows[file_id]
+            return (
+                0 if row["representative"] else 1,
+                0 if row["protected"] else 1,
+                0 if row["assignment_state"] == "managed" else 1,
+                0 if entry.source == "house" else 1,
+                entry.rel_path,
+            )
+
+        pair = [(candidate.left, left_file), (candidate.right, right_file)]
+        reference_entry, reference_file = min(
+            pair, key=lambda item: reference_rank(item[0], item[1])
+        )
+        candidate_entry, candidate_file = next(
+            item for item in pair if item[1] != reference_file
+        )
+        return (
+            candidate_entry,
+            candidate_file,
+            reference_entry,
+            reference_file,
+            self.fingerprint_ids[candidate_entry.path],
+            self.fingerprint_ids[reference_entry.path],
+        )
+
     def store_pair_results(self, candidates, results):
         stable = {
             "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
@@ -1488,17 +1639,31 @@ class PersistentAuditCache:
             for candidate in candidates
         )
         open_reviews = set()
+        review_states = {}
         if needs_open_review_snapshot:
+            review_file_ids = {
+                self.file_ids[entry.path]
+                for candidate in candidates
+                if candidate.pair_id in self.cache_hit_pair_ids
+                and (result := by_pair.get(candidate.pair_id)) is not None
+                and result.classification in _REVIEWABLE_CLASSIFICATIONS
+                for entry in (candidate.left, candidate.right)
+                if entry.path in self.file_ids
+            }
+            review_states = self._load_review_states(review_file_ids)
             open_reviews = {
                 (
-                    min(row["left_fingerprint_id"], row["right_fingerprint_id"]),
-                    max(row["left_fingerprint_id"], row["right_fingerprint_id"]),
+                    row["candidate_file_id"],
+                    row["reference_file_id"],
+                    row["left_fingerprint_id"],
+                    row["right_fingerprint_id"],
                     row["classification"],
                     row["evidence_json"] or "",
                 )
                 for row in self.conn.execute(
                     """
-                    SELECT left_fingerprint_id, right_fingerprint_id,
+                    SELECT candidate_file_id, reference_file_id,
+                           left_fingerprint_id, right_fingerprint_id,
                            classification, evidence_json
                     FROM review_items
                     WHERE state IN ('pending', 'deferred')
@@ -1521,9 +1686,25 @@ class PersistentAuditCache:
                 evidence_json = json.dumps(
                     result.evidence, ensure_ascii=False, sort_keys=True
                 )
-                review_key = (
-                    left_id, right_id, result.classification, evidence_json
-                )
+                direction = self._review_direction(candidate, review_states)
+                review_key = None
+                if direction is not None:
+                    (
+                        _candidate_entry,
+                        candidate_file,
+                        _reference_entry,
+                        reference_file,
+                        candidate_fp,
+                        reference_fp,
+                    ) = direction
+                    review_key = (
+                        candidate_file,
+                        reference_file,
+                        candidate_fp,
+                        reference_fp,
+                        result.classification,
+                        evidence_json,
+                    )
                 if (
                     result.classification in _REVIEWABLE_CLASSIFICATIONS
                     and review_key not in open_reviews
@@ -1544,12 +1725,16 @@ class PersistentAuditCache:
             return
         with self.store.transaction(self.conn):
             for candidate, result, left_id, right_id in pair_writes:
-                self.conn.execute(
+                inserted = self.conn.execute(
                     """
                     INSERT INTO pair_cache(
                         left_fingerprint_id, right_fingerprint_id, auditor_version,
                         configuration_hash, classification, evidence_json, completed
                     ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(
+                        left_fingerprint_id, right_fingerprint_id,
+                        auditor_version, configuration_hash
+                    ) DO NOTHING
                     """,
                     (
                         left_id,
@@ -1560,12 +1745,39 @@ class PersistentAuditCache:
                         json.dumps(result.evidence, ensure_ascii=False, sort_keys=True),
                     ),
                 )
-                self.stats["pair_cache_writes"] += 1
-                self._store_review_item(candidate, result, left_id, right_id)
+                stored = self.conn.execute(
+                    """
+                    SELECT classification, evidence_json, completed
+                    FROM pair_cache
+                    WHERE left_fingerprint_id = ? AND right_fingerprint_id = ?
+                      AND auditor_version = ? AND configuration_hash = ?
+                    """,
+                    (
+                        left_id,
+                        right_id,
+                        PAIR_POLICY_VERSION,
+                        self.configuration_hash,
+                    ),
+                ).fetchone()
+                if stored is None or stored["completed"] != 1:
+                    raise RuntimeError(
+                        "pair cache conflict did not converge to a completed row"
+                    )
+                if inserted.rowcount == 1:
+                    self.stats["pair_cache_writes"] += 1
+                    review_result = result
+                else:
+                    self.stats["pair_cache_concurrent_reuses"] += 1
+                    review_result = _basic_result(
+                        candidate,
+                        stored["classification"],
+                        json.loads(stored["evidence_json"] or "{}"),
+                    )
+                self._store_review_item(candidate, review_result)
             for candidate, result, left_id, right_id in review_repairs:
-                self._store_review_item(candidate, result, left_id, right_id)
+                self._store_review_item(candidate, result)
 
-    def _store_review_item(self, candidate, result, ordered_left_fp, ordered_right_fp):
+    def _store_review_item(self, candidate, result):
         if result.classification not in _REVIEWABLE_CLASSIFICATIONS:
             return
         if (
@@ -1592,39 +1804,28 @@ class PersistentAuditCache:
         ):
             self.stats["cross_core_reviews_suppressed"] += 1
             return
+        if not (
+            _entry_is_current(candidate.left)
+            and _entry_is_current(candidate.right)
+        ):
+            self.stats["review_item_stale_skips"] += 1
+            return
         left_file = self.file_ids[candidate.left.path]
         right_file = self.file_ids[candidate.right.path]
-        rows = {
-            row["file_id"]: row
-            for row in self.conn.execute(
-                """
-                SELECT f.file_id, f.assignment_state, f.protected,
-                       CASE WHEN r.file_id IS NULL THEN 0 ELSE 1 END AS representative
-                FROM files AS f
-                LEFT JOIN representatives AS r ON r.file_id = f.file_id
-                WHERE f.file_id IN (?, ?)
-                """,
-                (left_file, right_file),
-            ).fetchall()
-        }
-
-        def reference_rank(entry, file_id):
-            row = rows[file_id]
-            return (
-                0 if row["representative"] else 1,
-                0 if row["protected"] else 1,
-                0 if row["assignment_state"] == "managed" else 1,
-                0 if entry.source == "house" else 1,
-                entry.rel_path,
-            )
-
-        pair = [(candidate.left, left_file), (candidate.right, right_file)]
-        reference_entry, reference_file = min(
-            pair, key=lambda item: reference_rank(item[0], item[1])
+        direction = self._review_direction(
+            candidate, self._load_review_states((left_file, right_file))
         )
-        candidate_entry, candidate_file = next(item for item in pair if item[1] != reference_file)
-        candidate_fp = self.fingerprint_ids[candidate_entry.path]
-        reference_fp = self.fingerprint_ids[reference_entry.path]
+        if direction is None:
+            self.stats["review_item_stale_skips"] += 1
+            return
+        (
+            candidate_entry,
+            candidate_file,
+            reference_entry,
+            reference_file,
+            candidate_fp,
+            reference_fp,
+        ) = direction
         evidence_json = json.dumps(
             result.evidence, ensure_ascii=False, sort_keys=True
         )
@@ -1673,6 +1874,15 @@ class PersistentAuditCache:
             ),
         ):
             self.stats["human_disposition_cache_hits"] += 1
+            return
+        # The repair path is intentionally rare. Recheck immediately before
+        # superseding/creating a row so a file changed after the warm cache hit
+        # cannot leave a pending review against the old fingerprint.
+        if not (
+            _entry_is_current(candidate.left)
+            and _entry_is_current(candidate.right)
+        ):
+            self.stats["review_item_stale_skips"] += 1
             return
         self.stats["stale_open_reviews_superseded"] += supersede_open_pair_reviews(
             self.conn,
@@ -2024,7 +2234,7 @@ def _analyze_entry_set(
                 )
                 analysis = _ensure_analysis_raw_sha(analysis, entry, budget)
                 if persistent is not None:
-                    persistent.store_analysis(entry, analysis)
+                    analysis = persistent.store_analysis(entry, analysis) or analysis
                 stats["analyzed_txt"] += 1
             else:
                 cache.put(analysis)
@@ -2097,7 +2307,7 @@ def _analyze_entry_set(
                     ),
                 )
                 if persistent is not None:
-                    persistent.store_analysis(entry, analysis)
+                    analysis = persistent.store_analysis(entry, analysis) or analysis
                 stats["analyzed_epub"] += 1
             else:
                 stats["cache_hit_epub"] += 1
@@ -3245,6 +3455,12 @@ def run_audit(args):
         "fingerprint_cache_peek_misses": persistent_stats.get(
             "fingerprint_cache_peek_misses", 0
         ),
+        "fingerprint_cache_writes": persistent_stats.get(
+            "fingerprint_cache_writes", 0
+        ),
+        "fingerprint_cache_concurrent_reuses": persistent_stats.get(
+            "fingerprint_cache_concurrent_reuses", 0
+        ),
         "fingerprint_stale_inputs": persistent_stats.get("fingerprint_stale_inputs", 0),
         "fingerprint_identity_stat_skips": persistent_stats.get(
             "fingerprint_identity_stat_skips", 0
@@ -3261,6 +3477,9 @@ def run_audit(args):
         "pair_cache_hits": persistent_stats.get("pair_cache_hits", 0),
         "pair_cache_misses": persistent_stats.get("pair_cache_misses", 0),
         "pair_cache_writes": persistent_stats.get("pair_cache_writes", 0),
+        "pair_cache_concurrent_reuses": persistent_stats.get(
+            "pair_cache_concurrent_reuses", 0
+        ),
         "pair_cache_write_skips": persistent_stats.get(
             "pair_cache_write_skips", 0
         ),
@@ -3276,6 +3495,9 @@ def run_audit(args):
         "review_items_created": persistent_stats.get("review_items_created", 0),
         "review_items_refreshed": persistent_stats.get(
             "review_items_refreshed", 0
+        ),
+        "review_item_stale_skips": persistent_stats.get(
+            "review_item_stale_skips", 0
         ),
         "distinct_volume_reviews_suppressed": persistent_stats.get(
             "distinct_volume_reviews_suppressed", 0
