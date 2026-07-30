@@ -151,7 +151,7 @@ def _materialize_component_rebound_reviews(conn, plans):
         else:
             evidence = dict(plan.get("review_evidence") or {})
             evidence["strong_component_rebind"] = {
-                "version": "1.4.6",
+                "version": "1.4.7",
                 "source_review_id": plan["source_review_id"],
                 "source_pair_file_ids": list(plan["source_pair_file_ids"]),
                 "final_pair_file_ids": [

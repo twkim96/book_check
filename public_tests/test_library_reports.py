@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import library_reports
 
 from library_reports import (
     dedup_report_listing,
@@ -92,6 +93,7 @@ def test_dedup_report_listing_groups_legacy_pairs_and_json_only_reports(tmp_path
     )
     assert current_item["text_available"] is False
     assert current_item["structured_available"] is True
+    assert "정확 중복 quarantine 3개" in current_item["summary"]
     paired_item = next(item for item in listing["items"] if item["report_id"] == paired.stem)
     assert paired_item["text_available"] is True
     assert paired_item["structured_available"] is True
@@ -121,6 +123,54 @@ def test_dedup_report_listing_pages_twenty_reports_at_a_time(tmp_path):
     assert {item["report_id"] for item in first["items"]}.isdisjoint(
         item["report_id"] for item in second["items"]
     )
+
+
+def test_listing_reads_report_contents_only_for_requested_page(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "dedup_logs"
+    root.mkdir()
+    for index in range(25):
+        (root / f"dedup_20260721_{index:06d}.txt").write_text(
+            f"모드: page fixture {index}", encoding="utf-8"
+        )
+    calls = []
+    original = library_reports._report_item
+
+    def tracked(*args, **kwargs):
+        calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(library_reports, "_report_item", tracked)
+
+    listing = dedup_report_listing(tmp_path, limit=5)
+
+    assert listing["total"] == 25
+    assert len(listing["items"]) == 5
+    assert len(calls) == 5
+
+
+def test_json_only_listing_reads_early_summary_without_parsing_large_tail(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "dedup_logs"
+    root.mkdir()
+    path = root / "dedup_20260721_153000_654321.json"
+    payload = _payload(exact_count=4)
+    payload["large_tail"] = ["x" * 1024] * 5000
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(
+        library_reports,
+        "_read_structured",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("listing must not parse the complete JSON report")
+        ),
+    )
+
+    listing = dedup_report_listing(tmp_path, limit=1)
+
+    assert listing["total"] == 1
+    assert "정확 중복 quarantine 4개" in listing["items"][0]["summary"]
 
 
 def test_json_only_detail_renders_text_and_exports_without_creating_txt(tmp_path):

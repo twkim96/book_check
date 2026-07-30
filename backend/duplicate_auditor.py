@@ -84,11 +84,12 @@ FINGERPRINT_POLICY_VERSION = "1.4.2"
 # are not invalidated.
 FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # Pair classification/evidence also has its own compatibility lifetime. 1.4.5
-# changed cache execution and 1.4.6 changes only filename/core parsing, so the
-# existing 1.4.2 pair rows remain valid while AUDITOR_VERSION follows releases.
+# changed cache execution, 1.4.6 changed only filename/core parsing, and 1.4.7
+# changes cache access only. Existing 1.4.2 pair rows therefore remain valid
+# while AUDITOR_VERSION follows releases.
 PAIR_POLICY_VERSION = "1.4.2"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.6"
+AUDITOR_VERSION = "1.4.7"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -105,6 +106,23 @@ DEFAULT_INDEX = str(FILE_INDEX)
 DEFAULT_HOUSE = str(HOUSE_DIR)
 DEFAULT_TEMP = str(TEMP_DIR)
 ORIGIN = "auditor_aux"
+
+
+_CURRENT_FINGERPRINT_COLUMNS = """
+    fp.fingerprint_id, fp.file_id, fp.canonical_path,
+    fp.size, fp.mtime_ns, fp.normalizer_version,
+    fp.fingerprint_version, fp.analysis_policy_hash,
+    fp.dev, fp.ino, fp.ctime_ns,
+    fp.raw_sha256, fp.normalized_sha256, fp.normalized_length,
+    fp.encoding, fp.status, fp.anchors_json
+"""
+
+_REVIEWABLE_CLASSIFICATIONS = {
+    "text_equivalent", "epub_equivalent", "marker_recheck",
+    "near_identical", "contained_exact", "contained_version",
+    "ordered_body_match", "ordered_body_review", "longer_unresolved",
+    "decode_lossy", "metadata_only", "insufficient_text",
+}
 
 
 @dataclass(frozen=True)
@@ -990,6 +1008,8 @@ class PersistentAuditCache:
         self.fingerprint_ids = {}
         self.pending_identities = {}
         self.raw_sha_cache = {}
+        self.deferred_detail_paths = set()
+        self.cache_hit_pair_ids = set()
         self.stats = Counter()
         reconcile_started = time.monotonic()
         rows_by_path = {
@@ -1119,7 +1139,7 @@ class PersistentAuditCache:
         return raw_sha256
 
     @staticmethod
-    def _text_analysis_from_row(entry, row):
+    def _text_analysis_from_row(entry, row, *, include_details=True):
         metadata = json.loads(row["anchors_json"] or "{}")
         return TextAnalysis(
             path=entry.path,
@@ -1131,8 +1151,8 @@ class PersistentAuditCache:
             raw_sha256=row["raw_sha256"],
             normalized_sha256=row["normalized_sha256"],
             normalized_length=row["normalized_length"] or 0,
-            front_anchor=row["front_anchor"] or "",
-            tail_anchor=row["tail_anchor"] or "",
+            front_anchor=(row["front_anchor"] or "") if include_details else "",
+            tail_anchor=(row["tail_anchor"] or "") if include_details else "",
             status=row["status"],
             read_bytes=0,
         )
@@ -1178,6 +1198,7 @@ class PersistentAuditCache:
             return None
         self.pending_identities.pop(entry.path, None)
         analysis = self._text_analysis_from_row(entry, row)
+        self.deferred_detail_paths.discard(entry.path)
         self.fingerprint_ids[entry.path] = row["fingerprint_id"]
         self.stats["fingerprint_cache_hits"] += 1
         return analysis
@@ -1193,8 +1214,8 @@ class PersistentAuditCache:
         rows = {
             row["file_id"]: row
             for row in self.conn.execute(
-                """
-                SELECT fp.* FROM files AS f
+                f"""
+                SELECT {_CURRENT_FINGERPRINT_COLUMNS} FROM files AS f
                 JOIN fingerprints AS fp
                   ON fp.fingerprint_id = f.current_fingerprint_id
                 WHERE f.active = 1 AND fp.normalizer_version = ?
@@ -1227,9 +1248,12 @@ class PersistentAuditCache:
             if not valid:
                 self.stats["fingerprint_cache_peek_misses"] += 1
                 continue
-            analysis = self._text_analysis_from_row(entry, row)
+            analysis = self._text_analysis_from_row(
+                entry, row, include_details=False
+            )
             analyses[entry.path] = analysis
             self.fingerprint_ids[entry.path] = row["fingerprint_id"]
+            self.deferred_detail_paths.add(entry.path)
             self.stats["fingerprint_cache_hits"] += 1
         return analyses
 
@@ -1291,6 +1315,34 @@ class PersistentAuditCache:
                 (fingerprint_id, file_id),
             )
         self.fingerprint_ids[entry.path] = fingerprint_id
+        self.deferred_detail_paths.discard(entry.path)
+
+    def analysis_with_details(self, entry, analysis):
+        """Load large anchor columns only when an uncached TXT pair needs them."""
+        if entry.path not in self.deferred_detail_paths:
+            return analysis
+        fingerprint_id = self.fingerprint_ids.get(entry.path)
+        row = self.conn.execute(
+            """
+            SELECT front_anchor, tail_anchor FROM fingerprints
+            WHERE fingerprint_id = ?
+            """,
+            (fingerprint_id,),
+        ).fetchone()
+        if row is None:
+            raise StaleInputDuringAnalysis(entry.path)
+        front_anchor = row["front_anchor"] or ""
+        tail_anchor = row["tail_anchor"] or ""
+        self.deferred_detail_paths.discard(entry.path)
+        self.stats["fingerprint_detail_loads"] += 1
+        self.stats["fingerprint_detail_chars"] += (
+            len(front_anchor) + len(tail_anchor)
+        )
+        return replace(
+            analysis,
+            front_anchor=front_anchor,
+            tail_anchor=tail_anchor,
+        )
 
     def pair_result(self, candidate):
         left_id = self.fingerprint_ids.get(candidate.left.path)
@@ -1311,11 +1363,13 @@ class PersistentAuditCache:
             self.stats["pair_cache_misses"] += 1
             return None
         self.stats["pair_cache_hits"] += 1
-        return _basic_result(
+        result = _basic_result(
             candidate,
             row["classification"],
             json.loads(row["evidence_json"] or "{}"),
         )
+        self.cache_hit_pair_ids.add(candidate.pair_id)
+        return result
 
     def store_pair_results(self, candidates, results):
         stable = {
@@ -1325,25 +1379,72 @@ class PersistentAuditCache:
             "decode_lossy", "empty_text", "insufficient_text", "metadata_only",
         }
         by_pair = {result.pair_id: result for result in results}
-        with self.store.transaction(self.conn):
-            for candidate in candidates:
-                result = by_pair.get(candidate.pair_id)
-                if result is None or result.classification not in stable:
-                    continue
-                if not (
-                    _entry_is_current(candidate.left)
-                    and _entry_is_current(candidate.right)
+        needs_open_review_snapshot = any(
+            candidate.pair_id in self.cache_hit_pair_ids
+            and (result := by_pair.get(candidate.pair_id)) is not None
+            and result.classification in _REVIEWABLE_CLASSIFICATIONS
+            for candidate in candidates
+        )
+        open_reviews = set()
+        if needs_open_review_snapshot:
+            open_reviews = {
+                (
+                    min(row["left_fingerprint_id"], row["right_fingerprint_id"]),
+                    max(row["left_fingerprint_id"], row["right_fingerprint_id"]),
+                    row["classification"],
+                    row["evidence_json"] or "",
+                )
+                for row in self.conn.execute(
+                    """
+                    SELECT left_fingerprint_id, right_fingerprint_id,
+                           classification, evidence_json
+                    FROM review_items
+                    WHERE state IN ('pending', 'deferred')
+                    """
+                )
+            }
+        pair_writes = []
+        review_repairs = []
+        for candidate in candidates:
+            result = by_pair.get(candidate.pair_id)
+            if result is None or result.classification not in stable:
+                continue
+            left_id = self.fingerprint_ids.get(candidate.left.path)
+            right_id = self.fingerprint_ids.get(candidate.right.path)
+            if left_id is None or right_id is None or left_id == right_id:
+                continue
+            left_id, right_id = sorted((left_id, right_id))
+            if candidate.pair_id in self.cache_hit_pair_ids:
+                self.stats["pair_cache_write_skips"] += 1
+                evidence_json = json.dumps(
+                    result.evidence, ensure_ascii=False, sort_keys=True
+                )
+                review_key = (
+                    left_id, right_id, result.classification, evidence_json
+                )
+                if (
+                    result.classification in _REVIEWABLE_CLASSIFICATIONS
+                    and review_key not in open_reviews
                 ):
-                    self.stats["fingerprint_stale_inputs"] += 1
-                    continue
-                left_id = self.fingerprint_ids.get(candidate.left.path)
-                right_id = self.fingerprint_ids.get(candidate.right.path)
-                if left_id is None or right_id is None or left_id == right_id:
-                    continue
-                left_id, right_id = sorted((left_id, right_id))
+                    review_repairs.append((candidate, result, left_id, right_id))
+                else:
+                    self.stats["review_item_sync_skips"] += 1
+                continue
+            if not (
+                _entry_is_current(candidate.left)
+                and _entry_is_current(candidate.right)
+            ):
+                self.stats["fingerprint_stale_inputs"] += 1
+                continue
+            pair_writes.append((candidate, result, left_id, right_id))
+
+        if not pair_writes and not review_repairs:
+            return
+        with self.store.transaction(self.conn):
+            for candidate, result, left_id, right_id in pair_writes:
                 self.conn.execute(
                     """
-                    INSERT OR REPLACE INTO pair_cache(
+                    INSERT INTO pair_cache(
                         left_fingerprint_id, right_fingerprint_id, auditor_version,
                         configuration_hash, classification, evidence_json, completed
                     ) VALUES (?, ?, ?, ?, ?, ?, 1)
@@ -1357,16 +1458,13 @@ class PersistentAuditCache:
                         json.dumps(result.evidence, ensure_ascii=False, sort_keys=True),
                     ),
                 )
+                self.stats["pair_cache_writes"] += 1
+                self._store_review_item(candidate, result, left_id, right_id)
+            for candidate, result, left_id, right_id in review_repairs:
                 self._store_review_item(candidate, result, left_id, right_id)
 
     def _store_review_item(self, candidate, result, ordered_left_fp, ordered_right_fp):
-        reviewable = {
-            "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
-            "contained_version", "ordered_body_match", "ordered_body_review",
-            "longer_unresolved", "decode_lossy",
-            "metadata_only", "insufficient_text",
-        }
-        if result.classification not in reviewable:
+        if result.classification not in _REVIEWABLE_CLASSIFICATIONS:
             return
         if (
             result.classification == "metadata_only"
@@ -1500,8 +1598,77 @@ class PersistentAuditCache:
         self.stats["review_items_created"] += 1
 
 
+class ReadOnlyAuditCache:
+    """Read fingerprint and pair evidence without acquiring a writer handle."""
+
+    def __init__(
+        self, conn, configuration_hash, fingerprint_ids,
+        deferred_detail_paths, stats,
+    ):
+        self.conn = conn
+        self.configuration_hash = configuration_hash
+        self.fingerprint_ids = fingerprint_ids
+        self.deferred_detail_paths = deferred_detail_paths
+        self.stats = stats
+
+    def close(self):
+        self.conn.close()
+
+    def pair_result(self, candidate):
+        left_id = self.fingerprint_ids.get(candidate.left.path)
+        right_id = self.fingerprint_ids.get(candidate.right.path)
+        if left_id is None or right_id is None or left_id == right_id:
+            self.stats["pair_cache_misses"] += 1
+            return None
+        left_id, right_id = sorted((left_id, right_id))
+        row = self.conn.execute(
+            """
+            SELECT classification, evidence_json FROM pair_cache
+            WHERE left_fingerprint_id = ? AND right_fingerprint_id = ?
+              AND auditor_version = ? AND configuration_hash = ? AND completed = 1
+            """,
+            (left_id, right_id, PAIR_POLICY_VERSION, self.configuration_hash),
+        ).fetchone()
+        if row is None:
+            self.stats["pair_cache_misses"] += 1
+            return None
+        self.stats["pair_cache_hits"] += 1
+        return _basic_result(
+            candidate,
+            row["classification"],
+            json.loads(row["evidence_json"] or "{}"),
+        )
+
+    def analysis_with_details(self, entry, analysis):
+        if entry.path not in self.deferred_detail_paths:
+            return analysis
+        fingerprint_id = self.fingerprint_ids.get(entry.path)
+        row = self.conn.execute(
+            """
+            SELECT front_anchor, tail_anchor FROM fingerprints
+            WHERE fingerprint_id = ?
+            """,
+            (fingerprint_id,),
+        ).fetchone()
+        if row is None:
+            raise StaleInputDuringAnalysis(entry.path)
+        front_anchor = row["front_anchor"] or ""
+        tail_anchor = row["tail_anchor"] or ""
+        self.deferred_detail_paths.discard(entry.path)
+        self.stats["fingerprint_detail_loads"] += 1
+        self.stats["fingerprint_detail_chars"] += (
+            len(front_anchor) + len(tail_anchor)
+        )
+        return replace(
+            analysis,
+            front_anchor=front_anchor,
+            tail_anchor=tail_anchor,
+        )
+
+
 def load_persisted_analyses_readonly(
-    entries, state_db_path, analysis_policy_hash, *, retry_deferred=False
+    entries, state_db_path, analysis_policy_hash, configuration_hash,
+    *, retry_deferred=False,
 ):
     """Load current fingerprints without opening the state DB for writes.
 
@@ -1511,15 +1678,15 @@ def load_persisted_analyses_readonly(
     """
     stats = Counter()
     if not state_db_path or not os.path.isfile(state_db_path):
-        return {}, stats
+        return {}, stats, None
 
     import decision_store
 
     conn = decision_store.connect_state_db_readonly(state_db_path)
     try:
         rows = conn.execute(
-            """
-            SELECT fp.* FROM files AS f
+            f"""
+            SELECT {_CURRENT_FINGERPRINT_COLUMNS} FROM files AS f
             JOIN fingerprints AS fp
               ON fp.fingerprint_id = f.current_fingerprint_id
             WHERE f.active = 1 AND fp.normalizer_version = ?
@@ -1527,11 +1694,14 @@ def load_persisted_analyses_readonly(
             """,
             (FINGERPRINT_NORMALIZER_COMPAT_VERSION, analysis_policy_hash),
         ).fetchall()
-    finally:
+    except BaseException:
         conn.close()
+        raise
 
     rows_by_path = {row["canonical_path"]: row for row in rows}
     analyses = {}
+    fingerprint_ids = {}
+    deferred_detail_paths = set()
     for entry in entries:
         canonical_path = decision_store.canonicalize_path(entry.path)
         row = rows_by_path.get(canonical_path)
@@ -1562,10 +1732,18 @@ def load_persisted_analyses_readonly(
             stats["fingerprint_cache_peek_misses"] += 1
             continue
         analyses[entry.path] = PersistentAuditCache._text_analysis_from_row(
-            entry, row
+            entry, row, include_details=False
         )
+        fingerprint_ids[entry.path] = row["fingerprint_id"]
+        deferred_detail_paths.add(entry.path)
         stats["fingerprint_cache_hits"] += 1
-    return analyses, stats
+    return analyses, stats, ReadOnlyAuditCache(
+        conn,
+        configuration_hash,
+        fingerprint_ids,
+        deferred_detail_paths,
+        stats,
+    )
 
 
 def _pair_configuration_hash(config):
@@ -2140,7 +2318,8 @@ def _apply_ordered_body_classification(
 
 def analyze_candidates(
     candidates, config, coverage, stop_reasons, persistent=None,
-    preloaded_analyses=None, budget=None, cache=None, runtime_stats=None,
+    pair_cache=None, preloaded_analyses=None, budget=None, cache=None,
+    runtime_stats=None,
 ):
     results = {}
     budget = budget or ReadBudget(max_bytes=config.max_read_bytes)
@@ -2168,6 +2347,7 @@ def analyze_candidates(
 
     deep_pairs = []
     epub_payload_cache = {}
+    pair_cache = pair_cache if pair_cache is not None else persistent
     if candidates:
         _emit_audit_progress(config, "pair_classification", 0, len(candidates), budget)
     for candidate_index, candidate in enumerate(candidates, start=1):
@@ -2191,8 +2371,8 @@ def analyze_candidates(
                     {"left_status": left.status, "right_status": right.status},
                 )
                 continue
-            if persistent is not None:
-                cached_result = persistent.pair_result(candidate)
+            if pair_cache is not None:
+                cached_result = pair_cache.pair_result(candidate)
                 if cached_result is not None:
                     results[candidate.pair_id] = cached_result
                     continue
@@ -2303,8 +2483,8 @@ def analyze_candidates(
                 {"left_status": left.status, "right_status": right.status},
             )
             continue
-        if persistent is not None:
-            cached_result = persistent.pair_result(candidate)
+        if pair_cache is not None:
+            cached_result = pair_cache.pair_result(candidate)
             if cached_result is not None:
                 results[candidate.pair_id] = cached_result
                 continue
@@ -2331,6 +2511,18 @@ def analyze_candidates(
             evidence["text_classification"] = "text_equivalent"
             results[candidate.pair_id] = _basic_result(candidate, classification, evidence)
             continue
+        if pair_cache is not None:
+            try:
+                left = pair_cache.analysis_with_details(candidate.left, left)
+                right = pair_cache.analysis_with_details(candidate.right, right)
+            except StaleInputDuringAnalysis:
+                stop_reasons.append("stale_input")
+                results[candidate.pair_id] = _basic_result(
+                    candidate, "stale", evidence
+                )
+                continue
+            analyses[candidate.left.path] = left
+            analyses[candidate.right.path] = right
         # A different upload header used to terminate here as ``different``.
         # Keep the pair inside the existing bounded deep-pair/read budgets so
         # internal and tail anchors can recover header-shifted editions.
@@ -2488,6 +2680,7 @@ def run_audit(args):
             raise ValueError("--full-fingerprint-sweep requires cache writes")
 
     persistent = None
+    readonly_cache = None
     preloaded_analyses = {}
     readonly_fingerprint_stats = Counter()
     sweep_stats = Counter()
@@ -2517,11 +2710,16 @@ def run_audit(args):
                 house_fingerprint_entries, retry_deferred=retry_house
             ))
         elif getattr(args, "state_db", None):
-            readonly_analyses, readonly_fingerprint_stats = (
+            (
+                readonly_analyses,
+                readonly_fingerprint_stats,
+                readonly_cache,
+            ) = (
                 load_persisted_analyses_readonly(
                     house_fingerprint_entries,
                     args.state_db,
                     analysis_policy_hash,
+                    _pair_configuration_hash(args),
                 )
             )
             preloaded_analyses.update(readonly_analyses)
@@ -2718,6 +2916,7 @@ def run_audit(args):
             coverage,
             stop_reasons,
             persistent=persistent,
+            pair_cache=persistent or readonly_cache,
             preloaded_analyses=preloaded_analyses,
             budget=main_budget,
             cache=main_cache,
@@ -2757,6 +2956,7 @@ def run_audit(args):
                         coverage,
                         stop_reasons,
                         persistent=persistent,
+                        pair_cache=persistent or readonly_cache,
                         preloaded_analyses=preloaded_analyses,
                         budget=budget,
                         cache=cache,
@@ -2794,6 +2994,8 @@ def run_audit(args):
     finally:
         if persistent is not None:
             persistent.close()
+        if readonly_cache is not None:
+            readonly_cache.close()
     final_changed = _snapshot_changes(snapshot)
     changed_by_path = {item["path"]: item for item in changed}
     changed_by_path.update({item["path"]: item for item in final_changed})
@@ -2908,6 +3110,19 @@ def run_audit(args):
         ),
         "pair_cache_hits": persistent_stats.get("pair_cache_hits", 0),
         "pair_cache_misses": persistent_stats.get("pair_cache_misses", 0),
+        "pair_cache_writes": persistent_stats.get("pair_cache_writes", 0),
+        "pair_cache_write_skips": persistent_stats.get(
+            "pair_cache_write_skips", 0
+        ),
+        "review_item_sync_skips": persistent_stats.get(
+            "review_item_sync_skips", 0
+        ),
+        "fingerprint_detail_loads": persistent_stats.get(
+            "fingerprint_detail_loads", 0
+        ),
+        "fingerprint_detail_chars": persistent_stats.get(
+            "fingerprint_detail_chars", 0
+        ),
         "review_items_created": persistent_stats.get("review_items_created", 0),
         "review_items_refreshed": persistent_stats.get(
             "review_items_refreshed", 0

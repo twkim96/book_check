@@ -338,7 +338,7 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
     assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.2"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.6"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.7"
 
 
 def _txt_cache_fixture(tmp_path):
@@ -367,7 +367,7 @@ def test_release_fingerprint_and_pair_cache_versions_are_independent(
     pair_hash = duplicate_auditor._pair_configuration_hash(args)
     duplicate_auditor.run_audit(args)
 
-    monkeypatch.setattr(duplicate_auditor, "AUDITOR_VERSION", "1.4.6")
+    monkeypatch.setattr(duplicate_auditor, "AUDITOR_VERSION", "9.9.9")
     warm = duplicate_auditor.run_audit(args)
 
     assert duplicate_auditor._analysis_policy_hash(args) == analysis_hash
@@ -422,6 +422,57 @@ def test_warm_audit_skips_unchanged_house_metadata_reconcile(
     assert warm.stats["metadata_reconcile_skips"] == 2
     assert warm.stats["metadata_reconcile_writes"] == 0
     assert calls == []
+
+
+def test_warm_pair_cache_hit_does_not_rewrite_pair_row(tmp_path):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    args = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    duplicate_auditor.run_audit(args)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        conn.execute(
+            "UPDATE pair_cache SET created_at = '2001-02-03 04:05:06'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    warm = duplicate_auditor.run_audit(args)
+
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        [row] = conn.execute(
+            "SELECT created_at FROM pair_cache"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert row["created_at"] == "2001-02-03 04:05:06"
+    assert warm.stats["pair_cache_hits"] == 1
+    assert warm.stats["pair_cache_writes"] == 0
+    assert warm.stats["pair_cache_write_skips"] == 1
+    assert warm.stats["review_item_sync_skips"] == 1
+
+
+def test_read_only_plan_reuses_pair_cache_without_loading_anchor_blobs(tmp_path):
+    house, temp, index, state_db = _txt_cache_fixture(tmp_path)
+    writable = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    duplicate_auditor.run_audit(writable)
+    before = state_db.read_bytes()
+    readonly = _general_args(
+        index, house, temp, "--house-only", "--state-db", str(state_db)
+    )
+    readonly.cache_write = False
+
+    report = duplicate_auditor.run_audit(readonly)
+
+    assert report.stats["pair_cache_hits"] == 1
+    assert report.stats["actual_read_bytes"] == 0
+    assert report.stats["fingerprint_detail_loads"] == 0
+    assert state_db.read_bytes() == before
 
 
 def test_warm_audit_reconciles_only_the_changed_house_entry(tmp_path):

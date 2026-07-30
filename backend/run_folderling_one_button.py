@@ -4,6 +4,7 @@
 import argparse
 import sqlite3
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -102,6 +103,8 @@ def run(
     script_dir=None,
     event_callback=None,
 ):
+    one_button_started_at = time.perf_counter()
+    preflight_started_at = one_button_started_at
     state_db = Path(state_db_path)
     if not state_db.is_file():
         raise RuntimeError(f"managed state DB is missing: {state_db}")
@@ -138,17 +141,15 @@ def run(
                 claimed_actions = review_actions.claim_external_action_moves(
                     conn, src_dir
                 )
-                issues = decision_store.doctor_issues(conn)
-                if issues:
-                    first = issues[0]
-                    raise RuntimeError(
-                        "doctor failed before Folderling; run disable/recover/doctor manually: "
-                        f"{len(issues)} issue(s), first={first['kind']}"
+                run_id, preflight_receipt = (
+                    decision_store.issue_prevalidated_actual_run_token(
+                        conn,
+                        str(run_backup),
+                        house_dir=dst_dir,
+                        temp_dir=src_dir,
                     )
-                approval_started = True
-                run_id = decision_store.issue_actual_run_token(
-                    conn, str(run_backup), house_dir=dst_dir, temp_dir=src_dir
                 )
+                approval_started = True
             finally:
                 conn.close()
             schema_message = str(pre_migration) if pre_migration else "불필요(schema current)"
@@ -156,6 +157,7 @@ def run(
             if claimed_actions:
                 print(f"📥 검토 처리함 입력 {len(claimed_actions)}개 확인")
             print(f"🔐 일회성 actual 승인 발급: {run_id}")
+            preflight_seconds = time.perf_counter() - preflight_started_at
             folderling.emit_folderling_event(
                 event_callback,
                 "preflight_result",
@@ -166,13 +168,25 @@ def run(
                 doctor_issue_count=0,
                 claimed_review_actions=len(claimed_actions),
                 approved_run_id=run_id,
+                preflight_seconds=round(preflight_seconds, 6),
             )
             process_kwargs = {"state_db_path": str(state_db)}
             if event_callback is not None:
                 process_kwargs["event_callback"] = event_callback
-            return folderling._process_items_with_lock_held(
-                src_dir, dst_dir, script_dir, **process_kwargs
+            result = folderling._process_items_with_lock_held(
+                src_dir,
+                dst_dir,
+                script_dir,
+                **process_kwargs,
             )
+            performance_metrics = result.setdefault("performance_metrics", {})
+            performance_metrics["one_button_preflight_seconds"] = round(
+                preflight_seconds, 6
+            )
+            performance_metrics["one_button_total_seconds"] = round(
+                time.perf_counter() - one_button_started_at, 6
+            )
+            return result
         except BaseException as exc:
             folderling.emit_folderling_event(
                 event_callback,

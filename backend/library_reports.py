@@ -111,6 +111,59 @@ def _summary_from_text(text: str, kind: str) -> str:
     )
 
 
+def _top_level_json_value(prefix: str, key: str):
+    """Decode one early top-level JSON value without loading the report tail."""
+    decoder = json.JSONDecoder()
+    cursor = 0
+    length = len(prefix)
+
+    def skip_space(position):
+        while position < length and prefix[position].isspace():
+            position += 1
+        return position
+
+    cursor = skip_space(cursor)
+    if cursor >= length or prefix[cursor] != "{":
+        raise ValueError("구조화 dedup 보고서 루트는 객체여야 합니다")
+    cursor += 1
+    while True:
+        cursor = skip_space(cursor)
+        if cursor >= length:
+            raise ValueError("구조화 dedup 보고서 summary가 앞부분에 없습니다")
+        if prefix[cursor] == "}":
+            return None
+        field, cursor = decoder.raw_decode(prefix, cursor)
+        if not isinstance(field, str):
+            raise ValueError("구조화 dedup 보고서 key가 문자열이 아닙니다")
+        cursor = skip_space(cursor)
+        if cursor >= length or prefix[cursor] != ":":
+            raise ValueError("구조화 dedup 보고서 key 구분자가 없습니다")
+        cursor = skip_space(cursor + 1)
+        value, cursor = decoder.raw_decode(prefix, cursor)
+        if field == key:
+            return value
+        cursor = skip_space(cursor)
+        if cursor < length and prefix[cursor] == ",":
+            cursor += 1
+            continue
+        if cursor < length and prefix[cursor] == "}":
+            return None
+        raise ValueError("구조화 dedup 보고서 field 구분자가 없습니다")
+
+
+def _dedup_summary_from_json_prefix(path: Path) -> str:
+    with path.open("r", encoding="utf-8", errors="strict") as stream:
+        prefix = stream.read(SUMMARY_READ_BYTES)
+    payload_kind = _top_level_json_value(prefix, "kind")
+    summary = _top_level_json_value(prefix, "summary")
+    if payload_kind != "folderling_dedup" or not isinstance(summary, dict):
+        raise ValueError("Folderling dedup 구조화 보고서가 아닙니다")
+    return dedup_report_summary_line({
+        "kind": payload_kind,
+        "summary": summary,
+    })
+
+
 def _text_from_files(files: dict[str, Path], *, for_view: bool = False) -> str:
     text_path = files.get("txt")
     if text_path is not None:
@@ -149,10 +202,9 @@ def _report_item(stem: str, files: dict[str, Path]) -> dict:
             with files["txt"].open("r", encoding="utf-8", errors="replace") as stream:
                 summary = _summary_from_text(stream.read(SUMMARY_READ_BYTES), kind)
         else:
-            payload = _read_structured(files["json"])
             summary = (
-                dedup_report_summary_line(payload)
-                if payload.get("kind") == "folderling_dedup"
+                _dedup_summary_from_json_prefix(files["json"])
+                if kind == "dedup"
                 else "구조화 보고서"
             )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -167,6 +219,28 @@ def _report_item(stem: str, files: dict[str, Path]) -> dict:
         "summary": summary,
         "text_available": "txt" in files,
         "structured_available": "json" in files,
+    }
+
+
+def _report_descriptor(stem: str, files: dict[str, Path]) -> dict:
+    """Return sortable/filterable metadata without opening report contents."""
+    match = REPORT_STEM_RE.fullmatch(stem)
+    if match is None:
+        raise ValueError(stem)
+    if match.group("kind"):
+        kind = "dedup"
+    elif match.group("strong"):
+        kind = "strong_candidates"
+    else:
+        kind = "cleanup"
+    primary = files.get("txt") or files["json"]
+    latest_mtime = max(path.stat().st_mtime for path in files.values())
+    return {
+        "stem": stem,
+        "files": files,
+        "kind": kind,
+        "name": primary.name,
+        "created_at": _created_at(match, latest_mtime),
     }
 
 
@@ -199,26 +273,50 @@ def dedup_report_listing(
                 continue
             grouped.setdefault(match.group("stem"), {})[match.group("extension")] = safe
 
+    descriptors = []
     items = []
     for stem, files in grouped.items():
         try:
-            item = _report_item(stem, files)
+            descriptor = _report_descriptor(stem, files)
         except (OSError, ValueError):
             continue
-        if kind != "all" and item["kind"] != kind:
+        if kind != "all" and descriptor["kind"] != kind:
             continue
-        if needle and needle not in f"{item['name']} {item['summary']}".casefold():
-            continue
-        items.append(item)
-    items.sort(key=lambda item: (item["created_at"], item["report_id"]), reverse=True)
-    page = items[offset:offset + limit]
+        if needle:
+            try:
+                item = _report_item(stem, files)
+            except (OSError, ValueError):
+                continue
+            if needle not in f"{item['name']} {item['summary']}".casefold():
+                continue
+            items.append(item)
+        else:
+            descriptors.append(descriptor)
+
+    if needle:
+        items.sort(
+            key=lambda item: (item["created_at"], item["report_id"]),
+            reverse=True,
+        )
+        total = len(items)
+        page = items[offset:offset + limit]
+    else:
+        descriptors.sort(
+            key=lambda item: (item["created_at"], item["stem"]),
+            reverse=True,
+        )
+        total = len(descriptors)
+        page = [
+            _report_item(item["stem"], item["files"])
+            for item in descriptors[offset:offset + limit]
+        ]
     next_offset = offset + len(page)
     return {
         "items": page,
-        "total": len(items),
+        "total": total,
         "limit": limit,
         "cursor": str(offset) if offset else None,
-        "next_cursor": str(next_offset) if next_offset < len(items) else None,
+        "next_cursor": str(next_offset) if next_offset < total else None,
         "search": search,
         "kind": kind,
         "readonly": True,

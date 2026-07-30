@@ -56,6 +56,27 @@ _ACTUAL_RUN_TRANSITIONS = {
     "cancelled": set(),
 }
 
+_PREFLIGHT_RECEIPT_SECRET = object()
+_PREFLIGHT_VALIDATION_RECEIPTS = {}
+_PREFLIGHT_VALIDATION_RECEIPT_LIMIT = 32
+
+
+class _PreflightValidationReceipt:
+    __slots__ = ("run_id", "state_db", "house_root", "temp_root", "secret")
+
+    def __init__(self, run_id, state_db, house_root, temp_root):
+        self.run_id = run_id
+        self.state_db = state_db
+        self.house_root = house_root
+        self.temp_root = temp_root
+        self.secret = _PREFLIGHT_RECEIPT_SECRET
+
+
+def _connection_main_path(conn):
+    rows = conn.execute("PRAGMA database_list").fetchall()
+    main_path = next(row[2] for row in rows if row[1] == "main")
+    return str(Path(main_path).expanduser().resolve())
+
 REQUIRED_TABLES = frozenset({
     "settings",
     "works",
@@ -1158,7 +1179,34 @@ def validate_schema(
             raise RuntimeError(f"integrity_check failed: {integrity}")
 
 
-def verify_state_db_ready(path: os.PathLike | str) -> Tuple[bool, str]:
+def _validated_receipt_run_id(
+    receipt, path, *, house_dir=None, temp_dir=None
+) -> str | None:
+    if receipt is None:
+        return None
+    if (
+        not isinstance(receipt, _PreflightValidationReceipt)
+        or receipt.secret is not _PREFLIGHT_RECEIPT_SECRET
+    ):
+        raise RuntimeError("invalid preflight validation receipt")
+    if receipt.state_db != str(Path(path).expanduser().resolve()):
+        raise RuntimeError("preflight receipt state DB does not match")
+    if (
+        house_dir is not None
+        and receipt.house_root != canonicalize_real_path(house_dir)
+    ):
+        raise RuntimeError("preflight receipt house root does not match")
+    if (
+        temp_dir is not None
+        and receipt.temp_root != canonicalize_real_path(temp_dir)
+    ):
+        raise RuntimeError("preflight receipt temp root does not match")
+    return receipt.run_id
+
+
+def verify_state_db_ready(
+    path: os.PathLike | str, *, preflight_receipt=None
+) -> Tuple[bool, str]:
     """Read-only readiness check used by the Phase 0 mutation gate."""
     db_path = Path(path)
     if not db_path.is_file():
@@ -1166,6 +1214,9 @@ def verify_state_db_ready(path: os.PathLike | str) -> Tuple[bool, str]:
 
     uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
     try:
+        prevalidated_run_id = _validated_receipt_run_id(
+            preflight_receipt, db_path
+        )
         conn = sqlite3.connect(uri, uri=True, timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000)
         try:
             conn.row_factory = sqlite3.Row
@@ -1185,6 +1236,8 @@ def verify_state_db_ready(path: os.PathLike | str) -> Tuple[bool, str]:
             ).fetchone()
             if token is None or not token[0]:
                 return False, "approved one-time run token is missing"
+            if prevalidated_run_id is not None and token[0] != prevalidated_run_id:
+                return False, "prevalidated actual run token does not match"
             run = conn.execute(
                 "SELECT * FROM actual_runs WHERE run_id = ? AND state = 'approved'",
                 (token[0],),
@@ -1205,9 +1258,14 @@ def verify_state_db_ready(path: os.PathLike | str) -> Tuple[bool, str]:
             ).fetchone()[0]
             if unfinished:
                 return False, f"unfinished operations: {unfinished}"
-            issues = doctor_issues(conn)
-            if issues:
-                return False, f"doctor issues: {len(issues)} ({issues[0]['kind']})"
+            # The one-button entry point already completed a full Doctor under
+            # the same roots mutation lock immediately before issuing this
+            # exact token. Generic callers still receive the full readiness
+            # Doctor; only the matching run-scoped receipt avoids duplication.
+            if prevalidated_run_id is None:
+                issues = doctor_issues(conn)
+                if issues:
+                    return False, f"doctor issues: {len(issues)} ({issues[0]['kind']})"
             return True, "ok"
         finally:
             conn.close()
@@ -1223,17 +1281,44 @@ def sha256_file(path: os.PathLike | str) -> str:
     return digest.hexdigest()
 
 
-def _verify_backup_evidence(backup_path: str, expected_sha256: str) -> None:
+_BACKUP_EVIDENCE_CACHE = {}
+_BACKUP_EVIDENCE_CACHE_LIMIT = 32
+
+
+def _clear_backup_evidence_cache_for_tests() -> None:
+    _BACKUP_EVIDENCE_CACHE.clear()
+
+
+def _verify_backup_evidence(
+    backup_path: str, expected_sha256: str | None = None
+) -> str:
     path = Path(backup_path)
-    if not path.is_file():
-        raise RuntimeError(f"approved backup does not exist: {backup_path}")
+    try:
+        path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"approved backup does not exist: {backup_path}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"approved backup cannot be read: {backup_path}: {exc}"
+        ) from exc
+    identity = _regular_file_identity(path)
+    cache_key = str(path.resolve())
+    cached = _BACKUP_EVIDENCE_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and cached["identity"] == identity
+        and (expected_sha256 is None or cached["sha256"] == expected_sha256)
+    ):
+        return cached["sha256"]
     try:
         actual_sha256 = sha256_file(path)
     except OSError as exc:
         raise RuntimeError(f"approved backup cannot be read: {backup_path}: {exc}") from exc
-    if actual_sha256 != expected_sha256:
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
         raise RuntimeError(f"approved backup SHA-256 mismatch: {backup_path}")
-    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    uri = f"file:{path.resolve().as_posix()}?mode=ro&immutable=1"
     try:
         backup = sqlite3.connect(uri, uri=True)
         try:
@@ -1244,6 +1329,13 @@ def _verify_backup_evidence(backup_path: str, expected_sha256: str) -> None:
         raise RuntimeError(f"approved backup cannot be opened: {backup_path}: {exc}") from exc
     if integrity != "ok":
         raise RuntimeError(f"approved backup integrity_check failed: {integrity}")
+    if len(_BACKUP_EVIDENCE_CACHE) >= _BACKUP_EVIDENCE_CACHE_LIMIT:
+        _BACKUP_EVIDENCE_CACHE.pop(next(iter(_BACKUP_EVIDENCE_CACHE)))
+    _BACKUP_EVIDENCE_CACHE[cache_key] = {
+        "identity": identity,
+        "sha256": actual_sha256,
+    }
+    return actual_sha256
 
 
 def _regular_file_identity(path: os.PathLike | str) -> tuple:
@@ -1270,9 +1362,10 @@ def issue_actual_run_token(
     house_dir: os.PathLike | str,
     temp_dir: os.PathLike | str,
 ) -> str:
+    state_db_path = _connection_main_path(conn)
+    _PREFLIGHT_VALIDATION_RECEIPTS.pop(state_db_path, None)
     backup_path = canonicalize_path(backup_path)
-    backup_sha256 = sha256_file(backup_path)
-    _verify_backup_evidence(backup_path, backup_sha256)
+    backup_sha256 = _verify_backup_evidence(backup_path)
     run_id = f"actual-{uuid.uuid4()}"
     with transaction(conn):
         if conn.execute(
@@ -1304,6 +1397,60 @@ def issue_actual_run_token(
                 (key, value),
             )
     return run_id
+
+
+def issue_prevalidated_actual_run_token(
+    conn: sqlite3.Connection,
+    backup_path: str,
+    *,
+    house_dir: os.PathLike | str,
+    temp_dir: os.PathLike | str,
+):
+    """Run the full preflight Doctor and issue an opaque same-process receipt."""
+    issues = doctor_issues(conn)
+    if issues:
+        first = issues[0]
+        raise RuntimeError(
+            "doctor failed before Folderling; run disable/recover/doctor manually: "
+            f"{len(issues)} issue(s), first={first['kind']}"
+        )
+    run_id = issue_actual_run_token(
+        conn,
+        backup_path,
+        house_dir=house_dir,
+        temp_dir=temp_dir,
+    )
+    receipt = _PreflightValidationReceipt(
+        run_id,
+        _connection_main_path(conn),
+        canonicalize_real_path(house_dir),
+        canonicalize_real_path(temp_dir),
+    )
+    if (
+        receipt.state_db not in _PREFLIGHT_VALIDATION_RECEIPTS
+        and len(_PREFLIGHT_VALIDATION_RECEIPTS)
+        >= _PREFLIGHT_VALIDATION_RECEIPT_LIMIT
+    ):
+        _PREFLIGHT_VALIDATION_RECEIPTS.pop(
+            next(iter(_PREFLIGHT_VALIDATION_RECEIPTS))
+        )
+    _PREFLIGHT_VALIDATION_RECEIPTS[receipt.state_db] = receipt
+    return run_id, receipt
+
+
+def consume_preflight_validation_receipt(path, house_dir, temp_dir):
+    """Return the opaque receipt issued for this same-process actual run."""
+    state_db = str(Path(path).expanduser().resolve())
+    receipt = _PREFLIGHT_VALIDATION_RECEIPTS.pop(state_db, None)
+    if receipt is None:
+        return None
+    _validated_receipt_run_id(
+        receipt,
+        state_db,
+        house_dir=house_dir,
+        temp_dir=temp_dir,
+    )
+    return receipt
 
 
 def disable_actual_run(conn: sqlite3.Connection) -> None:
@@ -1343,9 +1490,23 @@ def _manifest_lookup_from_records(records):
     return lookup
 
 
-def prepare_actual_run(path, house_dir, temp_dir, *, manifest_paths=None):
+def prepare_actual_run(
+    path, house_dir, temp_dir, *, manifest_paths=None,
+    preflight_receipt=None,
+):
     """Consume one approval before any filesystem mutation and record its manifest."""
-    ready, reason = verify_state_db_ready(path)
+    _validated_receipt_run_id(
+        preflight_receipt,
+        path,
+        house_dir=house_dir,
+        temp_dir=temp_dir,
+    )
+    if preflight_receipt is None:
+        ready, reason = verify_state_db_ready(path)
+    else:
+        ready, reason = verify_state_db_ready(
+            path, preflight_receipt=preflight_receipt
+        )
     if not ready:
         raise RuntimeError(reason)
     for label, root in (("house", house_dir), ("temp", temp_dir)):

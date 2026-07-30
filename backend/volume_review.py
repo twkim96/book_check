@@ -1123,6 +1123,27 @@ def apply_auto_ready_volume_groups(
     candidates = [
         case for case in initial_cases if case["classification"] == "auto_ready"
     ]
+    if not candidates:
+        # Keep the authorization contract, but do not invalidate the warm case
+        # cache and immediately rebuild the same 0-candidate analysis.
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            decision_store.assert_active_actual_run(conn, run_id)
+        finally:
+            conn.close()
+        summary = Counter(case["classification"] for case in initial_cases)
+        return {
+            "candidate_count": 0,
+            "applied_count": 0,
+            "moved_count": 0,
+            "applied": [],
+            "moved": [],
+            "removed_empty_folders": [],
+            "remaining_summary": {
+                key: summary.get(key, 0)
+                for key in sorted(CLASSIFICATIONS - {"all"})
+            },
+        }
     applied = []
     moved = []
     removed_empty_folders = []

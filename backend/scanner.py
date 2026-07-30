@@ -567,6 +567,7 @@ def validate_index_snapshot(
     state_db_path,
     *,
     allowed_active_run_id=None,
+    verify_doctor=True,
 ):
     """Return a reusable projected snapshot or a fail-closed fallback reason."""
     try:
@@ -581,6 +582,7 @@ def validate_index_snapshot(
             house_dir,
             state_db_path,
             allowed_active_run_id=allowed_active_run_id,
+            verify_doctor=verify_doctor,
         )
         if payload["entries"] != entries:
             raise IndexSnapshotStale("index entries differ from the verified DB projection")

@@ -1333,6 +1333,7 @@ def _process_items_authorized(
     *,
     state_db_path=None,
     event_callback=None,
+    preflight_validated=False,
 ):
     workflow_started_at = time.perf_counter()
     performance_metrics = {}
@@ -1410,6 +1411,7 @@ def _process_items_authorized(
         file_index_json,
         state_db_path,
         allowed_active_run_id=actual_run_id,
+        verify_doctor=not preflight_validated,
     )
     performance_metrics["snapshot_seconds"] = round(
         time.perf_counter() - stage_started_at, 6
@@ -2176,6 +2178,7 @@ def _process_items_with_lock_held(
     state_db_path=None,
     *,
     event_callback=None,
+    preflight_receipt=None,
 ):
     """Run Folderling while the caller owns the roots mutation lock."""
     import decision_store
@@ -2183,9 +2186,19 @@ def _process_items_with_lock_held(
     state_db_path = state_db_path or os.path.join(
         script_dir, ".dedup_state", "dedup_decisions.sqlite3"
     )
+    if preflight_receipt is None:
+        preflight_receipt = decision_store.consume_preflight_validation_receipt(
+            state_db_path, dst_dir, src_dir
+        )
+    activation_started_at = time.perf_counter()
     actual_run_id, manifest_path = decision_store.prepare_actual_run(
-        state_db_path, dst_dir, src_dir
+        state_db_path,
+        dst_dir,
+        src_dir,
+        preflight_receipt=preflight_receipt,
     )
+    preflight_validated = preflight_receipt is not None
+    activation_seconds = round(time.perf_counter() - activation_started_at, 6)
     emit_folderling_event(
         event_callback,
         "actual_run_started",
@@ -2231,8 +2244,11 @@ def _process_items_with_lock_held(
             manifest_path,
             state_db_path=state_db_path,
             event_callback=event_callback,
+            preflight_validated=preflight_validated,
         )
         result["review_action_summary"] = action_summary
+        metrics = result.setdefault("performance_metrics", {})
+        metrics["activation_seconds"] = activation_seconds
     except (Exception, KeyboardInterrupt) as exc:
         emit_folderling_event(
             event_callback,

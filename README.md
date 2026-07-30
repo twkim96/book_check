@@ -35,17 +35,18 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.6)
+## 동일 작품 자동 중복 정리 계약 (1.4.7)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
-1.4.6의 제목 접두사·메타데이터 cut 경계 계약은
+1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
 [`update_1.4.4.md`](update_1.4.4.md),
 [`update_1.4.5.md`](update_1.4.5.md),
-[`update_1.4.6.md`](update_1.4.6.md)에 기록합니다.
+[`update_1.4.6.md`](update_1.4.6.md),
+[`update_1.4.7.md`](update_1.4.7.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -291,6 +292,36 @@ Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.1`과 같은 결과를
 추측하지 않습니다. 이번 house의 해당 10권은 확인된 부모 폴더를 근거로 `은하영웅전설` 수동 override를
 남겼습니다. 이런 문맥 의존 예외를 범용 접두사 규칙으로 자동 확장해 다른 `제 N권` 도서를 잘못 합치는
 것보다, 로그가 있는 개별 override가 안전합니다.
+
+### 1.4.7 warm cache와 실행 검증 receipt 계약
+
+1.4.7은 중복 판정 의미를 바꾸지 않고 반복 검증 비용만 줄입니다. 따라서
+`FINGERPRINT_VERSION=5`, fingerprint/pair policy `1.4.2`, 본문 normalizer compatibility `1.3.0`을
+그대로 유지하며 기존 house fingerprint와 pair 결과를 다시 만들지 않습니다.
+
+- current pair cache hit는 `pair_cache`의 `created_at`이나 evidence를 다시 쓰지 않습니다. 대응하는 open
+  review도 현재 classification/evidence와 같으면 조회 한 번으로 확인하고 그대로 둡니다. 다만 review가
+  누락되거나 더 약한 과거 증거로 손상된 예외는 기존 review ID와 상태를 보존해 선별 복구합니다.
+- `cache_write=False` 순수 계획도 read-only 연결로 pair cache를 사용합니다. 계획 실행은 DB를 바꾸지
+  않으면서 warm pair를 본문 재독 없이 재사용합니다.
+- fingerprint bulk preload는 SHA·길이·상태·identity만 먼저 읽고 큰 front/tail anchor column은 pair
+  cache miss이면서 정밀 TXT 비교가 실제로 필요한 파일만 지연 로드합니다.
+- 원버튼 Folderling은 공용 root lock 안에서 최초 full Doctor를 통과하고 발급한 **정확히 같은 run ID·
+  DB·house/temp root**의 opaque 실행 검증 receipt만 받습니다. 이 receipt는 같은 프로세스에서 한 번
+  소비되며 중복 readiness/snapshot Doctor만 생략할 수 있습니다.
+  승인 token이 다르거나 일반 진입점이면 생략하지 않습니다. 변이 직전 full Doctor와 SHA/identity 검증,
+  실행 종료 final full Doctor는 항상 유지합니다.
+- 승인 백업의 SHA와 integrity는 파일 identity가 그대로인 동안만 process-local receipt로 재사용합니다.
+  inode/ctime/size/mtime 중 하나라도 달라지면 즉시 전체 SHA/integrity 검증으로 돌아갑니다.
+- 보고서 기본 목록은 파일명·mtime으로 정렬·페이지를 먼저 정한 뒤 그 페이지의 요약만 읽습니다.
+  JSON-only 보고서는 앞쪽의 `kind/summary`만 제한적으로 decode하며 큰 결과 배열을 읽지 않습니다.
+  검색은 모든 summary 후보를 확인하되 TXT/JSON 모두 제한된 앞부분만 읽습니다.
+- 자동 분권 후보가 0건이면 기존 분석 cache를 무효화하고 같은 228건을 다시 분석하지 않습니다. active
+  actual run 확인은 그대로 수행합니다.
+
+`.dedup_state`의 과거 fingerprint·pair·manifest·backup을 단순 삭제하는 수명주기는 도입하지 않습니다.
+이 데이터는 decision/review/operation/actual-run evidence가 참조하므로, hot DB와 압축 archive의 참조
+계약 및 복구 절차가 먼저 설계되어야 합니다. 1.4.7은 현재 참조 증거를 보존합니다.
 
 ## 권별·부별·회차 분할 시리즈 폴더 계약 (1.4.3)
 

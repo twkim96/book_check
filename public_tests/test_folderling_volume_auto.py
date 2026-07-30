@@ -2,6 +2,7 @@ from io import StringIO
 from pathlib import Path
 
 import decision_store
+import volume_review
 from folderling import move_to_house, retarget_owned_recent_link
 from library_work_management import alias_preview, apply_alias
 from volume_group_mutations import (
@@ -180,6 +181,53 @@ def test_episode_split_backlog_is_auto_grouped_but_side_only_is_not(tmp_path):
     assert not (house / "ㅇ" / "외전 작품").exists()
     assert result["applied_count"] == 1
     assert result["remaining_summary"]["review_required"] == 1
+
+
+def test_auto_volume_pass_with_no_candidates_keeps_warm_analysis(
+    tmp_path, monkeypatch,
+):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        _add(conn, house / "ㄷ" / "단독 작품 1권.txt", "house")
+    finally:
+        conn.close()
+    run_id = _approve(state_db, house, temp)
+    analyze_calls = []
+    original_analyze = volume_review.analyze_volume_cases
+
+    def tracked_analyze(*args, **kwargs):
+        analyze_calls.append(1)
+        return original_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(volume_review, "analyze_volume_cases", tracked_analyze)
+    monkeypatch.setattr(
+        volume_review,
+        "invalidate_volume_case_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("0-candidate pass must keep the case cache")
+        ),
+    )
+
+    result = volume_review.apply_auto_ready_volume_groups(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        run_id=run_id,
+    )
+
+    assert result["candidate_count"] == 0
+    assert result["applied_count"] == 0
+    assert len(analyze_calls) == 1
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
 
 
 def test_recent_link_retarget_requires_exact_old_destination(tmp_path):
