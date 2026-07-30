@@ -5,6 +5,7 @@ import { ApiError, api, postJson } from "./api";
 import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
 import { SettingsPage } from "./Settings";
 import { WorkManagementModal } from "./WorkManagementModal";
+import { APP_VERSION } from "./version";
 import type {
   CatalogItem,
   CatalogListing,
@@ -76,7 +77,7 @@ function Shell() {
           <span className="brand-mark">書</span>
           <div>
             <strong>도서 관리</strong>
-            <small>file_check 1.4.1</small>
+            <small>file_check {APP_VERSION}</small>
           </div>
         </div>
         <nav>

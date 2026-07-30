@@ -3,6 +3,7 @@ import { NavLink, useSearchParams } from "react-router-dom";
 
 import { api } from "./api";
 import { FileRelocateManager, FolderQuarantineManager, ManagedFolderAdoptManager, ManagedFolderManager, ManagedFolderRelocateManager, PurgeManager, QuarantineManager, QuickTitleCorrectionManager, RelationshipManager, RestoreManager } from "./ManagementModals";
+import { APP_VERSION } from "./version";
 import type {
   ExplorerComparison,
   ExplorerFile,
@@ -146,7 +147,7 @@ export function CatalogTabs({ active }: { active: CatalogTab }) {
 
 function Header({ title, description }: { title: string; description: string }) {
   return <header className="page-header">
-    <div><span className="eyebrow">LIBRARY MANAGEMENT · 1.4.6</span><h1>{title}</h1><p>{description}</p></div>
+    <div><span className="eyebrow">LIBRARY MANAGEMENT · {APP_VERSION}</span><h1>{title}</h1><p>{description}</p></div>
     <span className="readonly-pill">PLAN → CONFIRM</span>
   </header>;
 }
