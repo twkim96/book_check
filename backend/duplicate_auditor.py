@@ -85,11 +85,11 @@ FINGERPRINT_POLICY_VERSION = "1.4.2"
 FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # Pair classification/evidence also has its own compatibility lifetime. 1.4.5
 # changed cache execution, 1.4.6 changed only filename/core parsing, and
-# 1.4.7-1.4.8 change cache/inventory access only. Existing 1.4.2 pair rows
+# 1.4.7-1.4.9 change cache/inventory/state-archive access only. Existing 1.4.2 pair rows
 # therefore remain valid while AUDITOR_VERSION follows releases.
 PAIR_POLICY_VERSION = "1.4.2"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.8"
+AUDITOR_VERSION = "1.4.9"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024

@@ -1368,6 +1368,13 @@ def issue_actual_run_token(
     backup_sha256 = _verify_backup_evidence(backup_path)
     run_id = f"actual-{uuid.uuid4()}"
     with transaction(conn):
+        # A maintenance process may cold-archive an otherwise unreferenced
+        # backup between the first (potentially expensive) verification and
+        # this writer transaction.  Revalidate while holding SQLite's writer
+        # reservation so the archive path can make its final reference check
+        # under the same serialization boundary.  The evidence cache keeps
+        # this to an identity check when the file is unchanged.
+        _verify_backup_evidence(backup_path, backup_sha256)
         if conn.execute(
             "SELECT 1 FROM actual_runs WHERE state IN ('approved', 'active') LIMIT 1"
         ).fetchone():

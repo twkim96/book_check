@@ -35,12 +35,12 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.8)
+## 동일 작품 자동 중복 정리 계약 (1.4.9)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
 1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt,
-1.4.8의 run-local inventory 재사용 계약은
+1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -48,7 +48,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.5.md`](update_1.4.5.md),
 [`update_1.4.6.md`](update_1.4.6.md),
 [`update_1.4.7.md`](update_1.4.7.md),
-[`update_1.4.8.md`](update_1.4.8.md)에 기록합니다.
+[`update_1.4.8.md`](update_1.4.8.md),
+[`update_1.4.9.md`](update_1.4.9.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -344,6 +345,32 @@ Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.1`과 같은 결과를
 이 inventory는 메모리 안에서만 전달하며 JSON/DB에 영속화하지 않습니다. standalone auditor와 snapshot
 fallback은 기존 `file_index.json + current stat` 경로를 그대로 사용합니다. 따라서 오래된 inventory를
 다음 실행에 상속하거나 외부 API가 신뢰 token처럼 주입할 수 없습니다.
+
+### 1.4.9 검증된 상태 백업 cold archive 계약
+
+`.dedup_state/backups`의 SQLite 원본은 단순 보관 파일처럼 보여도 actual-run 승인·복구 증거가 될 수
+있습니다. 따라서 1.4.9의 보관 도구는 **현재 DB의 모든 `actual_runs.backup_path` 및
+`settings.approved_backup`에서 참조되지 않는 백업만** 대상으로 삼습니다. 참조 중인 백업, 최신
+미참조 2개, symlink와 hardlink는 그대로 둡니다.
+
+- `plan`은 읽기 전용이며 source inode/ctime/mtime/size, 대상 경로, 개수·바이트와 plan SHA-256을
+  고정합니다. `apply`에는 동일한 개수와 plan SHA-256을 명시해야 하고, lock 안에서 계획을 다시 만들어
+  한 항목이라도 달라졌으면 아무 작업도 시작하지 않습니다.
+- approved/active actual run이나 미완료 operation/group이 있으면 보관을 시작하지 않습니다. 각 원본은
+  SQLite `integrity_check`, SHA-256, 단일-link regular-file 조건을 통과해야 합니다.
+- gzip 객체는 결정적 header로 생성하고 압축 SHA와 원문 SHA를 같은 no-follow descriptor에서 검증합니다.
+  실행 intent와 객체별 metadata를 먼저 fsync한 뒤, SQLite writer transaction 안에서 참조·미완료 상태를
+  다시 검사하고 현재 source identity/SHA가 그대로일 때만 hot 원본을 unlink합니다.
+- actual-run 승인은 같은 writer transaction 안에서 백업 증거를 다시 확인합니다. 따라서 최초 검증과
+  승인 사이에 maintenance가 백업을 소비하거나, archive 최종 확인 직후 승인이 생기는 양방향 race를
+  허용하지 않습니다.
+- `restore`는 metadata에 기록한 raw SHA를 사용자가 다시 명시해야 합니다. 압축 SHA·원문 SHA·크기와
+  복원 SQLite integrity를 확인한 뒤 원래 backup 경로에 no-clobber로 복원하며, cold 객체는 삭제하지
+  않습니다. 보관 intent·완료·복원 보고서는 `.dedup_state/reports`에 남습니다.
+
+이 버전은 범위를 의도적으로 백업 tier 1단계로 제한합니다. actual-run이 참조하는 백업과 manifest,
+hot DB의 과거 fingerprint/pair row, 고아로 보이는 `-wal/-shm`은 자동 삭제하거나 재작성하지 않습니다.
+그 증거의 참조·복구 계약을 별도 버전에서 먼저 정의하기 전에는 용량 절감을 이유로 건드리지 않습니다.
 
 ## 권별·부별·회차 분할 시리즈 폴더 계약 (1.4.3)
 
