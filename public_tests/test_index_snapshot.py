@@ -1,7 +1,10 @@
 import json
 
+import pytest
+
 import decision_store
 import deduplicator
+import duplicate_auditor
 import folderling
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_review import TitleCorrectionProvider
@@ -53,6 +56,75 @@ def test_state_db_projection_matches_full_scanner(tmp_path):
     assert payload["entries"] == full
     assert payload["inventory_revision"] == revision
     assert validate_index_snapshot(house, index, state_db)["valid"] is True
+
+
+def test_verified_snapshot_reuses_exact_auditor_entries_without_restat(
+    tmp_path, monkeypatch,
+):
+    state_db, house, _temp, _file_list, index, _first = _fixture(tmp_path)
+    snapshot = validate_index_snapshot(house, index, state_db)
+    assert (
+        snapshot["auditor_inventory"].inventory_revision
+        == snapshot["inventory_revision"]
+    )
+    expected, invalid = duplicate_auditor.load_house_entries(index, house)
+    assert invalid == []
+
+    monkeypatch.setattr(
+        duplicate_auditor,
+        "_entry_from_stat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("verified inventory must not stat/materialize again")
+        ),
+    )
+    actual, invalid = duplicate_auditor.load_verified_house_entries(
+        snapshot["auditor_inventory"], house
+    )
+
+    assert invalid == []
+    assert actual == expected
+
+    with pytest.raises(ValueError, match="contract mismatch"):
+        duplicate_auditor.load_verified_house_entries(object(), house)
+    with pytest.raises(AttributeError, match="immutable"):
+        snapshot["auditor_inventory"].normalizer_version = "old-normalizer"
+
+
+def test_verified_inventory_audit_matches_index_and_detects_later_change(tmp_path):
+    state_db, house, temp, _file_list, index, first = _fixture(tmp_path)
+    snapshot = validate_index_snapshot(house, index, state_db)
+
+    def args():
+        parsed = duplicate_auditor.build_parser().parse_args([
+            "--index", str(index),
+            "--house", str(house),
+            "--temp", str(temp),
+            "--house-only",
+            "--state-db", str(state_db),
+        ])
+        parsed.cache_write = False
+        return parsed
+
+    warmup = args()
+    warmup.cache_write = True
+    duplicate_auditor.run_audit(warmup)
+    baseline = duplicate_auditor.run_audit(args())
+    reused_args = args()
+    reused_args.verified_house_inventory = snapshot["auditor_inventory"]
+    reused = duplicate_auditor.run_audit(reused_args)
+
+    assert reused.results == baseline.results
+    assert reused.stats["house_inventory_source"] == "verified_snapshot"
+    assert reused.stats["house_inventory_reused_files"] == 2
+    assert reused.stats["fingerprint_identity_stat_skips"] == 2
+
+    first.write_text("실행 중 외부 변경", encoding="utf-8")
+    stale_args = args()
+    stale_args.verified_house_inventory = snapshot["auditor_inventory"]
+    stale = duplicate_auditor.run_audit(stale_args)
+
+    assert "stale" in stale.stop_reasons
+    assert stale.completed is False
 
 
 def test_snapshot_validation_falls_back_for_external_changes(tmp_path):
@@ -184,6 +256,9 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
     assert intake["source_path"] == str(incoming)
     assert intake["destination_path"] == str(house / "ㅅ" / incoming.name)
     assert result["final_doctor_issue_count"] == 0
+    assert result["dedup_summary"]["auditor_metrics"][
+        "house_inventory_source"
+    ] == "verified_snapshot"
 
 
 def test_folderling_holds_conflicting_volume_but_ingests_later_new_volume(

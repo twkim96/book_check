@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections import namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +24,50 @@ from project_paths import FILE_INDEX, FILE_LIST, HOUSE_DIR, STATE_DB
 DEFAULT_STATE_DB = str(STATE_DB)
 INDEX_GENERATION_FILENAME = "index_generation.json"
 INDEX_GENERATION_SCHEMA = 1
+VERIFIED_HOUSE_INVENTORY_SCHEMA = 1
+_VERIFIED_HOUSE_INVENTORY_SECRET = object()
+
+_VerifiedHouseFile = namedtuple("_VerifiedHouseFile", (
+    "source", "name", "rel_path", "path", "size", "mtime_ns",
+    "dev", "ino", "ctime_ns", "recorded_size", "ext", "core_title",
+    "author", "max_number", "effective_max", "unit", "volume_number",
+    "start_number", "end_number", "span_ambiguous", "is_side_story",
+    "disambig", "complete", "pass_recheck",
+))
+
+
+class _VerifiedHouseInventory:
+    __slots__ = (
+        "schema_version", "normalizer_version", "inventory_revision",
+        "house_root", "entries", "_secret",
+    )
+
+    def __init__(self, inventory_revision, house_root, entries):
+        object.__setattr__(self, "schema_version", VERIFIED_HOUSE_INVENTORY_SCHEMA)
+        object.__setattr__(self, "normalizer_version", NORMALIZER_VERSION)
+        object.__setattr__(self, "inventory_revision", inventory_revision)
+        object.__setattr__(self, "house_root", house_root)
+        object.__setattr__(self, "entries", tuple(entries))
+        object.__setattr__(self, "_secret", _VERIFIED_HOUSE_INVENTORY_SECRET)
+
+    def __setattr__(self, _name, _value):
+        raise AttributeError("verified house inventory is immutable")
+
+
+def verified_house_inventory_records(inventory, house_root):
+    """Validate Scanner provenance and return immutable run-local records."""
+    root = str(Path(house_root).expanduser().resolve())
+    if (
+        not isinstance(inventory, _VerifiedHouseInventory)
+        or inventory._secret is not _VERIFIED_HOUSE_INVENTORY_SECRET
+        or inventory.schema_version != VERIFIED_HOUSE_INVENTORY_SCHEMA
+        or inventory.normalizer_version != NORMALIZER_VERSION
+        or inventory.house_root != root
+        or not isinstance(inventory.inventory_revision, str)
+        or len(inventory.inventory_revision) != 64
+    ):
+        raise ValueError("verified house inventory contract mismatch")
+    return inventory.entries
 
 # ==========================================
 # [설정] 소설 파일들이 있는 폴더 경로들을 리스트로 입력하세요.
@@ -56,7 +101,10 @@ def _backup_before_normalizer_reanalysis(conn, state_db_path):
     return backup
 
 
-def _build_entry(path, base_dir, entry_type, decision_projection=None, analysis=None):
+def _build_entry(
+    path, base_dir, entry_type, decision_projection=None, analysis=None,
+    verified_size=None,
+):
     name = normalize_nfc(os.path.basename(path))
     rel_path = normalize_nfc(os.path.relpath(path, base_dir))
     info = analysis or analyze_name(name)
@@ -80,10 +128,13 @@ def _build_entry(path, base_dir, entry_type, decision_projection=None, analysis=
     }
 
     if entry_type == "file":
-        try:
-            entry["size"] = os.path.getsize(path)
-        except OSError:
-            entry["size"] = None
+        if verified_size is not None:
+            entry["size"] = verified_size
+        else:
+            try:
+                entry["size"] = os.path.getsize(path)
+            except OSError:
+                entry["size"] = None
 
         legacy_marker = has_pass_marker(name) or read_disambig_marker(name) > 1
         projection = (decision_projection or {}).get(os.path.abspath(path))
@@ -424,7 +475,7 @@ def _state_projection_rows(conn):
     ).fetchall()
 
 
-def build_index_entries_from_state_db(
+def _build_verified_index_snapshot_from_state_db(
     house_dir,
     state_db_path,
     *,
@@ -476,6 +527,7 @@ def build_index_entries_from_state_db(
         expected_paths.add(normalize_nfc(str(relative)))
 
     entries = []
+    auditor_inventory = []
     seen_paths = set()
     revision_rows = []
     base_dir = str(house_root)
@@ -520,13 +572,46 @@ def build_index_entries_from_state_db(
                 "work_bucket_id": row["work_bucket_id"],
                 "representative": row["representative"],
             }
+            relative = normalize_nfc(os.path.relpath(path, house_root))
             entries.append(
                 _build_entry(
                     str(path), base_dir, "file",
                     {canonical_path: projection}, analysis=analysis,
+                    verified_size=stat_result.st_size,
                 )
             )
-            relative = normalize_nfc(os.path.relpath(path, house_root))
+            volume_number = analysis.get("volume_number")
+            auditor_inventory.append(_VerifiedHouseFile(
+                source="house",
+                name=normalized_name,
+                rel_path=relative,
+                path=str(path),
+                size=stat_result.st_size,
+                mtime_ns=stat_result.st_mtime_ns,
+                dev=stat_result.st_dev,
+                ino=stat_result.st_ino,
+                ctime_ns=stat_result.st_ctime_ns,
+                recorded_size=row["size"],
+                ext=analysis["ext"],
+                core_title=analysis["core_title"],
+                author=analysis["author"],
+                max_number=analysis["max_number"],
+                effective_max=analysis["effective_max"],
+                unit=analysis["unit"],
+                volume_number=(
+                    tuple(volume_number) if volume_number is not None else None
+                ),
+                start_number=analysis.get("start_number"),
+                end_number=analysis.get("end_number"),
+                span_ambiguous=bool(analysis.get("span_ambiguous", False)),
+                is_side_story=bool(analysis.get("is_side_story", False)),
+                disambig=analysis.get("disambig", 1),
+                complete=bool(analysis["complete"]),
+                pass_recheck=(
+                    has_pass_marker(normalized_name)
+                    or read_disambig_marker(normalized_name) > 1
+                ),
+            ))
             seen_paths.add(relative)
             revision_rows.append((
                 row["file_id"], relative, stat_result.st_size,
@@ -552,12 +637,36 @@ def build_index_entries_from_state_db(
         )
 
     entries.sort(key=lambda item: (item["rel_path"], item["name"]))
+    auditor_inventory.sort(
+        key=lambda item: (item.rel_path, item.name)
+    )
     revision = hashlib.sha256(
         json.dumps(
             revision_rows, ensure_ascii=False, sort_keys=False,
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    return entries, revision, _VerifiedHouseInventory(
+        revision, str(house_root), auditor_inventory
+    )
+
+
+def build_index_entries_from_state_db(
+    house_dir,
+    state_db_path,
+    *,
+    allowed_active_run_id=None,
+    verify_doctor=True,
+):
+    """Return the public projection while keeping run-local evidence private."""
+    entries, revision, _auditor_inventory = (
+        _build_verified_index_snapshot_from_state_db(
+            house_dir,
+            state_db_path,
+            allowed_active_run_id=allowed_active_run_id,
+            verify_doctor=verify_doctor,
+        )
+    )
     return entries, revision
 
 
@@ -578,11 +687,13 @@ def validate_index_snapshot(
             raise IndexSnapshotStale("index is not a v2 payload")
         if payload.get("normalizer_version") != NORMALIZER_VERSION:
             raise IndexSnapshotStale("normalizer version changed")
-        entries, revision = build_index_entries_from_state_db(
-            house_dir,
-            state_db_path,
-            allowed_active_run_id=allowed_active_run_id,
-            verify_doctor=verify_doctor,
+        entries, revision, auditor_inventory = (
+            _build_verified_index_snapshot_from_state_db(
+                house_dir,
+                state_db_path,
+                allowed_active_run_id=allowed_active_run_id,
+                verify_doctor=verify_doctor,
+            )
         )
         if payload["entries"] != entries:
             raise IndexSnapshotStale("index entries differ from the verified DB projection")
@@ -590,6 +701,7 @@ def validate_index_snapshot(
             "valid": True,
             "entries": entries,
             "inventory_revision": revision,
+            "auditor_inventory": auditor_inventory,
             "reason": None,
         }
     except Exception as exc:
@@ -597,6 +709,7 @@ def validate_index_snapshot(
             "valid": False,
             "entries": None,
             "inventory_revision": None,
+            "auditor_inventory": None,
             "reason": str(exc),
         }
 

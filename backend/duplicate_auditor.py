@@ -84,12 +84,12 @@ FINGERPRINT_POLICY_VERSION = "1.4.2"
 # are not invalidated.
 FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # Pair classification/evidence also has its own compatibility lifetime. 1.4.5
-# changed cache execution, 1.4.6 changed only filename/core parsing, and 1.4.7
-# changes cache access only. Existing 1.4.2 pair rows therefore remain valid
-# while AUDITOR_VERSION follows releases.
+# changed cache execution, 1.4.6 changed only filename/core parsing, and
+# 1.4.7-1.4.8 change cache/inventory access only. Existing 1.4.2 pair rows
+# therefore remain valid while AUDITOR_VERSION follows releases.
 PAIR_POLICY_VERSION = "1.4.2"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.7"
+AUDITOR_VERSION = "1.4.8"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -400,6 +400,75 @@ def load_house_entries(index_path, house_root, include_pass=False):
             ),
         ))
     return entries, invalid
+
+
+def load_verified_house_entries(inventory, house_root):
+    """Materialize a Scanner-verified run-local inventory without re-statting it."""
+    from scanner import verified_house_inventory_records
+
+    root = Path(house_root).expanduser().resolve()
+    records = verified_house_inventory_records(inventory, root)
+    entries = []
+    seen = set()
+    for raw in records:
+        if raw.source != "house":
+            raise ValueError("verified house inventory contains an invalid record")
+        name = normalize_nfc(raw.name)
+        rel_path = normalize_nfc(raw.rel_path)
+        path = os.fspath(raw.path)
+        if (
+            not name
+            or not is_supported_file(name)
+            or not _is_relative_safe(rel_path)
+            or not path
+            or rel_path in seen
+        ):
+            raise ValueError("verified house inventory identity is invalid")
+        try:
+            inside = os.path.commonpath((str(root), os.path.abspath(path))) == str(root)
+        except ValueError:
+            inside = False
+        if (
+            not inside
+            or normalize_nfc(os.path.basename(path)) != name
+            or normalize_nfc(os.path.relpath(path, root)) != rel_path
+        ):
+            raise ValueError("verified house inventory path is outside house")
+        seen.add(rel_path)
+        volume_number = raw.volume_number
+        entries.append(AuditEntry(
+            source="house",
+            name=name,
+            rel_path=rel_path,
+            path=path,
+            size=int(raw.size),
+            mtime_ns=int(raw.mtime_ns),
+            dev=int(raw.dev),
+            ino=int(raw.ino),
+            ctime_ns=int(raw.ctime_ns),
+            recorded_size=(
+                int(raw.recorded_size)
+                if raw.recorded_size is not None else None
+            ),
+            ext=str(raw.ext),
+            core_title=str(raw.core_title),
+            author=raw.author,
+            max_number=int(raw.max_number),
+            effective_max=int(raw.effective_max),
+            unit=str(raw.unit),
+            volume_number=(
+                tuple(volume_number) if volume_number is not None else None
+            ),
+            start_number=raw.start_number,
+            end_number=raw.end_number,
+            span_ambiguous=bool(raw.span_ambiguous),
+            is_side_story=bool(raw.is_side_story),
+            disambig=int(raw.disambig),
+            complete=bool(raw.complete),
+            pass_recheck=bool(raw.pass_recheck),
+        ))
+    entries.sort(key=lambda entry: (entry.rel_path, entry.name))
+    return entries, []
 
 
 def scan_temp_entries(temp_root, include_pass=False):
@@ -992,7 +1061,7 @@ def _without_changed_inputs(candidates, results, changed):
 class PersistentAuditCache:
     def __init__(
         self, state_db_path, entries, configuration_hash,
-        analysis_policy_hash=None,
+        analysis_policy_hash=None, trust_entry_identity=False,
     ):
         import decision_store
 
@@ -1000,6 +1069,7 @@ class PersistentAuditCache:
         self.conn = decision_store.initialize_state_db(state_db_path)
         self.configuration_hash = configuration_hash
         self.analysis_policy_hash = analysis_policy_hash or configuration_hash
+        self.trust_entry_identity = bool(trust_entry_identity)
         self.fingerprint_version = (
             f"{FINGERPRINT_VERSION}:{self.analysis_policy_hash}"
         )
@@ -1094,6 +1164,12 @@ class PersistentAuditCache:
         return (
             f"{self.fingerprint_version}:{current.st_dev}:"
             f"{current.st_ino}:{current.st_ctime_ns}"
+        )
+
+    def _entry_fingerprint_version(self, entry):
+        return (
+            f"{self.fingerprint_version}:{entry.dev}:"
+            f"{entry.ino}:{entry.ctime_ns}"
         )
 
     @staticmethod
@@ -1228,16 +1304,42 @@ class PersistentAuditCache:
         for entry in entries:
             file_id = self.file_ids[entry.path]
             row = rows.get(file_id)
-            current = os.stat(entry.path, follow_symlinks=False)
+            current = (
+                None
+                if self.trust_entry_identity
+                else os.stat(entry.path, follow_symlinks=False)
+            )
+            if current is None:
+                self.stats["fingerprint_identity_stat_skips"] += 1
             valid = bool(
                 row is not None
+                and entry.dev is not None
+                and entry.ino is not None
+                and entry.ctime_ns is not None
                 and row["canonical_path"] == self.canonical_paths[entry.path]
-                and row["size"] == entry.size == current.st_size
-                and row["mtime_ns"] == entry.mtime_ns == current.st_mtime_ns
+                and row["size"] == entry.size
+                and row["mtime_ns"] == entry.mtime_ns
                 and row["fingerprint_version"]
-                == self._identity_fingerprint_version(current)
+                == self._entry_fingerprint_version(entry)
                 and (row["dev"], row["ino"], row["ctime_ns"])
-                == (current.st_dev, current.st_ino, current.st_ctime_ns)
+                == (entry.dev, entry.ino, entry.ctime_ns)
+                and (
+                    current is None
+                    or (
+                        entry.size,
+                        entry.mtime_ns,
+                        entry.dev,
+                        entry.ino,
+                        entry.ctime_ns,
+                    )
+                    == (
+                        current.st_size,
+                        current.st_mtime_ns,
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_ctime_ns,
+                    )
+                )
                 and not (
                     retry_deferred
                     and row["status"] in {
@@ -1668,7 +1770,7 @@ class ReadOnlyAuditCache:
 
 def load_persisted_analyses_readonly(
     entries, state_db_path, analysis_policy_hash, configuration_hash,
-    *, retry_deferred=False,
+    *, retry_deferred=False, trust_entry_identity=False,
 ):
     """Load current fingerprints without opening the state DB for writes.
 
@@ -1705,22 +1807,46 @@ def load_persisted_analyses_readonly(
     for entry in entries:
         canonical_path = decision_store.canonicalize_path(entry.path)
         row = rows_by_path.get(canonical_path)
-        try:
-            current = os.stat(entry.path, follow_symlinks=False)
-        except OSError:
-            stats["fingerprint_cache_peek_misses"] += 1
-            continue
+        current = None
+        if not trust_entry_identity:
+            try:
+                current = os.stat(entry.path, follow_symlinks=False)
+            except OSError:
+                stats["fingerprint_cache_peek_misses"] += 1
+                continue
+        else:
+            stats["fingerprint_identity_stat_skips"] += 1
         expected_version = (
             f"{FINGERPRINT_VERSION}:{analysis_policy_hash}:"
-            f"{current.st_dev}:{current.st_ino}:{current.st_ctime_ns}"
+            f"{entry.dev}:{entry.ino}:{entry.ctime_ns}"
         )
         valid = bool(
             row is not None
-            and row["size"] == entry.size == current.st_size
-            and row["mtime_ns"] == entry.mtime_ns == current.st_mtime_ns
+            and entry.dev is not None
+            and entry.ino is not None
+            and entry.ctime_ns is not None
+            and row["size"] == entry.size
+            and row["mtime_ns"] == entry.mtime_ns
             and row["fingerprint_version"] == expected_version
             and (row["dev"], row["ino"], row["ctime_ns"])
-            == (current.st_dev, current.st_ino, current.st_ctime_ns)
+            == (entry.dev, entry.ino, entry.ctime_ns)
+            and (
+                current is None
+                or (
+                    entry.size,
+                    entry.mtime_ns,
+                    entry.dev,
+                    entry.ino,
+                    entry.ctime_ns,
+                )
+                == (
+                    current.st_size,
+                    current.st_mtime_ns,
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_ctime_ns,
+                )
+            )
             and not (
                 retry_deferred
                 and row["status"] in {
@@ -2648,14 +2774,28 @@ def analyze_candidates(
 def _configuration(args):
     return {
         key: value for key, value in vars(args).items()
-        if key not in {"write_report"}
+        if key not in {"write_report", "verified_house_inventory"}
     }
 
 
 def run_audit(args):
     started = time.monotonic()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    house_entries, house_invalid = load_house_entries(args.index, args.house, args.include_pass)
+    inventory_started = time.monotonic()
+    verified_house_inventory = getattr(args, "verified_house_inventory", None)
+    if verified_house_inventory is None:
+        house_entries, house_invalid = load_house_entries(
+            args.index, args.house, args.include_pass
+        )
+        house_inventory_source = "file_index_json"
+    else:
+        house_entries, house_invalid = load_verified_house_entries(
+            verified_house_inventory, args.house
+        )
+        house_inventory_source = "verified_snapshot"
+    house_inventory_load_seconds = round(
+        time.monotonic() - inventory_started, 6
+    )
     temp_entries, temp_invalid = ([], []) if args.house_only else scan_temp_entries(args.temp, args.include_pass)
     entries = house_entries + temp_entries
     snapshot = _snapshot(entries)
@@ -2704,6 +2844,7 @@ def run_audit(args):
                 entries,
                 _pair_configuration_hash(args),
                 analysis_policy_hash,
+                trust_entry_identity=verified_house_inventory is not None,
             )
             retry_house = bool(getattr(args, "full_fingerprint_sweep", False))
             preloaded_analyses.update(persistent.peek_many(
@@ -2720,6 +2861,7 @@ def run_audit(args):
                     args.state_db,
                     analysis_policy_hash,
                     _pair_configuration_hash(args),
+                    trust_entry_identity=verified_house_inventory is not None,
                 )
             )
             preloaded_analyses.update(readonly_analyses)
@@ -3021,6 +3163,11 @@ def run_audit(args):
     unique_txt_bytes = sum(os.path.getsize(path) for path in unique_txt_paths if os.path.exists(path))
     stats = {
         "house_entries": len(house_entries),
+        "house_inventory_source": house_inventory_source,
+        "house_inventory_reused_files": (
+            len(house_entries) if verified_house_inventory is not None else 0
+        ),
+        "house_inventory_load_seconds": house_inventory_load_seconds,
         "temp_entries": len(temp_entries),
         "candidate_pairs": len(candidates),
         "managed_representative_pairs": managed_representative_pair_count,
@@ -3099,6 +3246,9 @@ def run_audit(args):
             "fingerprint_cache_peek_misses", 0
         ),
         "fingerprint_stale_inputs": persistent_stats.get("fingerprint_stale_inputs", 0),
+        "fingerprint_identity_stat_skips": persistent_stats.get(
+            "fingerprint_identity_stat_skips", 0
+        ),
         "metadata_reconcile_skips": persistent_stats.get(
             "metadata_reconcile_skips", 0
         ),

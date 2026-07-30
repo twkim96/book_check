@@ -35,18 +35,20 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.7)
+## 동일 작품 자동 중복 정리 계약 (1.4.8)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
-1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt 계약은
+1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt,
+1.4.8의 run-local inventory 재사용 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
 [`update_1.4.4.md`](update_1.4.4.md),
 [`update_1.4.5.md`](update_1.4.5.md),
 [`update_1.4.6.md`](update_1.4.6.md),
-[`update_1.4.7.md`](update_1.4.7.md)에 기록합니다.
+[`update_1.4.7.md`](update_1.4.7.md),
+[`update_1.4.8.md`](update_1.4.8.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -322,6 +324,26 @@ Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.1`과 같은 결과를
 `.dedup_state`의 과거 fingerprint·pair·manifest·backup을 단순 삭제하는 수명주기는 도입하지 않습니다.
 이 데이터는 decision/review/operation/actual-run evidence가 참조하므로, hot DB와 압축 archive의 참조
 계약 및 복구 절차가 먼저 설계되어야 합니다. 1.4.7은 현재 참조 증거를 보존합니다.
+
+### 1.4.8 run-local inventory 재사용 계약
+
+원버튼 Folderling의 최초 snapshot은 active house 파일을 실제로 walk하면서 DB identity와 현재
+`file_analysis`, 공개 `file_index.json`을 모두 대조합니다. 1.4.8은 이 검증에서 얻은 내부 inventory를
+같은 root lock의 바로 다음 auditor에 전달합니다.
+
+- inventory에는 공개 index에 넣지 않는 dev/inode/ctime/mtime/size와 현재 parser 결과가 들어갑니다.
+- schema, normalizer version, house root, inventory revision이 하나라도 다르면 재사용하지 않습니다.
+- auditor는 전달된 identity로 시작 snapshot을 만들고, fingerprint bulk lookup에서 같은 파일을 다시
+  stat하지 않습니다.
+- 감사 종료 때 전체 입력 identity를 다시 stat합니다. snapshot 이후 바뀐 파일은 결과에서 제거하고
+  `stale`로 fail-closed합니다.
+- 본문 cache miss 분석과 pair cache miss 저장, 모든 실제 mutation은 기존 current identity·SHA 검사를
+  그대로 수행합니다.
+- final Doctor와 최종 DB→index projection은 실행 중 이동 결과를 반영해야 하므로 재사용하지 않습니다.
+
+이 inventory는 메모리 안에서만 전달하며 JSON/DB에 영속화하지 않습니다. standalone auditor와 snapshot
+fallback은 기존 `file_index.json + current stat` 경로를 그대로 사용합니다. 따라서 오래된 inventory를
+다음 실행에 상속하거나 외부 API가 신뢰 token처럼 주입할 수 없습니다.
 
 ## 권별·부별·회차 분할 시리즈 폴더 계약 (1.4.3)
 

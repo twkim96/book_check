@@ -943,13 +943,13 @@ def move_suspect_group(group, temp_dir, dry_run):
 
 def run_auditor_queue_report(
     index_path, house_dir, temp_dir, state_db_path=None, cache_write=True,
-    progress_callback=None, rebaseline=False,
+    progress_callback=None, rebaseline=False, verified_house_inventory=None,
 ):
     """folderling 검토 큐용 read-only auditor 실행. 파일 이동은 호출 측에서만 한다."""
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.4.7"
+        duplicate_auditor.AUDITOR_VERSION == "1.4.8"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -980,6 +980,7 @@ def run_auditor_queue_report(
     args.progress = True
     args.cache_write = cache_write
     args.progress_callback = progress_callback
+    args.verified_house_inventory = verified_house_inventory
     return duplicate_auditor.run_audit(args)
 
 
@@ -2333,6 +2334,7 @@ def _clean_duplicates_impl(
     pure_plan=False,
     event_callback=None,
     verified_index_entries=None,
+    verified_house_inventory=None,
 ):
     performance_metrics = {}
     auditor_rebaseline_retry = False
@@ -2409,6 +2411,7 @@ def _clean_duplicates_impl(
             state_db_path=state_db_path if managed_mode else None,
             cache_write=not pure_plan,
             progress_callback=auditor_progress_callback,
+            verified_house_inventory=verified_house_inventory,
         )
         rebaseline_reasons = _auditor_rebaseline_reasons(auditor_report)
         if (
@@ -2448,6 +2451,7 @@ def _clean_duplicates_impl(
                 cache_write=True,
                 progress_callback=auditor_progress_callback,
                 rebaseline=True,
+                verified_house_inventory=verified_house_inventory,
             )
             if isinstance(getattr(auditor_report, "stats", None), dict):
                 retry_read_bytes = int(
@@ -2688,6 +2692,10 @@ def _clean_duplicates_impl(
                     "result_pairs", "actual_read_bytes",
                     "fingerprint_cache_hits", "fingerprint_cache_misses",
                     "pair_cache_hits", "pair_cache_misses",
+                    "house_inventory_source",
+                    "house_inventory_reused_files",
+                    "house_inventory_load_seconds",
+                    "fingerprint_identity_stat_skips",
                     "folderling_initial_read_bytes",
                     "folderling_total_read_bytes",
                 )
@@ -2822,6 +2830,7 @@ def clean_duplicates(
     pure_plan=False,
     event_callback=None,
     verified_index_entries=None,
+    verified_house_inventory=None,
 ):
     """Public entry point; actual managed runs require a DB-backed active capability."""
     if not dry_run and not require_state_db:
@@ -2846,6 +2855,7 @@ def clean_duplicates(
         pure_plan=pure_plan,
         event_callback=event_callback,
         verified_index_entries=verified_index_entries,
+        verified_house_inventory=verified_house_inventory,
     )
     if dry_run or not require_state_db:
         return _clean_duplicates_impl(**kwargs, actual_run_id=None)

@@ -1452,6 +1452,9 @@ def _process_items_authorized(
         authorized_run_id=actual_run_id,
         event_callback=event_callback,
         verified_index_entries=(snapshot["entries"] if snapshot["valid"] else None),
+        verified_house_inventory=(
+            snapshot["auditor_inventory"] if snapshot["valid"] else None
+        ),
     )
     performance_metrics["dedup_seconds"] = round(
         time.perf_counter() - stage_started_at, 6
