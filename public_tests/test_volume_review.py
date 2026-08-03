@@ -95,7 +95,11 @@ def test_current_file_analysis_does_not_reparse_every_listing_row(
         "coordinate_fields_from_name",
         unexpected_reparse,
     )
-    monkeypatch.setattr(volume_review, "extract_author", unexpected_reparse)
+    monkeypatch.setattr(
+        volume_review.decision_store,
+        "build_file_analysis",
+        unexpected_reparse,
+    )
 
     listing = list_volume_cases(state_db, house_dir=house, limit=50)
 

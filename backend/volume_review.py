@@ -18,7 +18,7 @@ from typing import Mapping, Optional, Sequence
 
 import decision_store
 from mutation_io import mutation_lock_for_roots
-from normalizer import NORMALIZER_VERSION, extract_author, get_chosung, normalize_nfc
+from normalizer import get_chosung
 from volume_group_mutations import (
     cleanup_staging,
     merge_staged_volume_group,
@@ -247,32 +247,10 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
             ORDER BY fa.core_title COLLATE NOCASE, f.canonical_path COLLATE NOCASE
             """
         ).fetchall()
-        current_rows = []
-        for row in rows:
-            item = dict(row)
-            path_name = normalize_nfc(Path(str(row["canonical_path"])).name)
-            analysis_is_current = (
-                row["analysis_normalizer_version"] == NORMALIZER_VERSION
-                and row["analyzed_name"] == path_name
-                and row["analyzed_size"] == row["size"]
-                and row["analyzed_mtime_ns"] == row["mtime_ns"]
-                and (
-                    row["analyzed_ctime_ns"] is None
-                    or row["analyzed_ctime_ns"] == row["ctime_ns"]
-                )
-            )
-            if not analysis_is_current:
-                # Scanner를 기다릴 수 없는 stale 행만 현재 parser로 보정한다.
-                # 정상 행은 DB에 저장된 같은-version 결과를 사용해 목록 조회가
-                # 16k 파일 전체를 매번 재파싱하지 않게 한다.
-                item.update(
-                    author=extract_author(str(row["analyzed_name"])),
-                    **decision_store.coordinate_fields_from_name(
-                        str(row["analyzed_name"])
-                    ),
-                )
-            current_rows.append(item)
-        return current_rows
+        # Scanner를 기다릴 수 없는 stale 행만 현재 파일명으로 보정한다.
+        # 정상 행은 DB에 저장된 같은-version 결과(사람이 확정한 작가 포함)를
+        # 사용해 목록과 Folderling 자동 라우팅의 판단 기준을 일치시킨다.
+        return [decision_store.resolve_current_file_analysis(row) for row in rows]
     finally:
         conn.close()
 

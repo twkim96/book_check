@@ -5,6 +5,10 @@ import pytest
 import decision_store
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from mutation_io import inspect_regular_file
+from volume_group_mutations import (
+    recover_abandoned_volume_staging,
+    stage_volume_sources,
+)
 from volume_review import apply_volume_plan, list_volume_cases, preview_volume_group
 
 
@@ -35,6 +39,85 @@ def _case(state_db, house, classification="auto_ready"):
     )
     [case] = listing["items"]
     return case
+
+
+def _active_run(state_db, house, temp):
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        backup = decision_store.backup_state_db(
+            conn, state_db.parent / "backups" / "before-stage-recovery.sqlite3"
+        )
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+    return decision_store.prepare_actual_run(state_db, house, temp)[0]
+
+
+def test_abandoned_volume_staging_is_removed_only_after_full_evidence_check(tmp_path):
+    state_db, house, temp, rows = _fixture(
+        tmp_path,
+        ["ㅂ/별빛 연대기 1권.txt", "ㅂ/별빛 연대기 2권.txt"],
+    )
+    run_id = _active_run(state_db, house, temp)
+    staging_root = temp / ".volume_group_staging" / run_id / "verified-case"
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        staged = stage_volume_sources(
+            conn,
+            file_ids=[row["file_id"] for row in rows],
+            staging_root=staging_root,
+            run_id=run_id,
+        )
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
+
+    result = recover_abandoned_volume_staging(
+        state_db, house_root=house, temp_root=temp
+    )
+
+    assert result == {
+        "recovered_case_count": 1,
+        "recovered_file_count": 2,
+        "issues": [],
+    }
+    assert temp.is_dir()
+    assert not (temp / ".volume_group_staging").exists()
+    assert all(Path(item["source_path"]).is_file() for item in staged)
+
+
+def test_abandoned_volume_staging_with_unexpected_file_is_preserved(tmp_path):
+    state_db, house, temp, rows = _fixture(
+        tmp_path,
+        ["ㅂ/별빛 연대기 1권.txt", "ㅂ/별빛 연대기 2권.txt"],
+    )
+    run_id = _active_run(state_db, house, temp)
+    staging_root = temp / ".volume_group_staging" / run_id / "unknown-case"
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        stage_volume_sources(
+            conn,
+            file_ids=[row["file_id"] for row in rows],
+            staging_root=staging_root,
+            run_id=run_id,
+        )
+        (staging_root / "unexpected.bin").write_bytes(b"do not delete")
+        decision_store.finish_actual_run(conn, run_id, success=False)
+    finally:
+        conn.close()
+
+    result = recover_abandoned_volume_staging(
+        state_db, house_root=house, temp_root=temp
+    )
+
+    assert result["recovered_case_count"] == 0
+    assert result["recovered_file_count"] == 0
+    assert len(result["issues"]) == 1
+    assert "unexpected file" in result["issues"][0]["reason"]
+    assert (staging_root / "unexpected.bin").read_bytes() == b"do not delete"
+    assert (staging_root / "stage-manifest.json").is_file()
 
 
 def test_volume_group_apply_stages_moves_and_links_one_work(tmp_path):

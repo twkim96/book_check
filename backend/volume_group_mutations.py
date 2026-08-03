@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -12,15 +13,22 @@ from bare_volume_context import context_name
 from dedup_mutations import _ensure_intake_fingerprint, _file_state, _preflight
 from mutation_io import (
     copy_no_clobber,
+    canonical_absolute_path,
     ensure_directory_nofollow,
     evidence_matches,
     inspect_regular_file,
     mutation_lock,
+    mutation_lock_for_roots,
+    opened_directory_nofollow,
+    opened_regular_file_nofollow,
     unlink_owned,
 )
 
 
 ACTION = "volume_group_merge"
+STAGING_DIRECTORY_NAME = ".volume_group_staging"
+_STAGE_MANIFEST_MAX_BYTES = 8 * 1024 * 1024
+_STAGE_MANIFEST_MAX_FILES = 10_000
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -122,7 +130,10 @@ def classify_folderling_volume_target(
     house_root = Path(house_root).resolve()
     source_row = conn.execute(
         """
-        SELECT f.*, fa.core_title, fa.readable_title, fa.author, fa.disambig
+        SELECT f.*, fa.core_title, fa.readable_title, fa.author, fa.disambig,
+               fa.normalizer_version AS analysis_normalizer_version,
+               fa.analyzed_name, fa.analyzed_size,
+               fa.analyzed_mtime_ns, fa.analyzed_ctime_ns
         FROM files AS f LEFT JOIN file_analysis AS fa ON fa.file_id = f.file_id
         WHERE f.file_id = ? AND f.active = 1 AND f.source = 'temp'
         """,
@@ -130,17 +141,10 @@ def classify_folderling_volume_target(
     ).fetchone()
     if source_row is None:
         return no_target("missing_active_temp_source")
-    source = dict(source_row)
-    current_source_analysis = decision_store.build_file_analysis(
-        context_name(Path(str(source["canonical_path"])).name)
+    source = decision_store.resolve_current_file_analysis(
+        source_row,
+        analysis_name=context_name(Path(str(source_row["canonical_path"])).name),
     )
-    source["author"] = source.get("author") or current_source_analysis["author"]
-    if source["core_title"] is None:
-        source.update(
-            core_title=current_source_analysis["core_title"],
-            readable_title=current_source_analysis["readable_title"],
-            disambig=current_source_analysis["disambig"],
-        )
     if (
         source["coordinate_kind"] not in {"volume", "part"}
         or source["span_ambiguous"]
@@ -160,24 +164,25 @@ def classify_folderling_volume_target(
         peers = []
         for row in conn.execute(
             """
-            SELECT f.*, fa.core_title, fa.author, fa.disambig
+            SELECT f.*, fa.core_title, fa.readable_title, fa.author, fa.disambig,
+                   fa.normalizer_version AS analysis_normalizer_version,
+                   fa.analyzed_name, fa.analyzed_size,
+                   fa.analyzed_mtime_ns, fa.analyzed_ctime_ns
             FROM files AS f
             LEFT JOIN file_analysis AS fa ON fa.file_id = f.file_id
             WHERE f.active = 1 AND f.source = 'temp'
             ORDER BY f.canonical_path
             """
         ):
-            peer = dict(row)
-            peer_path = Path(str(peer["canonical_path"]))
+            peer_path = Path(str(row["canonical_path"]))
             if peer_path.suffix.lower() not in {".epub", ".pdf"}:
                 continue
-            analysis = decision_store.build_file_analysis(context_name(peer_path.name))
-            peer_core = peer.get("core_title") or analysis["core_title"]
+            peer = decision_store.resolve_current_file_analysis(
+                row, analysis_name=context_name(peer_path.name)
+            )
+            peer_core = peer.get("core_title")
             if peer_core != source["core_title"]:
                 continue
-            peer["core_title"] = peer_core
-            peer["author"] = peer.get("author") or analysis["author"]
-            peer["disambig"] = peer.get("disambig") or analysis["disambig"]
             peers.append(peer)
         if len(peers) < 2:
             return no_target("new_group_requires_multiple_volumes")
@@ -220,15 +225,14 @@ def classify_folderling_volume_target(
         }
 
     existing = [
-        {
-            **dict(row),
-            "author": decision_store.build_file_analysis(
-                Path(str(row["canonical_path"])).name
-            )["author"],
-        }
+        decision_store.resolve_current_file_analysis(row)
         for row in conn.execute(
             """
-            SELECT f.*, fa.readable_title, fa.author, fa.disambig, v.work_bucket_id
+            SELECT f.*, fa.readable_title, fa.author, fa.disambig,
+                   fa.normalizer_version AS analysis_normalizer_version,
+                   fa.analyzed_name, fa.analyzed_size,
+                   fa.analyzed_mtime_ns, fa.analyzed_ctime_ns,
+                   v.work_bucket_id
             FROM files AS f
             JOIN file_analysis AS fa ON fa.file_id = f.file_id
             LEFT JOIN variants AS v ON v.variant_id = f.variant_id
@@ -528,12 +532,219 @@ def cleanup_staging(records: Sequence[Mapping[str, object]], staging_root: Path)
     except FileNotFoundError:
         pass
     current = Path(staging_root)
+    cleanup_boundary = next(
+        (
+            candidate
+            for candidate in (current, *current.parents)
+            if candidate.name in {STAGING_DIRECTORY_NAME, ".stage"}
+        ),
+        current,
+    )
     while current.name and current.exists():
         try:
             current.rmdir()
         except OSError:
             break
+        if current == cleanup_boundary:
+            break
         current = current.parent
+
+
+def _directory_entries_nofollow(path: Path) -> dict[str, int]:
+    with opened_directory_nofollow(path) as directory_fd:
+        return {
+            name: os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode
+            for name in os.listdir(directory_fd)
+        }
+
+
+def _read_stage_manifest(path: Path) -> dict:
+    with opened_regular_file_nofollow(path) as fd:
+        size = os.fstat(fd).st_size
+        if size > _STAGE_MANIFEST_MAX_BYTES:
+            raise RuntimeError("volume staging manifest exceeds the size limit")
+        remaining = size
+        chunks = []
+        while remaining:
+            chunk = os.read(fd, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("volume staging manifest is invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("volume staging manifest root is not an object")
+    return payload
+
+
+def _remove_empty_directory_owned(path: Path) -> bool:
+    """Remove one empty directory after pinning and rechecking its identity."""
+    path = canonical_absolute_path(path)
+    try:
+        with opened_directory_nofollow(path) as directory_fd:
+            expected = os.fstat(directory_fd)
+            if os.listdir(directory_fd):
+                return False
+    except FileNotFoundError:
+        return True
+    with opened_directory_nofollow(path.parent) as parent_fd:
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or (
+            current.st_dev, current.st_ino, current.st_ctime_ns
+        ) != (expected.st_dev, expected.st_ino, expected.st_ctime_ns):
+            raise RuntimeError(f"volume staging directory identity changed: {path}")
+        os.rmdir(path.name, dir_fd=parent_fd)
+    return True
+
+
+def _recover_staging_case(case_root: Path, *, run_id: str) -> int:
+    entries = _directory_entries_nofollow(case_root)
+    manifest_name = "stage-manifest.json"
+    if entries.get(manifest_name) is None or not stat.S_ISREG(entries[manifest_name]):
+        raise RuntimeError("volume staging case has no regular manifest")
+    payload = _read_stage_manifest(case_root / manifest_name)
+    if payload.get("action") != ACTION or payload.get("run_id") != run_id:
+        raise RuntimeError("volume staging manifest action/run does not match its path")
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("volume staging manifest has no files")
+    if len(files) > _STAGE_MANIFEST_MAX_FILES:
+        raise RuntimeError("volume staging manifest file count exceeds the limit")
+
+    records = []
+    expected_names = {manifest_name}
+    for item in files:
+        if not isinstance(item, dict):
+            raise RuntimeError("volume staging manifest file entry is invalid")
+        stage_path = Path(str(item.get("stage_path") or ""))
+        leaf = stage_path.name
+        expected_path = case_root / leaf
+        if (
+            not leaf
+            or leaf in expected_names
+            or canonical_absolute_path(stage_path)
+            != canonical_absolute_path(expected_path)
+        ):
+            raise RuntimeError("volume staging manifest path escapes or collides")
+        expected_names.add(leaf)
+        if entries.get(leaf) is None or not stat.S_ISREG(entries[leaf]):
+            raise RuntimeError("volume staging file is missing or is not regular")
+        evidence = inspect_regular_file(expected_path)
+        if (
+            evidence.size != int(item.get("size", -1))
+            or evidence.sha256 != str(item.get("sha256") or "")
+        ):
+            raise RuntimeError("volume staging file evidence does not match manifest")
+        records.append({"stage_path": str(expected_path), "stage_evidence": evidence})
+    if set(entries) != expected_names:
+        raise RuntimeError("volume staging case contains an unexpected file")
+    cleanup_staging(records, case_root)
+    return len(records)
+
+
+def recover_abandoned_volume_staging(
+    state_db: Path, *, house_root: Path, temp_root: Path
+) -> dict:
+    """Remove only fully verified stage copies from terminal actual runs.
+
+    Unknown paths, non-terminal runs, unfinished operations, symlinks, manifest
+    drift, or extra files are preserved and reported so Folderling can stop
+    before starting another mutation run.
+    """
+    state_db = Path(state_db).expanduser().resolve()
+    house_root = Path(house_root).expanduser().resolve()
+    temp_root = Path(temp_root).expanduser().resolve()
+    staging_root = temp_root / STAGING_DIRECTORY_NAME
+    result = {"recovered_case_count": 0, "recovered_file_count": 0, "issues": []}
+    if not os.path.lexists(staging_root):
+        return result
+
+    with mutation_lock_for_roots(
+        house_root, temp_root, "volume-staging-recovery"
+    ):
+        try:
+            run_entries = _directory_entries_nofollow(staging_root)
+        except (OSError, RuntimeError) as exc:
+            result["issues"].append({"path": str(staging_root), "reason": str(exc)})
+            return result
+        conn = decision_store.connect_state_db_readonly(state_db)
+        try:
+            for run_id, mode in sorted(run_entries.items()):
+                run_root = staging_root / run_id
+                if not stat.S_ISDIR(mode):
+                    result["issues"].append({
+                        "path": str(run_root),
+                        "reason": "unexpected non-directory staging entry",
+                    })
+                    continue
+                run = conn.execute(
+                    "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if run is None or run["state"] not in {"finished", "failed", "cancelled"}:
+                    result["issues"].append({
+                        "path": str(run_root),
+                        "reason": "staging run is missing or not terminal",
+                    })
+                    continue
+                unfinished_operations = conn.execute(
+                    "SELECT COUNT(*) FROM operations WHERE run_id = ? "
+                    "AND state IN ('planned', 'fs_done', 'db_done')",
+                    (run_id,),
+                ).fetchone()[0]
+                unfinished_groups = conn.execute(
+                    "SELECT COUNT(*) FROM operation_groups WHERE run_id = ? "
+                    "AND state IN ('planned', 'fs_done', 'db_done')",
+                    (run_id,),
+                ).fetchone()[0]
+                if unfinished_operations or unfinished_groups:
+                    result["issues"].append({
+                        "path": str(run_root),
+                        "reason": "staging run still has unfinished operations",
+                    })
+                    continue
+                try:
+                    case_entries = _directory_entries_nofollow(run_root)
+                except (OSError, RuntimeError) as exc:
+                    result["issues"].append({"path": str(run_root), "reason": str(exc)})
+                    continue
+                if not case_entries:
+                    try:
+                        _remove_empty_directory_owned(run_root)
+                    except (OSError, RuntimeError) as exc:
+                        result["issues"].append({
+                            "path": str(run_root), "reason": str(exc)
+                        })
+                    continue
+                for case_name, case_mode in sorted(case_entries.items()):
+                    case_root = run_root / case_name
+                    if not stat.S_ISDIR(case_mode):
+                        result["issues"].append({
+                            "path": str(case_root),
+                            "reason": "unexpected non-directory case entry",
+                        })
+                        continue
+                    try:
+                        recovered = _recover_staging_case(case_root, run_id=run_id)
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        result["issues"].append({
+                            "path": str(case_root), "reason": str(exc)
+                        })
+                    else:
+                        result["recovered_case_count"] += 1
+                        result["recovered_file_count"] += recovered
+        finally:
+            conn.close()
+        if not result["issues"]:
+            try:
+                _remove_empty_directory_owned(staging_root)
+            except (OSError, RuntimeError) as exc:
+                result["issues"].append({
+                    "path": str(staging_root), "reason": str(exc)
+                })
+    return result
 
 
 def stage_volume_sources(

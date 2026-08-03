@@ -4,11 +4,12 @@
 파일명을 새 규칙으로 맞춘다. 자모 폴더 위치는 그대로 둔다(파일명만 변경).
 
 사용:
-    python3 migrate_marker_position.py            # dry-run(미리보기)
-    python3 migrate_marker_position.py --run      # 실제 이름 변경
+    python3 migrate_marker_position.py            # dry-run(미리보기)만 지원
     python3 migrate_marker_position.py --house <경로>
 
-`_최근` 심볼릭 링크도 새 대상으로 다시 건다. 인덱스 재생성은 scanner.py로 별도 수행.
+이전의 ``--run`` 직접 변경 모드는 현재 actual-run/journal/Doctor 계약을
+우회하므로 1.4.13부터 hard-fail한다. 이 파일은 과거 이름을 찾는 읽기 전용
+감사기로만 남긴다.
 """
 import os
 import re
@@ -85,6 +86,11 @@ def _relink_recent(recent_dir, old_name, new_name, new_target, dry_run):
 
 
 def migrate(house_dir, dry_run):
+    if not dry_run:
+        raise RuntimeError(
+            "legacy marker migration actual mode is disabled; "
+            "use a managed title/rename operation"
+        )
     recent_dir = os.path.join(house_dir, RECENT_DIR_NAME)
     converted = 0
     skipped = 0
@@ -110,7 +116,7 @@ def migrate(house_dir, dry_run):
     label = "미리보기" if dry_run else "실행"
     print(f"\n{label} 완료: 변환 {converted}개, 건너뜀 {skipped}개")
     if dry_run:
-        print("실제 적용: python3 migrate_marker_position.py --run  (이후 python3 scanner.py)")
+        print("실제 변경은 관리형 제목/이름 변경 작업을 사용하세요.")
     return converted
 
 

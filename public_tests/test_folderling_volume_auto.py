@@ -438,6 +438,74 @@ def test_folderling_volume_target_allows_missing_author_for_authored_work(tmp_pa
     assert Path(decision["target_folder"]) == house / "ㅂ" / "별빛 연대기"
 
 
+def test_folderling_volume_target_preserves_current_stored_author_conflict(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        existing = _add(
+            conn,
+            house / "ㅂ" / "별빛 연대기" / "별빛 연대기 1권.epub",
+            "house",
+        )
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE file_analysis SET author = ? WHERE file_id = ?",
+                ("저장작가", existing["file_id"]),
+            )
+        incoming = _add(
+            conn, temp / "별빛 연대기 2권 [다른작가].epub", "temp"
+        )
+
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming["file_id"],
+            house_root=house,
+        )
+    finally:
+        conn.close()
+
+    assert decision == {"status": "no_target", "reason": "author_conflict"}
+
+
+def test_folderling_volume_target_reparses_only_stale_stored_author(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        existing = _add(
+            conn,
+            house / "ㅂ" / "별빛 연대기" / "별빛 연대기 1권.epub",
+            "house",
+        )
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE file_analysis SET author = ?, analyzed_mtime_ns = analyzed_mtime_ns - 1 "
+                "WHERE file_id = ?",
+                ("과거작가", existing["file_id"]),
+            )
+        incoming = _add(
+            conn, temp / "별빛 연대기 2권 [새작가].epub", "temp"
+        )
+
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming["file_id"],
+            house_root=house,
+        )
+    finally:
+        conn.close()
+
+    assert decision["status"] == "target"
+    assert Path(decision["target_folder"]) == house / "ㅂ" / "별빛 연대기"
+
+
 def test_folderling_volume_target_rejects_two_explicit_authors(tmp_path):
     house = tmp_path / "house"
     temp = tmp_path / "temp"

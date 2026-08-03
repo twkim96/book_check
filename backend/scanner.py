@@ -783,8 +783,6 @@ def _generate_file_list_from_state_db_unlocked(
     allowed_active_run_id=None,
 ):
     """Write final public indexes without a second Scanner reconciliation."""
-    import decision_store
-
     entries, revision, _auditor_inventory, integrity_receipt = (
         _build_verified_index_snapshot_from_state_db(
             house_dir,
@@ -975,7 +973,7 @@ def get_file_entries(
                 seen_file_ids=seen_file_ids,
                 scanned_roots=directory_list,
             )
-            contextual = sync_contextual_bare_volume_metadata(
+            sync_contextual_bare_volume_metadata(
                 decision_conn,
                 target_sources=("house",),
                 evidence_sources=("house",),

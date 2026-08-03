@@ -180,7 +180,7 @@ def _materialize_component_rebound_reviews(conn, plans):
         else:
             evidence = dict(plan.get("review_evidence") or {})
             evidence["strong_component_rebind"] = {
-                "version": "1.4.12",
+                "version": "1.4.13",
                 "source_review_id": plan["source_review_id"],
                 "source_pair_file_ids": list(plan["source_pair_file_ids"]),
                 "final_pair_file_ids": [
@@ -206,7 +206,6 @@ def build_plan(conn, scope="queueable", review_ids=None):
         raise ValueError(f"unknown house review scope: {scope}")
     classifications = QUEUEABLE if scope == "queueable" else HUMAN_REVIEW_CLASSES
     placeholders = ", ".join("?" for _ in classifications)
-    plans = []
     review_ids = tuple(sorted(set(review_ids or ())))
     review_filter = ""
     params = list(sorted(classifications))

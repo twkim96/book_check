@@ -3995,6 +3995,55 @@ def build_file_analysis(name: str) -> dict:
     }
 
 
+def file_analysis_snapshot_is_current(row: Mapping[str, object]) -> bool:
+    """Return whether a joined file/file_analysis row still describes its file.
+
+    Callers that make routing decisions must preserve a current stored analysis,
+    including a human-corrected author.  Reparse only when the normalizer or
+    file identity columns prove that the stored snapshot is stale.
+    """
+    from normalizer import NORMALIZER_VERSION, normalize_nfc
+
+    item = dict(row)
+    canonical_path = item.get("canonical_path")
+    if not canonical_path:
+        return False
+    analysis_version = item.get(
+        "analysis_normalizer_version", item.get("normalizer_version")
+    )
+    return bool(
+        analysis_version == NORMALIZER_VERSION
+        and item.get("analyzed_name")
+        == normalize_nfc(Path(str(canonical_path)).name)
+        and item.get("analyzed_size") == item.get("size")
+        and item.get("analyzed_mtime_ns") == item.get("mtime_ns")
+        and (
+            item.get("analyzed_ctime_ns") is None
+            or item.get("analyzed_ctime_ns") == item.get("ctime_ns")
+        )
+    )
+
+
+def resolve_current_file_analysis(
+    row: Mapping[str, object], *, analysis_name: Optional[str] = None
+) -> dict:
+    """Use current stored metadata, otherwise return a fresh in-memory analysis."""
+    item = dict(row)
+    if file_analysis_snapshot_is_current(item):
+        return item
+    name = analysis_name or Path(str(item.get("canonical_path") or "")).name
+    fresh = build_file_analysis(name)
+    item.update({
+        key: fresh[key]
+        for key in (
+            "core_title", "readable_title", "author", "max_number",
+            "effective_max", "unit", "complete", "disambig",
+        )
+    })
+    item.update(coordinate_fields_from_name(name))
+    return item
+
+
 def _effective_file_analysis(current, analysis: dict) -> dict:
     """Preserve a human literal-title override after its transport markers are gone."""
     effective = dict(analysis)

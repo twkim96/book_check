@@ -325,8 +325,9 @@ def test_folderling_reuses_verified_index_and_projects_final_delta(tmp_path, mon
         house, script_dir / "file_index.json", state_db
     )["valid"] is True
     phases = [event["phase"] for event in events]
-    assert phases[:3] == [
-        "actual_run_started", "review_actions_result", "workflow_started"
+    assert phases[:4] == [
+        "volume_staging_recovery", "actual_run_started",
+        "review_actions_result", "workflow_started",
     ]
     assert "snapshot_result" in phases
     assert "final_doctor_result" in phases

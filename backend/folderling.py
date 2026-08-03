@@ -1487,12 +1487,10 @@ def _process_items_authorized(
     context_conn = decision_store.connect_state_db(state_db_path)
     try:
         with decision_store.transaction(context_conn):
-            pre_intake_bare_volume_context = (
-                decision_store.sync_contextual_bare_volume_metadata(
-                    context_conn,
-                    target_sources=("temp",),
-                    evidence_sources=("house", "temp"),
-                )
+            decision_store.sync_contextual_bare_volume_metadata(
+                context_conn,
+                target_sources=("temp",),
+                evidence_sources=("house", "temp"),
             )
     finally:
         context_conn.close()
@@ -2253,6 +2251,27 @@ def _process_items_with_lock_held(
         preflight_receipt = decision_store.consume_preflight_validation_receipt(
             state_db_path, dst_dir, src_dir
         )
+    from volume_group_mutations import recover_abandoned_volume_staging
+
+    volume_staging_recovery = recover_abandoned_volume_staging(
+        state_db_path,
+        house_root=dst_dir,
+        temp_root=src_dir,
+    )
+    emit_folderling_event(
+        event_callback,
+        "volume_staging_recovery",
+        status=(
+            "needs_review" if volume_staging_recovery["issues"] else "succeeded"
+        ),
+        **volume_staging_recovery,
+    )
+    if volume_staging_recovery["issues"]:
+        first = volume_staging_recovery["issues"][0]
+        raise RuntimeError(
+            "volume staging recovery needs review: "
+            f"{first['path']} ({first['reason']})"
+        )
     activation_started_at = time.perf_counter()
     actual_run_id, manifest_path = decision_store.prepare_actual_run(
         state_db_path,
@@ -2310,6 +2329,7 @@ def _process_items_with_lock_held(
             preflight_validated=preflight_validated,
         )
         result["review_action_summary"] = action_summary
+        result["volume_staging_recovery"] = volume_staging_recovery
         metrics = result.setdefault("performance_metrics", {})
         metrics["activation_seconds"] = activation_seconds
     except (Exception, KeyboardInterrupt) as exc:

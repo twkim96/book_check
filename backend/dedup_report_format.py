@@ -64,7 +64,6 @@ def render_dedup_report_text(payload: Mapping[str, Any]) -> str:
     summary = payload.get("summary")
     if not isinstance(summary, Mapping):
         summary = {}
-    exact_records = payload.get("exact_records") or []
     suspect_groups = payload.get("suspect_groups") or []
     suspect_move_records = payload.get("suspect_move_records") or []
     disambig_records = payload.get("disambig_records") or []

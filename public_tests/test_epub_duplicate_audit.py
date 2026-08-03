@@ -341,7 +341,7 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
     assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.12"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.12"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.13"
 
 
 def _txt_cache_fixture(tmp_path):

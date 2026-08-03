@@ -594,6 +594,7 @@ class LibraryServiceRegistry:
         phase_labels = {
             "preflight_start": "Folderling 사전 검사 시작",
             "preflight_result": "schema·doctor·backup 준비 완료",
+            "volume_staging_recovery": "분권 staging 복구 확인",
             "actual_run_started": "일회성 actual run 시작",
             "review_actions_result": "검토 처리함 반영 완료",
             "workflow_started": "Folderling workflow 시작",

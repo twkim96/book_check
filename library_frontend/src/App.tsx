@@ -1332,6 +1332,7 @@ const folderlingPhaseLabels: Record<string, string> = {
   preflight_start: "사전 검사",
   preflight_result: "사전 검사 완료",
   preflight_failed: "사전 검사 실패",
+  volume_staging_recovery: "분권 staging 복구 확인",
   actual_run_started: "안전 실행 시작",
   review_actions_result: "기존 검토 처리함 반영",
   workflow_started: "입고 workflow 시작",

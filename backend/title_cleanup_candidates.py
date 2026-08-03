@@ -8,7 +8,6 @@ import hashlib
 import json
 import sqlite3
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 

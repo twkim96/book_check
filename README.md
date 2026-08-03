@@ -35,14 +35,14 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.12)
+## 동일 작품 자동 중복 정리 계약 (1.4.13)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
 1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt,
 1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive,
 1.4.10의 archive/review 경합·경로 안전 보강, 1.4.11의 숫자 권 문맥 추론,
-1.4.12의 닫힌 좌표 보정·EPUB spine 동일성 계약은
+1.4.12의 닫힌 좌표 보정·EPUB spine 동일성, 1.4.13의 legacy 실행 차단·분권 분석/복구 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -54,7 +54,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.9.md`](update_1.4.9.md),
 [`update_1.4.10.md`](update_1.4.10.md),
 [`update_1.4.11.md`](update_1.4.11.md),
-[`update_1.4.12.md`](update_1.4.12.md)에 기록합니다.
+[`update_1.4.12.md`](update_1.4.12.md),
+[`update_1.4.13.md`](update_1.4.13.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -292,7 +293,7 @@ Scanner가 실제 관측 시각의 소유자이며 warm auditor는 변하지 않
   `-2회차-작품명`처럼 제목 숫자와 뒤 좌표가 우연히 이어진 경우에는 실제 뒤쪽 좌표에서 자릅니다.
 
 이 절의 접두사 보정 당시 Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.2`와 같은 단일 파일
-분석 결과를 사용했습니다. 현재 1.4.12는 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
+분석 결과를 사용했습니다. 현재 1.4.13은 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
 해당 변경은 파일명·`core_title` 의미만 바꿉니다. TXT/EPUB 본문 fingerprint 의미는 바뀌지 않았으므로
 `FINGERPRINT_NORMALIZER_COMPAT_VERSION`과 `PAIR_NORMALIZER_COMPAT_VERSION`은 `1.3.0`에 고정하고,
 1.4.2 fingerprint/pair policy hash를 유지합니다. 제목 parser 버전 상승만으로 house 본문 전체를 다시
@@ -538,6 +539,30 @@ EPUB의 ZIP 내부 bytes가 다를 때는 기존 strict content와 reading-paylo
 
 이 버전은 `NORMALIZER_VERSION=1.3.3`, pair policy/auditor `1.4.12`입니다. 파일명 projection과 pair
 cache만 새 세대로 계산하며, 기존 대용량 fingerprint는 다시 만들지 않습니다.
+
+### Legacy 실행 차단과 분권 복구 계약 (1.4.13)
+
+1.4.13은 중복·제목 파싱 의미를 넓히지 않고 제품 바깥의 우회 경로와 분권 작업의 복구 경계만
+보강합니다.
+
+- `migrate_marker_position.py`는 과거 앞마커 파일을 찾는 dry-run 감사기로만 남습니다. `--run` 또는
+  `migrate(..., dry_run=False)`는 파일 walk 전에 hard-fail하며, 실제 변경은 backup·manifest·journal·
+  Doctor가 연결된 관리형 작업만 사용해야 합니다.
+- 분권 검토와 Folderling 자동 합류는 공통 resolver를 사용합니다. normalizer version, 파일명,
+  size·mtime·ctime이 현재 DB 분석과 모두 맞으면 저장된 작가를 보존하고, 하나라도 stale일 때만 현재
+  파일명을 다시 해석합니다.
+- 작가가 비어 있는 파일은 계속 정상 입력입니다. 같은 core와 안전한 서로 다른 권 좌표가 있고 양쪽에
+  명시된 작가끼리 충돌하지 않으면 자동 묶습니다. 작가 누락만으로 검토 큐를 만들지 않습니다.
+- 강제 종료로 `.volume_group_staging` 복사본이 남으면 다음 Folderling 시작 전에 검사합니다. terminal
+  actual run, 미완료 operation 0건, manifest의 경로·개수·size·SHA 일치, 예상 밖 파일 0건을 모두
+  만족할 때만 stage 복사본을 지웁니다. 알 수 없는 항목은 보존하고 새 actual run을 차단합니다.
+- `unpack`의 JPG·ZIP 등 비지원 부속파일 영구 폐기는 의도된 운영 정책입니다. 모든 TXT·EPUB·PDF가
+  먼저 안전하게 이동·격리되어 하나도 남지 않고, symlink와 tree identity 검사를 통과한 wrapper만
+  정리합니다. 삭제 건수·byte는 결과 이벤트와 로그에 남지만 복구용 quarantine은 만들지 않습니다.
+
+배포/auditor/UI는 `1.4.13`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
+version/policy `5`/`1.4.2`, pair policy `1.4.12`를 유지합니다. 따라서 제목·본문 cache 재기준은
+발생하지 않습니다.
 
 ## 구조
 
