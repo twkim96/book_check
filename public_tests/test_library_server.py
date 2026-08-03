@@ -855,6 +855,48 @@ def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
     assert platform["blocked_code"] == "non_production_layout"
 
 
+def test_google_sheet_service_uses_private_local_config(tmp_path, monkeypatch):
+    app, _ = _server_fixture(tmp_path)
+    registry = app.extensions["library_service_registry"]
+    credentials = tmp_path / "service-account.json"
+    credentials.write_text("{}", encoding="utf-8")
+    config = tmp_path / "google-sheet.json"
+    config.write_text(
+        json.dumps(
+            {
+                "credentials_path": str(credentials),
+                "spreadsheet_id": "sheet-id",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+    monkeypatch.delenv("FILE_CHECK_GOOGLE_CREDENTIALS", raising=False)
+    monkeypatch.delenv("FILE_CHECK_GOOGLE_SPREADSHEET_ID", raising=False)
+    monkeypatch.setenv("FILE_CHECK_GOOGLE_CONFIG", str(config))
+    monkeypatch.setattr(registry, "_production_layout", lambda: True)
+
+    descriptor = registry.descriptor(
+        "google-sheet",
+        context={
+            "jobs": [],
+            "active": None,
+            "doctor_ok": True,
+            "doctor_issue_count": 0,
+            "supported_house_files": 1,
+            "platform_previews": {
+                "platform-update": (1, {"discovered_titles": 1})
+            },
+            "platform_error": None,
+        },
+    )
+
+    assert descriptor["ready"] is True
+    assert descriptor["configured"] is True
+    assert descriptor["target_count"] == 1
+    assert descriptor["blocked_code"] is None
+
+
 def test_scanner_service_runs_as_persistent_job_with_events_and_log(tmp_path):
     app, _ = _server_fixture(tmp_path)
     client = app.test_client()

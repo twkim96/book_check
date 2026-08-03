@@ -451,11 +451,13 @@ class LibraryServiceRegistry:
                         blocked_code = "no_targets"
                         blocked_reason = "현재 실행 대상이 없습니다."
                 elif service_id == "google-sheet":
-                    credentials = os.environ.get("FILE_CHECK_GOOGLE_CREDENTIALS", "").strip()
-                    spreadsheet_id = os.environ.get("FILE_CHECK_GOOGLE_SPREADSHEET_ID", "").strip()
-                    configured = bool(
-                        credentials and spreadsheet_id and Path(credentials).expanduser().is_file()
-                    )
+                    from platform_sheet_export import resolve_google_sheet_settings
+
+                    try:
+                        resolve_google_sheet_settings()
+                        configured = True
+                    except (OSError, RuntimeError, ValueError):
+                        configured = False
                     discovered = context.get("platform_previews", {}).get(
                         "platform-update", (0, {})
                     )[1].get("discovered_titles")
@@ -471,7 +473,9 @@ class LibraryServiceRegistry:
                     if not configured:
                         ready = False
                         blocked_code = "credentials_missing"
-                        blocked_reason = "Google 인증 파일 또는 Spreadsheet ID가 설정되지 않았습니다."
+                        blocked_reason = (
+                            "Google 환경변수 또는 private 설정 파일과 인증 파일을 확인하세요."
+                        )
             except Exception as exc:  # fail closed while keeping the catalog visible
                 ready = False
                 blocked_code = "preview_failed"

@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -151,6 +152,74 @@ def test_sheet_sync_dry_run_never_loads_google_credentials(tmp_path, monkeypatch
     assert result["error_rows"] == 0
     assert result["works_columns"] == 15
     assert result["error_columns"] == 8
+
+
+def _write_google_config(path, credentials, spreadsheet_id="sheet-id"):
+    path.write_text(
+        json.dumps(
+            {
+                "credentials_path": str(credentials),
+                "spreadsheet_id": spreadsheet_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def test_google_settings_fall_back_to_owner_only_local_config(tmp_path):
+    credentials = tmp_path / "service-account.json"
+    credentials.write_text("{}", encoding="utf-8")
+    config = tmp_path / "google-sheet.json"
+    _write_google_config(config, credentials)
+
+    settings = platform_sheet_export.resolve_google_sheet_settings(
+        {}, config_path=config
+    )
+
+    assert settings.credentials_path == str(credentials)
+    assert settings.spreadsheet_id == "sheet-id"
+    assert settings.source == "local_config"
+
+
+def test_google_settings_environment_pair_wins_over_local_config(tmp_path):
+    credentials = tmp_path / "environment-service-account.json"
+    credentials.write_text("{}", encoding="utf-8")
+
+    settings = platform_sheet_export.resolve_google_sheet_settings(
+        {
+            "FILE_CHECK_GOOGLE_CREDENTIALS": str(credentials),
+            "FILE_CHECK_GOOGLE_SPREADSHEET_ID": "environment-sheet",
+        },
+        config_path=tmp_path / "missing.json",
+    )
+
+    assert settings.spreadsheet_id == "environment-sheet"
+    assert settings.source == "environment"
+
+
+def test_google_settings_reject_partial_environment_instead_of_mixing(tmp_path):
+    credentials = tmp_path / "service-account.json"
+    credentials.write_text("{}", encoding="utf-8")
+    config = tmp_path / "google-sheet.json"
+    _write_google_config(config, credentials)
+
+    with pytest.raises(RuntimeError, match="must be configured together"):
+        platform_sheet_export.resolve_google_sheet_settings(
+            {"FILE_CHECK_GOOGLE_SPREADSHEET_ID": "stale-sheet"},
+            config_path=config,
+        )
+
+
+def test_google_settings_reject_world_readable_local_config(tmp_path):
+    credentials = tmp_path / "service-account.json"
+    credentials.write_text("{}", encoding="utf-8")
+    config = tmp_path / "google-sheet.json"
+    _write_google_config(config, credentials)
+    config.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="permissions must be 0600"):
+        platform_sheet_export.resolve_google_sheet_settings({}, config_path=config)
 
 
 def test_scanner_prunes_only_analysis_projection_for_excluded_house_paths(tmp_path):

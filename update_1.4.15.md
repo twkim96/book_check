@@ -7,6 +7,7 @@
 3. 분권 staging 복구가 검증한 manifest와 실제 cleanup 대상을 같은 evidence로 묶는다.
 4. 검증 후 디렉터리 drift나 제거 실패가 있으면 recovery 성공으로 보고하지 않는다.
 5. NFC DB 경로 키와 실제 Unicode 파일명 접근을 분리해 Linux에서도 NFD fixture를 안전하게 처리한다.
+6. 컨트롤서버가 앱별 비밀 환경을 전달하지 않아도 owner-only Google Sheet 설정을 사용한다.
 
 ## 리뷰 수용 결과
 
@@ -20,6 +21,18 @@ no-follow component walk와 macOS `/var`·`/private/var` 동일성 계약은 유
 `canonical_path`는 계속 NFC로 정규화하되, `reconcile_file_metadata()`와
 `upsert_file_analysis()`의 파일 I/O는 호출자가 전달한 실제 경로 표기를 사용한다. 따라서 macOS의
 NFD 파일을 나타내는 합성 fixture도 Linux에서 존재하지 않는 NFC pathname으로 바꿔 읽지 않는다.
+
+### 후속: Google Sheet private 설정
+
+컨트롤서버 1.5.x의 공개 배포 경계는 file_check 자격증명을 LaunchAgent plist에 복제하지 않는다.
+이 보안 경계를 되돌리는 대신 file_check가 `~/.config/book_check/google-sheet.json`을 직접 읽는
+대체 경로를 추가했다.
+
+- 파일은 현재 사용자 소유의 일반 파일이며 권한 `0600`이어야 한다.
+- `credentials_path`와 `spreadsheet_id`를 한 쌍으로 읽고 인증 파일 실재 여부를 확인한다.
+- 기존 환경변수 두 개가 모두 있으면 계속 최우선으로 사용한다.
+- 환경변수가 한쪽만 있으면 local config와 섞지 않고 fail-closed 한다.
+- UI readiness와 실제 Sheet writer가 같은 resolver를 사용한다.
 
 ### 수용: stale 수동 제목 override
 
@@ -76,8 +89,8 @@ schema migration, filename projection 재기준, fingerprint/pair cache 무효�
   - stale title literal/structure override와 stored-author 분리
   - stored core 양방향 drift의 최종 resolver 필터
   - manifest pathname 교체, 늦은 파일 유입, stage drift, rmdir 실패
-- 공개 회귀: `463 passed`, backend coverage `72%` (`fail-under=70` 통과)
-- 전체 회귀: `866 passed`, backend coverage `81%` (`fail-under=75` 통과)
+- 공개 회귀: `468 passed`, backend coverage `72%` (`fail-under=70` 통과)
+- 전체 회귀: `871 passed`, backend coverage `81%` (`fail-under=75` 통과)
 - frontend TypeScript typecheck와 production build: 통과
 - backend/tools compileall, pyflakes, Python/Chrome normalizer parity 35건,
   `git diff --check`: 통과
@@ -85,6 +98,13 @@ schema migration, filename projection 재기준, fingerprint/pair cache 무효�
 실제 Ubuntu GitHub Actions는 첫 실행에서 NFD 물리 경로를 NFC DB 키로 `stat`한 경계를 찾아냈고,
 파일 I/O와 식별 키를 분리한 후 재실행하는 배포 gate로 확인한다. 로컬에서는 platform 값을
 Linux/Darwin으로 각각 고정한 회귀로 경로 변환 자체도 검증했다.
+
+Google 후속 적용에서는 private 설정을 `0600`으로 설치한 뒤 다음 운영 증거를 확인했다.
+
+- Google API 읽기 인증과 대상 Spreadsheet 접근 성공, 기존 두 탭 확인
+- PM2 관리 `book_check`만 재시작하고 `/health`의 `version=1.4.15` 확인
+- `/api/services`의 Google Sheet가 `configured=true`, `ready=true`, blocker 없음
+- 실제 Sheet 쓰기와 도서 DB·house/temp 변경은 수행하지 않음
 
 검증은 합성 temp fixture와 빌드만 사용했다. 실제 상태 DB, index, house/temp 파일 이동·격리·삭제,
 Folderling actual 실행은 수행하지 않았다.

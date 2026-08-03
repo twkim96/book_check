@@ -1287,9 +1287,21 @@ python3 run_platform_catalog.py refresh --all --sync-sheet
 ~~~
 
 빈 Spreadsheet를 하나 만든 뒤 서비스 계정 이메일에 편집 권한을 공유해야 합니다. 인증 JSON과
-Spreadsheet ID는 Git에 넣지 말고 컨트롤서버의 로컬 환경변수에만 둡니다. 동기화는 임시 탭에
+Spreadsheet ID는 Git에 넣지 말고 로컬 환경변수나 아래 private 설정에만 둡니다. 동기화는 임시 탭에
 전체 값을 먼저 쓴 뒤 성공한 경우에만 `도서 목록`, `수집 오류` 탭을 교체합니다. 이전 버전의
 `작품 현황` 탭이 있으면 성공적인 첫 동기화 때 정리합니다.
+
+컨트롤서버·launchd·PM2가 앱별 환경변수를 전달하지 않는 설치에서는 owner-only private 설정을
+사용할 수 있습니다. 기본 경로는 `~/.config/book_check/google-sheet.json`이며 권한은 `0600`,
+내용은 아래 두 키입니다. 두 환경변수가 모두 있으면 환경변수가 우선하며, 한쪽만 있으면 private
+설정과 섞지 않고 오류로 처리합니다. 다른 경로를 쓰려면 `FILE_CHECK_GOOGLE_CONFIG`로 지정합니다.
+
+~~~json
+{
+  "credentials_path": "/local-only/path/service-account.json",
+  "spreadsheet_id": "spreadsheet-id"
+}
+~~~
 
 ## 테스트
 

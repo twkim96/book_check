@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
+import stat
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import decision_store
@@ -27,6 +29,9 @@ GOOGLE_VALUE_WRITE_ATTEMPTS = 3
 GOOGLE_RATE_LIMIT_ATTEMPTS = 3
 GOOGLE_RATE_LIMIT_DELAY_SECONDS = 30
 GOOGLE_REQUEST_TIMEOUT = (10, 180)
+GOOGLE_CONFIG_ENV = "FILE_CHECK_GOOGLE_CONFIG"
+DEFAULT_GOOGLE_CONFIG = Path("~/.config/book_check/google-sheet.json")
+MAX_GOOGLE_CONFIG_BYTES = 64 * 1024
 COMMA_NUMBER_HEADERS = frozenset({"다운로드 수", "조회 수", "좋아요 수"})
 
 WORK_HEADERS = (
@@ -79,6 +84,110 @@ class SheetSnapshot:
     works: SheetTable
     errors: SheetTable
     synced_at: str
+
+
+@dataclass(frozen=True)
+class GoogleSheetSettings:
+    credentials_path: str
+    spreadsheet_id: str
+    source: str
+
+
+def _read_private_google_config(path: Path) -> Mapping[str, object]:
+    """Read one owner-only regular JSON file without following its final link."""
+    path = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("Google Sheet local config is not configured") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError("Google Sheet local config must be a regular file")
+    if hasattr(os, "getuid") and before.st_uid != os.getuid():
+        raise RuntimeError("Google Sheet local config must be owned by the current user")
+    if stat.S_IMODE(before.st_mode) & 0o077:
+        raise RuntimeError("Google Sheet local config permissions must be 0600")
+    if before.st_size > MAX_GOOGLE_CONFIG_BYTES:
+        raise RuntimeError("Google Sheet local config is too large")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("Google Sheet local config could not be opened safely") from exc
+    try:
+        current = os.fstat(fd)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError("Google Sheet local config changed before it was opened")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            raw = handle.read(MAX_GOOGLE_CONFIG_BYTES + 1)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (
+        (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise RuntimeError("Google Sheet local config changed while it was read")
+    if len(raw) > MAX_GOOGLE_CONFIG_BYTES:
+        raise RuntimeError("Google Sheet local config is too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Google Sheet local config is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Google Sheet local config must be a JSON object")
+    return payload
+
+
+def resolve_google_sheet_settings(
+    environ: Optional[Mapping[str, str]] = None,
+    *,
+    config_path: Optional[os.PathLike | str] = None,
+) -> GoogleSheetSettings:
+    """Resolve an atomic credentials/Spreadsheet pair.
+
+    Explicit environment variables retain precedence.  If either legacy
+    variable is present, both must be present so a stale environment value is
+    never mixed with the private file.  Otherwise an owner-only local JSON file
+    keeps the settings independent from launchd/PM2 environment inheritance.
+    """
+    env = os.environ if environ is None else environ
+    credentials = str(env.get("FILE_CHECK_GOOGLE_CREDENTIALS", "") or "").strip()
+    spreadsheet_id = str(
+        env.get("FILE_CHECK_GOOGLE_SPREADSHEET_ID", "") or ""
+    ).strip()
+    if credentials or spreadsheet_id:
+        if not credentials or not spreadsheet_id:
+            raise RuntimeError(
+                "FILE_CHECK_GOOGLE_CREDENTIALS and FILE_CHECK_GOOGLE_SPREADSHEET_ID "
+                "must be configured together"
+            )
+        source = "environment"
+    else:
+        selected = config_path
+        if selected is None:
+            selected = str(env.get(GOOGLE_CONFIG_ENV, "") or "").strip()
+        selected = selected or DEFAULT_GOOGLE_CONFIG
+        payload = _read_private_google_config(Path(selected))
+        credentials = str(payload.get("credentials_path") or "").strip()
+        spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
+        if not credentials or not spreadsheet_id:
+            raise RuntimeError(
+                "Google Sheet local config requires credentials_path and spreadsheet_id"
+            )
+        source = "local_config"
+
+    credentials_file = Path(credentials).expanduser()
+    if not credentials_file.is_file():
+        raise RuntimeError("Google service-account credentials file is missing")
+    return GoogleSheetSettings(
+        credentials_path=str(credentials_file),
+        spreadsheet_id=spreadsheet_id,
+        source=source,
+    )
 
 
 def _utc_text(value: Optional[datetime] = None) -> str:
@@ -275,13 +384,8 @@ class GoogleSheetsRestClient:
 
     @classmethod
     def from_environment(cls):
-        credentials = os.environ.get("FILE_CHECK_GOOGLE_CREDENTIALS", "").strip()
-        spreadsheet_id = os.environ.get("FILE_CHECK_GOOGLE_SPREADSHEET_ID", "").strip()
-        if not credentials:
-            raise RuntimeError("FILE_CHECK_GOOGLE_CREDENTIALS is not configured")
-        if not spreadsheet_id:
-            raise RuntimeError("FILE_CHECK_GOOGLE_SPREADSHEET_ID is not configured")
-        return cls(spreadsheet_id, credentials)
+        settings = resolve_google_sheet_settings()
+        return cls(settings.spreadsheet_id, settings.credentials_path)
 
     def _request(self, method: str, url: str, *, body=None):
         for attempt in range(GOOGLE_RATE_LIMIT_ATTEMPTS):
