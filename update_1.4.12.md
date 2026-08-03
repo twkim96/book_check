@@ -129,3 +129,18 @@ journal을 거쳤다. 영구 삭제는 없으며 아래 격리는 모두 복구 
   지원 도서 파일 17,677개와 시리즈 디렉터리 285개
 - DB와 인덱스의 파일 수 차이 4개는 EPUB 해제 폴더의 `cover.jpg` 3개와 `hwp` 1개로,
   확장 검색 대상이 아닌 의도된 제외다. index에는 DB에 없는 도서 파일이 0개다.
+
+## UI 후속 마감
+
+- 밝은 테마에서 원색 노랑이 배경과 섞이던 `needs_review`·warning·collision 표시는
+  테마의 본문색을 혼합한 `--warning-text`를 공통 사용하도록 바꿨다. 실제 저장된 밝은 테마
+  (`background=#e0e0e0`, `text=#1b1a18`)에서 상태 글자의 대비는 약 `5.19:1`이다.
+- Folderling 타임라인은 특정 이벤트명에 종속하지 않고, 표시되는 이벤트 중 같은 `phase`가
+  연속될 때 하나의 카드와 `×N` 배지로 압축한다. 다른 phase가 끼면 반드시 새 그룹을 시작하며,
+  마지막 이벤트의 시각·상태를 표시한다. 마지막 이벤트에 error/fallback이 없으면 같은 묶음에서
+  가장 최근에 확인된 error/fallback을 보존한다.
+- 실제 작업 `3abe80b3-638a-4bbb-a048-6b683e9d9b4b`에서 표시 대상 214개가 26개 카드로 줄었다.
+  `auditor_progress ×14` 다음 `cold cache`를 경계로 새 `auditor_progress ×14`가 만들어졌고,
+  별도 연속 phase인 `series_group_item` 163개도 `×163`으로 압축됨을 브라우저에서 확인했다.
+- frontend production build와 `git diff --check`를 통과했다. 이 변경은 표시 계층에만 있으며
+  Folderling 판정, 작업 이벤트 원본, 상태 DB 및 도서 파일에는 손대지 않는다.

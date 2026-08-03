@@ -32,7 +32,7 @@
   --success-text: color-mix(in srgb, var(--green) 42%, var(--text));
   --warning-surface: color-mix(in srgb, var(--yellow) 16%, var(--panel));
   --warning-border: color-mix(in srgb, var(--yellow) 42%, var(--line));
-  --warning-text: color-mix(in srgb, var(--yellow) 36%, var(--text));
+  --warning-text: color-mix(in srgb, var(--yellow) 30%, var(--text));
   --danger-surface: color-mix(in srgb, var(--red) 15%, var(--panel));
   --danger-border: color-mix(in srgb, var(--red) 44%, var(--line));
   --danger-text: color-mix(in srgb, var(--red) 46%, var(--text));
@@ -92,7 +92,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .next-action span { color: var(--muted); font-size: 13px; line-height: 1.45; }
 .next-action b { grid-row: 1 / 3; grid-column: 2; align-self: center; color: var(--link); font-size: 13px; }
 .next-action-action { border-left-color: var(--blue); }
-.next-action-warning { border-left-color: var(--yellow); }
+.next-action-warning { border-left-color: var(--warning-text); }
 .next-action-error { border-left-color: var(--red); }
 .next-action-info { border-left-color: var(--blue); }
 .all-clear { padding: 18px; border: 1px dashed var(--success-border); border-radius: 9px; color: var(--success-text); text-align: center; background: var(--success-surface); }
@@ -506,7 +506,7 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .filename { display: block; line-height: 1.45; word-break: break-word; }
 .path, .blocked, .collision, .muted { display: block; margin-top: 7px; color: var(--muted); font-size: 13px; line-height: 1.4; }
 .blocked { color: var(--red); }
-.collision { color: var(--yellow); }
+.collision { color: var(--warning-text); }
 .core { color: var(--blue); background: color-mix(in srgb, var(--blue-2) 8%, var(--surface-low)); border: 1px solid color-mix(in srgb, var(--blue-2) 30%, var(--line)); padding: 4px 6px; border-radius: 5px; white-space: normal; word-break: break-all; }
 .core-new { color: var(--success-text); border-color: var(--success-border); }
 .core-bad { color: var(--danger-text); border-color: var(--danger-border); }
@@ -702,7 +702,7 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .job-detail-summary article > strong { margin: 8px 0 5px; font-size: 22px; }
 .job-detail-summary article > small { color: var(--muted); }
 .state-text-succeeded { color: var(--green); }
-.state-text-needs_review { color: var(--yellow); }
+.state-text-needs_review { color: var(--warning-text); }
 .state-text-failed, .state-text-interrupted { color: var(--red); }
 .state-text-cancelled { color: var(--muted); }
 .page-actions { display: flex; align-items: center; gap: 9px; }
@@ -723,9 +723,10 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .folderling-timeline article > p { grid-column: 2 / -1; margin: 2px 0 0; color: var(--warning-text); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }
 .folderling-dot { width: 8px; height: 8px; margin-top: 3px; border-radius: 99px; background: var(--muted); box-shadow: 0 0 8px color-mix(in srgb, var(--muted) 45%, transparent); }
 .folderling-dot-succeeded, .folderling-dot-completed { background: var(--green); box-shadow: 0 0 8px #43d17c77; }
-.folderling-dot-needs_review, .folderling-dot-warning, .folderling-dot-fallback { background: var(--yellow); box-shadow: 0 0 8px #ffd45c77; }
+.folderling-dot-needs_review, .folderling-dot-warning, .folderling-dot-fallback { background: var(--warning-text); box-shadow: 0 0 8px color-mix(in srgb, var(--warning-text) 55%, transparent); }
 .folderling-dot-failed { background: var(--red); box-shadow: 0 0 8px #ff727277; }
 .folderling-status { display: inline-block; width: fit-content; border-radius: 99px; padding: 3px 7px; color: var(--neutral-text); background: var(--neutral-surface); font-size: 13px; font-weight: 800; white-space: nowrap; }
+.folderling-event-count { display: inline-block; min-width: 34px; width: fit-content; border: 1px solid var(--line); border-radius: 99px; padding: 3px 8px; color: var(--neutral-text); background: var(--neutral-surface); font-size: 13px; font-weight: 800; text-align: center; white-space: nowrap; }
 .folderling-status-succeeded, .folderling-status-completed, .folderling-status-ingested, .folderling-status-pass_ingested, .folderling-status-ordered_body_duplicate { color: var(--success-text); background: var(--success-surface); }
 .folderling-status-exact_duplicate { color: var(--blue); background: color-mix(in srgb, var(--blue-2) 16%, var(--panel-2)); }
 .folderling-status-needs_review, .folderling-status-warning, .folderling-status-fallback, .folderling-status-suspected_duplicate, .folderling-status-author_conflict { color: var(--warning-text); background: var(--warning-surface); }

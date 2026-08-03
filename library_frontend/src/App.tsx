@@ -3,6 +3,7 @@ import { NavLink, Navigate, Route, Routes, useParams, useSearchParams } from "re
 
 import { ApiError, api, postJson } from "./api";
 import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
+import { groupFolderlingTimelineEvents } from "./folderlingTimeline";
 import { SettingsPage } from "./Settings";
 import { WorkManagementModal } from "./WorkManagementModal";
 import { APP_VERSION } from "./version";
@@ -1401,6 +1402,10 @@ function FolderlingJobOutput({ events, result }: { events: JobEvent[]; result: R
     () => events.filter((event) => event.phase !== "file_result"),
     [events]
   );
+  const timelineGroups = useMemo(
+    () => groupFolderlingTimelineEvents(timelineEvents),
+    [timelineEvents]
+  );
   const counts = useMemo(() => fileEvents.reduce<Record<string, number>>((acc, event) => {
     const status = eventText(event.status) || "unknown";
     acc[status] = (acc[status] ?? 0) + 1;
@@ -1444,13 +1449,17 @@ function FolderlingJobOutput({ events, result }: { events: JobEvent[]; result: R
       <article className="panel"><span>실패</span><strong>{formatNumber(failureCount)}</strong><small>재확인 필요</small></article>
     </section>
     <section className="panel folderling-timeline-panel">
-      <div className="panel-title"><div><span className="eyebrow">FOLDERLING TIMELINE</span><h2>입고 단계</h2></div><span>{timelineEvents.length}개 단계 이벤트</span></div>
-      {timelineEvents.length ? <div className="folderling-timeline">{timelineEvents.map((event, index) => {
+      <div className="panel-title"><div><span className="eyebrow">FOLDERLING TIMELINE</span><h2>입고 단계</h2></div><span>{timelineGroups.length}개 단계</span></div>
+      {timelineGroups.length ? <div className="folderling-timeline">{timelineGroups.map((group, index) => {
+        const event = group.event;
         const status = eventText(event.status) || "running";
-        return <article key={`${event.recorded_at}-${event.phase}-${index}`}>
+        const grouped = group.count > 1;
+        return <article key={`${group.firstRecordedAt}-${event.phase}-${index}`}>
           <i className={`folderling-dot folderling-dot-${status}`} />
           <div><strong>{folderlingPhaseLabels[event.phase] ?? event.phase}</strong><small>{new Date(event.recorded_at).toLocaleTimeString("ko-KR")}</small></div>
-          <span className={`folderling-status folderling-status-${status}`}>{status}</span>
+          {grouped
+            ? <span className="folderling-event-count" title={`연속 이벤트 ${group.count}개`}>×{formatNumber(group.count)}</span>
+            : <span className={`folderling-status folderling-status-${status}`}>{status}</span>}
           {Boolean(event.fallback_reason) && <p>{eventText(event.fallback_reason)}</p>}
           {Boolean(event.error) && <p className="blocked">{eventText(event.error)}</p>}
         </article>;
