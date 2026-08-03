@@ -6,6 +6,7 @@
 2. stale 파일 분석에서도 사람이 확정한 제목 override를 보존한다.
 3. 분권 staging 복구가 검증한 manifest와 실제 cleanup 대상을 같은 evidence로 묶는다.
 4. 검증 후 디렉터리 drift나 제거 실패가 있으면 recovery 성공으로 보고하지 않는다.
+5. NFC DB 경로 키와 실제 Unicode 파일명 접근을 분리해 Linux에서도 NFD fixture를 안전하게 처리한다.
 
 ## 리뷰 수용 결과
 
@@ -14,6 +15,11 @@
 `mutation_io._canonical_absolute()`의 `/tmp → /private/tmp`, `/var → /private/var` 변환을
 `sys.platform == "darwin"` 안으로 제한했다. Linux에서는 lexical absolute path를 그대로 사용한다.
 no-follow component walk와 macOS `/var`·`/private/var` 동일성 계약은 유지한다.
+
+후속 Ubuntu CI에서 드러난 Unicode 경로 문제도 같은 플랫폼 경계에서 수정했다. DB의
+`canonical_path`는 계속 NFC로 정규화하되, `reconcile_file_metadata()`와
+`upsert_file_analysis()`의 파일 I/O는 호출자가 전달한 실제 경로 표기를 사용한다. 따라서 macOS의
+NFD 파일을 나타내는 합성 fixture도 Linux에서 존재하지 않는 NFC pathname으로 바꿔 읽지 않는다.
 
 ### 수용: stale 수동 제목 override
 
@@ -76,8 +82,9 @@ schema migration, filename projection 재기준, fingerprint/pair cache 무효�
 - backend/tools compileall, pyflakes, Python/Chrome normalizer parity 35건,
   `git diff --check`: 통과
 
-실제 Ubuntu GitHub Actions 재실행은 commit/push 이후 확인할 배포 gate다. 로컬에서는 platform 값을
-Linux/Darwin으로 각각 고정한 회귀로 경로 변환 자체를 검증했다.
+실제 Ubuntu GitHub Actions는 첫 실행에서 NFD 물리 경로를 NFC DB 키로 `stat`한 경계를 찾아냈고,
+파일 I/O와 식별 키를 분리한 후 재실행하는 배포 gate로 확인한다. 로컬에서는 platform 값을
+Linux/Darwin으로 각각 고정한 회귀로 경로 변환 자체도 검증했다.
 
 검증은 합성 temp fixture와 빌드만 사용했다. 실제 상태 DB, index, house/temp 파일 이동·격리·삭제,
 Folderling actual 실행은 수행하지 않았다.

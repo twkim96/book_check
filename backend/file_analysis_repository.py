@@ -184,8 +184,12 @@ def upsert_file_analysis(
     stat_result=None,
 ) -> bool:
     """Store one file's derived title metadata; return whether the row changed."""
-    canonical_path = canonicalize_path(path)
-    stat_result = stat_result or os.stat(canonical_path, follow_symlinks=False)
+    physical_path = os.path.abspath(os.fspath(path))
+    canonical_path = canonicalize_path(physical_path)
+    # ``canonical_path`` is the stable NFC database key.  On Linux an NFD
+    # filename is a different pathname, so filesystem access must remain bound
+    # to the exact spelling supplied by the caller.
+    stat_result = stat_result or os.stat(physical_path, follow_symlinks=False)
     current = conn.execute(
         "SELECT * FROM file_analysis WHERE file_id = ?", (file_id,)
     ).fetchone()
@@ -1059,8 +1063,11 @@ def reconcile_file_metadata(
     already managed file is treated as display-only; markers only initialize
     previously unseen/unassigned files as legacy_unresolved.
     """
-    canonical_path = canonicalize_path(path)
-    stat = os.stat(canonical_path, follow_symlinks=False)
+    physical_path = os.path.abspath(os.fspath(path))
+    canonical_path = canonicalize_path(physical_path)
+    # Keep the persisted key normalized while reading the actual directory
+    # entry.  macOS accepts both Unicode forms; Linux does not.
+    stat = os.stat(physical_path, follow_symlinks=False)
     coordinates = coordinate_fields_from_name(Path(canonical_path).name)
     row = conn.execute(
         "SELECT * FROM files WHERE canonical_path = ?", (canonical_path,)
@@ -1158,7 +1165,7 @@ def reconcile_file_metadata(
 
     if source == "house":
         upsert_file_analysis(
-            conn, file_id, canonical_path, analysis=analysis, stat_result=stat
+            conn, file_id, physical_path, analysis=analysis, stat_result=stat
         )
     elif source == "temp":
         # ``[[...]]`` 제목 literal과 ``{{...}}`` 구조 힌트는 temp 운반
@@ -1167,7 +1174,7 @@ def reconcile_file_metadata(
         temp_analysis = analysis or build_file_analysis(Path(canonical_path).name)
         if temp_analysis.get("title_override_json"):
             upsert_file_analysis(
-                conn, file_id, canonical_path,
+                conn, file_id, physical_path,
                 analysis=temp_analysis, stat_result=stat,
             )
 
