@@ -20,9 +20,10 @@ from mutation_io import (
     mutation_lock,
     mutation_lock_for_roots,
     opened_directory_nofollow,
-    opened_regular_file_nofollow,
+    read_json_with_evidence,
     unlink_owned,
 )
+from normalizer import NORMALIZER_VERSION
 
 
 ACTION = "volume_group_merge"
@@ -130,7 +131,8 @@ def classify_folderling_volume_target(
     house_root = Path(house_root).resolve()
     source_row = conn.execute(
         """
-        SELECT f.*, fa.core_title, fa.readable_title, fa.author, fa.disambig,
+        SELECT f.*, fa.core_title, fa.readable_title, fa.catalog_query_title,
+               fa.title_override_json, fa.author, fa.disambig,
                fa.normalizer_version AS analysis_normalizer_version,
                fa.analyzed_name, fa.analyzed_size,
                fa.analyzed_mtime_ns, fa.analyzed_ctime_ns
@@ -164,7 +166,8 @@ def classify_folderling_volume_target(
         peers = []
         for row in conn.execute(
             """
-            SELECT f.*, fa.core_title, fa.readable_title, fa.author, fa.disambig,
+            SELECT f.*, fa.core_title, fa.readable_title, fa.catalog_query_title,
+                   fa.title_override_json, fa.author, fa.disambig,
                    fa.normalizer_version AS analysis_normalizer_version,
                    fa.analyzed_name, fa.analyzed_size,
                    fa.analyzed_mtime_ns, fa.analyzed_ctime_ns
@@ -224,24 +227,45 @@ def classify_folderling_volume_target(
             "batch_file_ids": [str(row["file_id"]) for row in peers],
         }
 
-    existing = [
-        decision_store.resolve_current_file_analysis(row)
-        for row in conn.execute(
-            """
-            SELECT f.*, fa.readable_title, fa.author, fa.disambig,
-                   fa.normalizer_version AS analysis_normalizer_version,
-                   fa.analyzed_name, fa.analyzed_size,
-                   fa.analyzed_mtime_ns, fa.analyzed_ctime_ns,
-                   v.work_bucket_id
-            FROM files AS f
-            JOIN file_analysis AS fa ON fa.file_id = f.file_id
-            LEFT JOIN variants AS v ON v.variant_id = f.variant_id
-            WHERE f.active = 1 AND f.source = 'house' AND fa.core_title = ?
-            ORDER BY f.canonical_path
-            """,
-            (source["core_title"],),
-        ).fetchall()
-    ]
+    candidate_rows = conn.execute(
+        """
+        SELECT f.*, fa.core_title, fa.readable_title, fa.catalog_query_title,
+               fa.title_override_json, fa.author, fa.disambig,
+               fa.normalizer_version AS analysis_normalizer_version,
+               fa.analyzed_name, fa.analyzed_size,
+               fa.analyzed_mtime_ns, fa.analyzed_ctime_ns,
+               v.work_bucket_id
+        FROM files AS f
+        JOIN file_analysis AS fa ON fa.file_id = f.file_id
+        LEFT JOIN variants AS v ON v.variant_id = f.variant_id
+        WHERE f.active = 1 AND f.source = 'house'
+          AND (
+              fa.core_title = ?
+              OR fa.normalizer_version != ?
+              OR fa.analyzed_size != f.size
+              OR fa.analyzed_mtime_ns != f.mtime_ns
+              OR (
+                  fa.analyzed_ctime_ns IS NOT NULL
+                  AND (f.ctime_ns IS NULL OR fa.analyzed_ctime_ns != f.ctime_ns)
+              )
+              OR length(f.canonical_path) <= length(fa.analyzed_name)
+              OR substr(f.canonical_path, -length(fa.analyzed_name)) != fa.analyzed_name
+              OR substr(
+                  f.canonical_path, -(length(fa.analyzed_name) + 1), 1
+              ) != '/'
+          )
+        ORDER BY f.canonical_path
+        """,
+        (source["core_title"], NORMALIZER_VERSION),
+    ).fetchall()
+    # Stored-core matches stay eligible while identity-stale rows are added so
+    # a rename or normalizer change cannot hide a newly matching work.  The
+    # shared resolver is the final authority in either direction.
+    existing = []
+    for row in candidate_rows:
+        resolved = decision_store.resolve_current_file_analysis(row)
+        if resolved.get("core_title") == source["core_title"]:
+            existing.append(resolved)
     if not existing:
         return classify_new_batch()
 
@@ -515,8 +539,32 @@ def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def cleanup_staging(records: Sequence[Mapping[str, object]], staging_root: Path) -> None:
-    """Remove only stage copies whose durable evidence still matches."""
+def cleanup_staging(
+    records: Sequence[Mapping[str, object]],
+    staging_root: Path,
+    *,
+    manifest_evidence=None,
+    expected_names: set[str] | None = None,
+) -> bool:
+    """Remove only stage copies whose bound evidence still matches.
+
+    Recovery callers pass the manifest evidence and complete directory entry
+    set they validated.  A drift is rejected before any known stage copy is
+    removed, and a case is successful only when its root is actually gone.
+    """
+
+    staging_root = Path(staging_root)
+    manifest = staging_root / "stage-manifest.json"
+    if expected_names is not None:
+        entries = _directory_entries_nofollow(staging_root)
+        if set(entries) != set(expected_names):
+            raise RuntimeError("volume staging case changed before cleanup")
+        if any(not stat.S_ISREG(entries[name]) for name in expected_names):
+            raise RuntimeError("volume staging case gained a non-regular entry")
+    if manifest_evidence is not None:
+        manifest_now = inspect_regular_file(manifest)
+        if not evidence_matches(manifest_now, manifest_evidence):
+            raise RuntimeError("volume staging manifest changed before cleanup")
 
     for record in reversed(list(records)):
         stage_path = Path(record["stage_path"])
@@ -525,13 +573,15 @@ def cleanup_staging(records: Sequence[Mapping[str, object]], staging_root: Path)
             unlink_owned(stage_path, expected=evidence)
         except FileNotFoundError:
             continue
-    manifest = Path(staging_root) / "stage-manifest.json"
-    try:
-        manifest_evidence = inspect_regular_file(manifest)
+    if manifest_evidence is None:
+        try:
+            current_manifest_evidence = inspect_regular_file(manifest)
+            unlink_owned(manifest, expected=current_manifest_evidence)
+        except FileNotFoundError:
+            pass
+    else:
         unlink_owned(manifest, expected=manifest_evidence)
-    except FileNotFoundError:
-        pass
-    current = Path(staging_root)
+    current = staging_root
     cleanup_boundary = next(
         (
             candidate
@@ -540,14 +590,17 @@ def cleanup_staging(records: Sequence[Mapping[str, object]], staging_root: Path)
         ),
         current,
     )
-    while current.name and current.exists():
+    while current.name and os.path.lexists(current):
         try:
-            current.rmdir()
+            removed = _remove_empty_directory_owned(current)
         except OSError:
+            break
+        if not removed:
             break
         if current == cleanup_boundary:
             break
         current = current.parent
+    return not os.path.lexists(staging_root)
 
 
 def _directory_entries_nofollow(path: Path) -> dict[str, int]:
@@ -558,26 +611,16 @@ def _directory_entries_nofollow(path: Path) -> dict[str, int]:
         }
 
 
-def _read_stage_manifest(path: Path) -> dict:
-    with opened_regular_file_nofollow(path) as fd:
-        size = os.fstat(fd).st_size
-        if size > _STAGE_MANIFEST_MAX_BYTES:
-            raise RuntimeError("volume staging manifest exceeds the size limit")
-        remaining = size
-        chunks = []
-        while remaining:
-            chunk = os.read(fd, min(remaining, 1024 * 1024))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
+def _read_stage_manifest(path: Path):
     try:
-        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        evidence, payload = read_json_with_evidence(
+            path, max_bytes=_STAGE_MANIFEST_MAX_BYTES
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("volume staging manifest is invalid JSON") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("volume staging manifest root is not an object")
-    return payload
+    return evidence, payload
 
 
 def _remove_empty_directory_owned(path: Path) -> bool:
@@ -605,7 +648,7 @@ def _recover_staging_case(case_root: Path, *, run_id: str) -> int:
     manifest_name = "stage-manifest.json"
     if entries.get(manifest_name) is None or not stat.S_ISREG(entries[manifest_name]):
         raise RuntimeError("volume staging case has no regular manifest")
-    payload = _read_stage_manifest(case_root / manifest_name)
+    manifest_evidence, payload = _read_stage_manifest(case_root / manifest_name)
     if payload.get("action") != ACTION or payload.get("run_id") != run_id:
         raise RuntimeError("volume staging manifest action/run does not match its path")
     files = payload.get("files")
@@ -641,7 +684,14 @@ def _recover_staging_case(case_root: Path, *, run_id: str) -> int:
         records.append({"stage_path": str(expected_path), "stage_evidence": evidence})
     if set(entries) != expected_names:
         raise RuntimeError("volume staging case contains an unexpected file")
-    cleanup_staging(records, case_root)
+    removed = cleanup_staging(
+        records,
+        case_root,
+        manifest_evidence=manifest_evidence,
+        expected_names=expected_names,
+    )
+    if not removed:
+        raise RuntimeError("volume staging case remained after cleanup")
     return len(records)
 
 
@@ -674,6 +724,9 @@ def recover_abandoned_volume_staging(
         try:
             for run_id, mode in sorted(run_entries.items()):
                 run_root = staging_root / run_id
+                run_issue_start = len(result["issues"])
+                run_recovered_cases = 0
+                run_recovered_files = 0
                 if not stat.S_ISDIR(mode):
                     result["issues"].append({
                         "path": str(run_root),
@@ -712,11 +765,17 @@ def recover_abandoned_volume_staging(
                     continue
                 if not case_entries:
                     try:
-                        _remove_empty_directory_owned(run_root)
+                        removed = _remove_empty_directory_owned(run_root)
                     except (OSError, RuntimeError) as exc:
                         result["issues"].append({
                             "path": str(run_root), "reason": str(exc)
                         })
+                    else:
+                        if not removed:
+                            result["issues"].append({
+                                "path": str(run_root),
+                                "reason": "empty staging run remained after cleanup",
+                            })
                     continue
                 for case_name, case_mode in sorted(case_entries.items()):
                     case_root = run_root / case_name
@@ -733,17 +792,41 @@ def recover_abandoned_volume_staging(
                             "path": str(case_root), "reason": str(exc)
                         })
                     else:
-                        result["recovered_case_count"] += 1
-                        result["recovered_file_count"] += recovered
+                        run_recovered_cases += 1
+                        run_recovered_files += recovered
+                try:
+                    run_removed = _remove_empty_directory_owned(run_root)
+                except (OSError, RuntimeError) as exc:
+                    result["issues"].append({
+                        "path": str(run_root), "reason": str(exc)
+                    })
+                else:
+                    if (
+                        not run_removed
+                        and len(result["issues"]) == run_issue_start
+                    ):
+                        result["issues"].append({
+                            "path": str(run_root),
+                            "reason": "staging run remained non-empty after recovery",
+                        })
+                if len(result["issues"]) == run_issue_start:
+                    result["recovered_case_count"] += run_recovered_cases
+                    result["recovered_file_count"] += run_recovered_files
         finally:
             conn.close()
         if not result["issues"]:
             try:
-                _remove_empty_directory_owned(staging_root)
+                staging_removed = _remove_empty_directory_owned(staging_root)
             except (OSError, RuntimeError) as exc:
                 result["issues"].append({
                     "path": str(staging_root), "reason": str(exc)
                 })
+            else:
+                if not staging_removed:
+                    result["issues"].append({
+                        "path": str(staging_root),
+                        "reason": "volume staging root remained non-empty after recovery",
+                    })
     return result
 
 

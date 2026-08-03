@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import struct
+import sys
 import tempfile
 import threading
 import unicodedata
@@ -329,10 +330,11 @@ def _canonical_absolute(path):
     # here would follow an attacker-replaced intermediate symlink before the
     # component-wise O_NOFOLLOW walk gets a chance to reject it.
     absolute_text = os.path.abspath(os.fspath(path))
-    if absolute_text == "/var" or absolute_text.startswith("/var/"):
-        absolute_text = "/private" + absolute_text
-    elif absolute_text == "/tmp" or absolute_text.startswith("/tmp/"):
-        absolute_text = "/private" + absolute_text
+    if sys.platform == "darwin":
+        if absolute_text == "/var" or absolute_text.startswith("/var/"):
+            absolute_text = "/private" + absolute_text
+        elif absolute_text == "/tmp" or absolute_text.startswith("/tmp/"):
+            absolute_text = "/private" + absolute_text
     return Path(absolute_text)
 
 
@@ -461,19 +463,23 @@ def inspect_regular_file_at(directory_fd: int, leaf: str) -> FileEvidence:
         os.close(fd)
 
 
-def read_json_with_evidence(path):
+def read_json_with_evidence(path, *, max_bytes: int | None = None):
     """Hash and parse JSON from the same pinned no-follow file descriptor."""
     parent_fd, fd, _ = _open_regular_nofollow(path)
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise RuntimeError(f"JSON evidence is not a regular file: {path}")
+        if max_bytes is not None and before.st_size > int(max_bytes):
+            raise RuntimeError(f"JSON evidence exceeds the size limit: {path}")
         raw = bytearray()
         digest = hashlib.sha256()
         while True:
             chunk = os.read(fd, 1024 * 1024)
             if not chunk:
                 break
+            if max_bytes is not None and len(raw) + len(chunk) > int(max_bytes):
+                raise RuntimeError(f"JSON evidence exceeds the size limit: {path}")
             digest.update(chunk)
             raw.extend(chunk)
         after = os.fstat(fd)

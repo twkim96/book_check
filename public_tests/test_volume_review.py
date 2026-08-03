@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -104,6 +105,71 @@ def test_current_file_analysis_does_not_reparse_every_listing_row(
     listing = list_volume_cases(state_db, house_dir=house, limit=50)
 
     assert listing["total"] == 5
+
+
+def test_stale_manual_title_override_remains_one_volume_work(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        rows = [
+            _add_file(conn, house / "ㅇ" / f"제 {number}권 부제.txt")
+            for number in (1, 2)
+        ]
+        override = json.dumps(
+            {
+                "title_literals": ["은하영웅전설"],
+                "structure_hints": ["제 N권"],
+            },
+            ensure_ascii=False,
+        )
+        with decision_store.transaction(conn):
+            conn.executemany(
+                "UPDATE file_analysis SET core_title = ?, readable_title = ?, "
+                "catalog_query_title = ?, title_override_json = ? WHERE file_id = ?",
+                [
+                    (
+                        "은하영웅전설",
+                        "은하영웅전설",
+                        "은하영웅전설",
+                        override,
+                        row["file_id"],
+                    )
+                    for row in rows
+                ],
+            )
+            conn.execute(
+                "UPDATE file_analysis SET author = '과거작가', "
+                "analyzed_mtime_ns = analyzed_mtime_ns - 1 WHERE file_id = ?",
+                (rows[0]["file_id"],),
+            )
+        stale = conn.execute(
+            """
+            SELECT f.*, fa.core_title, fa.readable_title, fa.catalog_query_title,
+                   fa.title_override_json, fa.author, fa.disambig,
+                   fa.normalizer_version AS analysis_normalizer_version,
+                   fa.analyzed_name, fa.analyzed_size,
+                   fa.analyzed_mtime_ns, fa.analyzed_ctime_ns
+            FROM files AS f JOIN file_analysis AS fa ON fa.file_id = f.file_id
+            WHERE f.file_id = ?
+            """,
+            (rows[0]["file_id"],),
+        ).fetchone()
+        resolved = decision_store.resolve_current_file_analysis(stale)
+    finally:
+        conn.close()
+
+    assert resolved["core_title"] == "은하영웅전설"
+    assert resolved["readable_title"] == "은하영웅전설"
+    assert resolved["catalog_query_title"] == "은하영웅전설"
+    assert resolved["title_override_json"] == override
+    assert resolved["author"] is None
+
+    listing = list_volume_cases(state_db, house_dir=house, limit=50)
+    [case] = listing["items"]
+    assert case["core_title"] == "은하영웅전설"
+    assert case["file_count"] == 2
 
 
 def test_parallel_complete_editions_are_not_series_cases(tmp_path):

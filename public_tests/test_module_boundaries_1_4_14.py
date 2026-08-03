@@ -17,6 +17,7 @@ EXTRACTED_MODULES = (
 
 
 def test_decision_store_preserves_the_public_compatibility_facade():
+    assert not hasattr(decision_store, "__all__")
     assert decision_store.SCHEMA_VERSION == state_schema.SCHEMA_VERSION == 15
     assert decision_store.connect_state_db is state_repository.connect_state_db
     assert decision_store.transaction is state_repository.transaction

@@ -90,47 +90,31 @@ def sync_contextual_bare_volume_metadata(conn, **kwargs):
     )
 
 
-# Compatibility facade: existing server, CLI, and tests keep importing these
-# names from decision_store while their single implementation lives in the
-# responsibility-specific modules above.
-__all__ = (
-    "ASSIGNMENT_STATES",
-    "CATALOG_SCHEMA_SQL",
-    "DEFAULT_BUSY_TIMEOUT_MS",
-    "FILE_ANALYSIS_SCHEMA_SQL",
-    "FINAL_VERDICTS",
-    "OPERATION_STATES",
-    "REQUIRED_TABLES",
-    "REQUIRED_VIEWS",
-    "REVIEW_STATES",
-    "SCHEMA_SQL",
-    "SCHEMA_VERSION",
-    "_connection_main_path",
-    "build_effective_file_analysis",
-    "build_file_analysis",
-    "canonical_rational",
-    "canonical_symbol",
-    "canonicalize_path",
-    "canonicalize_real_path",
-    "connect_state_db",
-    "connect_state_db_readonly",
-    "coordinate_fields_from_name",
-    "coordinate_sort_token",
-    "coordinates_compatible",
-    "file_analysis_snapshot_is_current",
-    "file_analysis_sync_status",
-    "initialize_state_db",
-    "migrate_catalog_title_keys",
-    "prune_file_analysis_projection",
-    "reconcile_file_metadata",
-    "resolve_current_file_analysis",
-    "retire_legacy_title_requeue_path_owners",
-    "retired_canonical_path",
-    "sync_active_file_analysis",
-    "sync_contextual_bare_volume_metadata",
-    "transaction",
-    "upsert_file_analysis",
-    "validate_schema",
+# Do not narrow legacy ``from decision_store import *`` behavior with
+# ``__all__``.  Existing callers may import the actual-run, journal, recovery,
+# and Doctor API that intentionally remains implemented in this facade.
+_COMPATIBILITY_FACADE_EXPORTS = (
+    ASSIGNMENT_STATES,
+    CATALOG_SCHEMA_SQL,
+    FILE_ANALYSIS_SCHEMA_SQL,
+    REQUIRED_TABLES,
+    REQUIRED_VIEWS,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
+    build_effective_file_analysis,
+    file_analysis_snapshot_is_current,
+    file_analysis_sync_status,
+    migrate_catalog_title_keys,
+    prune_file_analysis_projection,
+    reconcile_file_metadata,
+    resolve_current_file_analysis,
+    sync_active_file_analysis,
+    connect_state_db_readonly,
+    retire_legacy_title_requeue_path_owners,
+    canonical_rational,
+    canonical_symbol,
+    coordinate_sort_token,
+    coordinates_compatible,
 )
 
 

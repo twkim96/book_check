@@ -35,7 +35,7 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.14)
+## 동일 작품 자동 중복 정리 계약 (1.4.15)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
@@ -43,7 +43,7 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive,
 1.4.10의 archive/review 경합·경로 안전 보강, 1.4.11의 숫자 권 문맥 추론,
 1.4.12의 닫힌 좌표 보정·EPUB spine 동일성, 1.4.13의 legacy 실행 차단·분권 분석/복구,
-1.4.14의 상태 저장소 모듈 ownership 계약은
+1.4.14의 상태 저장소 모듈 ownership, 1.4.15의 플랫폼·stale override·staging recovery 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -57,7 +57,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.11.md`](update_1.4.11.md),
 [`update_1.4.12.md`](update_1.4.12.md),
 [`update_1.4.13.md`](update_1.4.13.md),
-[`update_1.4.14.md`](update_1.4.14.md)에 기록합니다.
+[`update_1.4.14.md`](update_1.4.14.md),
+[`update_1.4.15.md`](update_1.4.15.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -295,7 +296,7 @@ Scanner가 실제 관측 시각의 소유자이며 warm auditor는 변하지 않
   `-2회차-작품명`처럼 제목 숫자와 뒤 좌표가 우연히 이어진 경우에는 실제 뒤쪽 좌표에서 자릅니다.
 
 이 절의 접두사 보정 당시 Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.2`와 같은 단일 파일
-분석 결과를 사용했습니다. 현재 1.4.14는 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
+분석 결과를 사용했습니다. 현재 1.4.15는 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
 해당 변경은 파일명·`core_title` 의미만 바꿉니다. TXT/EPUB 본문 fingerprint 의미는 바뀌지 않았으므로
 `FINGERPRINT_NORMALIZER_COMPAT_VERSION`과 `PAIR_NORMALIZER_COMPAT_VERSION`은 `1.3.0`에 고정하고,
 1.4.2 fingerprint/pair policy hash를 유지합니다. 제목 parser 버전 상승만으로 house 본문 전체를 다시
@@ -591,6 +592,31 @@ version/policy `5`/`1.4.2`, pair policy `1.4.12`를 유지합니다. 따라서 �
 
 배포/auditor/UI는 `1.4.14`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
 version/policy `5`/`1.4.2`, pair policy `1.4.12`, archive `1.4.10`을 유지합니다. 따라서 DB migration,
+fingerprint/pair cache 재기준, house 전체 재분석은 발생하지 않습니다.
+
+### 플랫폼·stale override·staging recovery 계약 (1.4.15)
+
+1.4.15는 1.4.13·1.4.14 후속 리뷰에서 재현된 세 안전 결함을 좁게 보정합니다.
+
+- `/tmp`와 `/var`의 `/private` 별칭 접기는 Darwin에서만 수행합니다. Linux의 `/tmp`, `/var`는
+  원래 절대 경로를 유지해 Ubuntu CI와 Linux mutation 경로가 존재하지 않는 `/private`를 열지 않습니다.
+- 파일 분석 identity가 stale이어도 명시적인 `title_override_json`이 있으면 저장된 core/readable/catalog
+  제목은 보존합니다. author와 권·회차 좌표는 현재 파일명에서 다시 계산하므로 과거 작가 보존 정책과
+  제목 override 정책을 섞지 않습니다.
+- 분권 후보 조회는 현재 저장 core 일치 행뿐 아니라 stale identity 행도 공용 resolver로 재판정하고,
+  resolver 결과 core가 실제로 일치하는 행만 자동 라우팅에 사용합니다.
+- abandoned staging 복구는 같은 no-follow FD에서 읽은 manifest evidence를 cleanup에 전달합니다.
+  manifest·stage identity, 전체 디렉터리 entry 집합, case/run/root 제거 완료 중 하나라도 달라지면
+  recovered 성공으로 세지 않고 issue를 남겨 다음 actual run을 차단합니다.
+
+`backend.*` package import는 공식 실행 계약에 추가하지 않습니다. 현재 실행기는 `backend/`를 하나의
+top-level application module 경로로 공유합니다. package import를 별도 지원하면 `decision_store`의
+process-local lock·receipt·recovery registry가 두 module identity로 갈릴 수 있으므로, 별도 loader
+설계 없이 상대 import만 추가하는 수정은 더 위험합니다. 다만 1.4.14에서 추가한 제한적 `__all__`은
+제거해 기존 top-level star import의 actual-run·journal·recovery·Doctor export 범위를 복원합니다.
+
+배포/auditor/UI는 `1.4.15`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
+version/policy `5`/`1.4.2`, pair policy `1.4.12`, archive `1.4.10`을 유지합니다. DB migration,
 fingerprint/pair cache 재기준, house 전체 재분석은 발생하지 않습니다.
 
 ## 구조

@@ -1,8 +1,10 @@
+import os
 from pathlib import Path
 
 import pytest
 
 import decision_store
+import volume_group_mutations
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from mutation_io import inspect_regular_file
 from volume_group_mutations import (
@@ -53,6 +55,132 @@ def _active_run(state_db, house, temp):
     finally:
         conn.close()
     return decision_store.prepare_actual_run(state_db, house, temp)[0]
+
+
+def _terminal_staging_case(tmp_path, case_name):
+    state_db, house, temp, rows = _fixture(
+        tmp_path,
+        ["ㅂ/별빛 연대기 1권.txt", "ㅂ/별빛 연대기 2권.txt"],
+    )
+    run_id = _active_run(state_db, house, temp)
+    staging_root = temp / ".volume_group_staging" / run_id / case_name
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        staged = stage_volume_sources(
+            conn,
+            file_ids=[row["file_id"] for row in rows],
+            staging_root=staging_root,
+            run_id=run_id,
+        )
+        decision_store.finish_actual_run(conn, run_id, success=False)
+    finally:
+        conn.close()
+    return state_db, house, temp, staging_root, staged
+
+
+def test_abandoned_staging_rejects_manifest_path_replacement(tmp_path, monkeypatch):
+    state_db, house, temp, staging_root, staged = _terminal_staging_case(
+        tmp_path, "manifest-replaced"
+    )
+    original_read = volume_group_mutations._read_stage_manifest
+
+    def replace_after_read(path):
+        evidence, payload = original_read(path)
+        replacement = Path(path).with_name("manifest-replacement.tmp")
+        replacement.write_bytes(Path(path).read_bytes())
+        os.replace(replacement, path)
+        return evidence, payload
+
+    monkeypatch.setattr(
+        volume_group_mutations, "_read_stage_manifest", replace_after_read
+    )
+
+    result = recover_abandoned_volume_staging(
+        state_db, house_root=house, temp_root=temp
+    )
+
+    assert result["recovered_case_count"] == 0
+    assert result["recovered_file_count"] == 0
+    assert any("manifest changed" in item["reason"] for item in result["issues"])
+    assert (staging_root / "stage-manifest.json").is_file()
+    assert all(Path(item["stage_path"]).is_file() for item in staged)
+
+
+def test_abandoned_staging_rejects_late_unexpected_file(tmp_path, monkeypatch):
+    state_db, house, temp, staging_root, staged = _terminal_staging_case(
+        tmp_path, "late-entry"
+    )
+    original_cleanup = volume_group_mutations.cleanup_staging
+
+    def inject_before_cleanup(records, root, **kwargs):
+        (Path(root) / "late.bin").write_bytes(b"late")
+        return original_cleanup(records, root, **kwargs)
+
+    monkeypatch.setattr(
+        volume_group_mutations, "cleanup_staging", inject_before_cleanup
+    )
+
+    result = recover_abandoned_volume_staging(
+        state_db, house_root=house, temp_root=temp
+    )
+
+    assert result["recovered_case_count"] == 0
+    assert result["recovered_file_count"] == 0
+    assert any("changed before cleanup" in item["reason"] for item in result["issues"])
+    assert (staging_root / "late.bin").read_bytes() == b"late"
+    assert (staging_root / "stage-manifest.json").is_file()
+    assert all(Path(item["stage_path"]).is_file() for item in staged)
+
+
+def test_abandoned_staging_rejects_stage_file_drift(tmp_path, monkeypatch):
+    state_db, house, temp, staging_root, staged = _terminal_staging_case(
+        tmp_path, "stage-drift"
+    )
+    original_cleanup = volume_group_mutations.cleanup_staging
+
+    def mutate_before_cleanup(records, root, **kwargs):
+        Path(records[-1]["stage_path"]).write_bytes(b"changed")
+        return original_cleanup(records, root, **kwargs)
+
+    monkeypatch.setattr(
+        volume_group_mutations, "cleanup_staging", mutate_before_cleanup
+    )
+
+    result = recover_abandoned_volume_staging(
+        state_db, house_root=house, temp_root=temp
+    )
+
+    assert result["recovered_case_count"] == 0
+    assert result["recovered_file_count"] == 0
+    assert result["issues"]
+    assert (staging_root / "stage-manifest.json").is_file()
+    assert all(Path(item["stage_path"]).is_file() for item in staged)
+
+
+def test_abandoned_staging_does_not_count_unremoved_case(tmp_path, monkeypatch):
+    state_db, house, temp, staging_root, _staged = _terminal_staging_case(
+        tmp_path, "rmdir-failed"
+    )
+    original_remove = volume_group_mutations._remove_empty_directory_owned
+
+    def refuse_case_root(path):
+        if Path(path) == staging_root:
+            return False
+        return original_remove(path)
+
+    monkeypatch.setattr(
+        volume_group_mutations, "_remove_empty_directory_owned", refuse_case_root
+    )
+
+    result = recover_abandoned_volume_staging(
+        state_db, house_root=house, temp_root=temp
+    )
+
+    assert result["recovered_case_count"] == 0
+    assert result["recovered_file_count"] == 0
+    assert any("remained after cleanup" in item["reason"] for item in result["issues"])
+    assert staging_root.is_dir()
+    assert list(staging_root.iterdir()) == []
 
 
 def test_abandoned_volume_staging_is_removed_only_after_full_evidence_check(tmp_path):

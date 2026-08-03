@@ -103,17 +103,24 @@ def file_analysis_snapshot_is_current(row: Mapping[str, object]) -> bool:
 def resolve_current_file_analysis(
     row: Mapping[str, object], *, analysis_name: Optional[str] = None
 ) -> dict:
-    """Use current stored metadata, otherwise return a fresh in-memory analysis."""
+    """Resolve current metadata while retaining explicit title overrides.
+
+    A stale filename identity invalidates parser-derived author and coordinate
+    fields, but not a human-confirmed title override.  Keeping those policies
+    separate prevents ``제 N권``-style works from losing their work identity
+    after an mtime or normalizer change.
+    """
     item = dict(row)
     if file_analysis_snapshot_is_current(item):
         return item
     name = analysis_name or Path(str(item.get("canonical_path") or "")).name
-    fresh = build_file_analysis(name)
+    effective = _effective_file_analysis(item, build_file_analysis(name))
     item.update({
-        key: fresh[key]
+        key: effective[key]
         for key in (
-            "core_title", "readable_title", "author", "max_number",
-            "effective_max", "unit", "complete", "disambig",
+            "core_title", "readable_title", "catalog_query_title",
+            "title_override_json", "author", "max_number", "effective_max",
+            "unit", "complete", "disambig",
         )
     })
     item.update(coordinate_fields_from_name(name))
@@ -126,12 +133,13 @@ def _effective_file_analysis(current, analysis: dict) -> dict:
     effective = dict(analysis)
     if effective.get("title_override_json"):
         return effective
-    if current is not None and current["title_override_json"]:
+    current_item = dict(current) if current is not None else {}
+    if current_item.get("title_override_json"):
         effective.update({
-            "core_title": current["core_title"],
-            "readable_title": current["readable_title"],
-            "catalog_query_title": current["catalog_query_title"],
-            "title_override_json": current["title_override_json"],
+            "core_title": current_item["core_title"],
+            "readable_title": current_item["readable_title"],
+            "catalog_query_title": current_item["catalog_query_title"],
+            "title_override_json": current_item["title_override_json"],
         })
     return effective
 

@@ -232,6 +232,7 @@ def _load_volume_rows(state_db: Path) -> list[Mapping[str, object]]:
                    f.coordinate_sort_key, f.coordinate_raw, f.span_ambiguous,
                    f.episode_start, f.episode_end,
                    fa.analyzed_name, fa.core_title, fa.readable_title,
+                   fa.catalog_query_title, fa.title_override_json,
                    fa.author, fa.disambig, fa.effective_max, fa.unit,
                    fa.complete, fa.updated_at AS analysis_updated_at,
                    fa.normalizer_version AS analysis_normalizer_version,
