@@ -69,6 +69,35 @@ QUEUEABLE = {
     "ordered_body_match", "ordered_body_review",
 }
 EXACT_EQUIVALENT = {"text_equivalent", "epub_equivalent"}
+EPUB_SPINE_TEXT_MIN_CHARS = 50_000
+
+
+def _spine_evidence_allows_coordinate_override(classification, evidence):
+    """Allow only the strongest EPUB proof to bridge filename coordinate syntax.
+
+    The auditor has already required the same declared edition before emitting
+    this evidence, and the mutation path recalculates it immediately before the
+    move.  Keeping the exception here means ordinary text/metadata relations
+    retain the global fail-closed coordinate boundary.
+    """
+    if classification != "epub_equivalent" or not isinstance(evidence, dict):
+        return False
+    if evidence.get("epub_equivalence_mode") != "spine_text":
+        return False
+    left_hash = evidence.get("left_spine_text_sha256")
+    right_hash = evidence.get("right_spine_text_sha256")
+    if not left_hash or left_hash != right_hash:
+        return False
+    try:
+        left_chars = int(evidence.get("left_spine_text_chars", 0))
+        right_chars = int(evidence.get("right_spine_text_chars", 0))
+    except (TypeError, ValueError):
+        return False
+    return (
+        left_chars >= EPUB_SPINE_TEXT_MIN_CHARS
+        and right_chars >= EPUB_SPINE_TEXT_MIN_CHARS
+        and bool(evidence.get("epub_identifier_overlap"))
+    )
 
 
 def _managed_identity_compatible(left, right):
@@ -151,7 +180,7 @@ def _materialize_component_rebound_reviews(conn, plans):
         else:
             evidence = dict(plan.get("review_evidence") or {})
             evidence["strong_component_rebind"] = {
-                "version": "1.4.10",
+                "version": "1.4.12",
                 "source_review_id": plan["source_review_id"],
                 "source_pair_file_ids": list(plan["source_pair_file_ids"]),
                 "final_pair_file_ids": [
@@ -211,6 +240,12 @@ def build_plan(conn, scope="queueable", review_ids=None):
         if right_row is None:
             continue
         right = dict(right_row)
+        try:
+            review_evidence = json.loads(row["review_evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            review_evidence = {
+                "previous_evidence": row["review_evidence_json"],
+            }
         if row["source"] != "house" or right["source"] != "house":
             continue
         if not row["active"] or not right["active"]:
@@ -222,17 +257,16 @@ def build_plan(conn, scope="queueable", review_ids=None):
             continue
         if not _managed_identity_compatible(row, right):
             continue
-        if not decision_store.coordinates_compatible(row, right):
+        if (
+            not decision_store.coordinates_compatible(row, right)
+            and not _spine_evidence_allows_coordinate_override(
+                row["classification"], review_evidence
+            )
+        ):
             continue
         left_entry, right_entry = _entry(row), _entry(right)
         files[left_entry["file_id"]] = left_entry
         files[right_entry["file_id"]] = right_entry
-        try:
-            review_evidence = json.loads(row["review_evidence_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            review_evidence = {
-                "previous_evidence": row["review_evidence_json"],
-            }
         edge = {
             "review_id": row["review_id"],
             "classification": row["classification"],

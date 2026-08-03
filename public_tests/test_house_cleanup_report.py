@@ -97,6 +97,20 @@ def _house_review_graph(tmp_path, names, relations):
     }
 
 
+def _set_mismatched_volume_coordinates(conn, left_file_id, right_file_id):
+    with decision_store.transaction(conn):
+        conn.execute(
+            "UPDATE files SET coordinate_kind='episode', episode_start=8, "
+            "episode_end=8, volume_num=NULL, volume_den=NULL WHERE file_id=?",
+            (left_file_id,),
+        )
+        conn.execute(
+            "UPDATE files SET coordinate_kind='volume', episode_start=NULL, "
+            "episode_end=NULL, volume_num=8, volume_den=1 WHERE file_id=?",
+            (right_file_id,),
+        )
+
+
 def test_exact_plan_preserves_protected_representative_and_review_evidence(tmp_path):
     fixture = _protected_exact_pair(tmp_path)
     try:
@@ -130,6 +144,88 @@ def test_all_pending_cannot_cross_explicit_sibling_volume_coordinates(tmp_path):
         assert run_house_cleanup_once.build_plan(
             fixture["conn"], scope="all-pending"
         ) == []
+    finally:
+        fixture["conn"].close()
+
+
+def test_spine_exact_epub_can_bridge_filename_coordinate_syntax_only_with_full_evidence(
+    tmp_path,
+):
+    fixture = _house_review_graph(
+        tmp_path,
+        {
+            "좌표 표기 작품 8 완결.txt": "동일 본문",
+            "좌표 표기 작품 8권.txt": "동일 본문",
+        },
+        [("좌표 표기 작품 8 완결.txt", "좌표 표기 작품 8권.txt", "epub_equivalent")],
+    )
+    evidence = {
+        "epub_equivalence_mode": "spine_text",
+        "epub_identifier_overlap": ["urn:uuid:same-edition"],
+        "left_spine_text_chars": 120_000,
+        "right_spine_text_chars": 120_000,
+        "left_spine_text_sha256": "same-spine-hash",
+        "right_spine_text_sha256": "same-spine-hash",
+    }
+    rows = list(fixture["rows"].values())
+    _set_mismatched_volume_coordinates(
+        fixture["conn"], rows[0]["file_id"], rows[1]["file_id"]
+    )
+    with decision_store.transaction(fixture["conn"]):
+        fixture["conn"].execute(
+            "UPDATE review_items SET evidence_json=? WHERE review_id=?",
+            (json.dumps(evidence), fixture["review_ids"][0]),
+        )
+    rows = fixture["conn"].execute(
+        "SELECT * FROM files WHERE file_id IN (?, ?) ORDER BY file_id",
+        (rows[0]["file_id"], rows[1]["file_id"]),
+    ).fetchall()
+    assert not decision_store.coordinates_compatible(rows[0], rows[1])
+    try:
+        plans = run_house_cleanup_once.build_plan(fixture["conn"])
+    finally:
+        fixture["conn"].close()
+
+    assert len(plans) == 1
+    assert plans[0]["classification"] == "epub_equivalent"
+
+
+@pytest.mark.parametrize(
+    "evidence_patch",
+    [
+        {"epub_identifier_overlap": []},
+        {"left_spine_text_chars": 49_999},
+        {"right_spine_text_sha256": "different-spine-hash"},
+    ],
+)
+def test_spine_coordinate_override_fails_closed_when_proof_is_incomplete(
+    tmp_path, evidence_patch,
+):
+    fixture = _house_review_graph(
+        tmp_path,
+        {"좌표 안전선 8 완결.txt": "A", "좌표 안전선 8권.txt": "A"},
+        [("좌표 안전선 8 완결.txt", "좌표 안전선 8권.txt", "epub_equivalent")],
+    )
+    evidence = {
+        "epub_equivalence_mode": "spine_text",
+        "epub_identifier_overlap": ["urn:uuid:same-edition"],
+        "left_spine_text_chars": 120_000,
+        "right_spine_text_chars": 120_000,
+        "left_spine_text_sha256": "same-spine-hash",
+        "right_spine_text_sha256": "same-spine-hash",
+        **evidence_patch,
+    }
+    rows = list(fixture["rows"].values())
+    _set_mismatched_volume_coordinates(
+        fixture["conn"], rows[0]["file_id"], rows[1]["file_id"]
+    )
+    with decision_store.transaction(fixture["conn"]):
+        fixture["conn"].execute(
+            "UPDATE review_items SET evidence_json=? WHERE review_id=?",
+            (json.dumps(evidence), fixture["review_ids"][0]),
+        )
+    try:
+        assert run_house_cleanup_once.build_plan(fixture["conn"]) == []
     finally:
         fixture["conn"].close()
 

@@ -419,8 +419,8 @@ def build_plan(conn, delete_list, extra_plan):
             rows, all_index, item, "keep", "explicit keep selector"
         )
         blocked_reason = None
-        if delete["source"] != "house":
-            blocked_reason = "explicit_delete_source_not_house"
+        if delete["source"] not in {"house", "queue"}:
+            blocked_reason = "explicit_delete_source_not_house_or_queue"
         elif keep["source"] != "house":
             blocked_reason = "explicit_keep_source_not_house"
         approval_required = not item.get("blocked", False) and blocked_reason is None

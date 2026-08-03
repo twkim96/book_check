@@ -2,8 +2,12 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
 import {
   BUILTIN_APPEARANCE_PRESETS,
+  type AppearancePreset,
   type AppearanceSettings,
+  createCustomAppearancePreset,
+  deleteCustomAppearancePreset,
   fetchAppearanceSettings,
+  fetchCustomAppearancePresets,
   readAppearanceSettings,
   resetAppearanceSettings,
   saveAppearanceSettings
@@ -24,6 +28,9 @@ export function SettingsPage() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [customPresets, setCustomPresets] = useState<AppearancePreset[]>([]);
+  const [presetName, setPresetName] = useState("");
+  const [deletingPresetId, setDeletingPresetId] = useState("");
   const dirty = useMemo(() => JSON.stringify(saved) !== JSON.stringify(draft), [saved, draft]);
 
   useEffect(() => {
@@ -32,6 +39,9 @@ export function SettingsPage() {
       if (cancelled || !response.persisted) return;
       setSaved(response.settings);
       setDraft(response.settings);
+    }).catch(() => undefined);
+    fetchCustomAppearancePresets().then((response) => {
+      if (!cancelled) setCustomPresets(response.presets);
     }).catch(() => undefined);
     return () => { cancelled = true; };
   }, []);
@@ -72,6 +82,45 @@ export function SettingsPage() {
     }
   };
 
+  const addPreset = async (event: FormEvent) => {
+    event.preventDefault();
+    const name = presetName.trim();
+    if (!name) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await createCustomAppearancePreset(name, draft);
+      setCustomPresets(result.presets);
+      setPresetName("");
+      setNotice(`사용자 프리셋 '${name}'을 저장했습니다.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "사용자 프리셋을 저장하지 못했습니다.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removePreset = async (preset: AppearancePreset) => {
+    setBusy(true);
+    setDeletingPresetId(preset.id);
+    setError("");
+    try {
+      const result = await deleteCustomAppearancePreset(preset.id);
+      setCustomPresets(result.presets);
+      setNotice(`사용자 프리셋 '${preset.name}'을 삭제했습니다.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "사용자 프리셋을 삭제하지 못했습니다.");
+    } finally {
+      setDeletingPresetId("");
+      setBusy(false);
+    }
+  };
+
+  const choosePreset = (settings: AppearanceSettings) => {
+    setDraft({ ...settings });
+    setNotice("");
+  };
+
   return <>
     <header className="page-header">
       <div><span className="eyebrow">SETTINGS · APPEARANCE</span><h1>화면 색상 설정</h1><p>컨트롤서버와 같은 3색 구조입니다. 배경·글자·포인트를 정하면 패널과 테두리 등 나머지 색상은 자동으로 계산됩니다.</p></div>
@@ -97,19 +146,36 @@ export function SettingsPage() {
         </footer>
       </form>
       <section className="panel preset-panel">
-        <div className="panel-title"><div><span className="eyebrow">PRESETS</span><h2>빠른 테마</h2></div></div>
-        <p>프리셋을 선택한 뒤 왼쪽에서 세부 색상을 조정하고 저장할 수 있습니다.</p>
+        <div className="panel-title"><div><span className="eyebrow">PRESETS</span><h2>빠른 테마</h2></div><span>사용자 {customPresets.length}/24</span></div>
+        <p>프리셋을 선택한 뒤 왼쪽에서 세부 색상을 조정하고 저장할 수 있습니다. 현재 편집 중인 세 색상은 이름을 붙여 사용자 프리셋으로 보관할 수 있습니다.</p>
+        <form className="appearance-preset-create" onSubmit={addPreset}>
+          <label htmlFor="appearance-preset-name">새 프리셋 이름</label>
+          <div><input id="appearance-preset-name" value={presetName} maxLength={40} placeholder="예: 밝은 그린" onChange={(event) => setPresetName(event.target.value)} />
+            <button className="button primary" disabled={busy || !presetName.trim() || customPresets.length >= 24}>추가</button></div>
+          <small>왼쪽 미리보기의 배경·글자·포인트 색을 저장합니다.</small>
+        </form>
         <div className="appearance-presets">
-          {BUILTIN_APPEARANCE_PRESETS.map((preset) => <button type="button" key={preset.name} onClick={() => { setDraft(preset.settings); setNotice(""); }}>
-            <span className="preset-swatches"><i style={{ background: preset.settings.backgroundColor }} /><i style={{ background: preset.settings.textColor }} /><i style={{ background: preset.settings.accentColor }} /></span>
-            <strong>{preset.name}</strong>
-            <small>{preset.settings.backgroundColor} · {preset.settings.accentColor}</small>
-          </button>)}
+          {BUILTIN_APPEARANCE_PRESETS.map((preset) => <div className="appearance-preset-row" key={`builtin-${preset.name}`}>
+            <PresetChoice name={preset.name} settings={preset.settings} choose={() => choosePreset(preset.settings)} />
+            <span className="appearance-preset-kind">내장</span>
+          </div>)}
+          {customPresets.map((preset) => <div className="appearance-preset-row" key={preset.id}>
+            <PresetChoice name={preset.name} settings={preset.settings} choose={() => choosePreset(preset.settings)} />
+            <button type="button" className="appearance-preset-delete" disabled={busy} onClick={() => void removePreset(preset)}>{deletingPresetId === preset.id ? "삭제 중…" : "삭제"}</button>
+          </div>)}
         </div>
-        <small className="settings-storage-note">저장값은 서버의 <code>.dedup_state/library-server/appearance.json</code>과 현재 브라우저에 함께 보관됩니다.</small>
+        <small className="settings-storage-note">현재 색상과 사용자 프리셋은 서버의 <code>.dedup_state/library-server/</code>와 현재 브라우저에 함께 보관됩니다. 내장 프리셋은 삭제되지 않습니다.</small>
       </section>
     </section>
   </>;
+}
+
+function PresetChoice({ name, settings, choose }: { name: string; settings: AppearanceSettings; choose: () => void }) {
+  return <button type="button" className="appearance-preset-choice" onClick={choose}>
+    <span className="preset-swatches"><i style={{ background: settings.backgroundColor }} /><i style={{ background: settings.textColor }} /><i style={{ background: settings.accentColor }} /></span>
+    <strong>{name}</strong>
+    <small>{settings.backgroundColor} · {settings.accentColor}</small>
+  </button>;
 }
 
 function ThemePreview({ settings }: { settings: AppearanceSettings }) {
@@ -151,8 +217,8 @@ function HexColorInput({ value, onChange, label }: { value: string; onChange: (v
 
 function contrastText(hex: string): string {
   const value = hex.replace("#", "");
-  const r = Number.parseInt(value.slice(0, 2), 16);
-  const g = Number.parseInt(value.slice(2, 4), 16);
-  const b = Number.parseInt(value.slice(4, 6), 16);
-  return r * 0.299 + g * 0.587 + b * 0.114 > 160 ? "#0a0c10" : "#ffffff";
+  const channels = [0, 2, 4].map((offset) => Number.parseInt(value.slice(offset, offset + 2), 16) / 255)
+    .map((channel) => channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+  const relativeLuminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+  return relativeLuminance > 0.179 ? "#0a0c10" : "#ffffff";
 }

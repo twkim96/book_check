@@ -88,8 +88,12 @@ def test_auditor_keeps_distinct_epub_volumes_out_of_human_review(tmp_path):
 
     report = duplicate_auditor.run_audit(args)
 
-    assert report.results[0]["classification"] == "metadata_only"
-    assert report.stats["distinct_volume_reviews_suppressed"] == 1
+    # 1.4.11 inventory context promotes the bare 05/09 suffixes to explicit
+    # sibling volume coordinates before candidate generation. They no longer
+    # need a metadata-only noise pair merely to suppress human review.
+    assert report.results == []
+    assert report.stats["candidate_pairs"] == 0
+    assert report.stats["distinct_volume_reviews_suppressed"] == 0
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
         assert conn.execute("SELECT COUNT(*) FROM review_items").fetchone()[0] == 0
@@ -192,6 +196,11 @@ def test_cleanup_supersedes_existing_noise_after_backup_without_moving_files(
         "different_core_titles",
         lambda _left, _right: False,
     )
+    monkeypatch.setattr(
+        duplicate_auditor,
+        "_different_explicit_volumes",
+        lambda _left, _right: False,
+    )
     duplicate_auditor.run_audit(args)
     before = {
         path.name: path.read_bytes()
@@ -242,6 +251,11 @@ def test_review_queue_merges_database_relation_with_its_physical_queue_file(
     monkeypatch.setattr(
         duplicate_auditor,
         "different_core_titles",
+        lambda _left, _right: False,
+    )
+    monkeypatch.setattr(
+        duplicate_auditor,
+        "_different_explicit_volumes",
         lambda _left, _right: False,
     )
     duplicate_auditor.run_audit(args)

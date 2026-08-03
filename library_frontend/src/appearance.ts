@@ -11,6 +11,21 @@ export interface AppearanceResponse {
   persisted: boolean;
 }
 
+export interface AppearancePreset {
+  id: string;
+  name: string;
+  settings: AppearanceSettings;
+}
+
+export interface AppearancePresetsResponse {
+  presets: AppearancePreset[];
+  persisted: boolean;
+}
+
+interface AppearancePresetMutationResponse extends AppearancePresetsResponse {
+  preset?: AppearancePreset;
+}
+
 export const DEFAULT_APPEARANCE_SETTINGS: AppearanceSettings = {
   backgroundColor: "#0a0c10",
   textColor: "#edf1f7",
@@ -26,7 +41,9 @@ export const BUILTIN_APPEARANCE_PRESETS: Array<{ name: string; settings: Appeara
 ];
 
 const STORAGE_KEY = "file-check.library.appearance";
+const PRESET_STORAGE_KEY = "file-check.library.appearance-presets";
 const HEX_COLOR_RE = /^#[0-9a-f]{6}$/i;
+const PRESET_ID_RE = /^[0-9a-f]{32}$/;
 
 export function readAppearanceSettings(): AppearanceSettings {
   if (typeof window === "undefined") return DEFAULT_APPEARANCE_SETTINGS;
@@ -41,6 +58,17 @@ export function readAppearanceSettings(): AppearanceSettings {
 
 export function hasStoredAppearanceSettings(): boolean {
   return typeof window !== "undefined" && window.localStorage.getItem(STORAGE_KEY) !== null;
+}
+
+export function readCustomAppearancePresets(): AppearancePreset[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PRESET_STORAGE_KEY);
+    if (!raw) return [];
+    return normalizeAppearancePresets(JSON.parse(raw));
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchAppearanceSettings(): Promise<AppearanceResponse> {
@@ -73,6 +101,35 @@ export async function resetAppearanceSettings(): Promise<AppearanceSettings> {
   return saved;
 }
 
+export async function fetchCustomAppearancePresets(): Promise<AppearancePresetsResponse> {
+  const response = await api<AppearancePresetsResponse>("/api/settings/appearance/presets");
+  const presets = normalizeAppearancePresets(response.presets);
+  if (response.persisted || !hasStoredAppearancePresets()) {
+    storeAppearancePresets(presets);
+    return { presets, persisted: response.persisted };
+  }
+  return { presets: readCustomAppearancePresets(), persisted: false };
+}
+
+export async function createCustomAppearancePreset(name: string, settings: AppearanceSettings): Promise<AppearancePresetsResponse> {
+  const response = await api<AppearancePresetMutationResponse>("/api/settings/appearance/presets", {
+    method: "POST",
+    body: JSON.stringify({ preset: { name: name.trim(), settings: normalizeAppearanceSettings(settings) } })
+  });
+  const presets = normalizeAppearancePresets(response.presets);
+  storeAppearancePresets(presets);
+  return { presets, persisted: response.persisted };
+}
+
+export async function deleteCustomAppearancePreset(presetId: string): Promise<AppearancePresetsResponse> {
+  const response = await api<AppearancePresetMutationResponse>(`/api/settings/appearance/presets/${encodeURIComponent(presetId)}`, {
+    method: "DELETE"
+  });
+  const presets = normalizeAppearancePresets(response.presets);
+  storeAppearancePresets(presets);
+  return { presets, persisted: response.persisted };
+}
+
 export function applyAppearanceSettings(settings: AppearanceSettings): void {
   if (typeof document === "undefined") return;
   const variables = buildCssVariables(normalizeAppearanceSettings(settings));
@@ -103,6 +160,37 @@ function storeAndApply(settings: AppearanceSettings): void {
   applyAppearanceSettings(normalized);
 }
 
+function hasStoredAppearancePresets(): boolean {
+  return typeof window !== "undefined" && window.localStorage.getItem(PRESET_STORAGE_KEY) !== null;
+}
+
+function storeAppearancePresets(presets: AppearancePreset[]): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets));
+  }
+}
+
+function normalizeAppearancePresets(value: unknown): AppearancePreset[] {
+  if (!Array.isArray(value)) return [];
+  const presets: AppearancePreset[] = [];
+  const names = new Set<string>();
+  const ids = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const candidate = item as Partial<AppearancePreset>;
+    const id = typeof candidate.id === "string" ? candidate.id : "";
+    const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+    if (!PRESET_ID_RE.test(id) || !name || name.length > 40 || !candidate.settings) continue;
+    const foldedName = name.toLocaleLowerCase();
+    if (ids.has(id) || names.has(foldedName)) continue;
+    ids.add(id);
+    names.add(foldedName);
+    presets.push({ id, name, settings: normalizeAppearanceSettings(candidate.settings) });
+    if (presets.length >= 24) break;
+  }
+  return presets;
+}
+
 type Rgb = { r: number; g: number; b: number };
 
 function buildCssVariables(settings: AppearanceSettings): Record<string, string> {
@@ -123,10 +211,14 @@ function buildCssVariables(settings: AppearanceSettings): Record<string, string>
     "--line": rgbToHex(mix(background, surfaceTarget, 0.18)),
     "--line-strong": rgbToHex(mix(background, surfaceTarget, 0.27)),
     "--text": settings.textColor,
-    "--muted": rgbToHex(mix(text, background, 0.55)),
+    // Keep secondary copy visibly quieter without letting it fade below a
+    // readable contrast on user-defined light backgrounds.
+    "--muted": rgbToHex(mix(text, background, 0.36)),
     "--blue": rgbToHex(accentLight),
     "--blue-2": settings.accentColor,
-    "--accent-on": luminance(accent) > 0.5 ? "#0a0c10" : "#ffffff",
+    // Pick the higher-contrast foreground.  The former 0.5 threshold left
+    // medium green/blue accents with low-contrast white labels in light themes.
+    "--accent-on": luminance(accent) > 0.179 ? "#0a0c10" : "#ffffff",
     "--accent-soft": `rgba(${accent.r}, ${accent.g}, ${accent.b}, .18)`,
     "--accent-shadow": `rgba(${accent.r}, ${accent.g}, ${accent.b}, .26)`,
     "--sidebar": `rgba(${background.r}, ${background.g}, ${background.b}, .94)`,

@@ -16,9 +16,11 @@ import sys
 import time
 import unicodedata
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -58,6 +60,7 @@ from project_paths import FILE_INDEX, HOUSE_DIR, TEMP_DIR
 from mutation_io import (
     inspect_epub_content,
     inspect_epub_reading_payload,
+    inspect_epub_spine_text,
     inspect_regular_file,
 )
 from review_noise import (
@@ -83,19 +86,19 @@ FINGERPRINT_POLICY_VERSION = "1.4.2"
 # a title-only NORMALIZER_VERSION bump so 100+ GiB of valid body fingerprints
 # are not invalidated.
 FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
-# Pair classification/evidence also has its own compatibility lifetime. 1.4.5
-# changed cache execution, 1.4.6 changed only filename/core parsing, and
-# 1.4.7-1.4.10 change cache/inventory/state-archive access only. Existing 1.4.2 pair rows
-# therefore remain valid while AUDITOR_VERSION follows releases.
-PAIR_POLICY_VERSION = "1.4.2"
+# Pair classification/evidence also has its own compatibility lifetime. 1.4.12
+# adds exact OPF-spine visible-text proof and stable package identity checks.
+# This invalidates pair decisions only; the base fingerprint policy stays 1.4.2.
+PAIR_POLICY_VERSION = "1.4.12"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.10"
+AUDITOR_VERSION = "1.4.12"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
 DEFAULT_FULL_SWEEP_MAX_FILE_BYTES = 1024 * 1024 * 1024
 DEFAULT_FULL_SWEEP_MAX_EPUB_UNCOMPRESSED_BYTES = 6 * 1024 * 1024 * 1024
 ORDERED_BODY_REVIEW_FLOOR_PPM = 900_000
+EPUB_SPINE_TEXT_MIN_CHARS = 50_000
 
 
 class StaleInputDuringAnalysis(RuntimeError):
@@ -151,6 +154,7 @@ class AuditEntry:
     ino: int | None = None
     ctime_ns: int | None = None
     pass_recheck: bool = False
+    title_override: bool = False
 
     def __post_init__(self):
         """Backfill identity for older direct constructors.
@@ -318,10 +322,15 @@ def _contains_symlink(root, candidate):
 
 def _entry_from_stat(
     source, name, rel_path, path, recorded_size=None, pass_recheck=False,
-    core_title_override=None,
+    core_title_override=None, analysis_override=None, title_override=False,
 ):
     stat = os.stat(path, follow_symlinks=False)
     info = analyze_name(name)
+    if analysis_override:
+        info.update({
+            key: value for key, value in analysis_override.items()
+            if value is not None
+        })
     if core_title_override:
         info["core_title"] = str(core_title_override)
     volume = info.get("volume_number")
@@ -352,7 +361,113 @@ def _entry_from_stat(
         disambig=info.get("disambig", 1),
         complete=info["complete"],
         pass_recheck=pass_recheck,
+        title_override=(
+            bool(title_override)
+            or bool(info.get("title_literal_tokens"))
+            or bool(info.get("structure_hint_tokens"))
+        ),
     )
+
+
+def _index_contextual_bare_analysis(name, raw):
+    """Accept only the contextual semantic delta from an otherwise advisory index."""
+
+    from bare_volume_context import parse_bare_volume_candidate
+
+    def value(key, default=None):
+        if isinstance(raw, dict):
+            return raw.get(key, default)
+        return getattr(raw, key, default)
+
+    if bool(value("title_override", False)):
+        return None
+    baseline = analyze_name(name)
+    candidate = parse_bare_volume_candidate(name, analysis=baseline)
+    indexed_volume = value("volume_number")
+    if indexed_volume is None:
+        return None
+    try:
+        part, volume = indexed_volume
+    except (TypeError, ValueError):
+        return None
+    try:
+        same_volume = bool(
+            candidate is not None
+            and Decimal(str(volume)) == Decimal(str(candidate.volume_number))
+        )
+    except (InvalidOperation, ValueError):
+        same_volume = False
+    if candidate is None or part is not None or not same_volume:
+        return None
+    if str(value("core_title") or "") != candidate.core_title:
+        return None
+    return candidate.apply_to_analysis(baseline)
+
+
+def contextualize_audit_entries(entries):
+    """Promote inventory-proven bare numbers without reading file bodies."""
+
+    from bare_volume_context import has_bare_volume_shape, infer_bare_volume_overrides
+
+    records = []
+    for entry in entries:
+        part = volume = None
+        if entry.volume_number is not None:
+            part, volume = entry.volume_number
+        coordinates = {
+            "coordinate_kind": "volume" if volume is not None else (
+                "episode"
+                if entry.start_number is not None and entry.end_number is not None
+                else None
+            ),
+            "part_num": part,
+            "part_den": 1 if part is not None else None,
+            "volume_num": volume,
+            "volume_den": 1 if volume is not None else None,
+            "episode_start": entry.start_number if volume is None else None,
+            "episode_end": entry.end_number if volume is None else None,
+        }
+        records.append({
+            "key": entry.path,
+            "name": entry.name,
+            "analysis": {
+                "core_title": entry.core_title,
+                "author": entry.author,
+                "max_number": entry.max_number,
+                "effective_max": entry.effective_max,
+                "unit": entry.unit,
+                "volume_number": entry.volume_number,
+                "start_number": entry.start_number,
+                "end_number": entry.end_number,
+                "span_ambiguous": entry.span_ambiguous,
+                "is_side_story": entry.is_side_story,
+                "disambig": entry.disambig,
+                "complete": entry.complete,
+            },
+            "coordinates": coordinates,
+            "current_core_title": entry.core_title,
+            "title_override": entry.title_override,
+            "candidate_enabled": has_bare_volume_shape(entry.name),
+        })
+    overrides = infer_bare_volume_overrides(records)
+    contextualized = []
+    for entry in entries:
+        override = overrides.get(entry.path)
+        if override is None:
+            contextualized.append(entry)
+            continue
+        contextualized.append(replace(
+            entry,
+            core_title=override.core_title,
+            author=override.author,
+            effective_max=int(float(override.volume_number)),
+            unit="권",
+            volume_number=(None, override.volume_number),
+            start_number=float(override.volume_number),
+            end_number=float(override.volume_number),
+            span_ambiguous=False,
+        ))
+    return contextualized
 
 
 def load_house_entries(index_path, house_root, include_pass=False):
@@ -398,6 +513,8 @@ def load_house_entries(index_path, house_root, include_pass=False):
             core_title_override=(
                 raw.get("core_title") if raw.get("title_override") else None
             ),
+            analysis_override=_index_contextual_bare_analysis(name, raw),
+            title_override=bool(raw.get("title_override")),
         ))
     return entries, invalid
 
@@ -435,7 +552,13 @@ def load_verified_house_entries(inventory, house_root):
         ):
             raise ValueError("verified house inventory path is outside house")
         seen.add(rel_path)
-        volume_number = raw.volume_number
+        info = analyze_name(name)
+        contextual_analysis = _index_contextual_bare_analysis(name, raw)
+        if contextual_analysis is not None:
+            info.update(contextual_analysis)
+        if bool(getattr(raw, "title_override", False)) and raw.core_title:
+            info["core_title"] = str(raw.core_title)
+        volume_number = info.get("volume_number")
         entries.append(AuditEntry(
             source="house",
             name=name,
@@ -450,22 +573,23 @@ def load_verified_house_entries(inventory, house_root):
                 int(raw.recorded_size)
                 if raw.recorded_size is not None else None
             ),
-            ext=str(raw.ext),
-            core_title=str(raw.core_title),
-            author=raw.author,
-            max_number=int(raw.max_number),
-            effective_max=int(raw.effective_max),
-            unit=str(raw.unit),
+            ext=str(info["ext"]),
+            core_title=str(info["core_title"]),
+            author=info.get("author"),
+            max_number=int(info["max_number"]),
+            effective_max=int(info["effective_max"]),
+            unit=str(info["unit"]),
             volume_number=(
                 tuple(volume_number) if volume_number is not None else None
             ),
-            start_number=raw.start_number,
-            end_number=raw.end_number,
-            span_ambiguous=bool(raw.span_ambiguous),
-            is_side_story=bool(raw.is_side_story),
-            disambig=int(raw.disambig),
-            complete=bool(raw.complete),
+            start_number=info.get("start_number"),
+            end_number=info.get("end_number"),
+            span_ambiguous=bool(info.get("span_ambiguous", False)),
+            is_side_story=bool(info.get("is_side_story", False)),
+            disambig=int(info.get("disambig", 1)),
+            complete=bool(info["complete"]),
             pass_recheck=bool(raw.pass_recheck),
+            title_override=bool(getattr(raw, "title_override", False)),
         ))
     entries.sort(key=lambda entry: (entry.rel_path, entry.name))
     return entries, []
@@ -1159,6 +1283,18 @@ class PersistentAuditCache:
                     self.file_ids[entry.path] = row["file_id"]
                     self.canonical_paths[entry.path] = row["canonical_path"]
                     self.stats["metadata_reconcile_writes"] += 1
+        with decision_store.transaction(self.conn):
+            contextual = decision_store.sync_contextual_bare_volume_metadata(
+                self.conn,
+                target_sources=("temp",),
+                evidence_sources=("house", "temp"),
+            )
+        self.stats["contextual_bare_volume_promotions"] = contextual[
+            "promoted_count"
+        ]
+        self.stats["contextual_bare_volume_writes"] = (
+            contextual["analysis_changed"] + contextual["coordinate_changed"]
+        )
         self.stats["metadata_reconcile_seconds"] = round(
             time.monotonic() - reconcile_started, 6
         )
@@ -1773,6 +1909,18 @@ class PersistentAuditCache:
                         stored["classification"],
                         json.loads(stored["evidence_json"] or "{}"),
                     )
+                if (
+                    review_result.classification == "different"
+                    and review_result.evidence.get("epub_distinct_edition") is True
+                ):
+                    self.stats["distinct_epub_reviews_superseded"] += (
+                        supersede_open_pair_reviews(
+                            self.conn,
+                            candidate_file_id=self.file_ids[candidate.left.path],
+                            reference_file_id=self.file_ids[candidate.right.path],
+                            classification="metadata_only",
+                        )
+                    )
                 self._store_review_item(candidate, review_result)
             for candidate, result, left_id, right_id in review_repairs:
                 self._store_review_item(candidate, result)
@@ -2095,6 +2243,9 @@ def _pair_configuration_hash(config):
         # Pair-only semantic contract. Keep this outside the fingerprint policy
         # so a retry/cache correction does not rebuild every base fingerprint.
         "epub_reading_payload_contract": "same-edition+opf-metadata+calibre-bookmark-v3",
+        "epub_spine_text_contract": (
+            f"exact-visible-spine+shared-package-id+min-{EPUB_SPINE_TEXT_MIN_CHARS}"
+        ),
     }
     payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -2402,6 +2553,117 @@ def _epub_reading_payload_candidate(candidate):
     return left_span == right_span == (None, None)
 
 
+def _epub_spine_candidate(candidate):
+    """Allow only same-title/no-author-conflict EPUBs into the fallback read."""
+
+    left, right = candidate.left, candidate.right
+    if (
+        left.ext != ".epub"
+        or right.ext != ".epub"
+        or not left.core_title
+        or normalize_nfc(left.core_title).casefold()
+        != normalize_nfc(right.core_title).casefold()
+        or left.span_ambiguous
+        or right.span_ambiguous
+    ):
+        return False
+    left_authors = _ordered_author_tokens(left.author)
+    right_authors = _ordered_author_tokens(right.author)
+    return not (
+        left_authors and right_authors and not (left_authors & right_authors)
+    )
+
+
+def _epub_title_coordinate(title):
+    from bare_volume_context import parse_bare_volume_candidate
+
+    synthetic = f"{normalize_nfc(title).strip()}.epub"
+    candidate = parse_bare_volume_candidate(synthetic)
+    if candidate is None:
+        core = str(analyze_name(synthetic).get("core_title") or "").strip()
+        return (core, None) if core else None
+    try:
+        coordinate = Decimal(str(candidate.volume_number))
+    except (InvalidOperation, ValueError):
+        return None
+    return candidate.core_title, coordinate
+
+
+def _normalized_metadata_set(values):
+    return {
+        normalize_nfc(value).casefold().strip()
+        for value in values if normalize_nfc(value).strip()
+    }
+
+
+def _epub_distinct_edition_evidence(left, right):
+    """Return proof only for different OPF coordinates and package editions."""
+
+    left_ids = set(left.identifiers)
+    right_ids = set(right.identifiers)
+    if not left_ids or not right_ids or left_ids & right_ids:
+        return None
+    left_forms = [
+        (title, parsed) for title in left.titles
+        if (parsed := _epub_title_coordinate(title)) is not None
+    ]
+    right_forms = [
+        (title, parsed) for title in right.titles
+        if (parsed := _epub_title_coordinate(title)) is not None
+    ]
+    title_pair = None
+    for left_title, (left_core, left_coordinate) in left_forms:
+        for right_title, (right_core, right_coordinate) in right_forms:
+            if left_core != right_core or left_coordinate == right_coordinate:
+                continue
+            coordinates = [
+                coordinate for coordinate in (left_coordinate, right_coordinate)
+                if coordinate is not None
+            ]
+            # An unnumbered package title can stand for volume 1, but accepting
+            # unnumbered vs 1 would be ambiguous. Require the numbered side >=2.
+            if len(coordinates) == 1 and coordinates[0] < 2:
+                continue
+            title_pair = {
+                "left_title": left_title,
+                "right_title": right_title,
+                "left_coordinate": (
+                    str(left_coordinate) if left_coordinate is not None else None
+                ),
+                "right_coordinate": (
+                    str(right_coordinate) if right_coordinate is not None else None
+                ),
+            }
+            break
+        if title_pair is not None:
+            break
+    if title_pair is None:
+        return None
+
+    left_publishers = _normalized_metadata_set(left.publishers)
+    right_publishers = _normalized_metadata_set(right.publishers)
+    left_dates = _normalized_metadata_set(left.dates)
+    right_dates = _normalized_metadata_set(right.dates)
+    publisher_conflict = bool(
+        left_publishers and right_publishers
+        and left_publishers.isdisjoint(right_publishers)
+    )
+    date_conflict = bool(
+        left_dates and right_dates and left_dates.isdisjoint(right_dates)
+    )
+    if not publisher_conflict and not date_conflict:
+        return None
+    return {
+        "epub_distinct_edition": True,
+        "epub_distinct_title_pair": title_pair,
+        "epub_distinct_identifier_sets": [
+            sorted(left_ids), sorted(right_ids),
+        ],
+        "epub_distinct_publisher_conflict": publisher_conflict,
+        "epub_distinct_date_conflict": date_conflict,
+    }
+
+
 def _ordered_body_relation(candidate):
     left, right = candidate.left, candidate.right
     if left.ext != ".txt" or right.ext != ".txt":
@@ -2683,6 +2945,7 @@ def analyze_candidates(
 
     deep_pairs = []
     epub_payload_cache = {}
+    epub_spine_cache = {}
     pair_cache = pair_cache if pair_cache is not None else persistent
     if candidates:
         _emit_audit_progress(config, "pair_classification", 0, len(candidates), budget)
@@ -2734,50 +2997,46 @@ def analyze_candidates(
                     candidate, "epub_equivalent", evidence
                 )
             else:
-                if not _epub_reading_payload_candidate(candidate):
-                    results[candidate.pair_id] = _basic_result(
-                        candidate, "metadata_only", evidence
-                    )
-                    continue
                 payloads = []
                 payload_error = None
-                for entry in (candidate.left, candidate.right):
-                    try:
-                        payload = epub_payload_cache.get(entry.path)
-                        if payload is None:
-                            payload_kwargs = {
-                                "max_file_bytes": config.max_file_bytes,
-                                "budget": budget,
-                            }
-                            max_uncompressed = getattr(
-                                config, "max_epub_uncompressed_bytes", None
-                            )
-                            if max_uncompressed is not None:
-                                payload_kwargs["max_uncompressed_bytes"] = max_uncompressed
-                            payload = inspect_epub_reading_payload(
-                                entry.path, **payload_kwargs
-                            )
-                            if (
-                                payload.file_evidence.dev,
-                                payload.file_evidence.ino,
-                                payload.file_evidence.ctime_ns,
-                                payload.file_evidence.size,
-                                payload.file_evidence.mtime_ns,
-                            ) != _entry_identity(entry):
-                                raise StaleInputDuringAnalysis(entry.path)
-                            epub_payload_cache[entry.path] = payload
-                        payloads.append(payload)
-                    except BodyBudgetExceeded:
-                        stop_reasons.append("body_budget_exhausted")
-                        payload_error = "body_budget_exhausted"
-                        break
-                    except (StaleInputDuringAnalysis, OSError):
-                        stop_reasons.append("stale_input")
-                        payload_error = "stale_input"
-                        break
-                    except (RuntimeError, zipfile.BadZipFile) as exc:
-                        payload_error = str(exc)
-                        break
+                if _epub_reading_payload_candidate(candidate):
+                    for entry in (candidate.left, candidate.right):
+                        try:
+                            payload = epub_payload_cache.get(entry.path)
+                            if payload is None:
+                                payload_kwargs = {
+                                    "max_file_bytes": config.max_file_bytes,
+                                    "budget": budget,
+                                }
+                                max_uncompressed = getattr(
+                                    config, "max_epub_uncompressed_bytes", None
+                                )
+                                if max_uncompressed is not None:
+                                    payload_kwargs["max_uncompressed_bytes"] = max_uncompressed
+                                payload = inspect_epub_reading_payload(
+                                    entry.path, **payload_kwargs
+                                )
+                                if (
+                                    payload.file_evidence.dev,
+                                    payload.file_evidence.ino,
+                                    payload.file_evidence.ctime_ns,
+                                    payload.file_evidence.size,
+                                    payload.file_evidence.mtime_ns,
+                                ) != _entry_identity(entry):
+                                    raise StaleInputDuringAnalysis(entry.path)
+                                epub_payload_cache[entry.path] = payload
+                            payloads.append(payload)
+                        except BodyBudgetExceeded:
+                            stop_reasons.append("body_budget_exhausted")
+                            payload_error = "body_budget_exhausted"
+                            break
+                        except (StaleInputDuringAnalysis, OSError):
+                            stop_reasons.append("stale_input")
+                            payload_error = "stale_input"
+                            break
+                        except (RuntimeError, zipfile.BadZipFile) as exc:
+                            payload_error = str(exc)
+                            break
                 if len(payloads) == 2:
                     evidence.update({
                         "epub_equivalence_mode": "reading_payload",
@@ -2797,6 +3056,96 @@ def analyze_candidates(
                 ):
                     results[candidate.pair_id] = _basic_result(
                         candidate, "epub_equivalent", evidence
+                    )
+                    continue
+
+                spines = []
+                spine_error = None
+                if _epub_spine_candidate(candidate):
+                    for entry in (candidate.left, candidate.right):
+                        try:
+                            spine = epub_spine_cache.get(entry.path)
+                            if spine is None:
+                                spine_kwargs = {
+                                    "max_file_bytes": config.max_file_bytes,
+                                    "budget": budget,
+                                }
+                                max_uncompressed = getattr(
+                                    config, "max_epub_uncompressed_bytes", None
+                                )
+                                if max_uncompressed is not None:
+                                    spine_kwargs["max_uncompressed_bytes"] = max_uncompressed
+                                spine = inspect_epub_spine_text(
+                                    entry.path, **spine_kwargs
+                                )
+                                if (
+                                    spine.file_evidence.dev,
+                                    spine.file_evidence.ino,
+                                    spine.file_evidence.ctime_ns,
+                                    spine.file_evidence.size,
+                                    spine.file_evidence.mtime_ns,
+                                ) != _entry_identity(entry):
+                                    raise StaleInputDuringAnalysis(entry.path)
+                                epub_spine_cache[entry.path] = spine
+                            spines.append(spine)
+                        except BodyBudgetExceeded:
+                            stop_reasons.append("body_budget_exhausted")
+                            spine_error = "body_budget_exhausted"
+                            break
+                        except (StaleInputDuringAnalysis, OSError):
+                            stop_reasons.append("stale_input")
+                            spine_error = "stale_input"
+                            break
+                        except (
+                            ElementTree.ParseError,
+                            RuntimeError,
+                            zipfile.BadZipFile,
+                        ) as exc:
+                            spine_error = str(exc)
+                            break
+                if len(spines) == 2:
+                    identifier_overlap = sorted(
+                        set(spines[0].identifiers) & set(spines[1].identifiers)
+                    )
+                    evidence.update({
+                        "left_spine_text_sha256": spines[0].text_sha256,
+                        "right_spine_text_sha256": spines[1].text_sha256,
+                        "left_spine_text_chars": spines[0].text_chars,
+                        "right_spine_text_chars": spines[1].text_chars,
+                        "left_spine_item_count": spines[0].spine_item_count,
+                        "right_spine_item_count": spines[1].spine_item_count,
+                        "epub_identifier_overlap": identifier_overlap,
+                    })
+                elif spine_error:
+                    evidence["epub_spine_text_error"] = spine_error
+                if spine_error in {"body_budget_exhausted", "stale_input"}:
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, spine_error, evidence
+                    )
+                    continue
+
+                same_spine_edition = bool(
+                    len(spines) == 2
+                    and _epub_reading_payload_candidate(candidate)
+                    and spines[0].text_chars >= EPUB_SPINE_TEXT_MIN_CHARS
+                    and spines[1].text_chars >= EPUB_SPINE_TEXT_MIN_CHARS
+                    and spines[0].text_sha256 == spines[1].text_sha256
+                    and set(spines[0].identifiers) & set(spines[1].identifiers)
+                )
+                if same_spine_edition:
+                    evidence["epub_equivalence_mode"] = "spine_text"
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, "epub_equivalent", evidence
+                    )
+                    continue
+                distinct_evidence = (
+                    _epub_distinct_edition_evidence(*spines)
+                    if len(spines) == 2 else None
+                )
+                if distinct_evidence is not None:
+                    evidence.update(distinct_evidence)
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, "different", evidence
                     )
                 else:
                     results[candidate.pair_id] = _basic_result(
@@ -3007,7 +3356,9 @@ def run_audit(args):
         time.monotonic() - inventory_started, 6
     )
     temp_entries, temp_invalid = ([], []) if args.house_only else scan_temp_entries(args.temp, args.include_pass)
-    entries = house_entries + temp_entries
+    entries = contextualize_audit_entries(house_entries + temp_entries)
+    house_entries = [entry for entry in entries if entry.source == "house"]
+    temp_entries = [entry for entry in entries if entry.source == "temp"]
     snapshot = _snapshot(entries)
     candidates, coverage, stop_reasons, posting_stats = generate_candidates(entries, args)
     if getattr(args, "same_coordinate_only", False):

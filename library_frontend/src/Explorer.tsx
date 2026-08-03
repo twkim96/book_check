@@ -209,8 +209,10 @@ function FileCatalogRow({ item, selected, toggle, inspect }: { item: ExplorerFil
       <td><code className="core">{item.core_title ?? "core 없음"}</code><small>{coordinate(item)} · {item.author ?? "작가 미상"}</small></td>
       <td><b>작품 {item.work_bucket_id ?? "-"} · 변형 {item.variant_id ?? "-"}</b><small>{item.assignment_state} · {item.variant_kind ?? "미분류"}</small><small>{item.representative ? "대표 파일" : "일반 파일"}{item.protected ? " · 보호" : ""}</small></td>
       <td className="explorer-review-cell">{item.open_review_count > 0 ? <>
-        <button type="button" className="explorer-review-count explorer-review-button" onClick={inspect}>열린 검토 {item.open_review_count}건</button>
-        <strong title={item.open_review_sample_path ?? undefined}>{fileName(item.open_review_sample_path)}</strong>
+        <div className="explorer-review-summary">
+          <strong title={item.open_review_sample_path ?? undefined}>{fileName(item.open_review_sample_path)}</strong>
+          <button type="button" className="explorer-review-link" onClick={inspect} aria-label={`열린 검토 ${item.open_review_count}건 상세 보기`}>검토 {item.open_review_count}건</button>
+        </div>
         <small>{reviewClassLabel(item.open_review_sample_classification ?? undefined)}{item.open_review_count > 1 ? ` · 외 ${item.open_review_count - 1}건` : ""}</small>
       </> : <span className="muted-value">없음</span>}</td>
       <td><b>{formatBytes(item.size)}</b><small>{item.fingerprint_status ?? "지문 없음"}</small><small>{item.normalized_sha256 ? `${item.normalized_sha256.slice(0, 12)}…` : "normalized SHA 없음"}</small></td>

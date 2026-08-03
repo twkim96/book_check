@@ -1,4 +1,4 @@
-"""Read-only 1.3.1 catalog explorer projections."""
+"""Read-only 1.3.2 catalog explorer projections."""
 
 from __future__ import annotations
 

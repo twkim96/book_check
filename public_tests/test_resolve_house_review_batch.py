@@ -355,6 +355,30 @@ def test_normal_house_source_cannot_masquerade_as_restore_resume(tmp_path):
     assert plan["blocked"][0]["blocked_reason"] == "restore_source_not_queue"
 
 
+def test_explicit_user_approved_queue_quarantine_is_allowed(tmp_path):
+    conn, _state_db = _active_pair(tmp_path)
+    try:
+        discard_id = conn.execute(
+            "SELECT file_id FROM files WHERE canonical_path LIKE '%수동 삭제 후보.txt'"
+        ).fetchone()[0]
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET source='queue' WHERE file_id=?", (discard_id,)
+            )
+        extra_plan = _bound_plan(conn, quarantine=[{
+            "delete_file_id": discard_id,
+            "keep": "보존할 도서",
+            "reason": "user_confirmed_queue_duplicate",
+        }])
+        plan = resolve_house_review_batch.build_plan(conn, None, extra_plan)
+    finally:
+        conn.close()
+
+    assert plan["blocked"] == []
+    assert len(plan["explicit_delete"]) == 1
+    assert plan["explicit_delete"][0]["file_id"] == discard_id
+
+
 def test_explicit_restore_destination_cannot_escape_house(tmp_path):
     house = tmp_path / "house"
     house.mkdir()

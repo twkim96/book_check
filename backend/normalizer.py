@@ -33,7 +33,7 @@ SOURCE_SITE_TAG_RE = re.compile(
 
 # normalizer 규칙 버전. 핵심 추출 로직(core_title/author/max_number/...)이 바뀌면
 # bump 한다. file_index.json에 함께 기록되어 stale index 감지에 사용된다.
-NORMALIZER_VERSION = "1.3.1"
+NORMALIZER_VERSION = "1.3.3"
 
 # 사용자가 제목 교정 화면에서 ``[[19금]]``처럼 표시한 문자열은 제목의
 # 실제 일부로 취급한다. 이 표시는 temp 운반 중에만 남고 house 입고 파일명에서는
@@ -536,6 +536,9 @@ _SPACE_RANGE_RE = re.compile(r"(?<!\d)(\d+)\s+(\d+)\s*(화|회|권|장|편)(?!�
 _SPACE_COMPLETION_RANGE_RE = re.compile(
     r"(?<!\d)(\d+)\s+(\d+)\s*(?:완결|完結|완|完|終)"
 )
+_TOTAL_COUNT_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])총\s*(\d+)\s*(화|회|장|편)"
+)
 _UNIT_NUMBER_RE = re.compile(
     r"(?<![\d.])(\d+)\s*(화|회|권|장|편|부)(?!\s*차|[가-힣A-Za-z])"
 )
@@ -710,6 +713,16 @@ def extract_episode_spans(filename):
         prefix = base[max(0, match.start() - 12):match.start()]
         role = "side" if _SIDE_PREFIX_RE.search(prefix) else "main"
         add(match, start, end, None, True, role=role)
+
+    # ``(총243화)``는 끝 회차를 뜻하는 닫힌 메타 표기다. 기존 단일 회차
+    # 규칙이 243~243으로 읽기 전에 1~243 범위로 점유한다. ``총``이 제목
+    # 단어에 붙은 경우와 권/부 총량은 건드리지 않는다.
+    for match in _TOTAL_COUNT_RE.finditer(base):
+        if _overlaps((match.start(), match.end()), occupied):
+            continue
+        end = int(match.group(1))
+        if end >= 1 and end < _NUMBER_MAX:
+            add(match, 1, end, match.group(2), False, role="main")
 
     for match in _UNIT_NUMBER_RE.finditer(base):
         if _overlaps((match.start(), match.end()), occupied):

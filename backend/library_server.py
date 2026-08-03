@@ -21,7 +21,14 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import decision_store
 from library_catalog import catalog_listing, review_queue_listing
-from library_appearance import read_appearance, reset_appearance, write_appearance
+from library_appearance import (
+    create_appearance_preset,
+    delete_appearance_preset,
+    read_appearance,
+    read_appearance_presets,
+    reset_appearance,
+    write_appearance,
+)
 from library_explorer import (
     compare_files,
     file_detail,
@@ -86,7 +93,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.10"
+SERVER_VERSION = "1.4.12"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -716,6 +723,7 @@ def create_app(
     app.extensions["library_job_runner"] = runner
     app.extensions["library_service_registry"] = services
     appearance_path = config.runtime_dir / "appearance.json"
+    appearance_presets_path = config.runtime_dir / "appearance-presets.json"
 
     @app.before_request
     def local_api_guard():
@@ -1267,6 +1275,33 @@ def create_app(
         return jsonify({
             "ok": True,
             "data": {"settings": settings, "persisted": False},
+        })
+
+    @app.get("/api/settings/appearance/presets")
+    def appearance_presets():
+        presets, persisted = read_appearance_presets(appearance_presets_path)
+        return jsonify({
+            "ok": True,
+            "data": {"presets": presets, "persisted": persisted},
+        })
+
+    @app.post("/api/settings/appearance/presets")
+    def create_custom_appearance_preset():
+        body = _json_body()
+        preset, presets = create_appearance_preset(
+            appearance_presets_path, body.get("preset")
+        )
+        return jsonify({
+            "ok": True,
+            "data": {"preset": preset, "presets": presets, "persisted": True},
+        }), 201
+
+    @app.delete("/api/settings/appearance/presets/<preset_id>")
+    def delete_custom_appearance_preset(preset_id: str):
+        presets = delete_appearance_preset(appearance_presets_path, preset_id)
+        return jsonify({
+            "ok": True,
+            "data": {"presets": presets, "persisted": bool(presets)},
         })
 
     @app.get("/api/providers")

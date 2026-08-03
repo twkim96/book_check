@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import decision_store
+from bare_volume_context import context_name
 from dedup_mutations import _ensure_intake_fingerprint, _file_state, _preflight
 from mutation_io import (
     copy_no_clobber,
@@ -131,9 +132,9 @@ def classify_folderling_volume_target(
         return no_target("missing_active_temp_source")
     source = dict(source_row)
     current_source_analysis = decision_store.build_file_analysis(
-        Path(str(source["canonical_path"])).name
+        context_name(Path(str(source["canonical_path"])).name)
     )
-    source["author"] = current_source_analysis["author"]
+    source["author"] = source.get("author") or current_source_analysis["author"]
     if source["core_title"] is None:
         source.update(
             core_title=current_source_analysis["core_title"],
@@ -158,18 +159,25 @@ def classify_folderling_volume_target(
             return no_target("new_group_requires_ebook")
         peers = []
         for row in conn.execute(
-            "SELECT * FROM files WHERE active = 1 AND source = 'temp' "
-            "ORDER BY canonical_path"
+            """
+            SELECT f.*, fa.core_title, fa.author, fa.disambig
+            FROM files AS f
+            LEFT JOIN file_analysis AS fa ON fa.file_id = f.file_id
+            WHERE f.active = 1 AND f.source = 'temp'
+            ORDER BY f.canonical_path
+            """
         ):
             peer = dict(row)
             peer_path = Path(str(peer["canonical_path"]))
             if peer_path.suffix.lower() not in {".epub", ".pdf"}:
                 continue
-            analysis = decision_store.build_file_analysis(peer_path.name)
-            if analysis["core_title"] != source["core_title"]:
+            analysis = decision_store.build_file_analysis(context_name(peer_path.name))
+            peer_core = peer.get("core_title") or analysis["core_title"]
+            if peer_core != source["core_title"]:
                 continue
-            peer["author"] = analysis["author"]
-            peer["disambig"] = analysis["disambig"]
+            peer["core_title"] = peer_core
+            peer["author"] = peer.get("author") or analysis["author"]
+            peer["disambig"] = peer.get("disambig") or analysis["disambig"]
             peers.append(peer)
         if len(peers) < 2:
             return no_target("new_group_requires_multiple_volumes")

@@ -32,7 +32,7 @@ _VerifiedHouseFile = namedtuple("_VerifiedHouseFile", (
     "dev", "ino", "ctime_ns", "recorded_size", "ext", "core_title",
     "author", "max_number", "effective_max", "unit", "volume_number",
     "start_number", "end_number", "span_ambiguous", "is_side_story",
-    "disambig", "complete", "pass_recheck",
+    "disambig", "complete", "pass_recheck", "title_override",
 ))
 
 
@@ -83,7 +83,14 @@ def _default_index_path(output_path):
 
 def _backup_before_normalizer_reanalysis(conn, state_db_path):
     stale = conn.execute(
-        "SELECT COUNT(*) FROM file_analysis WHERE normalizer_version != ?",
+        """
+        SELECT COUNT(*)
+        FROM file_analysis AS fa
+        JOIN files AS f ON f.file_id = fa.file_id
+        WHERE fa.normalizer_version != ?
+          AND f.active = 1
+          AND f.source = 'house'
+        """,
         (NORMALIZER_VERSION,),
     ).fetchone()[0]
     if not stale:
@@ -119,6 +126,7 @@ def _build_entry(
         "max_number": info["max_number"],
         "effective_max": info["effective_max"],
         "unit": info["unit"],
+        "volume_number": info.get("volume_number"),
         "start_number": info["start_number"],
         "end_number": info["end_number"],
         "span_ambiguous": info["span_ambiguous"],
@@ -456,7 +464,9 @@ def _state_projection_rows(conn):
         SELECT f.file_id, f.canonical_path, f.size, f.mtime_ns,
                f.dev, f.ino, f.ctime_ns, f.variant_id,
                f.assignment_state, f.protected,
-               f.coordinate_kind, f.episode_start, f.episode_end,
+               f.coordinate_kind, f.part_num, f.part_den,
+               f.volume_num, f.volume_den,
+               f.episode_start, f.episode_end,
                f.span_ambiguous,
                v.work_bucket_id,
                CASE WHEN r.file_id IS NULL THEN 0 ELSE 1 END AS representative,
@@ -585,6 +595,31 @@ def _build_verified_index_snapshot_from_state_db(
                 "disambig": row["disambig"],
                 "title_override": bool(row["title_override_json"]),
             })
+            if row["coordinate_kind"] == "volume" and row["volume_num"] is not None:
+                part = (
+                    row["part_num"]
+                    if row["part_num"] is not None and int(row["part_den"] or 1) == 1
+                    else None
+                )
+                volume = (
+                    row["volume_num"]
+                    if int(row["volume_den"] or 1) == 1
+                    else row["volume_num"] / row["volume_den"]
+                )
+                analysis.update({
+                    # file_index.json is a JSON projection, so keep the same
+                    # list shape produced by a full scan after serialization.
+                    "volume_number": [part, volume],
+                    "start_number": volume,
+                    "end_number": volume,
+                    "span_ambiguous": False,
+                })
+            elif row["coordinate_kind"] == "episode":
+                analysis.update({
+                    "volume_number": None,
+                    "start_number": row["episode_start"],
+                    "end_number": row["episode_end"],
+                })
             projection = {
                 "file_id": row["file_id"],
                 "variant_id": row["variant_id"],
@@ -632,6 +667,7 @@ def _build_verified_index_snapshot_from_state_db(
                     has_pass_marker(normalized_name)
                     or read_disambig_marker(normalized_name) > 1
                 ),
+                title_override=bool(row["title_override_json"]),
             ))
             seen_paths.add(relative)
             revision_rows.append((
@@ -810,6 +846,7 @@ def get_file_entries(
     decision_conn = None
     seen_file_ids = set()
     analysis_rekeys = []
+    previous_core_titles = {}
     if state_db_path:
         from decision_store import initialize_state_db
 
@@ -869,12 +906,11 @@ def get_file_entries(
                         if previous is not None:
                             from decision_store import build_effective_file_analysis
 
+                            previous_core_titles[previous["file_id"]] = previous[
+                                "core_title"
+                            ]
                             analysis = build_effective_file_analysis(
                                 decision_conn, previous["file_id"], name
-                            )
-                        if previous is not None and previous["core_title"] != analysis["core_title"]:
-                            analysis_rekeys.append(
-                                (previous["core_title"], analysis["core_title"])
                             )
                         projection = dict(reconcile_file_metadata(
                             decision_conn,
@@ -931,6 +967,7 @@ def get_file_entries(
             from decision_store import (
                 migrate_catalog_title_keys,
                 prune_file_analysis_projection,
+                sync_contextual_bare_volume_metadata,
             )
 
             prune_file_analysis_projection(
@@ -938,6 +975,82 @@ def get_file_entries(
                 seen_file_ids=seen_file_ids,
                 scanned_roots=directory_list,
             )
+            contextual = sync_contextual_bare_volume_metadata(
+                decision_conn,
+                target_sources=("house",),
+                evidence_sources=("house",),
+                managed_core_hints=previous_core_titles,
+                eligible_file_ids=seen_file_ids,
+            )
+
+            # The first pass above records stable identities. Refresh only the
+            # in-memory index metadata from the now context-complete DB; no
+            # second filesystem walk or body read is needed.
+            refreshed = {
+                row["file_id"]: row
+                for row in decision_conn.execute(
+                    """
+                    SELECT f.file_id, f.coordinate_kind, f.part_num, f.part_den,
+                           f.volume_num, f.volume_den, f.episode_start, f.episode_end,
+                           f.span_ambiguous,
+                           a.core_title, a.author, a.max_number, a.effective_max,
+                           a.unit, a.complete, a.disambig, a.title_override_json
+                    FROM files AS f
+                    JOIN file_analysis AS a ON a.file_id = f.file_id
+                    WHERE f.active = 1 AND f.source = 'house'
+                    """
+                )
+            }
+            for entry in entries:
+                if entry.get("type") != "file" or not entry.get("file_id"):
+                    continue
+                row = refreshed.get(entry["file_id"])
+                if row is None:
+                    continue
+                previous_core = previous_core_titles.get(entry["file_id"])
+                if (
+                    previous_core
+                    and row["core_title"]
+                    and previous_core != row["core_title"]
+                ):
+                    # Compare the pre-scan semantic key directly with the
+                    # final contextual key.  Recording the transient raw-name
+                    # key would create A->B->A chains on every warm rescan.
+                    analysis_rekeys.append((previous_core, row["core_title"]))
+                volume_number = None
+                start_number = entry.get("start_number")
+                end_number = entry.get("end_number")
+                if row["coordinate_kind"] == "volume" and row["volume_num"] is not None:
+                    part = (
+                        row["part_num"]
+                        if row["part_num"] is not None and int(row["part_den"] or 1) == 1
+                        else None
+                    )
+                    volume = (
+                        row["volume_num"]
+                        if int(row["volume_den"] or 1) == 1
+                        else row["volume_num"] / row["volume_den"]
+                    )
+                    # Match the serialized full-scan index representation.
+                    volume_number = [part, volume]
+                    start_number = end_number = volume
+                elif row["coordinate_kind"] == "episode":
+                    start_number = row["episode_start"]
+                    end_number = row["episode_end"]
+                entry.update({
+                    "core_title": row["core_title"],
+                    "author": row["author"],
+                    "max_number": row["max_number"],
+                    "effective_max": row["effective_max"],
+                    "unit": row["unit"],
+                    "volume_number": volume_number,
+                    "start_number": start_number,
+                    "end_number": end_number,
+                    "span_ambiguous": bool(row["span_ambiguous"]),
+                    "disambig": row["disambig"],
+                    "complete": bool(row["complete"]),
+                    "title_override": bool(row["title_override_json"]),
+                })
             rekey_result = migrate_catalog_title_keys(decision_conn, analysis_rekeys)
             if rekey_result["migrated"]:
                 print(

@@ -28,6 +28,23 @@ def _write_semantic_repack(path: Path, *, title: str, bookmark: bool):
             archive.writestr("META-INF/calibre_bookmarks.txt", "position=42")
 
 
+def _write_spine_asset_variant(path: Path, *, asset: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    opf = """<package version='2.0' unique-identifier='BookId'
+ xmlns='http://www.idpf.org/2007/opf'
+ xmlns:dc='http://purl.org/dc/elements/1.1/'>
+ <metadata><dc:identifier id='BookId'>urn:uuid:spine-same</dc:identifier>
+  <dc:title>척추 자동 격리 1</dc:title></metadata>
+ <manifest><item id='chapter' href='chapter.xhtml' media-type='application/xhtml+xml'/>
+  <item id='asset' href='asset.bin' media-type='application/octet-stream'/></manifest>
+ <spine><itemref idref='chapter'/></spine></package>"""
+    body = "동일한 장문 EPUB 실제 본문입니다." * 5_000
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/chapter.xhtml", f"<html><body>{body}</body></html>")
+        archive.writestr("OEBPS/asset.bin", asset)
+
+
 def _prepare(tmp_path, house_names, temp_names=()):
     house = tmp_path / "house"
     temp = tmp_path / "temp"
@@ -212,6 +229,48 @@ def test_metadata_only_house_epub_repack_is_revalidated_and_reduced(tmp_path):
     assert summary["warning_count"] == 0
     assert sum(path.is_file() for path in (first, second)) == 1
     assert len(list((temp / "trash_bin" / "strong_equivalent_duplicates").glob("*.epub"))) == 1
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+
+def test_spine_text_equivalent_is_revalidated_before_auto_quarantine(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    existing = house / "척추 자동 격리 1권.epub"
+    incoming = temp / "척추 자동 격리 01권.epub"
+    _write_spine_asset_variant(existing, asset=b"small asset")
+    _write_spine_asset_variant(incoming, asset=b"different larger asset payload")
+
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    index_path = tmp_path / "file_index.json"
+    assert generate_file_list(
+        [str(house)], str(tmp_path / "file_list.json"), str(index_path),
+        state_db_path=str(state_db), temp_root=str(temp),
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        backup = decision_store.backup_state_db(
+            conn, state_db.parent / "before-spine-equivalent.sqlite3"
+        )
+        decision_store.issue_actual_run_token(
+            conn, str(backup), house_dir=house, temp_dir=temp
+        )
+    finally:
+        conn.close()
+
+    summary = _run(house, temp, state_db, index_path)
+
+    assert summary["strong_equivalent_quarantine_count"] == 1
+    assert existing.is_file()
+    assert not incoming.exists()
+    assert len(list((
+        temp / "trash_bin" / "strong_equivalent_duplicates"
+    ).glob("*.epub"))) == 1
     conn = decision_store.connect_state_db(state_db)
     try:
         assert decision_store.doctor_issues(conn) == []

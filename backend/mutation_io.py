@@ -17,7 +17,10 @@ import zipfile
 import xml.etree.ElementTree as ElementTree
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from html.parser import HTMLParser
 from pathlib import Path
+from pathlib import PurePosixPath
+from urllib.parse import unquote, urlsplit
 
 from text_preview import (
     NormalizedLineSequence,
@@ -58,6 +61,19 @@ class EpubContentEvidence:
     content_sha256: str
     member_count: int
     uncompressed_size: int
+
+
+@dataclass(frozen=True)
+class EpubSpineTextEvidence:
+    file_evidence: FileEvidence
+    text_sha256: str
+    text_chars: int
+    spine_item_count: int
+    identifiers: tuple[str, ...]
+    titles: tuple[str, ...]
+    creators: tuple[str, ...]
+    publishers: tuple[str, ...]
+    dates: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1145,281 @@ def inspect_epub_reading_payload(
             content_sha256=digest.hexdigest(),
             member_count=included_members,
             uncompressed_size=uncompressed_size,
+        )
+    finally:
+        os.close(fd)
+        os.close(parent_fd)
+
+
+class _EpubVisibleTextParser(HTMLParser):
+    _HIDDEN = frozenset({"head", "script", "style", "template"})
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hidden_depth = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.casefold() in self._HIDDEN:
+            self.hidden_depth += 1
+
+    def handle_startendtag(self, tag, attrs):
+        return None
+
+    def handle_endtag(self, tag):
+        if tag.casefold() in self._HIDDEN and self.hidden_depth:
+            self.hidden_depth -= 1
+
+    def handle_data(self, data):
+        if not self.hidden_depth:
+            self.parts.append(data)
+
+
+def _epub_member_name(value):
+    value = unicodedata.normalize("NFC", str(value or ""))
+    if not value or "\\" in value or "\x00" in value or value.startswith("/"):
+        raise RuntimeError("EPUB contains an unsafe member path")
+    parts = PurePosixPath(value).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise RuntimeError("EPUB contains an unsafe member path")
+    return "/".join(parts)
+
+
+def _epub_href_member(opf_name, href):
+    split = urlsplit(str(href or ""))
+    if split.scheme or split.netloc or not split.path:
+        raise RuntimeError("EPUB manifest contains an external or empty href")
+    decoded = unicodedata.normalize("NFC", unquote(split.path))
+    combined = PurePosixPath(opf_name).parent / PurePosixPath(decoded)
+    parts = combined.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise RuntimeError("EPUB manifest href escapes the package directory")
+    return "/".join(parts)
+
+
+def _epub_xml_local(value):
+    return str(value).rsplit("}", 1)[-1].casefold()
+
+
+def _epub_metadata_values(root, local_name):
+    values = []
+    for element in root.iter():
+        if _epub_xml_local(element.tag) != local_name:
+            continue
+        value = unicodedata.normalize("NFC", " ".join("".join(
+            element.itertext()
+        ).split()))
+        if value and value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+def _epub_identifier_key(value):
+    return re.sub(r"\s+", "", unicodedata.normalize("NFC", value).casefold())
+
+
+def _decode_epub_markup(raw):
+    head = raw[:256]
+    encoding = "utf-8-sig"
+    match = re.search(br"encoding\s*=\s*['\"]\s*([A-Za-z0-9._-]+)", head, re.I)
+    if match is not None:
+        try:
+            encoding = match.group(1).decode("ascii")
+            codecs.lookup(encoding)
+        except (LookupError, UnicodeDecodeError):
+            raise RuntimeError("EPUB spine document declares an invalid encoding")
+    try:
+        return raw.decode(encoding, errors="strict")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("utf-8-sig", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("EPUB spine document is not valid Unicode text") from exc
+
+
+def _normalized_epub_visible_text(raw):
+    parser = _EpubVisibleTextParser()
+    parser.feed(_decode_epub_markup(raw))
+    parser.close()
+    return re.sub(r"\s+", "", unicodedata.normalize("NFC", "".join(parser.parts)))
+
+
+def inspect_epub_spine_text(
+    path,
+    *,
+    max_members=10_000,
+    max_file_bytes=None,
+    max_uncompressed_bytes=1024 * 1024 * 1024,
+    max_spine_member_bytes=64 * 1024 * 1024,
+    budget=None,
+):
+    """Hash exact visible text in OPF spine order and return package identity.
+
+    This deliberately ignores images, CSS and archive layout, so callers must
+    also require matching stable package identifiers before treating the hash
+    as duplicate proof. Every archive/member read remains no-follow, bounded,
+    and tied to the source identity for mutation-time revalidation.
+    """
+
+    parent_fd, fd, _ = _open_regular_nofollow(path)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"source is not a regular file: {path}")
+        if max_file_bytes is not None and before.st_size > int(max_file_bytes):
+            raise RuntimeError(
+                f"EPUB file limit exceeded: {before.st_size}>{int(max_file_bytes)}"
+            )
+        if budget is not None:
+            budget.reserve_pass(before.st_size)
+        raw_sha = _hash_fd(fd)
+        if budget is not None:
+            budget.consume(before.st_size)
+        os.lseek(fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(fd), "rb", closefd=True) as stream:
+            with zipfile.ZipFile(stream) as archive:
+                infos = [info for info in archive.infolist() if not info.is_dir()]
+                if len(infos) > int(max_members):
+                    raise RuntimeError(
+                        f"EPUB member limit exceeded: {len(infos)}>{max_members}"
+                    )
+                names = [_epub_member_name(info.filename) for info in infos]
+                if len(names) != len(set(names)):
+                    raise RuntimeError("EPUB contains duplicate normalized member names")
+                uncompressed_size = sum(int(info.file_size) for info in infos)
+                if uncompressed_size > int(max_uncompressed_bytes):
+                    raise RuntimeError(
+                        "EPUB uncompressed limit exceeded: "
+                        f"{uncompressed_size}>{max_uncompressed_bytes}"
+                    )
+                info_by_name = dict(zip(names, infos))
+                for info in infos:
+                    if info.flag_bits & 0x1:
+                        raise RuntimeError("encrypted EPUB member is unsupported")
+                    if ((info.external_attr >> 16) & 0o170000) == stat.S_IFLNK:
+                        raise RuntimeError("EPUB symlink member is unsupported")
+
+                def read_member(name, *, structural_limit=None):
+                    info = info_by_name.get(name)
+                    if info is None:
+                        raise RuntimeError(f"EPUB required member is missing: {name}")
+                    if structural_limit is not None and int(info.file_size) > structural_limit:
+                        raise RuntimeError(f"EPUB structural member is too large: {name}")
+                    if budget is not None:
+                        budget.reserve_pass(int(info.file_size))
+                    with archive.open(info, "r") as member:
+                        raw = member.read()
+                    if len(raw) != int(info.file_size):
+                        raise RuntimeError(f"EPUB member size changed while read: {name}")
+                    if budget is not None:
+                        budget.consume(len(raw))
+                    return raw
+
+                container_names = [
+                    name for name in names
+                    if name.casefold() == "meta-inf/container.xml"
+                ]
+                opf_name = None
+                if len(container_names) == 1:
+                    container = ElementTree.fromstring(
+                        read_member(container_names[0], structural_limit=1024 * 1024)
+                    )
+                    rootfiles = [
+                        element for element in container.iter()
+                        if _epub_xml_local(element.tag) == "rootfile"
+                        and element.attrib.get("full-path")
+                    ]
+                    if not rootfiles:
+                        raise RuntimeError("EPUB container has no rootfile")
+                    preferred = next((
+                        element for element in rootfiles
+                        if element.attrib.get("media-type")
+                        == "application/oebps-package+xml"
+                    ), rootfiles[0])
+                    opf_name = _epub_member_name(preferred.attrib["full-path"])
+                else:
+                    opf_names = [name for name in names if name.casefold().endswith(".opf")]
+                    if len(opf_names) != 1:
+                        raise RuntimeError("EPUB package document is ambiguous")
+                    opf_name = opf_names[0]
+
+                package = ElementTree.fromstring(
+                    read_member(opf_name, structural_limit=16 * 1024 * 1024)
+                )
+                if _epub_xml_local(package.tag) != "package":
+                    raise RuntimeError("EPUB OPF root is not package")
+                manifest = {}
+                for element in package.iter():
+                    if _epub_xml_local(element.tag) != "item":
+                        continue
+                    item_id = str(element.attrib.get("id") or "")
+                    if not item_id or item_id in manifest:
+                        raise RuntimeError("EPUB manifest contains a missing/duplicate id")
+                    manifest[item_id] = (
+                        _epub_href_member(opf_name, element.attrib.get("href")),
+                        str(element.attrib.get("media-type") or "").casefold(),
+                    )
+                spine_ids = [
+                    str(element.attrib.get("idref") or "")
+                    for element in package.iter()
+                    if _epub_xml_local(element.tag) == "itemref"
+                ]
+                if not spine_ids or any(not item_id for item_id in spine_ids):
+                    raise RuntimeError("EPUB spine is empty or malformed")
+
+                digest = hashlib.sha256()
+                text_chars = 0
+                spine_count = 0
+                for item_id in spine_ids:
+                    if item_id not in manifest:
+                        raise RuntimeError("EPUB spine references a missing manifest item")
+                    member_name, media_type = manifest[item_id]
+                    if media_type not in {"application/xhtml+xml", "text/html"} and not (
+                        member_name.casefold().endswith(".xhtml")
+                        or member_name.casefold().endswith(".html")
+                        or member_name.casefold().endswith(".htm")
+                    ):
+                        raise RuntimeError("EPUB spine contains a non-document item")
+                    visible = _normalized_epub_visible_text(read_member(
+                        member_name, structural_limit=int(max_spine_member_bytes)
+                    ))
+                    encoded = visible.encode("utf-8")
+                    digest.update(struct.pack(">Q", len(encoded)))
+                    digest.update(encoded)
+                    text_chars += len(visible)
+                    spine_count += 1
+
+                identifiers = tuple(sorted({
+                    _epub_identifier_key(value)
+                    for value in _epub_metadata_values(package, "identifier")
+                    if _epub_identifier_key(value)
+                }))
+                titles = _epub_metadata_values(package, "title")
+                creators = _epub_metadata_values(package, "creator")
+                publishers = _epub_metadata_values(package, "publisher")
+                dates = _epub_metadata_values(package, "date")
+
+        after = os.fstat(fd)
+        if (
+            before.st_dev, before.st_ino, before.st_ctime_ns,
+            before.st_size, before.st_mtime_ns,
+        ) != (
+            after.st_dev, after.st_ino, after.st_ctime_ns,
+            after.st_size, after.st_mtime_ns,
+        ):
+            raise SourceIdentityChanged(
+                f"source changed during EPUB spine text hash: {path}"
+            )
+        return EpubSpineTextEvidence(
+            file_evidence=_identity(after, raw_sha),
+            text_sha256=digest.hexdigest(),
+            text_chars=text_chars,
+            spine_item_count=spine_count,
+            identifiers=identifiers,
+            titles=titles,
+            creators=creators,
+            publishers=publishers,
+            dates=dates,
         )
     finally:
         os.close(fd)

@@ -1479,6 +1479,24 @@ def _process_items_authorized(
         for path in dedup_summary.get("blocked_intake_paths", ())
     }
 
+    # The auditor may run read-only in standalone configurations. Ensure the
+    # journal DB still has the same context-proven temp core/coordinate before
+    # per-file routing and same-coordinate conflict checks begin.
+    import decision_store
+
+    context_conn = decision_store.connect_state_db(state_db_path)
+    try:
+        with decision_store.transaction(context_conn):
+            pre_intake_bare_volume_context = (
+                decision_store.sync_contextual_bare_volume_metadata(
+                    context_conn,
+                    target_sources=("temp",),
+                    evidence_sources=("house", "temp"),
+                )
+            )
+    finally:
+        context_conn.close()
+
     # ── 2단계: 폴더링 (temp에 남아있는 파일을 house로 이동) ──
     print("=" * 60)
     print("📂 2단계: 폴더링 (temp → house)")
@@ -1817,6 +1835,41 @@ def _process_items_authorized(
         )
     performance_metrics["intake_seconds"] = round(
         time.perf_counter() - stage_started_at, 6
+    )
+
+    # A bare-number cohort may become provable only after every incoming file
+    # has reached house. Project those contextual cores/coordinates before the
+    # all-auto-ready series query, without reading any book body.
+    context_conn = decision_store.connect_state_db(state_db_path)
+    try:
+        with decision_store.transaction(context_conn):
+            bare_volume_context = (
+                decision_store.sync_contextual_bare_volume_metadata(
+                    context_conn,
+                    target_sources=("house",),
+                    evidence_sources=("house",),
+                )
+            )
+            bare_volume_catalog_rekeys = decision_store.migrate_catalog_title_keys(
+                context_conn, bare_volume_context["rekeys"]
+            )
+    finally:
+        context_conn.close()
+    print(
+        "🔢 숫자 권 문맥 반영: "
+        f"{bare_volume_context['promoted_count']}개 문맥 판정, "
+        f"좌표 {bare_volume_context['coordinate_changed']}개 갱신"
+    )
+    emit_folderling_event(
+        event_callback,
+        "bare_volume_context_result",
+        status="succeeded",
+        **{
+            key: value
+            for key, value in bare_volume_context.items()
+            if key != "rekeys"
+        },
+        catalog_rekeys=bare_volume_catalog_rekeys,
     )
 
     # ── 3단계: 전체 시리즈 자동 묶기 ──

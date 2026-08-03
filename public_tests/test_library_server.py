@@ -396,6 +396,92 @@ def test_appearance_settings_require_an_object_and_normalize_invalid_fields(tmp_
     }
 
 
+def test_custom_appearance_presets_are_added_listed_and_deleted(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+    config = app.config["library_server_config"]
+
+    initial = client.get("/api/settings/appearance/presets")
+    assert initial.status_code == 200
+    assert initial.get_json()["data"] == {"presets": [], "persisted": False}
+
+    created = client.post(
+        "/api/settings/appearance/presets",
+        json={
+            "preset": {
+                "name": "  밝은   그린  ",
+                "settings": {
+                    "backgroundColor": "#E0E0E0",
+                    "textColor": "#1B1A18",
+                    "accentColor": "#149058",
+                },
+            }
+        },
+    )
+    assert created.status_code == 201
+    data = created.get_json()["data"]
+    assert data["persisted"] is True
+    assert len(data["presets"]) == 1
+    preset = data["preset"]
+    assert preset == data["presets"][0]
+    assert preset["name"] == "밝은 그린"
+    assert len(preset["id"]) == 32
+    assert preset["settings"] == {
+        "backgroundColor": "#e0e0e0",
+        "textColor": "#1b1a18",
+        "accentColor": "#149058",
+    }
+
+    store = config.runtime_dir / "appearance-presets.json"
+    stored = json.loads(store.read_text(encoding="utf-8"))
+    assert stored == {"version": 1, "presets": [preset]}
+    assert client.get("/api/settings/appearance/presets").get_json()["data"] == {
+        "presets": [preset],
+        "persisted": True,
+    }
+
+    duplicate = client.post(
+        "/api/settings/appearance/presets",
+        json={"preset": {"name": "밝은 그린", "settings": preset["settings"]}},
+    )
+    assert duplicate.status_code == 400
+    builtin = client.post(
+        "/api/settings/appearance/presets",
+        json={"preset": {"name": "기본 블루", "settings": preset["settings"]}},
+    )
+    assert builtin.status_code == 400
+
+    deleted = client.delete(f"/api/settings/appearance/presets/{preset['id']}")
+    assert deleted.status_code == 200
+    assert deleted.get_json()["data"] == {"presets": [], "persisted": False}
+    assert not store.exists()
+
+
+def test_custom_appearance_preset_rejects_invalid_names_and_ids(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    client = app.test_client()
+    colors = {
+        "backgroundColor": "#101820",
+        "textColor": "#f1f5f9",
+        "accentColor": "#8b5cf6",
+    }
+
+    missing_name = client.post(
+        "/api/settings/appearance/presets",
+        json={"preset": {"name": "  ", "settings": colors}},
+    )
+    assert missing_name.status_code == 400
+    missing_settings = client.post(
+        "/api/settings/appearance/presets",
+        json={"preset": {"name": "테스트"}},
+    )
+    assert missing_settings.status_code == 400
+    assert client.delete("/api/settings/appearance/presets/not-an-id").status_code == 400
+    assert client.delete(
+        "/api/settings/appearance/presets/00000000000000000000000000000000"
+    ).status_code == 404
+
+
 def test_dashboard_defers_full_file_doctor_but_mutation_doctor_stays_strict(tmp_path):
     app, file_id = _server_fixture(tmp_path)
     config = app.config["library_server_config"]
