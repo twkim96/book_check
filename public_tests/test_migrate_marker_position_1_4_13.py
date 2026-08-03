@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-import migrate_marker_position
+from tools.legacy import migrate_marker_position
 
 
 def test_legacy_marker_migration_dry_run_is_read_only(tmp_path, capsys):

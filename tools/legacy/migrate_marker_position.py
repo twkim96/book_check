@@ -4,8 +4,8 @@
 파일명을 새 규칙으로 맞춘다. 자모 폴더 위치는 그대로 둔다(파일명만 변경).
 
 사용:
-    python3 migrate_marker_position.py            # dry-run(미리보기)만 지원
-    python3 migrate_marker_position.py --house <경로>
+    python3 tools/legacy/migrate_marker_position.py            # dry-run만 지원
+    python3 tools/legacy/migrate_marker_position.py --house <경로>
 
 이전의 ``--run`` 직접 변경 모드는 현재 actual-run/journal/Doctor 계약을
 우회하므로 1.4.13부터 hard-fail한다. 이 파일은 과거 이름을 찾는 읽기 전용
@@ -14,6 +14,11 @@
 import os
 import re
 import sys
+from pathlib import Path
+
+BACKEND = Path(__file__).resolve().parents[2] / "backend"
+if str(BACKEND) not in sys.path:
+    sys.path.insert(0, str(BACKEND))
 
 from normalizer import (
     PASS_MARKER,

@@ -18,6 +18,10 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+BACKEND = Path(__file__).resolve().parents[2] / "backend"
+if str(BACKEND) not in sys.path:
+    sys.path.insert(0, str(BACKEND))
+
 import decision_store
 import folderling
 from dedup_mutations import (

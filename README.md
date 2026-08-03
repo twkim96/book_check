@@ -35,14 +35,15 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.13)
+## 동일 작품 자동 중복 정리 계약 (1.4.14)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
 1.4.6의 제목 접두사·메타데이터 cut 경계, 1.4.7의 warm cache·검증 receipt,
 1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive,
 1.4.10의 archive/review 경합·경로 안전 보강, 1.4.11의 숫자 권 문맥 추론,
-1.4.12의 닫힌 좌표 보정·EPUB spine 동일성, 1.4.13의 legacy 실행 차단·분권 분석/복구 계약은
+1.4.12의 닫힌 좌표 보정·EPUB spine 동일성, 1.4.13의 legacy 실행 차단·분권 분석/복구,
+1.4.14의 상태 저장소 모듈 ownership 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -55,7 +56,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.10.md`](update_1.4.10.md),
 [`update_1.4.11.md`](update_1.4.11.md),
 [`update_1.4.12.md`](update_1.4.12.md),
-[`update_1.4.13.md`](update_1.4.13.md)에 기록합니다.
+[`update_1.4.13.md`](update_1.4.13.md),
+[`update_1.4.14.md`](update_1.4.14.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -232,8 +234,8 @@ SHA `a23b9e42ddd3b273d1ae0224ac0b1b4d384d0417316b17de0e08af95d78fadd5`를 승인
 - 이미 실체가 없던 과거 격리 2건을 별도 승인 group으로 정합화
 - 최종 `txt_temp/trash_bin` 일반 파일 0개, Doctor 0, integrity check `ok`
 
-실행 도구는 `backend/cleanup_quarantine_1_4_4.py`, 감사 계획 생성기는
-`backend/build_quarantine_cleanup_plan_1_4_4.py`입니다. 실행 결과 원본은
+감사 재현 도구는 `tools/legacy/cleanup_quarantine_1_4_4.py`, 당시 계획 생성기는
+`tools/legacy/build_quarantine_cleanup_plan_1_4_4.py`입니다. 실행 결과 원본은
 `txt_temp/dedup_logs/quarantine_cleanup_1_4_4_20260729_143535_894414.json`에 남습니다.
 
 ### 1.4.5 house cleanup 안전선과 감사 cache 계약
@@ -293,7 +295,7 @@ Scanner가 실제 관측 시각의 소유자이며 warm auditor는 변하지 않
   `-2회차-작품명`처럼 제목 숫자와 뒤 좌표가 우연히 이어진 경우에는 실제 뒤쪽 좌표에서 자릅니다.
 
 이 절의 접두사 보정 당시 Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.2`와 같은 단일 파일
-분석 결과를 사용했습니다. 현재 1.4.13은 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
+분석 결과를 사용했습니다. 현재 1.4.14는 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
 해당 변경은 파일명·`core_title` 의미만 바꿉니다. TXT/EPUB 본문 fingerprint 의미는 바뀌지 않았으므로
 `FINGERPRINT_NORMALIZER_COMPAT_VERSION`과 `PAIR_NORMALIZER_COMPAT_VERSION`은 `1.3.0`에 고정하고,
 1.4.2 fingerprint/pair policy hash를 유지합니다. 제목 parser 버전 상승만으로 house 본문 전체를 다시
@@ -545,7 +547,7 @@ cache만 새 세대로 계산하며, 기존 대용량 fingerprint는 다시 만�
 1.4.13은 중복·제목 파싱 의미를 넓히지 않고 제품 바깥의 우회 경로와 분권 작업의 복구 경계만
 보강합니다.
 
-- `migrate_marker_position.py`는 과거 앞마커 파일을 찾는 dry-run 감사기로만 남습니다. `--run` 또는
+- `tools/legacy/migrate_marker_position.py`는 과거 앞마커 파일을 찾는 dry-run 감사기로만 남습니다. `--run` 또는
   `migrate(..., dry_run=False)`는 파일 walk 전에 hard-fail하며, 실제 변경은 backup·manifest·journal·
   Doctor가 연결된 관리형 작업만 사용해야 합니다.
 - 분권 검토와 Folderling 자동 합류는 공통 resolver를 사용합니다. normalizer version, 파일명,
@@ -563,6 +565,33 @@ cache만 새 세대로 계산하며, 기존 대용량 fingerprint는 다시 만�
 배포/auditor/UI는 `1.4.13`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
 version/policy `5`/`1.4.2`, pair policy `1.4.12`를 유지합니다. 따라서 제목·본문 cache 재기준은
 발생하지 않습니다.
+
+### 상태 저장소 모듈 ownership 계약 (1.4.14)
+
+1.4.14는 중복 판정이나 파일 mutation 의미를 바꾸지 않는 구조개선 버전입니다. AI와 사람이 한 기능을
+수정할 때 6천 줄짜리 저장소 전체와 무관한 삭제 경계까지 동시에 건드리지 않도록 다음 소유권을 둡니다.
+
+- `state_schema.py`: schema version, DDL, 필수 table/view만 소유하며 import만으로 DB를 열지 않습니다.
+- `state_repository.py`: SQLite 연결, schema migration/validation, transaction, canonical DB path만
+  소유합니다.
+- `volume_policy.py`: 권·부·회차·외전 좌표 생성과 호환성 판단의 단일 구현입니다.
+- `file_analysis_repository.py`: current/stale filename 분석, contextual bare-volume 보정, catalog rekey,
+  파일 분석 projection을 소유합니다.
+- `decision_store.py`는 기존 import를 깨지 않는 compatibility facade이자 actual-run, backup/manifest,
+  operation journal, recovery, Doctor, review/decision 상태 머신의 소유자입니다. 이 mutation 상태 머신은
+  한 불변조건이므로 이번 버전에서 여러 파일로 쪼개지 않습니다.
+- 파일 descriptor·SHA·no-follow identity는 이미 `mutation_io.py`가 소유하므로 별도 `file_identity.py`를
+  만들어 중복하지 않습니다. 새 policy 모듈도 기존 `bare_volume_context.py`,
+  `dedup_episode_relation.py`와 역할이 겹치면 추가하지 않습니다.
+
+추출 모듈은 `decision_store`를 역으로 import하지 않습니다. 서버·CLI·기존 테스트는 계속
+`decision_store.*`를 사용할 수 있고, facade의 validation/analysis hook도 유지합니다. 1.1.1/1.4.4
+일회성 도구는 제품 backend에서 `tools/legacy/`로 이동했으며, 비호환 marker actual은 계속 파일 탐색
+전에 hard-fail합니다.
+
+배포/auditor/UI는 `1.4.14`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
+version/policy `5`/`1.4.2`, pair policy `1.4.12`, archive `1.4.10`을 유지합니다. 따라서 DB migration,
+fingerprint/pair cache 재기준, house 전체 재분석은 발생하지 않습니다.
 
 ## 구조
 

@@ -42,7 +42,7 @@ jobs:
       - name: Install quality dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Check production Python
-        run: python -m pyflakes backend *.py
+        run: python -m pyflakes backend tools *.py
       - name: Measure backend coverage
         run: python -m coverage run --source=backend -m pytest -q public_tests
       - name: Enforce coverage floor

@@ -5,10 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
+BACKEND = Path(__file__).resolve().parents[2] / "backend"
+if str(BACKEND) not in sys.path:
+    sys.path.insert(0, str(BACKEND))
+
 import decision_store
-from cleanup_quarantine_1_4_4 import _atomic_json
+try:
+    from .cleanup_quarantine_1_4_4 import _atomic_json
+except ImportError:  # direct ``python tools/legacy/...`` execution
+    from cleanup_quarantine_1_4_4 import _atomic_json
 from mutation_io import inspect_regular_file
 from project_paths import STATE_DB
 

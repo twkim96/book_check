@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import cleanup_quarantine_1_4_4 as cleanup
 import decision_store
 from dedup_mutations import (
     _ensure_intake_fingerprint,
@@ -10,6 +9,7 @@ from dedup_mutations import (
     user_quarantine,
 )
 from mutation_io import inspect_regular_file
+from tools.legacy import cleanup_quarantine_1_4_4 as cleanup
 
 
 def _register(conn, path, source):
