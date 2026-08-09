@@ -35,7 +35,7 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.15)
+## 동일 작품 자동 중복 정리 계약 (1.4.16)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
@@ -43,7 +43,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 1.4.8의 run-local inventory 재사용, 1.4.9의 검증된 상태 백업 cold archive,
 1.4.10의 archive/review 경합·경로 안전 보강, 1.4.11의 숫자 권 문맥 추론,
 1.4.12의 닫힌 좌표 보정·EPUB spine 동일성, 1.4.13의 legacy 실행 차단·분권 분석/복구,
-1.4.14의 상태 저장소 모듈 ownership, 1.4.15의 플랫폼·stale override·staging recovery 계약은
+1.4.14의 상태 저장소 모듈 ownership, 1.4.15의 플랫폼·stale override·staging recovery,
+1.4.16의 다중 사이트 Chrome 제목 검색 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -58,7 +59,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.12.md`](update_1.4.12.md),
 [`update_1.4.13.md`](update_1.4.13.md),
 [`update_1.4.14.md`](update_1.4.14.md),
-[`update_1.4.15.md`](update_1.4.15.md)에 기록합니다.
+[`update_1.4.15.md`](update_1.4.15.md),
+[`update_1.4.16.md`](update_1.4.16.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -296,7 +298,7 @@ Scanner가 실제 관측 시각의 소유자이며 warm auditor는 변하지 않
   `-2회차-작품명`처럼 제목 숫자와 뒤 좌표가 우연히 이어진 경우에는 실제 뒤쪽 좌표에서 자릅니다.
 
 이 절의 접두사 보정 당시 Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.2`와 같은 단일 파일
-분석 결과를 사용했습니다. 현재 1.4.15는 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
+분석 결과를 사용했습니다. 현재 1.4.16은 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
 해당 변경은 파일명·`core_title` 의미만 바꿉니다. TXT/EPUB 본문 fingerprint 의미는 바뀌지 않았으므로
 `FINGERPRINT_NORMALIZER_COMPAT_VERSION`과 `PAIR_NORMALIZER_COMPAT_VERSION`은 `1.3.0`에 고정하고,
 1.4.2 fingerprint/pair policy hash를 유지합니다. 제목 parser 버전 상승만으로 house 본문 전체를 다시
@@ -619,6 +621,25 @@ process-local lock·receipt·recovery registry가 두 module identity로 갈릴 
 version/policy `5`/`1.4.2`, pair policy `1.4.12`, archive `1.4.10`을 유지합니다. DB migration,
 fingerprint/pair cache 재기준, house 전체 재분석은 발생하지 않습니다.
 
+### 다중 사이트 Chrome 제목 검색 계약 (1.4.16)
+
+Chrome 확장 manifest `2.10`은 EnterJoy, Tcafe21, Pastebin에서 같은 로컬 중복 검색 모달을 사용합니다.
+
+- 일반 우클릭은 브라우저 메뉴를 보존하고 `이 제목으로 중복 확인` 항목을 제공합니다.
+- `Command+우클릭`은 제목 또는 Pastebin의 한 줄을 바로 검색합니다.
+- 선택 텍스트는 `Command+Shift+L`로 즉시 검색합니다. 이 명령은 브라우저가 포커스일 때만 활성화되며,
+  다른 확장과 충돌하면 `chrome://extensions/shortcuts`에서 변경할 수 있습니다.
+- 선택 텍스트가 없거나 지원 사이트의 content script가 없는 탭에서는 아무 동작도 하지 않습니다.
+- Pastebin은 전체 paste를 하나의 제목으로 보내지 않고 우클릭한 개별 줄만 사용합니다.
+
+확장 소스와 회귀 검증기는 공개 저장소에서 추적하되, 개인 라이브러리에서 생성한
+`extension/file_index.json`과 브라우저의 `extension/_metadata/`는 계속 제외합니다.
+
+배포/auditor/UI는 `1.4.16`, Chrome manifest는 `2.10`이며 schema `v15`,
+`NORMALIZER_VERSION=1.3.3`, fingerprint version/policy `5`/`1.4.2`, pair policy `1.4.12`,
+archive `1.4.10`을 유지합니다. DB migration, fingerprint/pair cache 재기준, house 전체 재분석은
+발생하지 않습니다.
+
 ## 구조
 
 ```text
@@ -632,6 +653,7 @@ run_title_cleanup_candidates.py  1.2.7 제목 후보 read-only 감사기
 run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
 run_library_server.py             1.2.8+ 독립 도서 관리 웹 서버
 library_frontend/                 React 기반 도서 관리 화면
+extension/                        Chrome 다중 사이트 제목 검색 확장과 공개 회귀
 ```
 
 mutable runtime 파일은 계속 프로젝트 루트에 생성됩니다.

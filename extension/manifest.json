@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "중복 다운로드 방지 도우미",
+  "version": "2.10",
+  "description": "EnterJoy, Tcafe21, Pastebin에서 로컬 파일 리스트와 다운로드 기록을 통합 검색합니다.",
+  "permissions": ["downloads", "storage", "unlimitedStorage", "declarativeNetRequest", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "kakao_bff_headers",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "파일 목록 관리"
+  },
+  "commands": {
+    "search-selected-text": {
+      "suggested_key": {
+        "mac": "Command+Shift+L"
+      },
+      "description": "선택한 제목의 중복 검색 결과 표시"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "include_globs": ["*://*enterjoy*/*", "*://*tcafe21*/*", "*://*pastebin.com/*"],
+      "js": ["content.js"],
+      "css": ["style.css"]
+    }
+  ]
+}

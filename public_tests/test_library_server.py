@@ -287,7 +287,9 @@ def test_work_merge_management_api_runs_as_exclusive_job(tmp_path):
 def test_health_dashboard_and_title_review_api(tmp_path):
     app, file_id = _server_fixture(tmp_path)
     client = app.test_client()
-    assert client.get("/health").get_json()["ok"] is True
+    health = client.get("/health").get_json()
+    assert health["ok"] is True
+    assert health["version"] == "1.4.16"
     providers = client.get("/api/providers").get_json()["data"]
     assert providers == [
         {"id": "title_correction", "label": "제목 교정", "enabled": True},

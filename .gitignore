@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
 .venv/
 library_frontend/node_modules/
 library_frontend/dist/
@@ -48,5 +49,7 @@ test_env/
 *.sqlite3
 *.sqlite3-*
 
-# 로컬 Chrome 확장 소스와 생성 인덱스는 공개 저장소에서 제외
-extension/
+# Chrome 확장 소스는 공개 회귀 대상으로 추적하고 로컬 생성물만 제외
+extension/file_index.json
+extension/_metadata/
+extension/__pycache__/

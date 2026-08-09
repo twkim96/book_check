@@ -67,3 +67,21 @@ jobs:
         run: npm run typecheck
       - name: Production build
         run: npm run build
+
+  extension:
+    name: Chrome extension checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check scripts and context search
+        run: |
+          node --check extension/content.js
+          node --check extension/background.js
+          node --experimental-default-type=module extension/check_context_search.mjs
+          python extension/check_normalizer_parity.py

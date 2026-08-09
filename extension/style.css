@@ -1,0 +1,286 @@
+/* 툴팁 기본 스타일 */
+.dl-check-tooltip {
+  display: none;
+  position: absolute;
+  background: rgba(30, 30, 30, 0.95);
+  color: #fff;
+  padding: 12px;
+  border-radius: 8px;
+  z-index: 99999;
+  font-size: 13px;
+  max-width: 350px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+  border: 1px solid #555;
+  backdrop-filter: blur(5px);
+  pointer-events: none; /* 마우스 이벤트 통과 */
+}
+
+.dl-check-btn, .google-search-btn {
+  cursor: pointer;
+  margin-left: 8px;
+  font-size: 14px;
+  transition: opacity 0.2s, color 0.2s, transform 0.2s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+}
+.dl-check-btn:hover, .google-search-btn:hover {
+  opacity: 0.9;
+  transform: scale(1.2);
+}
+
+.dl-check-btn.pending {
+  color: #a4b0be; /* 대기 중 - 회색 */
+}
+
+.dl-check-btn.safe {
+  color: #a4b0be; /* 발견 없음 - 회색 */
+}
+
+.dl-check-btn.duplicate {
+  color: #2ed573; /* 보유 파일 있음 - 녹색 */
+}
+
+.dl-check-btn.outdated {
+  color: #1e90ff; /* 갱신 후보 - 파랑 (보유 부족/편수 불명/단위 상이) */
+}
+
+.dl-check-btn svg {
+  display: block;
+  pointer-events: none;
+}
+
+/* coverage 배너 (툴팁 상단, 색+텍스트 병기) */
+.dl-check-tooltip .cov {
+  font-weight: 700;
+  margin-bottom: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+.dl-check-tooltip .cov-covered {
+  color: #2ed573; /* 녹색 */
+  background: rgba(46, 213, 115, 0.12);
+}
+.dl-check-tooltip .cov-outdated {
+  color: #4aa3ff; /* 파랑 (녹색과 대비 확보) */
+  background: rgba(30, 144, 255, 0.14);
+}
+.dl-check-tooltip .cov-none {
+  color: #b2bec3; /* 회색 */
+  background: rgba(178, 190, 195, 0.12);
+}
+
+/* 툴팁 내부 리스트 */
+.dl-check-tooltip ul {
+  list-style: none;
+  padding: 0;
+  margin: 5px 0 0 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.dl-check-tooltip li {
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #444;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dl-check-tooltip li:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+}
+
+/* 뱃지 스타일 */
+.badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  display: inline-block;
+  width: fit-content;
+  font-weight: bold;
+}
+
+.source-pc {
+  background-color: #6c5ce7; /* 보라색 (로컬) */
+  color: white;
+}
+
+.source-web {
+  background-color: #0984e3; /* 파란색 (다운로드기록) */
+  color: white;
+}
+
+/* 상태 메시지 */
+.safe {
+  color: #b2bec3;
+  font-weight: bold;
+}
+.found {
+  color: #55efc4;
+  font-weight: bold;
+  margin-bottom: 5px;
+}
+.warning {
+  color: #ff7675;
+  font-weight: bold;
+  margin-bottom: 5px;
+}
+.query-info {
+  color: #fdcb6e;
+  font-size: 11px;
+  line-height: 1.35;
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+.filename {
+  color: #dfe6e9;
+  word-break: break-all;
+}
+.match-meta {
+  color: #b2bec3;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.loading {
+  color: #fdcb6e;
+}
+
+.web-stats-title {
+  color: #dfe6e9;
+  font-weight: bold;
+  margin-bottom: 7px;
+  word-break: break-all;
+}
+
+.web-stat-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #444;
+  line-height: 1.35;
+}
+
+.web-stat-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.web-stat-source {
+  flex: 0 0 56px;
+  color: #74b9ff;
+  font-weight: bold;
+}
+
+.web-stat-status {
+  color: #dfe6e9;
+  word-break: keep-all;
+}
+
+.web-stat-row.status-ok .web-stat-status {
+  color: #55efc4;
+}
+
+.web-stat-row.status-not_found .web-stat-status,
+.web-stat-row.status-skipped .web-stat-status {
+  color: #b2bec3;
+}
+
+.web-stat-row.status-timeout .web-stat-status {
+  color: #fdcb6e;
+}
+
+.web-stat-row.status-error .web-stat-status {
+  color: #ff7675;
+}
+
+/* 선택 텍스트 우클릭 검색 모달 */
+.dl-selection-search-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 2147483647;
+  box-sizing: border-box;
+}
+
+.dl-selection-search-panel {
+  width: min(520px, 100%);
+  max-height: min(620px, 85vh);
+  overflow: hidden;
+  padding: 16px;
+  border: 1px solid #555;
+  border-radius: 10px;
+  background: rgba(30, 30, 30, 0.98);
+  color: #fff;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.dl-selection-search-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 15px;
+}
+
+.dl-selection-search-close {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #dfe6e9;
+  cursor: pointer;
+  font: 22px/28px sans-serif;
+}
+
+.dl-selection-search-close:hover,
+.dl-selection-search-close:focus-visible {
+  background: #444;
+  outline: none;
+}
+
+.dl-selection-search-query {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #292929;
+  color: #fdcb6e;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.dl-selection-search-results {
+  max-height: min(480px, 65vh);
+  overflow-y: auto;
+}
+
+.dl-selection-search-results .dl-check-tooltip {
+  display: block;
+  position: static;
+  max-width: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  pointer-events: auto;
+}
+
+.dl-selection-search-results .dl-check-tooltip ul {
+  max-height: none;
+}

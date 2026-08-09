@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        width: 300px;
+        padding: 15px;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background-color: #f8f9fa;
+      }
+      h3 {
+        margin: 0 0 10px 0;
+        font-size: 16px;
+        color: #333;
+      }
+      p {
+        font-size: 12px;
+        color: #666;
+        margin-bottom: 15px;
+      }
+
+      .upload-box {
+        border: 2px dashed #ccc;
+        padding: 20px;
+        text-align: center;
+        background: white;
+        border-radius: 8px;
+        transition: all 0.2s;
+      }
+      .upload-box:hover {
+        border-color: #6c5ce7;
+        background: #f0f0ff;
+      }
+
+      input[type="file"] {
+        width: 100%;
+        font-size: 12px;
+      }
+
+      #status {
+        margin-top: 15px;
+        padding: 10px;
+        border-radius: 5px;
+        font-size: 13px;
+        font-weight: bold;
+        display: none;
+      }
+      .success {
+        background-color: #d4edda;
+        color: #155724;
+      }
+      .error {
+        background-color: #f8d7da;
+        color: #721c24;
+      }
+
+      .info-area {
+        margin-top: 15px;
+        font-size: 11px;
+        color: #888;
+        border-top: 1px solid #eee;
+        padding-top: 10px;
+        text-align: right;
+      }
+
+      /* 검색 섹션 스타일 */
+      .search-section {
+        margin-top: 20px;
+        padding-top: 20px;
+        border-top: 2px solid #6c5ce7;
+      }
+      .search-box {
+        display: flex;
+        gap: 5px;
+        margin-bottom: 10px;
+      }
+      #searchInput {
+        flex: 1;
+        padding: 8px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 13px;
+      }
+      #searchBtn {
+        padding: 8px 12px;
+        background-color: #6c5ce7;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #searchBtn:hover {
+        background-color: #5b4cc4;
+      }
+
+      #searchResults {
+        margin-top: 10px;
+        max-height: 200px;
+        overflow-y: auto;
+        font-size: 12px;
+        background: white;
+        border-radius: 4px;
+      }
+      .result-item {
+        padding: 8px;
+        border-bottom: 1px solid #eee;
+      }
+      .result-item:last-child {
+        border-bottom: none;
+      }
+      .result-source {
+        font-size: 10px;
+        font-weight: bold;
+        margin-bottom: 2px;
+      }
+      .result-name {
+        word-break: break-all;
+      }
+      .result-meta {
+        margin-top: 3px;
+        color: #666;
+        font-size: 11px;
+        line-height: 1.35;
+      }
+      .query-info {
+        margin: 0 0 8px 0;
+        padding: 7px 8px;
+        color: #6b5b00;
+        background: #fff6cc;
+        border-radius: 4px;
+        font-size: 11px;
+        line-height: 1.35;
+        word-break: break-all;
+      }
+      .no-results {
+        padding: 10px;
+        color: #155724;
+        background-color: #d4edda;
+        border-radius: 4px;
+        text-align: center;
+        font-weight: bold;
+      }
+      .has-results-header {
+        color: #721c24;
+        background-color: #f8d7da;
+        padding: 8px;
+        border-radius: 4px;
+        margin-bottom: 5px;
+        font-weight: bold;
+        text-align: center;
+      }
+      .cov {
+        padding: 8px;
+        border-radius: 4px;
+        margin-bottom: 5px;
+        font-weight: bold;
+        text-align: center;
+      }
+      .cov-covered { color: #1e7e34; background-color: #d4edda; }
+      .cov-outdated { color: #0c5460; background-color: #d1ecf1; }
+      .cov-none { color: #383d41; background-color: #e2e3e5; }
+      .source-pc { color: #6c5ce7; }
+      .source-web { color: #0984e3; }
+    </style>
+  </head>
+  <body>
+    <h3>📂 로컬 파일 목록 업데이트</h3>
+    <p>Python으로 생성한 <code>file_list.json</code> 또는 <code>file_index.json</code> 파일을 업로드해주세요.</p>
+
+    <div class="upload-box">
+      <input type="file" id="fileInput" accept=".json" />
+    </div>
+
+    <div id="status"></div>
+
+    <div class="info-area">
+      현재 저장된 파일 수: <span id="currentCount">0</span>개
+      <div id="indexMeta" style="margin-top: 4px; font-size: 10px; color: #aaa;"></div>
+    </div>
+
+    <!-- 검색 섹션 추가 -->
+    <div class="search-section">
+      <h3>🔍 중복 파일 검색</h3>
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="검색할 파일명을 입력하세요..." />
+        <button id="searchBtn">검색</button>
+      </div>
+      <div id="searchResults"></div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
