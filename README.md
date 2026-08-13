@@ -10,6 +10,13 @@
 - 짧은 판본이 긴 판본에 포함됨을 강하게 증명한 경우는 애매한 항목이 아니며, 긴 판본을
   채택하고 짧은 판본을 복구 가능한 격리함으로 자동 이동합니다.
 - 실제 이동은 상태 DB, backup, manifest, 일회성 승인, 복구 기록을 사용합니다.
+- queue/quarantine 목적지는 디스크 항목(끊어진 symlink 포함)뿐 아니라 활성·비활성 DB 행의
+  `canonical_path` 점유도 함께 확인합니다. 과거 이력이 이름을 점유하면 `_1`, `_2`처럼 비어 있고
+  미점유인 이름을 골라, 파일 복사 뒤 DB UNIQUE 충돌이 생기지 않게 합니다.
+- 초기 exact 스냅샷에서 house keep이 없어 보류한 순수 temp-temp 중복은, 같은 실행에서 한 사본이
+  journal 입고된 경우에만 현재 raw SHA와 manifest를 다시 검증해 남은 사본을 복구 가능 격리합니다.
+- queue 내부 raw-exact 사본은 정확히 두 개이고 모든 외부 리뷰 관계가 보존본에 중복되어 있을 때만
+  한 사본을 격리합니다. 관계가 비대칭이거나 stale이면 자동 정리하지 않습니다.
 - `.dedup_state`, 인덱스, 로그와 실제 라이브러리는 Git에 포함하지 않습니다.
 
 ### 같은 house 경로 재입고 안전 계약 (DB schema v15)
@@ -35,7 +42,7 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 이 계약의 회귀는 `public_tests/test_legacy_canonical_path_recovery.py`에서 과거 tombstone migration,
 이동 전 DB 충돌 차단, journal 기반 `fs_done` 합류 복구를 함께 검증합니다.
 
-## 동일 작품 자동 중복 정리 계약 (1.4.16)
+## 동일 작품 자동 중복 정리 계약 (1.4.17)
 
 1.4.1의 순서형 본문 계약, 1.4.2의 강한 EPUB/입고 보정, 1.4.3의 전체 시리즈 자동 묶음,
 1.4.4의 강한 동일성 최종 격리·격리 수명주기, 1.4.5의 house cleanup 안전선·감사 cache 계약,
@@ -44,7 +51,7 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 1.4.10의 archive/review 경합·경로 안전 보강, 1.4.11의 숫자 권 문맥 추론,
 1.4.12의 닫힌 좌표 보정·EPUB spine 동일성, 1.4.13의 legacy 실행 차단·분권 분석/복구,
 1.4.14의 상태 저장소 모듈 ownership, 1.4.15의 플랫폼·stale override·staging recovery,
-1.4.16의 다중 사이트 Chrome 제목 검색 계약은
+1.4.16의 다중 사이트 Chrome 제목 검색, 1.4.17의 Folderling 운영 안정화 계약은
 각각 [`update_1.4.1.md`](update_1.4.1.md),
 [`update_1.4.2.md`](update_1.4.2.md),
 [`update_1.4.3.md`](update_1.4.3.md),
@@ -60,7 +67,8 @@ fingerprint에는 원래 경로가 그대로 남으므로 이 이동은 이력 �
 [`update_1.4.13.md`](update_1.4.13.md),
 [`update_1.4.14.md`](update_1.4.14.md),
 [`update_1.4.15.md`](update_1.4.15.md),
-[`update_1.4.16.md`](update_1.4.16.md)에 기록합니다.
+[`update_1.4.16.md`](update_1.4.16.md),
+[`update_1.4.17.md`](update_1.4.17.md)에 기록합니다.
 
 > **이 절은 구현 세부사항이 아니라 프로그램의 핵심 설계 계약입니다.**
 > 오탐 방지를 이유로 모든 포함 관계를 다시 수동 검토로 돌리면 안 됩니다. `file_check`를 만든
@@ -176,9 +184,21 @@ identity 비교에서 제외하고, `mtime`·`ctime`만 바뀌어도 기존 본�
 
 일상 Folderling 감사의 누적 읽기 예산은 20 GiB입니다. actual run에서 cold cache 때문에
 `body_budget_exhausted` 또는 `deep_check_deferred`만 발생하면 파일 mutation 전에 기존 cache를 이어 받아
-64 GiB·파일당 정밀 후보 128쌍으로 한 번 자동 재기준합니다. stale input, decode/구조 오류 등 다른
-중단 사유가 함께 있거나 재시도도 완료되지 않으면 기존처럼 fail-closed합니다. dry-run과 사람이 주입한
-auditor report에는 이 자동 재시도를 적용하지 않습니다.
+64 GiB·파일당 정밀 후보 128쌍으로 한 번 자동 재기준합니다. stale input이나 house의 decode/구조 오류가
+함께 있거나 재시도도 완료되지 않으면 기존처럼 fail-closed합니다. dry-run과 사람이 주입한 auditor
+report에는 이 자동 재시도를 적용하지 않습니다.
+
+신규 temp EPUB 하나만 구조 분석에 실패한 경우에는 그 파일을 중복 증거에서 제외하고 오류 경로·문구를
+구조화해 남깁니다. 따라서 같은 실행의 resource-only 재기준을 막지 않습니다. 재기준 감사가 완전히
+끝난 뒤에만 현재 파일 identity·actual manifest·동일 제한의 오류 재현을 다시 확인하고
+`trash_bin/warning/epub_analysis_errors`로 journal 이동합니다. 파일은 `decision_required` 상태로 보존되며
+삭제·덮어쓰지 않습니다. house EPUB 오류, 재검증 불일치, 다른 auditor stop reason은 계속 전체 실행을
+차단합니다.
+
+ZIP에 정규화 후 같은 이름의 멤버가 여러 개 있으면 각 멤버의 해제 bytes가 모두 동일할 때만 하나의
+논리 멤버로 접습니다. 물리 멤버 수·총 해제 크기 제한은 중복을 포함해 먼저 검사하고, 동일성 확인 읽기도
+I/O budget에 포함합니다. 같은 이름인데 bytes가 하나라도 다르면 어떤 항목이 실제 책 내용인지 모호하므로
+`epub_analysis_error`를 유지합니다.
 
 다음 관계는 review/warning에 남깁니다.
 
@@ -298,7 +318,7 @@ Scanner가 실제 관측 시각의 소유자이며 warm auditor는 변하지 않
   `-2회차-작품명`처럼 제목 숫자와 뒤 좌표가 우연히 이어진 경우에는 실제 뒤쪽 좌표에서 자릅니다.
 
 이 절의 접두사 보정 당시 Python과 Chrome 확장은 같은 `NORMALIZER_VERSION=1.3.2`와 같은 단일 파일
-분석 결과를 사용했습니다. 현재 1.4.16은 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
+분석 결과를 사용했습니다. 현재 1.4.17은 아래 절의 닫힌 좌표 보정을 포함해 `1.3.3`을 사용합니다.
 해당 변경은 파일명·`core_title` 의미만 바꿉니다. TXT/EPUB 본문 fingerprint 의미는 바뀌지 않았으므로
 `FINGERPRINT_NORMALIZER_COMPAT_VERSION`과 `PAIR_NORMALIZER_COMPAT_VERSION`은 `1.3.0`에 고정하고,
 1.4.2 fingerprint/pair policy hash를 유지합니다. 제목 parser 버전 상승만으로 house 본문 전체를 다시
@@ -640,6 +660,16 @@ Chrome 확장 manifest `2.10`은 EnterJoy, Tcafe21, Pastebin에서 같은 로컬
 archive `1.4.10`을 유지합니다. DB migration, fingerprint/pair cache 재기준, house 전체 재분석은
 발생하지 않습니다.
 
+### Folderling 운영 안정화 계약 (1.4.17)
+
+APFS device 재번호, 서버 재시작 중단, cold-cache 예산과 신규 temp EPUB 구조 오류를 안전하게
+복구한다. exact/contained/ordered 중복은 현재 bytes를 mutation 직전에 다시 검증해 복구 가능
+격리까지 수렴시키며, 명시적 판본 판정은 보존한다. 실제 운영 결과와 안전 불변식은
+[`update_1.4.17.md`](update_1.4.17.md)에 기록한다.
+
+배포/auditor/UI는 `1.4.17`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
+version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, archive `1.4.10`을 유지한다.
+
 ## 구조
 
 ```text
@@ -699,6 +729,12 @@ python3 run_folderling_one_button.py --help
 
 `run_folderling_one_button.py`는 실제 파일 입고를 수행할 수 있으므로 라이브 환경에서는
 상태 DB의 doctor 결과와 backup을 확인한 뒤 사용해야 합니다.
+
+1.4.17부터 macOS/APFS 재부팅·재마운트 뒤 활성 파일과 관리 폴더의 `st_dev`만 mount 전체에서
+일괄 변경된 경우, 원버튼 preflight가 먼저 SQLite backup을 검증하고 현재 device identity를 자동
+재결합합니다. inode·ctime·size·mtime 중 하나라도 달라졌거나 누락·symlink·부분/혼합 전환·다른
+Doctor issue가 있으면 자동 보정하지 않고 기존처럼 중단합니다. immutable fingerprint, 판정·검토,
+operation/actual-run 증거와 실제 도서 파일은 이 복구에서 변경하지 않습니다.
 
 ## 도서 관리 웹 서버 (1.2.8~1.3.0)
 
@@ -974,6 +1010,8 @@ Doctor도 남은 활성 판정 모순을 `active_decision_relation_conflict`로 
 손상되거나 크기 제한을 넘은 EPUB 후보는 `epub_analysis_error`로 auditor를 불완전 종료해 Folderling
 입고를 중단합니다. 새 압축 원본 제한이 이전 분석 cache에 가려지지 않도록 fingerprint generation을
 4, auditor version을 1.3.6으로 올렸습니다. mutation 재검증도 auditor와 같은 UTF-16 BOM 규칙을 사용합니다.
+1.4.17부터는 이 역사적 전역 차단 계약 중 신규 temp 단독 오류만 위의 journal warning 보류로 좁혔고,
+house 오류와 불완전 감사의 mutation 차단은 그대로 유지합니다.
 
 인덱스 생성·로드 실패는 빈 정상 인덱스로 바꾸지 않고 즉시 실패합니다. house와 로컬 확장 인덱스 배포는
 동일 디렉터리의 임시 정규 파일을 SHA-256으로 확인한 뒤 `os.replace()`하며, 기존 목적지가 symlink이면

@@ -7,6 +7,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
+from difflib import SequenceMatcher
 
 from normalizer import (
     SUPPORTED_EXTENSIONS,
@@ -14,6 +15,7 @@ from normalizer import (
     add_disambig_marker,
     analyze_name,
     has_pass_marker,
+    has_legacy_marker,
     is_supported_file,
     materialize_title_markup,
     normalize_filename,
@@ -24,9 +26,21 @@ from normalizer import (
     strip_trash_suffix,
     units_comparable,
 )
-from dedup_episode_relation import classify_dedup_coordinate_relation
+from dedup_episode_relation import (
+    DEDUP_SPECIAL_COORDINATE_MODES,
+    classify_dedup_coordinate_relation,
+    classify_loose_title_upgrade_relation,
+    episode_profile,
+)
 from scanner import generate_file_list, validate_index_generation
-from text_preview import count_text_chars, preview_similarity, read_text_edges
+from text_preview import (
+    NormalizationDeferred,
+    OrderedBodyCoverage,
+    count_text_chars,
+    ordered_body_coverage_sufficient,
+    preview_similarity,
+    read_text_edges,
+)
 from project_paths import EXTENSION_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
@@ -60,6 +74,16 @@ FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE = 128
 FOLDERLING_REBASELINE_STOP_REASONS = frozenset({
     "body_budget_exhausted", "deep_check_deferred",
 })
+STRONG_PROOF_POLICY_VERSION = "1.4.16-pinned-v1"
+HOUSE_NEAR_DUPLICATE_MIN_COVERAGE_PPM = 990_000
+_DISTRIBUTION_SUFFIX_RE = re.compile(
+    r"(?:^|[-_\s])(?:현|로)?판\d{6}(?=(?:[^0-9]|$))", re.IGNORECASE
+)
+_EXPLICIT_EDITION_MARKER_RE = re.compile(
+    r"개정|수정판|누락\s*수정|외전|특전|후일담|에필로그|"
+    r"19\s*(?:n|금|禁)|성인판|무삭제|번역판",
+    re.IGNORECASE,
+)
 
 AUDITOR_STRONG_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
 AUDITOR_RELATION_CLASSES = frozenset({
@@ -70,6 +94,98 @@ AUDITOR_RELATION_CLASSES = frozenset({
     "decode_lossy", "metadata_only", "insufficient_text", "boilerplate_only",
     "different",
 })
+
+
+def _legacy_marker_discard_allowed(discard, keep):
+    """Admit a legacy loose file only as the discard side of a strong proof.
+
+    ``〔P〕``/``〔Dn〕`` historically blocked every automatic mutation.  A
+    current 95% ordered-body proof may now retire that marked copy only when a
+    clean, independently mutable keep exists.  Protected, representative, or
+    variant-bound legacy files remain fail-closed.
+    """
+    return bool(
+        discard.get("assignment_state") == "legacy_unresolved"
+        and keep.get("assignment_state") != "legacy_unresolved"
+        and has_legacy_marker(discard.get("name", ""))
+        and not has_legacy_marker(keep.get("name", ""))
+        and discard.get("variant_id") is None
+        and not discard.get("protected")
+        and not discard.get("representative")
+    )
+
+
+def _current_strong_proof_not_sufficient(evidence_json):
+    try:
+        evidence = json.loads(evidence_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    marker = evidence.get("current_proof_not_sufficient")
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("policy_version") == STRONG_PROOF_POLICY_VERSION
+    )
+
+
+def _current_review_evidence_precludes_action(classification, evidence_json):
+    """Return true when current persisted evidence already disproves a rule."""
+    if _current_strong_proof_not_sufficient(evidence_json):
+        return True
+    if classification != "near_identical":
+        return False
+    try:
+        evidence = json.loads(evidence_json or "{}")
+        coverage = evidence.get("ordered_body_coverage")
+        if evidence.get("ordered_body_checked") is not True or not isinstance(
+            coverage, dict
+        ):
+            return False
+        return not ordered_body_coverage_sufficient(
+            OrderedBodyCoverage(**coverage)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _record_current_strong_proof_not_sufficient(
+    conn, review_id, classification, exc
+):
+    """Persist a current-fingerprint proof failure without closing review.
+
+    The review row itself binds the evidence to both current fingerprint IDs.
+    If either file changes, the row stops being current and a later auditor may
+    prove the new bytes.  Under the same proof policy and fingerprints, service
+    readiness must not repeatedly advertise a mutation that already failed its
+    final pinned-descriptor proof.
+    """
+    row = conn.execute(
+        "SELECT evidence_json FROM review_items WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        evidence = json.loads(row["evidence_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        evidence = {"previous_evidence": row["evidence_json"]}
+    evidence["current_proof_not_sufficient"] = {
+        "policy_version": STRONG_PROOF_POLICY_VERSION,
+        "classification": classification,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    import decision_store
+
+    with decision_store.transaction(conn):
+        conn.execute(
+            """
+            UPDATE review_items
+            SET state = 'deferred', evidence_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = ? AND state IN ('pending', 'deferred')
+            """,
+            (json.dumps(evidence, ensure_ascii=False, sort_keys=True), review_id),
+        )
 
 
 def calculate_hash(file_path):
@@ -949,7 +1065,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.4.16"
+        duplicate_auditor.AUDITOR_VERSION == "1.4.17"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -1368,7 +1484,10 @@ def _managed_exact_records(
     blocked_candidate_paths=(),
 ):
     import decision_store
-    from dedup_mutations import exact_quarantine
+    from dedup_mutations import (
+        exact_quarantine,
+        queue_exact_review_relationships_preserved,
+    )
 
     records = []
     blocked_candidates = set(blocked_candidate_paths)
@@ -1415,6 +1534,15 @@ def _managed_exact_records(
                 }
                 keep_state = keep.get("assignment_state")
                 entry_state = entry.get("assignment_state")
+                queue_keep_eligible = bool(
+                    keep.get("source") == "queue"
+                    and entry.get("source") == "queue"
+                    and keep.get("file_id")
+                    and entry.get("file_id")
+                    and queue_exact_review_relationships_preserved(
+                        conn, entry["file_id"], keep["file_id"]
+                    )
+                )
                 managed_relation_conflict = (
                     entry_state == "managed"
                     and (
@@ -1437,8 +1565,39 @@ def _managed_exact_records(
                     records.append(record)
                     continue
                 if (
+                    keep.get("source") == "queue"
+                    and entry.get("source") == "queue"
+                    and not queue_keep_eligible
+                ):
+                    record["action"] = "managed_report_only"
+                    record["reason"] = "queue_review_relationship_conflict"
+                    records.append(record)
+                    continue
+                if (
+                    keep.get("source") == "temp"
+                    and entry.get("source") == "temp"
+                    and keep.get("file_id")
+                    and entry.get("file_id")
+                    and keep_state == "unassigned"
+                    and entry_state == "unassigned"
+                    and not keep.get("protected")
+                    and not keep.get("representative")
+                    and not entry.get("protected")
+                    and not entry.get("representative")
+                    and keep.get("mutation_eligible", True)
+                    and entry.get("mutation_eligible", True)
+                    and not managed_relation_conflict
+                ):
+                    record["action"] = "managed_report_only"
+                    record["reason"] = "await_same_run_house_keep"
+                    records.append(record)
+                    continue
+                if (
                     not keep.get("file_id")
-                    or keep.get("source") != "house"
+                    or (
+                        keep.get("source") != "house"
+                        and not queue_keep_eligible
+                    )
                     or keep_state not in {
                         "managed", "unassigned", "legacy_unresolved", "decision_required"
                     }
@@ -1474,6 +1633,464 @@ def _managed_exact_records(
                 record["dest_path"] = result["dest_path"]
                 record["operation_id"] = result["operation_id"]
                 records.append(record)
+    finally:
+        conn.close()
+    return records
+
+
+def cleanup_post_intake_exact_duplicates(
+    state_db_path, temp_dir, actual_run_id, *, candidate_paths=None
+):
+    """Converge exact temp duplicates created by this run's intake ordering.
+
+    The initial dedup snapshot may contain two identical temp files but no house
+    keep.  One temp copy is therefore retained for intake and the other is held
+    report-only.  Once the retained copy is durably ingested, this narrow pass
+    finds only active temp rows matching that same run's committed house-ingest
+    SHA and sends them through the normal manifest-bound exact quarantine.
+    """
+
+    import decision_store
+    from dedup_mutations import exact_quarantine
+
+    if candidate_paths is not None and not candidate_paths:
+        return []
+    conn = decision_store.connect_state_db(state_db_path)
+    records = []
+    quarantine_dir = os.path.join(temp_dir, "trash_bin", "exact_quarantine")
+    allowed_paths = (
+        {
+            decision_store.canonicalize_path(path)
+            for path in candidate_paths
+        }
+        if candidate_paths is not None else None
+    )
+    try:
+        candidates = conn.execute(
+            """
+            SELECT source.file_id AS source_file_id,
+                   source.canonical_path AS source_path,
+                   keep.file_id AS keep_file_id,
+                   keep.canonical_path AS keep_path,
+                   origin.operation_id AS keep_origin_operation_id,
+                   origin.source_sha256 AS raw_sha256
+            FROM operations AS origin
+            JOIN files AS keep
+              ON keep.file_id = origin.file_id
+             AND keep.active = 1
+             AND keep.source = 'house'
+             AND keep.canonical_path = origin.dest_path
+            JOIN fingerprints AS source_fp
+              ON source_fp.raw_sha256 = origin.source_sha256
+             AND source_fp.size = origin.destination_size
+            JOIN files AS source
+              ON source.current_fingerprint_id = source_fp.fingerprint_id
+             AND source.active = 1
+             AND source.source = 'temp'
+             AND source.file_id != keep.file_id
+            WHERE origin.run_id = ?
+              AND origin.action = 'house_ingest'
+              AND origin.state = 'committed'
+              AND origin.source_sha256 IS NOT NULL
+              AND origin.destination_size IS NOT NULL
+            ORDER BY source.canonical_path, keep.canonical_path,
+                     origin.operation_id
+            """,
+            (actual_run_id,),
+        ).fetchall()
+        handled_sources = set()
+        for candidate in candidates:
+            source_file_id = candidate["source_file_id"]
+            if (
+                allowed_paths is not None
+                and decision_store.canonicalize_path(candidate["source_path"])
+                not in allowed_paths
+            ):
+                continue
+            if source_file_id in handled_sources:
+                continue
+            result = exact_quarantine(
+                conn,
+                source_file_id=source_file_id,
+                keep_file_id=candidate["keep_file_id"],
+                quarantine_dir=quarantine_dir,
+                run_id=actual_run_id,
+            )
+            handled_sources.add(source_file_id)
+            records.append({
+                **result,
+                "source_path": candidate["source_path"],
+                "keep_path": candidate["keep_path"],
+                "keep_origin_operation_id": candidate[
+                    "keep_origin_operation_id"
+                ],
+                "raw_sha256": candidate["raw_sha256"],
+            })
+    finally:
+        conn.close()
+    return records
+
+
+def cleanup_relationship_preserving_queue_exact_duplicates(
+    state_db_path, temp_dir, actual_run_id
+):
+    """Collapse an exact two-file queue group only when reviews are redundant.
+
+    Managed temp scanning intentionally excludes ``trash_bin``.  Queue rows are
+    nevertheless active state and included in the actual-run manifest, so a
+    byte-identical pair could otherwise remain indefinitely as a strong review
+    item.  Groups larger than two and pairs with asymmetric external review
+    relationships stay fail-closed.
+    """
+
+    import decision_store
+    from dedup_mutations import (
+        exact_quarantine,
+        queue_exact_review_relationships_preserved,
+    )
+
+    conn = decision_store.connect_state_db(state_db_path)
+    records = []
+    quarantine_dir = os.path.join(temp_dir, "trash_bin", "exact_quarantine")
+    try:
+        groups = conn.execute(
+            """
+            SELECT fp.raw_sha256, fp.size
+            FROM files AS f
+            JOIN fingerprints AS fp
+              ON fp.fingerprint_id = f.current_fingerprint_id
+            WHERE f.active = 1 AND f.source = 'queue'
+              AND fp.raw_sha256 IS NOT NULL
+            GROUP BY fp.raw_sha256, fp.size
+            HAVING COUNT(*) = 2
+            ORDER BY fp.raw_sha256, fp.size
+            """
+        ).fetchall()
+        for group in groups:
+            members = conn.execute(
+                """
+                SELECT f.file_id, f.canonical_path
+                FROM files AS f
+                JOIN fingerprints AS fp
+                  ON fp.fingerprint_id = f.current_fingerprint_id
+                WHERE f.active = 1 AND f.source = 'queue'
+                  AND fp.raw_sha256 = ? AND fp.size = ?
+                ORDER BY f.canonical_path, f.file_id
+                """,
+                (group["raw_sha256"], group["size"]),
+            ).fetchall()
+            if len(members) != 2:
+                continue
+            directions = (
+                (members[1], members[0]),
+                (members[0], members[1]),
+            )
+            selected = next((
+                (source, keep)
+                for source, keep in directions
+                if queue_exact_review_relationships_preserved(
+                    conn, source["file_id"], keep["file_id"]
+                )
+            ), None)
+            if selected is None:
+                continue
+            source, keep = selected
+            result = exact_quarantine(
+                conn,
+                source_file_id=source["file_id"],
+                keep_file_id=keep["file_id"],
+                quarantine_dir=quarantine_dir,
+                run_id=actual_run_id,
+            )
+            records.append({
+                **result,
+                "source_path": source["canonical_path"],
+                "keep_path": keep["canonical_path"],
+                "raw_sha256": group["raw_sha256"],
+            })
+    finally:
+        conn.close()
+    return records
+
+
+def cleanup_pending_queue_strong_reviews(
+    state_db_path, house_dir, temp_dir, actual_run_id
+):
+    """Finalize current persisted strong reviews that the temp scan can miss.
+
+    ``trash_bin`` is intentionally outside normal temp discovery.  A persisted
+    queue review can nevertheless become a complete prefix or a current 95%
+    ordered-body proof.  House/house reviews can also remain after a stronger
+    rule is deployed while no temp input exists.  This pass considers only
+    active house/queue endpoints with at least one house keep, honors active
+    human distinct-edition decisions, and routes every mutation through the
+    existing pinned proof, manifest, and journal APIs.
+    """
+
+    import decision_store
+    from dedup_mutations import (
+        ContainedUpgradeNotProven,
+        OrderedBodyMatchNotProven,
+        apply_contained_upgrade,
+        apply_ordered_body_quarantine,
+    )
+
+    conn = decision_store.connect_state_db(state_db_path)
+    records = []
+    superseded_dir = os.path.join(temp_dir, "trash_bin", "superseded_versions")
+    ordered_dir = os.path.join(temp_dir, "trash_bin", "ordered_body_duplicates")
+
+    def entry(prefix, row):
+        path = row[f"{prefix}_path"]
+        assignment_state = row[f"{prefix}_assignment_state"]
+        parsed = analyze_name(os.path.basename(path))
+        stored_complete = row[f"{prefix}_complete"]
+        return {
+            "file_id": row[f"{prefix}_file_id"],
+            "path": path,
+            "name": os.path.basename(path),
+            "source": row[f"{prefix}_source"],
+            "assignment_state": assignment_state,
+            "variant_id": row[f"{prefix}_variant_id"],
+            "protected": bool(row[f"{prefix}_protected"]),
+            "representative": bool(row[f"{prefix}_representative"]),
+            "span_ambiguous": bool(row[f"{prefix}_span_ambiguous"]),
+            "core_title": row[f"{prefix}_core_title"] or parsed["core_title"],
+            "author": row[f"{prefix}_author"] or parsed["author"],
+            "unit": row[f"{prefix}_unit"] or parsed.get("unit", "미상"),
+            "normalized_length": row[f"{prefix}_normalized_length"],
+            "char_count": row[f"{prefix}_normalized_length"] or 0,
+            "current_fingerprint_id": row[f"{prefix}_current_fingerprint_id"],
+            "complete": bool(
+                parsed["complete"]
+                if stored_complete is None else stored_complete
+            ),
+            "size": row[f"{prefix}_size"],
+            "ext": os.path.splitext(path)[1].lower(),
+            "mutation_eligible": assignment_state not in {
+                "legacy_unresolved", "decision_required"
+            },
+        }
+
+    def destination_for_queue(queue_entry, house_entry):
+        clean_name = materialize_title_markup(
+            normalize_filename(queue_entry["name"])
+        )
+        if not clean_name:
+            return None, None
+        destination = os.path.join(
+            os.path.dirname(house_entry["path"]), clean_name
+        )
+        if os.path.lexists(destination):
+            return None, None
+        recent_path = os.path.join(
+            house_dir, "_최근", os.path.basename(destination)
+        )
+        if os.path.lexists(recent_path):
+            from folderling import recent_link_matches_destination
+
+            if not recent_link_matches_destination(recent_path, destination):
+                return None, None
+        return destination, recent_path
+
+    query = """
+        SELECT r.review_id, r.classification,
+               c.file_id AS candidate_file_id,
+               c.canonical_path AS candidate_path,
+               c.source AS candidate_source,
+               c.assignment_state AS candidate_assignment_state,
+               c.variant_id AS candidate_variant_id,
+               c.protected AS candidate_protected,
+               c.span_ambiguous AS candidate_span_ambiguous,
+               c.current_fingerprint_id AS candidate_current_fingerprint_id,
+               c.size AS candidate_size,
+               CASE WHEN cr.file_id IS NULL THEN 0 ELSE 1 END
+                   AS candidate_representative,
+               cfp.normalized_length AS candidate_normalized_length,
+               cfa.core_title AS candidate_core_title,
+               cfa.author AS candidate_author,
+               cfa.unit AS candidate_unit,
+               cfa.complete AS candidate_complete,
+               k.file_id AS reference_file_id,
+               k.canonical_path AS reference_path,
+               k.source AS reference_source,
+               k.assignment_state AS reference_assignment_state,
+               k.variant_id AS reference_variant_id,
+               k.protected AS reference_protected,
+               k.span_ambiguous AS reference_span_ambiguous,
+               k.current_fingerprint_id AS reference_current_fingerprint_id,
+               k.size AS reference_size,
+               CASE WHEN kr.file_id IS NULL THEN 0 ELSE 1 END
+                   AS reference_representative,
+               kfp.normalized_length AS reference_normalized_length,
+               kfa.core_title AS reference_core_title,
+               kfa.author AS reference_author,
+               kfa.unit AS reference_unit,
+               kfa.complete AS reference_complete,
+               r.left_fingerprint_id, r.right_fingerprint_id,
+               r.evidence_json
+        FROM review_items AS r
+        JOIN files AS c ON c.file_id = r.candidate_file_id
+        JOIN files AS k ON k.file_id = r.reference_file_id
+        LEFT JOIN representatives AS cr ON cr.file_id = c.file_id
+        LEFT JOIN representatives AS kr ON kr.file_id = k.file_id
+        LEFT JOIN fingerprints AS cfp
+          ON cfp.fingerprint_id = c.current_fingerprint_id
+        LEFT JOIN fingerprints AS kfp
+          ON kfp.fingerprint_id = k.current_fingerprint_id
+        LEFT JOIN file_analysis AS cfa ON cfa.file_id = c.file_id
+        LEFT JOIN file_analysis AS kfa ON kfa.file_id = k.file_id
+        WHERE r.state IN ('pending', 'deferred')
+          AND r.classification IN (
+            'contained_exact', 'contained_version', 'ordered_body_match',
+            'near_identical'
+          )
+          AND c.active = 1 AND k.active = 1
+          AND c.source IN ('house', 'queue')
+          AND k.source IN ('house', 'queue')
+          AND (c.source = 'house' OR k.source = 'house')
+        ORDER BY r.review_id
+    """
+    try:
+        rows = conn.execute(query).fetchall()
+        settled = set()
+        for row in rows:
+            pair_ids = frozenset((
+                row["candidate_file_id"], row["reference_file_id"]
+            ))
+            if pair_ids & settled:
+                continue
+            if (
+                row["left_fingerprint_id"]
+                != row["candidate_current_fingerprint_id"]
+                or row["right_fingerprint_id"]
+                != row["reference_current_fingerprint_id"]
+            ):
+                continue
+            if _current_review_evidence_precludes_action(
+                row["classification"], row["evidence_json"]
+            ):
+                continue
+            if decision_store.suppress_open_reviews_for_active_distinct_decision(
+                conn,
+                row["candidate_file_id"],
+                row["reference_file_id"],
+            ) is not None:
+                continue
+
+            left = entry("candidate", row)
+            right = entry("reference", row)
+            relation = {
+                "classification": row["classification"],
+                "left": left,
+                "right": right,
+                "evidence": {
+                    "left_normalized_length": left["normalized_length"],
+                    "right_normalized_length": right["normalized_length"],
+                },
+            }
+
+            destination = recent_path = None
+            if row["classification"] in {
+                "contained_exact", "contained_version",
+            }:
+                direction = _contained_upgrade_direction(relation)
+                if direction is None:
+                    continue
+                shorter, longer = direction
+                if longer["source"] == "queue":
+                    destination, recent_path = destination_for_queue(
+                        longer, shorter
+                    )
+                    if destination is None:
+                        continue
+                try:
+                    result = apply_contained_upgrade(
+                        conn,
+                        review_id=row["review_id"],
+                        shorter_file_id=shorter["file_id"],
+                        longer_file_id=longer["file_id"],
+                        quarantine_dir=superseded_dir,
+                        run_id=actual_run_id,
+                        house_destination=destination,
+                        classification=row["classification"],
+                    )
+                except ContainedUpgradeNotProven as exc:
+                    _record_current_strong_proof_not_sufficient(
+                        conn, row["review_id"], row["classification"], exc
+                    )
+                    continue
+                record = {
+                    "status": "superseded",
+                    "classification": row["classification"],
+                    "review_id": row["review_id"],
+                    "source_file_id": shorter["file_id"],
+                    "keep_file_id": longer["file_id"],
+                    "source_path": shorter["path"],
+                    "keep_path": result["ingested_path"],
+                    "dest_path": result["quarantine_path"],
+                    "operation_id": result["quarantine_operation_id"],
+                    "ingest_operation_id": result["ingest_operation_id"],
+                }
+            else:
+                direction = (
+                    _ordered_body_direction(relation)
+                    if row["classification"] == "ordered_body_match"
+                    else _bidirectional_near_direction(relation)
+                )
+                if direction is None:
+                    continue
+                discard, keep, _coordinate_mode = direction
+                if keep["source"] == "queue":
+                    destination, recent_path = destination_for_queue(
+                        keep, discard
+                    )
+                    if destination is None:
+                        continue
+                try:
+                    result = apply_ordered_body_quarantine(
+                        conn,
+                        review_id=row["review_id"],
+                        discard_file_id=discard["file_id"],
+                        keep_file_id=keep["file_id"],
+                        quarantine_dir=ordered_dir,
+                        run_id=actual_run_id,
+                        house_destination=destination,
+                        classification=row["classification"],
+                    )
+                except (OrderedBodyMatchNotProven, NormalizationDeferred) as exc:
+                    _record_current_strong_proof_not_sufficient(
+                        conn, row["review_id"], row["classification"], exc
+                    )
+                    continue
+                record = {
+                    "status": "ordered_duplicate",
+                    "classification": row["classification"],
+                    "review_id": row["review_id"],
+                    "source_file_id": discard["file_id"],
+                    "keep_file_id": keep["file_id"],
+                    "source_path": discard["path"],
+                    "keep_path": result["ingested_path"],
+                    "dest_path": result["quarantine_path"],
+                    "operation_id": result["quarantine_operation_id"],
+                    "ingest_operation_id": result["ingest_operation_id"],
+                    "coverage_ppm": result["coverage_ppm"],
+                    "max_unmatched_chars": result["max_unmatched_chars"],
+                    "reverse_coverage_ppm": result["reverse_coverage_ppm"],
+                    "reverse_max_unmatched_chars": result[
+                        "reverse_max_unmatched_chars"
+                    ],
+                }
+            if recent_path is not None and record["ingest_operation_id"] is not None:
+                from folderling import create_recent_link
+
+                create_recent_link(
+                    record["keep_path"],
+                    os.path.basename(record["keep_path"]),
+                    os.path.dirname(recent_path),
+                )
+            records.append(record)
+            settled.update(pair_ids)
     finally:
         conn.close()
     return records
@@ -1542,21 +2159,43 @@ def _contained_upgrade_direction(relation):
         return None
     if "house" not in {shorter.get("source"), longer.get("source")}:
         return None
-    if not shorter.get("mutation_eligible", True) or not longer.get(
-        "mutation_eligible", True
-    ):
+    def automatic_endpoint(entry):
+        return entry.get("mutation_eligible", True) or (
+            entry.get("assignment_state") == "decision_required"
+            and not entry.get("protected")
+            and not entry.get("representative")
+            and entry.get("variant_id") is None
+        )
+
+    if not automatic_endpoint(shorter) or not automatic_endpoint(longer):
         return None
     if os.path.splitext(shorter.get("name", ""))[1].lower() != ".txt" or os.path.splitext(
         longer.get("name", "")
     )[1].lower() != ".txt":
         return None
-    if normalize_nfc(shorter.get("core_title") or "").casefold() != normalize_nfc(
-        longer.get("core_title") or ""
-    ).casefold():
+    coordinate_relation = classify_dedup_coordinate_relation(
+        shorter["name"],
+        longer["name"],
+        left_span_ambiguous=bool(shorter.get("span_ambiguous")),
+        right_span_ambiguous=bool(longer.get("span_ambiguous")),
+    )
+    special_coordinates = bool(
+        coordinate_relation is not None
+        and coordinate_relation.mode in DEDUP_SPECIAL_COORDINATE_MODES
+    )
+    if (
+        coordinate_relation is None
+        or coordinate_relation.preferred_side != "right"
+    ):
         return None
-    if not shorter.get("core_title") or _authors_conflict(shorter, longer):
-        return None
-    if shorter.get("unit") != longer.get("unit"):
+    if not special_coordinates:
+        if normalize_nfc(shorter.get("core_title") or "").casefold() != normalize_nfc(
+            longer.get("core_title") or ""
+        ).casefold():
+            return None
+        if not shorter.get("core_title") or shorter.get("unit") != longer.get("unit"):
+            return None
+    if _authors_conflict(shorter, longer):
         return None
 
     import decision_store
@@ -1566,19 +2205,20 @@ def _contained_upgrade_direction(relation):
             return entry
         return decision_store.coordinate_fields_from_name(entry["name"])
 
-    short_coordinates = coordinates(shorter)
-    long_coordinates = coordinates(longer)
-    if (
-        short_coordinates.get("span_ambiguous")
-        or long_coordinates.get("span_ambiguous")
-        or short_coordinates.get("episode_start") is None
-        or short_coordinates.get("episode_end") is None
-        or long_coordinates.get("episode_start") is None
-        or long_coordinates.get("episode_end") is None
-        or short_coordinates["episode_start"] != long_coordinates["episode_start"]
-        or long_coordinates["episode_end"] <= short_coordinates["episode_end"]
-    ):
-        return None
+    if not special_coordinates:
+        short_coordinates = coordinates(shorter)
+        long_coordinates = coordinates(longer)
+        if (
+            short_coordinates.get("span_ambiguous")
+            or long_coordinates.get("span_ambiguous")
+            or short_coordinates.get("episode_start") is None
+            or short_coordinates.get("episode_end") is None
+            or long_coordinates.get("episode_start") is None
+            or long_coordinates.get("episode_end") is None
+            or short_coordinates["episode_start"] != long_coordinates["episode_start"]
+            or long_coordinates["episode_end"] <= short_coordinates["episode_end"]
+        ):
+            return None
 
     if shorter.get("protected") and not shorter.get("representative"):
         return None
@@ -1608,24 +2248,24 @@ def _ordered_body_direction(relation):
         return None
     if "house" not in {left.get("source"), right.get("source")}:
         return None
-    if not left.get("mutation_eligible", True) or not right.get(
-        "mutation_eligible", True
-    ):
-        return None
     if os.path.splitext(left.get("name", ""))[1].lower() != ".txt" or os.path.splitext(
         right.get("name", "")
     )[1].lower() != ".txt":
         return None
-    if normalize_nfc(left.get("core_title") or "").casefold() != normalize_nfc(
-        right.get("core_title") or ""
-    ).casefold():
-        return None
-    if not left.get("core_title") or _authors_conflict(left, right):
+    exact_core = bool(
+        left.get("core_title")
+        and normalize_nfc(left.get("core_title") or "").casefold()
+        == normalize_nfc(right.get("core_title") or "").casefold()
+    )
+    if _authors_conflict(left, right):
         return None
 
-    coordinate_relation = classify_dedup_coordinate_relation(
-        left["name"],
-        right["name"],
+    classifier = (
+        classify_dedup_coordinate_relation
+        if exact_core else classify_loose_title_upgrade_relation
+    )
+    coordinate_relation = classifier(
+        left["name"], right["name"],
         left_span_ambiguous=bool(left.get("span_ambiguous")),
         right_span_ambiguous=bool(right.get("span_ambiguous")),
     )
@@ -1638,6 +2278,20 @@ def _ordered_body_direction(relation):
     else:
         keep = choose_keep([left, right])
         discard = right if keep is left else left
+
+    def automatic_endpoint(entry):
+        return entry.get("mutation_eligible", True) or (
+            entry.get("assignment_state") == "decision_required"
+            and not entry.get("protected")
+            and not entry.get("representative")
+            and entry.get("variant_id") is None
+        )
+
+    if not automatic_endpoint(keep) or not (
+        automatic_endpoint(discard)
+        or _legacy_marker_discard_allowed(discard, keep)
+    ):
+        return None
 
     if discard.get("protected") and not discard.get("representative"):
         return None
@@ -1657,6 +2311,366 @@ def _ordered_body_direction(relation):
     ):
         return None
     return discard, keep, coordinate_relation.mode
+
+
+def _bidirectional_near_direction(relation):
+    """Return a narrowly safe direction for a bidirectional near duplicate.
+
+    Queue -> house retains the established house endpoint.  House -> house is
+    admitted only for a clean filename paired with a longer distribution-date
+    filename, equal declared coordinates, near-identical cores, and no edition
+    markers or managed relationships.  The mutation boundary independently
+    replays both directions and raises the house/house threshold to 99%.
+    """
+    if relation.get("classification") != "near_identical":
+        return None
+    left, right = relation["left"], relation["right"]
+    if any(
+        os.path.splitext(entry.get("name", ""))[1].lower() != ".txt"
+        for entry in (left, right)
+    ):
+        return None
+    if any(
+        entry.get("variant_id") is not None
+        or entry.get("protected")
+        or entry.get("representative")
+        or entry.get("assignment_state") not in {
+            "unassigned", "decision_required",
+        }
+        or has_legacy_marker(entry.get("name", ""))
+        for entry in (left, right)
+    ):
+        return None
+
+    sources = {left.get("source"), right.get("source")}
+    if sources == {"house", "queue"}:
+        discard = left if left.get("source") == "queue" else right
+        keep = right if discard is left else left
+        discard_core = normalize_nfc(discard.get("core_title") or "").casefold()
+        keep_core = normalize_nfc(keep.get("core_title") or "").casefold()
+        if not discard_core or discard_core != keep_core:
+            return None
+    elif left.get("source") == right.get("source") == "house":
+        left_name = left.get("name", "")
+        right_name = right.get("name", "")
+        left_distribution = bool(_DISTRIBUTION_SUFFIX_RE.search(left_name))
+        right_distribution = bool(_DISTRIBUTION_SUFFIX_RE.search(right_name))
+        if left_distribution == right_distribution:
+            return None
+        discard, keep = (
+            (left, right) if left_distribution else (right, left)
+        )
+        if _EXPLICIT_EDITION_MARKER_RE.search(left_name) or (
+            _EXPLICIT_EDITION_MARKER_RE.search(right_name)
+        ):
+            return None
+        if not left.get("complete") or not right.get("complete"):
+            return None
+        left_core = normalize_nfc(left.get("core_title") or "").casefold()
+        right_core = normalize_nfc(right.get("core_title") or "").casefold()
+        if not left_core or not right_core or SequenceMatcher(
+            None, left_core, right_core, autojunk=False
+        ).ratio() < 0.90:
+            return None
+        lengths = (left.get("normalized_length"), right.get("normalized_length"))
+        if all(isinstance(value, int) and value > 0 for value in lengths):
+            if abs(lengths[0] - lengths[1]) / max(lengths) > 0.01:
+                return None
+    else:
+        return None
+
+    coordinate = classify_dedup_coordinate_relation(
+        discard["name"], keep["name"],
+        left_span_ambiguous=bool(discard.get("span_ambiguous")),
+        right_span_ambiguous=bool(keep.get("span_ambiguous")),
+    )
+    if coordinate is not None:
+        if coordinate.preferred_side is not None:
+            return None
+        if sources == {"house"} and coordinate.mode != "same_coordinates":
+            return None
+        mode = coordinate.mode
+    else:
+        profiles = (
+            episode_profile(
+                discard["name"],
+                span_ambiguous=bool(discard.get("span_ambiguous")),
+            ),
+            episode_profile(
+                keep["name"],
+                span_ambiguous=bool(keep.get("span_ambiguous")),
+            ),
+        )
+        # A single omitted span is tolerable because house is always kept.
+        # Two incompatible known spans or two unknown editions stay manual.
+        if (profiles[0] is None) == (profiles[1] is None):
+            return None
+        if sources == {"house"}:
+            return None
+        mode = "one_sided_unknown_coordinates"
+    return discard, keep, mode
+
+
+def count_actionable_pending_strong_reviews(state_db_path):
+    """Count persisted strong reviews that Folderling can settle automatically.
+
+    The normal intake walk intentionally excludes ``trash_bin`` and therefore
+    cannot make a queue/house review visible to the service readiness check.
+    House/house reviews can likewise remain after a rule upgrade even when
+    ``txt_temp`` is empty.  Reuse the same direction guards as the mutation
+    phase, require current fingerprints and on-disk endpoints, and honor an
+    active human distinct-edition decision.  This is a read-only readiness
+    probe; the mutation phase revalidates all content and snapshots again.
+    """
+
+    import decision_store
+
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT r.classification,
+                   c.file_id AS candidate_file_id,
+                   c.canonical_path AS candidate_path,
+                   c.source AS candidate_source,
+                   c.assignment_state AS candidate_assignment_state,
+                   c.variant_id AS candidate_variant_id,
+                   c.protected AS candidate_protected,
+                   c.span_ambiguous AS candidate_span_ambiguous,
+                   c.size AS candidate_size,
+                   c.current_fingerprint_id AS candidate_fingerprint_id,
+                   CASE WHEN cr.file_id IS NULL THEN 0 ELSE 1 END
+                       AS candidate_representative,
+                   cfp.normalized_length AS candidate_normalized_length,
+                   cfa.core_title AS candidate_core_title,
+                   cfa.author AS candidate_author,
+                   cfa.unit AS candidate_unit,
+                   cfa.complete AS candidate_complete,
+                   k.file_id AS reference_file_id,
+                   k.canonical_path AS reference_path,
+                   k.source AS reference_source,
+                   k.assignment_state AS reference_assignment_state,
+                   k.variant_id AS reference_variant_id,
+                   k.protected AS reference_protected,
+                   k.span_ambiguous AS reference_span_ambiguous,
+                   k.size AS reference_size,
+                   k.current_fingerprint_id AS reference_fingerprint_id,
+                   CASE WHEN kr.file_id IS NULL THEN 0 ELSE 1 END
+                       AS reference_representative,
+                   kfp.normalized_length AS reference_normalized_length,
+                   kfa.core_title AS reference_core_title,
+                   kfa.author AS reference_author,
+                   kfa.unit AS reference_unit,
+                   kfa.complete AS reference_complete,
+                   r.left_fingerprint_id, r.right_fingerprint_id,
+                   r.evidence_json
+            FROM review_items AS r
+            JOIN files AS c ON c.file_id = r.candidate_file_id
+            JOIN files AS k ON k.file_id = r.reference_file_id
+            LEFT JOIN representatives AS cr ON cr.file_id = c.file_id
+            LEFT JOIN representatives AS kr ON kr.file_id = k.file_id
+            LEFT JOIN fingerprints AS cfp
+              ON cfp.fingerprint_id = c.current_fingerprint_id
+            LEFT JOIN fingerprints AS kfp
+              ON kfp.fingerprint_id = k.current_fingerprint_id
+            LEFT JOIN file_analysis AS cfa ON cfa.file_id = c.file_id
+            LEFT JOIN file_analysis AS kfa ON kfa.file_id = k.file_id
+            WHERE r.state IN ('pending', 'deferred')
+              AND r.classification IN (
+                'contained_exact', 'contained_version', 'ordered_body_match',
+                'near_identical'
+              )
+              AND c.active = 1 AND k.active = 1
+              AND c.source IN ('house', 'queue')
+              AND k.source IN ('house', 'queue')
+              AND (c.source = 'house' OR k.source = 'house')
+            ORDER BY r.review_id
+            """
+        ).fetchall()
+
+        def entry(prefix, row):
+            state = row[f"{prefix}_assignment_state"]
+            path = row[f"{prefix}_path"]
+            parsed = analyze_name(os.path.basename(path))
+            stored_complete = row[f"{prefix}_complete"]
+            return {
+                "file_id": row[f"{prefix}_file_id"],
+                "path": path,
+                "name": os.path.basename(path),
+                "source": row[f"{prefix}_source"],
+                "assignment_state": state,
+                "variant_id": row[f"{prefix}_variant_id"],
+                "protected": bool(row[f"{prefix}_protected"]),
+                "representative": bool(row[f"{prefix}_representative"]),
+                "span_ambiguous": bool(row[f"{prefix}_span_ambiguous"]),
+                "size": int(row[f"{prefix}_size"] or 0),
+                "ext": os.path.splitext(path)[1].lower(),
+                "core_title": (
+                    row[f"{prefix}_core_title"] or parsed["core_title"]
+                ),
+                "author": row[f"{prefix}_author"] or parsed["author"],
+                "unit": row[f"{prefix}_unit"] or parsed.get("unit", "미상"),
+                "complete": bool(
+                    parsed["complete"]
+                    if stored_complete is None else stored_complete
+                ),
+                "char_count": row[f"{prefix}_normalized_length"] or 0,
+                "mutation_eligible": state not in {
+                    "legacy_unresolved", "decision_required"
+                },
+            }
+
+        count = 0
+        for row in rows:
+            if (
+                row["left_fingerprint_id"]
+                != row["candidate_fingerprint_id"]
+                or row["right_fingerprint_id"]
+                != row["reference_fingerprint_id"]
+                or not os.path.isfile(row["candidate_path"])
+                or not os.path.isfile(row["reference_path"])
+            ):
+                continue
+            if _current_review_evidence_precludes_action(
+                row["classification"], row["evidence_json"]
+            ):
+                continue
+            if decision_store.active_distinct_decision_for_pair(
+                conn,
+                row["candidate_file_id"],
+                row["reference_file_id"],
+            ) is not None:
+                continue
+            left = entry("candidate", row)
+            right = entry("reference", row)
+            relation = {
+                "classification": row["classification"],
+                "left": left,
+                "right": right,
+                "evidence": {
+                    "left_normalized_length": row[
+                        "candidate_normalized_length"
+                    ],
+                    "right_normalized_length": row[
+                        "reference_normalized_length"
+                    ],
+                },
+            }
+            direction = (
+                _contained_upgrade_direction(relation)
+                if row["classification"] in {
+                    "contained_exact", "contained_version",
+                }
+                else _ordered_body_direction(relation)
+                if row["classification"] == "ordered_body_match"
+                else _bidirectional_near_direction(relation)
+            )
+            if direction is not None:
+                count += 1
+        return count
+    finally:
+        conn.close()
+
+
+def _pending_active_distinct_decision_pairs(conn):
+    """Return one current open-review row for each human-vetoed file pair."""
+
+    import decision_store
+
+    rows = conn.execute(
+        """
+        SELECT r.candidate_file_id, r.reference_file_id,
+               c.canonical_path AS candidate_path,
+               k.canonical_path AS reference_path
+        FROM review_items AS r
+        JOIN files AS c ON c.file_id = r.candidate_file_id
+        JOIN files AS k ON k.file_id = r.reference_file_id
+        WHERE r.state IN ('pending', 'deferred')
+          AND c.active = 1 AND k.active = 1
+        ORDER BY r.review_id
+        """
+    ).fetchall()
+    pairs = []
+    seen = set()
+    for row in rows:
+        pair_key = frozenset(
+            (row["candidate_file_id"], row["reference_file_id"])
+        )
+        if pair_key in seen:
+            continue
+        seen.add(pair_key)
+        decision = decision_store.active_distinct_decision_for_pair(
+            conn, row["candidate_file_id"], row["reference_file_id"]
+        )
+        if decision is not None:
+            pairs.append((row, decision))
+    return pairs
+
+
+def count_pending_active_distinct_decision_reviews(state_db_path):
+    """Count open machine-review pairs already vetoed by a human decision."""
+
+    import decision_store
+
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        return len(_pending_active_distinct_decision_pairs(conn))
+    finally:
+        conn.close()
+
+
+def cleanup_pending_active_distinct_decision_reviews(state_db_path):
+    """Close stale machine reviews even when the auditor pair cache is warm.
+
+    Pair-cache hits need not pass through ``DuplicateAuditor._store_review_item``.
+    This independent convergence pass therefore makes the active human variant
+    decision authoritative without relying on a cold audit or new evidence.
+    """
+
+    import decision_store
+
+    conn = decision_store.connect_state_db(state_db_path)
+    records = []
+    try:
+        with decision_store.transaction(conn):
+            for row, decision in _pending_active_distinct_decision_pairs(conn):
+                open_reviews = conn.execute(
+                    """
+                    SELECT review_id, classification FROM review_items
+                    WHERE state IN ('pending', 'deferred')
+                      AND ((candidate_file_id = ? AND reference_file_id = ?)
+                        OR (candidate_file_id = ? AND reference_file_id = ?))
+                    ORDER BY review_id
+                    """,
+                    (
+                        row["candidate_file_id"], row["reference_file_id"],
+                        row["reference_file_id"], row["candidate_file_id"],
+                    ),
+                ).fetchall()
+                decision_id = (
+                    decision_store.suppress_open_reviews_for_active_distinct_decision(
+                        conn,
+                        row["candidate_file_id"],
+                        row["reference_file_id"],
+                    )
+                )
+                if decision_id is None:
+                    continue
+                records.append({
+                    "decision_id": decision_id,
+                    "verdict": decision["verdict"],
+                    "candidate_file_id": row["candidate_file_id"],
+                    "reference_file_id": row["reference_file_id"],
+                    "candidate_path": row["candidate_path"],
+                    "reference_path": row["reference_path"],
+                    "review_ids": [item["review_id"] for item in open_reviews],
+                    "classifications": sorted({
+                        item["classification"] for item in open_reviews
+                    }),
+                })
+        return records
+    finally:
+        conn.close()
 
 
 def _managed_auditor_queue_records(
@@ -1946,7 +2960,10 @@ def _managed_auditor_queue_records(
                         house_destination=destination,
                         classification=relation["classification"],
                     )
-                except ContainedUpgradeNotProven:
+                except ContainedUpgradeNotProven as exc:
+                    _record_current_strong_proof_not_sufficient(
+                        conn, review_id, relation["classification"], exc
+                    )
                     continue
                 record["dest_path"] = result["quarantine_path"]
                 record["operation_id"] = result["quarantine_operation_id"]
@@ -1980,7 +2997,13 @@ def _managed_auditor_queue_records(
             records.append(record)
             queued_paths.add(shorter["path"])
             if original_long_path != longer["path"]:
+                # Auditor relations share entry dictionaries.  Intake mutates
+                # this path to the new house destination, while other edges
+                # may retain either the old temp path or the shared new path.
+                # Both identities describe the same already-settled file and
+                # must be excluded from the rest of this snapshot graph.
                 queued_paths.add(original_long_path)
+                queued_paths.add(longer["path"])
 
         ordered_relations = []
         for relation in auditor_relations:
@@ -2074,7 +3097,10 @@ def _managed_auditor_queue_records(
                         house_destination=destination,
                         classification=relation["classification"],
                     )
-                except OrderedBodyMatchNotProven:
+                except (OrderedBodyMatchNotProven, NormalizationDeferred) as exc:
+                    _record_current_strong_proof_not_sufficient(
+                        conn, review_id, relation["classification"], exc
+                    )
                     continue
                 record["dest_path"] = result["quarantine_path"]
                 record["operation_id"] = result["quarantine_operation_id"]
@@ -2110,7 +3136,10 @@ def _managed_auditor_queue_records(
             records.append(record)
             queued_paths.add(discard["path"])
             if original_keep_path != keep["path"]:
+                # See the contained-upgrade case above: exclude both path
+                # representations of a keep that this run just ingested.
                 queued_paths.add(original_keep_path)
+                queued_paths.add(keep["path"])
 
         by_temp = defaultdict(list)
         for relation in auditor_relations:
@@ -2196,6 +3225,102 @@ def _managed_auditor_queue_records(
                 )
     finally:
         conn.close()
+    return records
+
+
+def _managed_epub_analysis_hold_records(
+    auditor_report,
+    entries,
+    state_db_path,
+    temp_dir,
+    dry_run,
+    actual_run_id=None,
+):
+    """Hold only incoming EPUBs whose exact audit error was persisted.
+
+    House EPUB errors remain report stop reasons and never reach this path.
+    Missing entry/file/error evidence fails closed instead of silently allowing
+    an ambiguous archive into the library.
+    """
+
+    errors = list(
+        getattr(auditor_report, "stats", {}).get("epub_analysis_errors", ())
+        or ()
+    )
+    if not errors:
+        return []
+    configuration = getattr(auditor_report, "configuration", {}) or {}
+    max_file_bytes = configuration.get("max_file_bytes")
+    max_uncompressed_bytes = configuration.get("max_epub_uncompressed_bytes")
+    if not isinstance(max_file_bytes, int) or max_file_bytes <= 0:
+        raise RuntimeError("auditor EPUB file limit evidence is missing")
+    if max_uncompressed_bytes is not None and (
+        not isinstance(max_uncompressed_bytes, int)
+        or max_uncompressed_bytes <= 0
+    ):
+        raise RuntimeError("auditor EPUB expansion limit evidence is missing")
+    by_key = {
+        (entry.get("source", "house"), normalize_nfc(entry.get("rel_path", ""))): entry
+        for entry in entries
+    }
+    records = []
+    conn = None
+    if not dry_run:
+        import decision_store
+
+        conn = decision_store.connect_state_db(state_db_path)
+    try:
+        for error_record in errors:
+            source = str(error_record.get("source") or "")
+            rel_path = normalize_nfc(error_record.get("rel_path", ""))
+            analysis_error = str(error_record.get("error") or "")
+            entry = by_key.get((source, rel_path))
+            if source != "temp":
+                raise RuntimeError(
+                    "house EPUB analysis error escaped the auditor stop gate"
+                )
+            if entry is None or not entry.get("file_id") or not analysis_error:
+                raise RuntimeError(
+                    "incoming EPUB analysis error evidence is incomplete"
+                )
+            destination = os.path.join(
+                temp_dir,
+                "trash_bin",
+                "warning",
+                "epub_analysis_errors",
+                os.path.basename(entry["path"]),
+            )
+            record = {
+                "dry_run": dry_run,
+                "core_title": entry.get("core_title"),
+                "keep": {},
+                "entry": entry,
+                "dest_path": destination if dry_run else None,
+                "size": entry["size"],
+                "distinct_authors": False,
+                "status": "warning",
+                "classification": "epub_analysis_error",
+                "analysis_error": analysis_error,
+                "final_quarantine": False,
+            }
+            if not dry_run:
+                from dedup_mutations import hold_epub_analysis_error
+
+                result = hold_epub_analysis_error(
+                    conn,
+                    source_file_id=entry["file_id"],
+                    temp_root=temp_dir,
+                    run_id=actual_run_id,
+                    analysis_error=analysis_error,
+                    max_file_bytes=max_file_bytes,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                )
+                record["dest_path"] = result["dest_path"]
+                record["operation_id"] = result["operation_id"]
+            records.append(record)
+    finally:
+        if conn is not None:
+            conn.close()
     return records
 
 
@@ -2517,8 +3642,25 @@ def _clean_duplicates_impl(
                 f"{len(issues)} ({issues[0]['kind']})"
             )
 
+    epub_analysis_hold_records = []
+    if managed_mode and audit_suspects and move_suspects:
+        epub_analysis_hold_records = _managed_epub_analysis_hold_records(
+            auditor_report,
+            entries,
+            state_db_path,
+            temp_dir,
+            dry_run,
+            actual_run_id=actual_run_id,
+        )
+    epub_analysis_hold_paths = {
+        record["entry"]["path"] for record in epub_analysis_hold_records
+    }
+
     stage_started_at = time.perf_counter()
-    exact_groups = find_exact_duplicates(entries)
+    exact_groups = find_exact_duplicates([
+        entry for entry in entries
+        if entry["path"] not in epub_analysis_hold_paths
+    ])
     performance_metrics["exact_grouping_seconds"] = round(
         time.perf_counter() - stage_started_at, 6
     )
@@ -2531,7 +3673,7 @@ def _clean_duplicates_impl(
             entries, multi_representative_paths, state_db_path, dry_run=dry_run
         )
     exact_records = []
-    excluded_paths = set()
+    excluded_paths = set(epub_analysis_hold_paths)
     if managed_mode:
         exact_records = _managed_exact_records(
             exact_groups,
@@ -2573,7 +3715,7 @@ def _clean_duplicates_impl(
             print(f"⚠️ 분리 마커 충돌로 건너뜀: {len(collisions)}개 (목적 파일명이 이미 존재)")
 
     suspect_groups = [] if managed_mode else find_suspect_groups(entries, excluded_paths)
-    suspect_move_records = []
+    suspect_move_records = list(epub_analysis_hold_records)
     if move_suspects and not managed_mode:
         for group in suspect_groups:
             suspect_move_records.extend(move_suspect_group(group, temp_dir, dry_run))
@@ -2609,7 +3751,11 @@ def _clean_duplicates_impl(
         suspect_groups.extend(auditor_groups)
         if managed_mode:
             for record in suspect_move_records:
-                if record.get("status") != "warning" or not record.get("classification"):
+                if (
+                    record.get("status") != "warning"
+                    or not record.get("classification")
+                    or not record.get("keep")
+                ):
                     continue
                 suspect_groups.append({
                     "origin": "auditor_aux",
@@ -2670,6 +3816,14 @@ def _clean_duplicates_impl(
         for record in managed_report_only_records
         if record.get("entry", {}).get("source") == "temp"
     })
+    post_intake_exact_candidate_paths = sorted({
+        record["entry"]["path"]
+        for record in managed_report_only_records
+        if (
+            record.get("reason") == "await_same_run_house_keep"
+            and record.get("entry", {}).get("source") == "temp"
+        )
+    })
     exact_mutation_records = [
         record for record in exact_records
         if record.get("action") not in {"legacy_report_only", "managed_report_only"}
@@ -2715,12 +3869,16 @@ def _clean_duplicates_impl(
         "managed_report_only_count": len(managed_report_only_records),
         "managed_temp_report_only_count": len(blocked_intake_paths),
         "blocked_intake_paths": blocked_intake_paths,
+        "post_intake_exact_candidate_paths": (
+            post_intake_exact_candidate_paths
+        ),
         "multi_representative_conflict_count": len(multi_representative_paths),
         "suspect_group_count": len(suspect_groups),
         "suspect_move_count": len(moved_records),
         "strong_equivalent_quarantine_count": len(strong_quarantine_records),
         "review_queue_move_count": review_queue_move_count,
         "warning_count": len(warning_records),
+        "epub_analysis_hold_count": len(epub_analysis_hold_records),
         "contained_upgrade_count": len(superseded_records),
         "ordered_body_quarantine_count": len(ordered_duplicate_records),
         "metadata_only_count": len(metadata_only_records),

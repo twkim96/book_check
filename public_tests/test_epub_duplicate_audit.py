@@ -339,9 +339,9 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
     assert duplicate_auditor.FINGERPRINT_POLICY_VERSION == "1.4.2"
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.12"
+    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.16-lossless-legacy-v3"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.16"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.4.17"
 
 
 def _txt_cache_fixture(tmp_path):
@@ -766,6 +766,63 @@ def test_full_sweep_backfills_cross_core_txt_and_warm_run_reuses_cache(tmp_path)
     assert warm.stats["actual_read_bytes"] == 0
     assert warm.results[0]["classification"] == "text_equivalent"
     assert "global_normalized_sha256" in warm.results[0]["candidate_reasons"]
+
+
+def test_full_sweep_backfills_identical_lightly_damaged_legacy_txt(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["서로 다른 제목 하나.txt", "전혀 다른 제목 둘.txt"]
+    raw = ("읽을 수 있는 CP949 장편 본문 " * 400).encode("cp949") + b"\x81"
+    for name in names:
+        (house / name).write_bytes(raw)
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+    state_db = tmp_path / "state.sqlite3"
+
+    report = duplicate_auditor.run_audit(_general_args(
+        index, house, temp,
+        "--house-only", "--state-db", str(state_db),
+        "--full-fingerprint-sweep",
+    ))
+
+    assert report.completed is True
+    assert report.stats["full_fingerprint_sweep_failed_files"] == 0
+    assert report.stats["global_fingerprint_pairs"] == 1
+    pair = report.results[0]
+    assert pair["classification"] == "text_equivalent"
+    assert pair["evidence"]["lossless_identity_only"] is True
+    assert pair["evidence"]["left_status"] == "lossless_legacy_text"
+    assert pair["evidence"]["right_status"] == "lossless_legacy_text"
+
+
+def test_lightly_damaged_legacy_txt_never_enters_fuzzy_comparison(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["같은 제목 1-100.txt", "같은 제목 1-200.txt"]
+    body = ("거의 같은 CP949 장편 본문 " * 400).encode("cp949")
+    (house / names[0]).write_bytes(body + b"\x81")
+    (house / names[1]).write_bytes(body + b"\x82")
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+    state_db = tmp_path / "state.sqlite3"
+
+    report = duplicate_auditor.run_audit(_general_args(
+        index, house, temp,
+        "--house-only", "--state-db", str(state_db),
+        "--full-fingerprint-sweep",
+    ))
+
+    assert report.completed is True
+    pair = next(
+        result for result in report.results
+        if result["left"]["name"] in names and result["right"]["name"] in names
+    )
+    assert pair["classification"] == "lossless_identity_mismatch"
+    assert pair["evidence"]["lossless_identity_only"] is True
 
 
 def test_default_run_fingerprints_new_temp_txt_against_backfilled_house(tmp_path):

@@ -289,7 +289,7 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     client = app.test_client()
     health = client.get("/health").get_json()
     assert health["ok"] is True
-    assert health["version"] == "1.4.16"
+    assert health["version"] == "1.4.17"
     providers = client.get("/api/providers").get_json()["data"]
     assert providers == [
         {"id": "title_correction", "label": "제목 교정", "enabled": True},
@@ -857,6 +857,50 @@ def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
     assert platform["blocked_code"] == "non_production_layout"
 
 
+def test_folderling_is_ready_for_actionable_strong_review_without_temp_input(
+    tmp_path,
+):
+    app, _ = _server_fixture(tmp_path)
+    config = app.config["library_server_config"]
+    short_path = config.house_dir / "대마법사의 귀촌 생활 1-5 완.txt"
+    long_path = config.house_dir / "대마법사의 귀촌 생활 001~127 완결.txt"
+    short_path.write_text("귀촌 생활 앞부분", encoding="utf-8")
+    long_path.write_text("귀촌 생활 앞부분과 뒷부분", encoding="utf-8")
+
+    conn = decision_store.connect_state_db(config.state_db)
+    try:
+        with decision_store.transaction(conn):
+            short = decision_store.reconcile_file_metadata(
+                conn, short_path, source="house"
+            )
+            long = decision_store.reconcile_file_metadata(
+                conn, long_path, source="house"
+            )
+        _ensure_intake_fingerprint(conn, _file_state(conn, short["file_id"]))
+        _ensure_intake_fingerprint(conn, _file_state(conn, long["file_id"]))
+        decision_store.add_review_item(
+            conn,
+            candidate_file_id=short["file_id"],
+            reference_file_id=long["file_id"],
+            classification="ordered_body_match",
+        )
+    finally:
+        conn.close()
+
+    descriptor = app.extensions["library_service_registry"].descriptor(
+        "folderling"
+    )
+
+    assert descriptor["ready"] is True
+    assert descriptor["blocked_code"] is None
+    assert descriptor["target_count"] == 1
+    assert descriptor["preview"] == {
+        "intake_count": 0,
+        "actionable_strong_review_count": 1,
+        "decided_review_cleanup_count": 0,
+    }
+
+
 def test_google_sheet_service_uses_private_local_config(tmp_path, monkeypatch):
     app, _ = _server_fixture(tmp_path)
     registry = app.extensions["library_service_registry"]
@@ -1073,6 +1117,116 @@ def test_job_store_marks_running_records_interrupted_after_restart(tmp_path):
     [event] = store.events(record["job_id"])
     assert event["phase"] == "job_interrupted"
     assert event["status"] == "interrupted"
+
+
+def _interrupted_folderling_fixture(tmp_path, *, with_operation=False):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    frontend = tmp_path / "dist"
+    runtime = tmp_path / "runtime"
+    house.mkdir()
+    temp.mkdir()
+    frontend.mkdir()
+    (frontend / "index.html").write_text("fixture", encoding="utf-8")
+    source = house / "interrupt fixture.txt"
+    source.write_text("stable bytes", encoding="utf-8")
+    conn = decision_store.initialize_state_db(state_db)
+    with decision_store.transaction(conn):
+        decision_store.reconcile_file_metadata(conn, source, source="house")
+    backup = decision_store.backup_state_db(
+        conn, state_db.parent / "before_interrupted_folderling.sqlite3"
+    )
+    run_id = decision_store.issue_actual_run_token(
+        conn, str(backup), house_dir=house, temp_dir=temp
+    )
+    conn.close()
+    activated_run_id, _ = decision_store.prepare_actual_run(
+        state_db, house, temp
+    )
+    assert activated_run_id == run_id
+    if with_operation:
+        conn = decision_store.connect_state_db(state_db)
+        with decision_store.transaction(conn):
+            decision_store.create_operation_group(
+                conn,
+                run_id=run_id,
+                action="fixture_interrupted_group",
+                plan_sha256="fixture-plan",
+                item_count=1,
+            )
+        conn.close()
+
+    store = JobStore(runtime)
+    job = store.create("service_folderling", {"source": "fixture"})
+    store.update(job["job_id"], state="running", stage="running")
+    store.append_event(job["job_id"], {
+        "phase": "actual_run_started",
+        "status": "running",
+        "run_id": run_id,
+    })
+    return state_db, house, temp, frontend, runtime, job["job_id"], run_id
+
+
+def test_server_restart_closes_folderling_run_before_first_operation(tmp_path):
+    state_db, house, temp, frontend, runtime, job_id, run_id = (
+        _interrupted_folderling_fixture(tmp_path)
+    )
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+        project_root=tmp_path,
+    )
+    store = app.extensions["library_job_runner"].store
+    restored = store.get(job_id)
+    events = store.events(job_id)
+    assert restored["state"] == "interrupted"
+    assert restored["error"]["code"] == "server_restarted_before_mutation"
+    assert "다시 실행" in restored["error"]["message"]
+    assert events[-1]["phase"] == "interrupted_run_recovered"
+    assert events[-1]["run_id"] == run_id
+
+    conn = decision_store.connect_state_db(state_db)
+    assert conn.execute(
+        "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()["state"] == "failed"
+    assert not decision_store.doctor_issues(conn)
+    conn.close()
+
+
+def test_server_restart_keeps_journaled_folderling_run_for_manual_recovery(tmp_path):
+    state_db, house, temp, frontend, runtime, job_id, run_id = (
+        _interrupted_folderling_fixture(tmp_path, with_operation=True)
+    )
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+        project_root=tmp_path,
+    )
+    store = app.extensions["library_job_runner"].store
+    restored = store.get(job_id)
+    events = store.events(job_id)
+    assert restored["state"] == "interrupted"
+    assert restored["error"]["code"] == "server_restarted"
+    assert events[-1]["phase"] == "interrupted_run_recovery_required"
+    assert "operations=0, groups=1" in events[-1]["error_message"]
+
+    conn = decision_store.connect_state_db(state_db)
+    assert conn.execute(
+        "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()["state"] == "active"
+    decision_store.disable_actual_run(conn)
+    conn.close()
 
 
 def test_job_cancel_api_only_cancels_waiting_record(tmp_path):

@@ -3,10 +3,16 @@
 import json
 import re
 import unicodedata
+import zipfile
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import decision_store
-from dedup_episode_relation import classify_dedup_coordinate_relation
+from dedup_episode_relation import (
+    DEDUP_SPECIAL_COORDINATE_MODES,
+    classify_dedup_coordinate_relation,
+    classify_loose_title_upgrade_relation,
+)
 from mutation_io import (
     assert_mutation_lock_held,
     contained_anchor_proof_sufficient,
@@ -22,7 +28,7 @@ from mutation_io import (
     mutation_lock,
 )
 from text_preview import ordered_body_coverage_sufficient
-from normalizer import analyze_name
+from normalizer import analyze_name, has_legacy_marker
 
 
 STRONG_QUEUE_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
@@ -43,6 +49,15 @@ HUMAN_REVIEW_CLASSES = (
     | frozenset({"exact_bytes"})
 )
 EPUB_SPINE_TEXT_MIN_CHARS = 50_000
+HOUSE_NEAR_DUPLICATE_MIN_COVERAGE_PPM = 990_000
+_DISTRIBUTION_SUFFIX_RE = re.compile(
+    r"(?:^|[-_\s])(?:현|로)?판\d{6}(?=(?:[^0-9]|$))", re.IGNORECASE
+)
+_EXPLICIT_EDITION_MARKER_RE = re.compile(
+    r"개정|수정판|누락\s*수정|외전|특전|후일담|에필로그|"
+    r"19\s*(?:n|금|禁)|성인판|무삭제|번역판",
+    re.IGNORECASE,
+)
 
 
 class ContainedUpgradeNotProven(RuntimeError):
@@ -51,6 +66,56 @@ class ContainedUpgradeNotProven(RuntimeError):
 
 class OrderedBodyMatchNotProven(RuntimeError):
     pass
+
+
+def _legacy_marker_discard_contract(discard, keep):
+    """Independent mutation-boundary check for the marker-only exception."""
+    return bool(
+        discard["assignment_state"] == "legacy_unresolved"
+        and keep["assignment_state"] != "legacy_unresolved"
+        and has_legacy_marker(Path(discard["canonical_path"]).name)
+        and not has_legacy_marker(Path(keep["canonical_path"]).name)
+        and discard["variant_id"] is None
+        and not discard["protected"]
+        and not discard["representative"]
+    )
+
+
+def _house_near_distribution_contract(
+    discard, keep, discard_meta, keep_meta, coordinate_relation
+):
+    """Independently authorize only a dated-distribution house duplicate."""
+    discard_name = Path(discard["canonical_path"]).name
+    keep_name = Path(keep["canonical_path"]).name
+    discard_core = _normalized_metadata_token(discard_meta["core_title"])
+    keep_core = _normalized_metadata_token(keep_meta["core_title"])
+    return bool(
+        discard["source"] == keep["source"] == "house"
+        and discard["assignment_state"] in {"unassigned", "decision_required"}
+        and keep["assignment_state"] in {"unassigned", "decision_required"}
+        and discard["variant_id"] is None
+        and keep["variant_id"] is None
+        and not discard["protected"]
+        and not keep["protected"]
+        and not discard["representative"]
+        and not keep["representative"]
+        and not has_legacy_marker(discard_name)
+        and not has_legacy_marker(keep_name)
+        and _DISTRIBUTION_SUFFIX_RE.search(discard_name) is not None
+        and _DISTRIBUTION_SUFFIX_RE.search(keep_name) is None
+        and _EXPLICIT_EDITION_MARKER_RE.search(discard_name) is None
+        and _EXPLICIT_EDITION_MARKER_RE.search(keep_name) is None
+        and analyze_name(discard_name)["complete"]
+        and analyze_name(keep_name)["complete"]
+        and coordinate_relation is not None
+        and coordinate_relation.mode == "same_coordinates"
+        and coordinate_relation.preferred_side is None
+        and discard_core
+        and keep_core
+        and SequenceMatcher(
+            None, discard_core, keep_core, autojunk=False
+        ).ratio() >= 0.90
+    )
 
 
 def _review_evidence(review):
@@ -460,7 +525,7 @@ def house_review_move(
             "house_root" if keep["source"] == "house" else "temp_root",
             keep_evidence,
         )
-        destination = _unique_destination(queue_dir, move_path.name)
+        destination = _unique_destination(conn, queue_dir, move_path.name)
         with decision_store.transaction(conn):
             operation_id = decision_store.create_operation(
                 conn, run_id=run_id, action="house_review_move",
@@ -737,17 +802,37 @@ def _ingest_to_house(
     }
 
 
-def _unique_destination(directory, filename):
+def _unique_destination(conn, directory, filename):
+    """Return a no-clobber path unowned by both disk and the state DB.
+
+    Inactive rows intentionally retain quarantine/queue provenance after their
+    physical files are purged.  Those canonical paths still participate in the
+    ``files.canonical_path`` UNIQUE constraint, so a filesystem-only vacancy is
+    not sufficient.  Skipping every reserved DB path prevents a copy from
+    reaching ``fs_done`` only to fail during the subsequent file-row update.
+    """
     directory = Path(directory)
     ensure_directory_nofollow(directory)
+
+    def available(candidate):
+        # ``Path.exists()`` is false for a dangling symlink.  Treat it as
+        # occupied as well so the later no-follow copy never targets it.
+        if candidate.exists() or candidate.is_symlink():
+            return False
+        reserved = conn.execute(
+            "SELECT 1 FROM files WHERE canonical_path = ? LIMIT 1",
+            (decision_store.canonicalize_path(candidate),),
+        ).fetchone()
+        return reserved is None
+
     candidate = directory / filename
-    if not candidate.exists():
+    if available(candidate):
         return candidate
     stem, suffix = Path(filename).stem, Path(filename).suffix
     counter = 1
     while True:
         candidate = directory / f"{stem}_{counter}{suffix}"
-        if not candidate.exists():
+        if available(candidate):
             return candidate
         counter += 1
 
@@ -882,6 +967,104 @@ def exact_quarantine(
         )
 
 
+def queue_exact_review_relationships_preserved(
+    conn, source_file_id, keep_file_id
+):
+    """Return whether one exact queue copy can be removed without losing review edges.
+
+    Queue files are not canonical keeps.  Two byte-identical queue rows may still
+    carry different review relationships, so exact bytes alone do not authorize
+    collapsing them.  The source is disposable only when both rows have the same
+    queue state and every current external review incident to the source already
+    has a current, role-preserving counterpart incident to the keep.  The direct
+    source/keep edge is intentionally ignored because it becomes meaningless once
+    the duplicate source is quarantined.
+    """
+
+    if source_file_id == keep_file_id:
+        return False
+    try:
+        source = _file_state(conn, source_file_id)
+        keep = _file_state(conn, keep_file_id)
+    except ValueError:
+        return False
+    if (
+        source["source"] != "queue"
+        or keep["source"] != "queue"
+        or source["assignment_state"] != keep["assignment_state"]
+        or source["assignment_state"] not in {"unassigned", "decision_required"}
+        or source["variant_id"] is not None
+        or keep["variant_id"] is not None
+        or source["protected"]
+        or keep["protected"]
+        or source["representative"]
+        or keep["representative"]
+    ):
+        return False
+
+    def signatures(focal_file_id, other_exact_file_id, focal_fingerprint_id):
+        rows = conn.execute(
+            """
+            SELECT review_id, candidate_file_id, reference_file_id,
+                   left_fingerprint_id, right_fingerprint_id, classification
+            FROM review_items
+            WHERE state IN ('pending', 'deferred')
+              AND (candidate_file_id = ? OR reference_file_id = ?)
+            ORDER BY review_id
+            """,
+            (focal_file_id, focal_file_id),
+        ).fetchall()
+        result = []
+        for row in rows:
+            focal_is_candidate = row["candidate_file_id"] == focal_file_id
+            other_file_id = (
+                row["reference_file_id"]
+                if focal_is_candidate else row["candidate_file_id"]
+            )
+            if other_file_id == other_exact_file_id:
+                continue
+            focal_review_fingerprint = (
+                row["left_fingerprint_id"]
+                if focal_is_candidate else row["right_fingerprint_id"]
+            )
+            other_review_fingerprint = (
+                row["right_fingerprint_id"]
+                if focal_is_candidate else row["left_fingerprint_id"]
+            )
+            other = conn.execute(
+                "SELECT active, current_fingerprint_id FROM files WHERE file_id = ?",
+                (other_file_id,),
+            ).fetchone()
+            if (
+                focal_review_fingerprint != focal_fingerprint_id
+                or other is None
+                or not other["active"]
+                or other_review_fingerprint != other["current_fingerprint_id"]
+            ):
+                return None
+            result.append((
+                "candidate" if focal_is_candidate else "reference",
+                other_file_id,
+                other_review_fingerprint,
+                row["classification"],
+            ))
+        return result
+
+    source_signatures = signatures(
+        source_file_id, keep_file_id, source["current_fingerprint_id"]
+    )
+    keep_signatures = signatures(
+        keep_file_id, source_file_id, keep["current_fingerprint_id"]
+    )
+    if source_signatures is None or keep_signatures is None:
+        return False
+    from collections import Counter
+
+    source_counts = Counter(source_signatures)
+    keep_counts = Counter(keep_signatures)
+    return all(keep_counts[key] >= count for key, count in source_counts.items())
+
+
 def _exact_quarantine(
     conn,
     *,
@@ -902,7 +1085,10 @@ def _exact_quarantine(
     keep = _ensure_intake_fingerprint(conn, keep)
     source_root = "house_root" if source["source"] == "house" else "temp_root"
     decision_store.assert_actual_run_path(actual_run, source["canonical_path"], source_root)
-    decision_store.assert_actual_run_path(actual_run, keep["canonical_path"], "house_root")
+    keep_root = "house_root" if keep["source"] == "house" else "temp_root"
+    decision_store.assert_actual_run_path(
+        actual_run, keep["canonical_path"], keep_root
+    )
     decision_store.assert_actual_run_path(actual_run, quarantine_dir, "temp_root")
     # Exact cleanup is the only automatic mutation allowed to consume an
     # unassigned or unresolved house file.  It is still bound to the approved
@@ -914,8 +1100,17 @@ def _exact_quarantine(
     keep_path = _preflight(keep)
     if source_file_id == keep_file_id:
         raise ValueError("source and keep must differ")
-    if keep["source"] != "house":
-        raise RuntimeError("exact keep must be an active house file")
+    queue_keep = keep["source"] == "queue"
+    if keep["source"] != "house" and not (
+        source["source"] == "queue"
+        and queue_keep
+        and queue_exact_review_relationships_preserved(
+            conn, source_file_id, keep_file_id
+        )
+    ):
+        raise RuntimeError(
+            "exact keep must be house or a relationship-preserving queue peer"
+        )
     if keep["assignment_state"] not in {
         "managed", "unassigned", "legacy_unresolved", "decision_required"
     }:
@@ -953,6 +1148,18 @@ def _exact_quarantine(
     decision_store.assert_manifest_source(
         actual_run, source_path, source_root, source_evidence
     )
+    if queue_keep:
+        # Unlike a house keep produced by this same run, a queue keep must have
+        # existed at activation and be bound to the approved manifest.
+        decision_store.assert_manifest_source(
+            actual_run, keep_path, "temp_root", keep_evidence
+        )
+    else:
+        # A house keep must either be part of the activation snapshot or be an
+        # exact destination durably produced by this still-active run.
+        decision_store.assert_manifest_or_same_run_house_source(
+            conn, actual_run, keep_path, keep_evidence
+        )
     source_hash = source_evidence.sha256
     keep_hash = keep_evidence.sha256
     if source_hash != keep_hash:
@@ -979,7 +1186,7 @@ def _exact_quarantine(
             f"cached keep raw SHA does not match current bytes: {keep_path}"
         )
 
-    destination = _unique_destination(quarantine_dir, source_path.name)
+    destination = _unique_destination(conn, quarantine_dir, source_path.name)
     with decision_store.transaction(conn):
         operation_id = decision_store.create_operation(
             conn,
@@ -1007,8 +1214,12 @@ def _exact_quarantine(
             raise RuntimeError("exact source fingerprint changed before consume")
         if current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
             raise RuntimeError("exact keep guard changed before consume")
-        if current_keep["source"] != "house":
-            raise RuntimeError("exact keep left house before consume")
+        if current_keep["source"] != keep["source"]:
+            raise RuntimeError("exact keep source changed before consume")
+        if queue_keep and not queue_exact_review_relationships_preserved(
+            conn, source_file_id, keep_file_id
+        ):
+            raise RuntimeError("queue exact review relationships changed before consume")
         if current_keep["assignment_state"] == "managed":
             if not current_keep["representative"]:
                 raise RuntimeError("managed exact keep is no longer representative")
@@ -1169,7 +1380,7 @@ def user_quarantine(
             decision_store.assert_manifest_source(
                 actual_run, replacement_path, "house_root", replacement_evidence
             )
-        destination = _unique_destination(quarantine_dir, source_path.name)
+        destination = _unique_destination(conn, quarantine_dir, source_path.name)
         with decision_store.transaction(conn):
             operation_id = decision_store.create_operation(
                 conn,
@@ -1256,6 +1467,132 @@ def user_quarantine(
             "source_file_id": source_file_id,
             "keep_file_id": keep_file_id,
             "dest_path": str(destination),
+        }
+
+
+def hold_epub_analysis_error(
+    conn,
+    *,
+    source_file_id,
+    temp_root,
+    run_id,
+    analysis_error,
+    max_file_bytes,
+    max_uncompressed_bytes,
+):
+    """Journal one ambiguous incoming EPUB into a recoverable warning queue.
+
+    This is not a duplicate decision or a discard. The move is allowed only
+    when the same bounded inspection reproduces the exact auditor error and the
+    actual-run manifest still owns the incoming file identity.
+    """
+
+    with mutation_lock(conn, f"epub-analysis-hold:{run_id}", run_id=run_id):
+        actual_run = decision_store.assert_active_actual_run(conn, run_id)
+        source = _file_state(conn, source_file_id)
+        if source["source"] != "temp":
+            raise RuntimeError("EPUB analysis hold source must be temp")
+        if (
+            source["variant_id"] is not None
+            or source["protected"]
+            or source["representative"]
+            or source["assignment_state"] == "managed"
+        ):
+            raise RuntimeError(
+                "managed EPUB analysis error requires relationship-preserving review"
+            )
+        source = _ensure_intake_fingerprint(conn, source)
+        inspection_options = {"max_file_bytes": max_file_bytes}
+        if max_uncompressed_bytes is not None:
+            inspection_options["max_uncompressed_bytes"] = max_uncompressed_bytes
+        try:
+            inspect_epub_content(
+                source["canonical_path"], **inspection_options
+            )
+        except (RuntimeError, zipfile.BadZipFile) as exc:
+            current_error = str(exc)
+        else:
+            current_error = None
+        if not analysis_error or current_error != analysis_error:
+            raise RuntimeError("EPUB analysis hold evidence is not current")
+
+        source_path = _preflight(source)
+        decision_store.assert_actual_run_path(
+            actual_run, source_path, "temp_root"
+        )
+        source_evidence = inspect_regular_file(source_path)
+        decision_store.assert_manifest_source(
+            actual_run, source_path, "temp_root", source_evidence
+        )
+        destination_dir = (
+            Path(temp_root) / "trash_bin" / "warning" / "epub_analysis_errors"
+        )
+        destination = _unique_destination(conn, destination_dir, source_path.name)
+        decision_store.assert_actual_run_path(
+            actual_run, destination, "temp_root"
+        )
+        with decision_store.transaction(conn):
+            operation_id = decision_store.create_operation(
+                conn,
+                run_id=run_id,
+                action="epub_analysis_hold",
+                source_path=str(source_path),
+                dest_path=str(destination),
+                file_id=source_file_id,
+                expected_size=source["size"],
+                expected_mtime_ns=source["mtime_ns"],
+                expected_fingerprint_id=source["current_fingerprint_id"],
+                source_dev=source_evidence.dev,
+                source_ino=source_evidence.ino,
+                source_ctime_ns=source_evidence.ctime_ns,
+                source_sha256=source_evidence.sha256,
+            )
+
+        def guard():
+            decision_store.assert_active_actual_run(conn, run_id)
+            current = _file_state(conn, source_file_id)
+            if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
+                raise RuntimeError("EPUB analysis hold source changed before consume")
+
+        destination_evidence = _copy_record_consume(
+            conn,
+            operation_id,
+            source_path,
+            destination,
+            source_evidence,
+            guard=guard,
+        )
+        with decision_store.transaction(conn):
+            conn.execute(
+                """
+                UPDATE files
+                SET canonical_path = ?, source = 'queue',
+                    assignment_state = 'decision_required',
+                    assignment_origin = NULL, variant_id = NULL, protected = 0,
+                    dev = ?, ino = ?, ctime_ns = ?, size = ?, mtime_ns = ?,
+                    last_seen_at = CURRENT_TIMESTAMP
+                WHERE file_id = ?
+                """,
+                (
+                    str(destination),
+                    destination_evidence.dev,
+                    destination_evidence.ino,
+                    destination_evidence.ctime_ns,
+                    destination_evidence.size,
+                    destination_evidence.mtime_ns,
+                    source_file_id,
+                ),
+            )
+            decision_store.transition_operation(conn, operation_id, "db_done")
+        with decision_store.transaction(conn):
+            decision_store.transition_operation(conn, operation_id, "committed")
+        return {
+            "operation_id": operation_id,
+            "action": "epub_analysis_hold",
+            "file_id": source_file_id,
+            "source_path": str(source_path),
+            "dest_path": str(destination),
+            "analysis_error": analysis_error,
         }
 
 
@@ -1430,11 +1767,13 @@ def apply_contained_upgrade(
     longer = _file_state(conn, longer_file_id)
     if shorter_file_id == longer_file_id:
         raise ValueError("contained upgrade endpoints must differ")
-    if shorter["source"] not in {"house", "temp"} or longer["source"] not in {
-        "house", "temp"
+    if shorter["source"] not in {"house", "temp", "queue"} or longer["source"] not in {
+        "house", "temp", "queue"
     }:
-        raise RuntimeError("contained upgrade endpoints must be active house/temp files")
-    if shorter["source"] == longer["source"] == "temp":
+        raise RuntimeError(
+            "contained upgrade endpoints must be active house/temp/queue files"
+        )
+    if "house" not in {shorter["source"], longer["source"]}:
         raise RuntimeError("contained upgrade requires an established house endpoint")
     if Path(shorter["canonical_path"]).suffix.lower() != ".txt" or Path(
         longer["canonical_path"]
@@ -1465,31 +1804,53 @@ def apply_contained_upgrade(
 
     short_meta = _contained_metadata(conn, shorter_file_id)
     long_meta = _contained_metadata(conn, longer_file_id)
-    if not _normalized_metadata_token(short_meta["core_title"]) or (
-        _normalized_metadata_token(short_meta["core_title"])
-        != _normalized_metadata_token(long_meta["core_title"])
+    coordinate_relation = classify_dedup_coordinate_relation(
+        Path(shorter["canonical_path"]).name,
+        Path(longer["canonical_path"]).name,
+        left_span_ambiguous=bool(shorter["span_ambiguous"]),
+        right_span_ambiguous=bool(longer["span_ambiguous"]),
+    )
+    special_coordinates = bool(
+        coordinate_relation is not None
+        and coordinate_relation.mode in DEDUP_SPECIAL_COORDINATE_MODES
+    )
+    if (
+        coordinate_relation is None
+        or coordinate_relation.preferred_side != "right"
+    ):
+        raise RuntimeError("contained upgrade declared coverage is not strictly wider")
+    if (
+        not special_coordinates
+        and (
+            not _normalized_metadata_token(short_meta["core_title"])
+            or _normalized_metadata_token(short_meta["core_title"])
+            != _normalized_metadata_token(long_meta["core_title"])
+        )
     ):
         raise RuntimeError("contained upgrade core title mismatch")
     short_authors = _author_tokens(short_meta["author"])
     long_authors = _author_tokens(long_meta["author"])
     if short_authors and long_authors and not (short_authors & long_authors):
         raise RuntimeError("contained upgrade author mismatch")
-    if short_meta["unit"] != long_meta["unit"]:
+    if not special_coordinates and short_meta["unit"] != long_meta["unit"]:
         raise RuntimeError("contained upgrade unit mismatch")
 
-    short_coordinates = _coordinate_view(shorter)
-    long_coordinates = _coordinate_view(longer)
-    if (
-        short_coordinates["span_ambiguous"]
-        or long_coordinates["span_ambiguous"]
-        or short_coordinates["episode_start"] is None
-        or short_coordinates["episode_end"] is None
-        or long_coordinates["episode_start"] is None
-        or long_coordinates["episode_end"] is None
-        or short_coordinates["episode_start"] != long_coordinates["episode_start"]
-        or long_coordinates["episode_end"] <= short_coordinates["episode_end"]
-    ):
-        raise RuntimeError("contained upgrade requires a strict matching episode span")
+    if not special_coordinates:
+        short_coordinates = _coordinate_view(shorter)
+        long_coordinates = _coordinate_view(longer)
+        if (
+            short_coordinates["span_ambiguous"]
+            or long_coordinates["span_ambiguous"]
+            or short_coordinates["episode_start"] is None
+            or short_coordinates["episode_end"] is None
+            or long_coordinates["episode_start"] is None
+            or long_coordinates["episode_end"] is None
+            or short_coordinates["episode_start"] != long_coordinates["episode_start"]
+            or long_coordinates["episode_end"] <= short_coordinates["episode_end"]
+        ):
+            raise RuntimeError(
+                "contained upgrade requires a strict matching episode span"
+            )
 
     short_path = _preflight(shorter)
     long_path = _preflight(longer)
@@ -1524,17 +1885,25 @@ def apply_contained_upgrade(
     )
 
     ingest_result = None
-    if longer["source"] == "temp":
+    if longer["source"] in {"temp", "queue"}:
         if house_destination is None:
             raise RuntimeError("contained upgrade house destination is required")
         destination = Path(decision_store.canonicalize_path(house_destination))
         decision_store.assert_actual_run_path(actual_run, destination, "house_root")
-        ingest_result = ingest_to_house(
-            conn,
-            source_file_id=longer_file_id,
-            destination=destination,
-            run_id=run_id,
-        )
+        if longer["source"] == "queue":
+            ingest_result = user_queue_accept_to_house(
+                conn,
+                file_id=longer_file_id,
+                destination=destination,
+                run_id=run_id,
+            )
+        else:
+            ingest_result = ingest_to_house(
+                conn,
+                source_file_id=longer_file_id,
+                destination=destination,
+                run_id=run_id,
+            )
         longer = _file_state(conn, longer_file_id)
     elif house_destination is not None and decision_store.canonicalize_path(
         house_destination
@@ -1640,23 +2009,39 @@ def apply_ordered_body_quarantine(
     house_destination=None,
     classification="ordered_body_match",
 ):
-    """Finalize a same-core edition after a directional 95% body proof."""
+    """Finalize a same-core edition after a current 95% body proof.
+
+    ``near_identical`` additionally needs the same proof in reverse, so a
+    shared fragment cannot consume a distinct edition.  House -> house is
+    limited to the dated-distribution contract and requires 99% in both
+    directions.
+    """
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     assert_mutation_lock_held(conn, run_id=run_id)
     discard = _file_state(conn, discard_file_id)
     keep = _file_state(conn, keep_file_id)
     if discard_file_id == keep_file_id:
         raise ValueError("ordered body endpoints must differ")
-    if discard["source"] not in {"house", "temp"} or keep["source"] not in {
-        "house", "temp"
+    if discard["source"] not in {"house", "temp", "queue"} or keep["source"] not in {
+        "house", "temp", "queue"
     }:
-        raise RuntimeError("ordered body endpoints must be active house/temp files")
-    if discard["source"] == keep["source"] == "temp":
+        raise RuntimeError(
+            "ordered body endpoints must be active house/temp/queue files"
+        )
+    if "house" not in {discard["source"], keep["source"]}:
         raise RuntimeError("ordered body quarantine requires a house endpoint")
     if Path(discard["canonical_path"]).suffix.lower() != ".txt" or Path(
         keep["canonical_path"]
     ).suffix.lower() != ".txt":
         raise RuntimeError("ordered body quarantine supports TXT only")
+    legacy_marker_discard = _legacy_marker_discard_contract(discard, keep)
+    if (
+        discard["assignment_state"] == "legacy_unresolved"
+        or keep["assignment_state"] == "legacy_unresolved"
+    ) and not legacy_marker_discard:
+        raise RuntimeError(
+            "ordered body legacy marker is allowed only on the loose discard"
+        )
 
     review = conn.execute(
         "SELECT * FROM review_items WHERE review_id = ?", (review_id,)
@@ -1664,7 +2049,7 @@ def apply_ordered_body_quarantine(
     if (
         review is None
         or review["classification"] != classification
-        or classification != "ordered_body_match"
+        or classification not in {"ordered_body_match", "near_identical"}
         or review["state"] not in {"pending", "deferred"}
         or {review["candidate_file_id"], review["reference_file_id"]}
         != {discard_file_id, keep_file_id}
@@ -1683,26 +2068,102 @@ def apply_ordered_body_quarantine(
 
     discard_meta = _contained_metadata(conn, discard_file_id)
     keep_meta = _contained_metadata(conn, keep_file_id)
-    if not _normalized_metadata_token(discard_meta["core_title"]) or (
-        _normalized_metadata_token(discard_meta["core_title"])
-        != _normalized_metadata_token(keep_meta["core_title"])
-    ):
-        raise RuntimeError("ordered body quarantine core title mismatch")
-    discard_authors = _author_tokens(discard_meta["author"])
-    keep_authors = _author_tokens(keep_meta["author"])
-    if discard_authors and keep_authors and not (discard_authors & keep_authors):
-        raise RuntimeError("ordered body quarantine author mismatch")
-
-    coordinate_relation = classify_dedup_coordinate_relation(
+    discard_core = _normalized_metadata_token(discard_meta["core_title"])
+    keep_core = _normalized_metadata_token(keep_meta["core_title"])
+    loose_upgrade_relation = classify_loose_title_upgrade_relation(
         Path(discard["canonical_path"]).name,
         Path(keep["canonical_path"]).name,
         left_span_ambiguous=bool(discard["span_ambiguous"]),
         right_span_ambiguous=bool(keep["span_ambiguous"]),
     )
-    if coordinate_relation is None:
-        raise RuntimeError("ordered body quarantine coordinate relation changed")
-    if coordinate_relation.preferred_side not in {None, "right"}:
-        raise RuntimeError("ordered body quarantine would discard wider coverage")
+    house_near_core = bool(
+        classification == "near_identical"
+        and discard["source"] == keep["source"] == "house"
+        and discard_core
+        and keep_core
+        and SequenceMatcher(
+            None, discard_core, keep_core, autojunk=False
+        ).ratio() >= 0.90
+    )
+    if not discard_core or (
+        discard_core != keep_core
+        and not house_near_core
+        and not (
+            classification == "ordered_body_match"
+            and loose_upgrade_relation is not None
+        )
+    ):
+        raise RuntimeError("ordered body quarantine core title mismatch")
+    discard_authors = _author_tokens(discard_meta["author"])
+    keep_authors = _author_tokens(keep_meta["author"])
+    if (
+        classification != "near_identical"
+        and discard_authors
+        and keep_authors
+        and not (discard_authors & keep_authors)
+    ):
+        raise RuntimeError("ordered body quarantine author mismatch")
+
+    coordinate_relation = (
+        loose_upgrade_relation
+        if classification == "ordered_body_match"
+        and discard_core != keep_core
+        else classify_dedup_coordinate_relation(
+            Path(discard["canonical_path"]).name,
+            Path(keep["canonical_path"]).name,
+            left_span_ambiguous=bool(discard["span_ambiguous"]),
+            right_span_ambiguous=bool(keep["span_ambiguous"]),
+        )
+    )
+    if classification == "ordered_body_match":
+        if coordinate_relation is None:
+            raise RuntimeError("ordered body quarantine coordinate relation changed")
+        if coordinate_relation.preferred_side not in {None, "right"}:
+            raise RuntimeError("ordered body quarantine would discard wider coverage")
+        coordinate_mode = coordinate_relation.mode
+    else:
+        queue_house = (
+            discard["source"] == "queue" and keep["source"] == "house"
+        )
+        house_distribution = _house_near_distribution_contract(
+            discard, keep, discard_meta, keep_meta, coordinate_relation
+        )
+        if not queue_house and not house_distribution:
+            raise RuntimeError("near-identical endpoint contract is unsafe")
+        if queue_house:
+            if any(
+                row["variant_id"] is not None
+                or row["protected"]
+                or row["representative"]
+                or row["assignment_state"] not in {
+                    "unassigned", "decision_required",
+                }
+                or has_legacy_marker(Path(row["canonical_path"]).name)
+                for row in (discard, keep)
+            ):
+                raise RuntimeError("near-identical endpoint relationships are unsafe")
+        if coordinate_relation is not None:
+            if coordinate_relation.preferred_side is not None:
+                raise RuntimeError("near-identical coordinates prefer one edition")
+            coordinate_mode = coordinate_relation.mode
+        else:
+            if not queue_house:
+                raise RuntimeError("house near-identical coordinates are required")
+            from dedup_episode_relation import episode_profile
+
+            profiles = (
+                episode_profile(
+                    Path(discard["canonical_path"]).name,
+                    span_ambiguous=bool(discard["span_ambiguous"]),
+                ),
+                episode_profile(
+                    Path(keep["canonical_path"]).name,
+                    span_ambiguous=bool(keep["span_ambiguous"]),
+                ),
+            )
+            if (profiles[0] is None) == (profiles[1] is None):
+                raise RuntimeError("near-identical coordinates are ambiguous")
+            coordinate_mode = "one_sided_unknown_coordinates"
 
     discard_path = _preflight(discard)
     keep_path = _preflight(keep)
@@ -1720,6 +2181,38 @@ def apply_ordered_body_quarantine(
         raise OrderedBodyMatchNotProven(
             "ordered body coverage fell below the current 1.4.1 contract"
         )
+    reverse_proof = None
+    if classification == "near_identical":
+        reverse_proof = inspect_ordered_text(keep_path, discard_path)
+        _assert_row_identity(keep, reverse_proof.source_file_evidence, keep_path)
+        _assert_row_identity(
+            discard, reverse_proof.target_file_evidence, discard_path
+        )
+        if (
+            reverse_proof.source_normalized_sha256
+            != keep["normalized_sha256"]
+            or reverse_proof.target_normalized_sha256
+            != discard["normalized_sha256"]
+            or not ordered_body_coverage_sufficient(reverse_proof.coverage)
+        ):
+            raise OrderedBodyMatchNotProven(
+                "near-identical reverse coverage fell below the current contract"
+            )
+        if discard["source"] == keep["source"] == "house":
+            lengths = (
+                proof.source_normalized_length,
+                proof.target_normalized_length,
+            )
+            if (
+                proof.coverage.coverage_ppm
+                < HOUSE_NEAR_DUPLICATE_MIN_COVERAGE_PPM
+                or reverse_proof.coverage.coverage_ppm
+                < HOUSE_NEAR_DUPLICATE_MIN_COVERAGE_PPM
+                or abs(lengths[0] - lengths[1]) / max(lengths) > 0.01
+            ):
+                raise OrderedBodyMatchNotProven(
+                    "house near-identical proof is below the bidirectional 99% contract"
+                )
 
     discard_root = "house_root" if discard["source"] == "house" else "temp_root"
     keep_root = "house_root" if keep["source"] == "house" else "temp_root"
@@ -1731,17 +2224,25 @@ def apply_ordered_body_quarantine(
     )
 
     ingest_result = None
-    if keep["source"] == "temp":
+    if keep["source"] in {"temp", "queue"}:
         if house_destination is None:
             raise RuntimeError("ordered body keep destination is required")
         destination = Path(decision_store.canonicalize_path(house_destination))
         decision_store.assert_actual_run_path(actual_run, destination, "house_root")
-        ingest_result = ingest_to_house(
-            conn,
-            source_file_id=keep_file_id,
-            destination=destination,
-            run_id=run_id,
-        )
+        if keep["source"] == "queue":
+            ingest_result = user_queue_accept_to_house(
+                conn,
+                file_id=keep_file_id,
+                destination=destination,
+                run_id=run_id,
+            )
+        else:
+            ingest_result = ingest_to_house(
+                conn,
+                source_file_id=keep_file_id,
+                destination=destination,
+                run_id=run_id,
+            )
         keep = _file_state(conn, keep_file_id)
     elif house_destination is not None and decision_store.canonicalize_path(
         house_destination
@@ -1794,13 +2295,13 @@ def apply_ordered_body_quarantine(
         ):
             raise RuntimeError("ordered body cannot consume a protected loose file")
         elif discard["source"] == "house" and discard["assignment_state"] not in {
-            "unassigned", "managed"
-        }:
+            "unassigned", "managed", "decision_required"
+        } and not legacy_marker_discard:
             raise RuntimeError("ordered body discard requires a prior decision")
-        elif discard["source"] == "temp" and (
+        elif discard["source"] in {"temp", "queue"} and (
             discard["protected"] or discard["representative"]
         ):
-            raise RuntimeError("ordered body temp discard is protected")
+            raise RuntimeError("ordered body temp/queue discard is protected")
 
     quarantine_result = user_quarantine(
         conn,
@@ -1808,7 +2309,14 @@ def apply_ordered_body_quarantine(
         keep_file_id=keep_file_id,
         quarantine_dir=quarantine_dir,
         run_id=run_id,
-        reason="ordered_body_95_auto_duplicate",
+        reason=(
+            "near_identical_house_bidirectional_99_auto_duplicate"
+            if classification == "near_identical"
+            and discard["source"] == keep["source"] == "house"
+            else "near_identical_bidirectional_95_auto_duplicate"
+            if classification == "near_identical"
+            else "ordered_body_95_auto_duplicate"
+        ),
         keep_origin_operation_id=(
             ingest_result["operation_id"] if ingest_result is not None else None
         ),
@@ -1826,7 +2334,15 @@ def apply_ordered_body_quarantine(
         "matched_chars": coverage.matched_chars,
         "source_chars": coverage.source_chars,
         "max_unmatched_chars": coverage.max_unmatched_chars,
-        "coordinate_mode": coordinate_relation.mode,
+        "coordinate_mode": coordinate_mode,
+        "reverse_coverage_ppm": (
+            reverse_proof.coverage.coverage_ppm
+            if reverse_proof is not None else None
+        ),
+        "reverse_max_unmatched_chars": (
+            reverse_proof.coverage.max_unmatched_chars
+            if reverse_proof is not None else None
+        ),
         "ingest_operation_id": (
             ingest_result["operation_id"] if ingest_result is not None else None
         ),
@@ -1858,7 +2374,7 @@ def user_action_quarantine(
         decision_store.assert_manifest_source(
             actual_run, source_path, "temp_root", source_evidence
         )
-        destination = _unique_destination(quarantine_dir, source_path.name)
+        destination = _unique_destination(conn, quarantine_dir, source_path.name)
         with decision_store.transaction(conn):
             operation_id = decision_store.create_operation(
                 conn, run_id=run_id, action="user_quarantine",
@@ -2032,7 +2548,7 @@ def _queue_candidate(
                 raise RuntimeError("strong queue current normalized SHA-256 revalidation failed")
             source_evidence = candidate_evidence
     action = "suspected_move" if strong else "warning_move"
-    destination = _unique_destination(queue_dir, candidate_path.name)
+    destination = _unique_destination(conn, queue_dir, candidate_path.name)
     source_evidence = source_evidence or inspect_regular_file(candidate_path)
     decision_store.assert_manifest_source(
         actual_run, candidate_path, "temp_root", source_evidence

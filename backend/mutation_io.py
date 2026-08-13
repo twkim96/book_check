@@ -16,6 +16,7 @@ import threading
 import unicodedata
 import zipfile
 import xml.etree.ElementTree as ElementTree
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
@@ -26,6 +27,7 @@ from urllib.parse import unquote, urlsplit
 from text_preview import (
     NormalizedLineSequence,
     OrderedBodyCoverage,
+    lossless_legacy_text_fingerprint_bytes,
     ordered_body_coverage,
 )
 
@@ -302,6 +304,26 @@ def assert_mutation_lock_held(conn, *, run_id=None):
             )
 
 
+def assert_mutation_lock_for_roots_held(house_root, temp_root):
+    """Require ownership of the command lock for explicit pre-approval roots."""
+    roots = tuple(
+        sorted((str(Path(house_root).resolve()), str(Path(temp_root).resolve())))
+    )
+    lock_path = _lock_path_for_roots(roots)
+    with _LOCK_REGISTRY_GUARD:
+        held = _LOCK_REGISTRY.get(str(lock_path))
+        if not (
+            held
+            and held["pid"] == os.getpid()
+            and held["thread"] == threading.get_ident()
+            and held["depth"] > 0
+            and held.get("command")
+        ):
+            raise MutationLockBusy(
+                f"mutation lock is not held by the current command: {lock_path}"
+            )
+
+
 def _identity(info, sha256: str) -> FileEvidence:
     return FileEvidence(
         dev=info.st_dev,
@@ -547,7 +569,19 @@ def inspect_normalized_text(path):
             except UnicodeDecodeError as exc:
                 decode_errors.append(f"{encoding}: {exc}")
         if normalized_sha is None:
-            raise RuntimeError("text decode failed: " + "; ".join(decode_errors))
+            if before.st_size > 256 * 1024 * 1024:
+                raise RuntimeError("text decode failed: " + "; ".join(decode_errors))
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            legacy = lossless_legacy_text_fingerprint_bytes(raw)
+            if legacy is None:
+                raise RuntimeError("text decode failed: " + "; ".join(decode_errors))
+            normalized_sha = legacy["normalized_sha256"]
         after = os.fstat(fd)
         if (before.st_dev, before.st_ino, before.st_ctime_ns, before.st_size) != (
             after.st_dev, after.st_ino, after.st_ctime_ns, after.st_size
@@ -742,13 +776,33 @@ def inspect_ordered_text(source_path, target_path) -> OrderedTextEvidence:
             _,
             target_encoding,
         ) = _normalized_metrics_with_fallback(target_fd)
-        source_lines = _normalized_line_sequence_from_fd(
-            source_fd, source_encoding, source_path, source_before
-        )
-        target_lines = _normalized_line_sequence_from_fd(
-            target_fd, target_encoding, target_path, target_before
-        )
-        coverage = ordered_body_coverage(source_lines, target_lines)
+        if source_sha == target_sha and source_length == target_length:
+            # The auditor already treats exact normalized equality as a
+            # complete ordered-body proof without allocating an LCS graph.
+            # Revalidation has just recomputed both full normalized digests
+            # from pinned descriptors, so use the same exact proof here. This
+            # preserves the 500k-node ceiling for merely similar texts while
+            # allowing very large whitespace/encoding-only equivalents to
+            # reach their journaled automatic disposition.
+            coverage = OrderedBodyCoverage(
+                source_chars=source_length,
+                target_chars=target_length,
+                source_lines=0,
+                target_lines=0,
+                matched_chars=source_length,
+                matched_lines=0,
+                coverage_ppm=1_000_000,
+                max_unmatched_chars=0,
+                repetitive_source_chars=0,
+            )
+        else:
+            source_lines = _normalized_line_sequence_from_fd(
+                source_fd, source_encoding, source_path, source_before
+            )
+            target_lines = _normalized_line_sequence_from_fd(
+                target_fd, target_encoding, target_path, target_before
+            )
+            coverage = ordered_body_coverage(source_lines, target_lines)
 
         source_after = os.fstat(source_fd)
         target_after = os.fstat(target_fd)
@@ -865,6 +919,71 @@ def inspect_contained_text(short_path, long_path) -> ContainedTextEvidence:
         os.close(short_parent_fd)
 
 
+def _unique_epub_member_pairs(archive, infos, normalized_names, *, budget=None):
+    """Return one member per normalized name after proving duplicates equal.
+
+    Some EPUB writers append the same package member more than once. ZIP readers
+    then disagree about which central-directory entry wins. Treat that layout as
+    unambiguous only when every entry for the normalized name has identical
+    bytes. Conflicting duplicates remain a hard error. Duplicate validation is
+    charged to the caller's read budget and never extracts archive members.
+    """
+
+    if len(infos) != len(normalized_names):
+        raise ValueError("EPUB member/name length mismatch")
+    grouped = defaultdict(list)
+    for normalized_name, info in zip(normalized_names, infos):
+        if info.flag_bits & 0x1:
+            raise RuntimeError("encrypted EPUB member is unsupported")
+        member_mode = (info.external_attr >> 16) & 0o170000
+        if member_mode == stat.S_IFLNK:
+            raise RuntimeError("EPUB symlink member is unsupported")
+        grouped[normalized_name].append(info)
+
+    duplicate_read_bytes = sum(
+        int(info.file_size)
+        for group in grouped.values() if len(group) > 1
+        for info in group
+    )
+    if budget is not None and duplicate_read_bytes:
+        budget.reserve_pass(duplicate_read_bytes)
+
+    unique = []
+    for normalized_name, group in grouped.items():
+        if len(group) > 1:
+            expected_size = int(group[0].file_size)
+            if any(int(info.file_size) != expected_size for info in group[1:]):
+                raise RuntimeError(
+                    "EPUB contains conflicting duplicate normalized member name: "
+                    f"{normalized_name}"
+                )
+            digests = set()
+            for info in group:
+                digest = hashlib.sha256()
+                consumed = 0
+                with archive.open(info, "r") as member:
+                    while True:
+                        chunk = member.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        consumed += len(chunk)
+                        if budget is not None:
+                            budget.consume(len(chunk))
+                        digest.update(chunk)
+                if consumed != int(info.file_size):
+                    raise RuntimeError(
+                        f"EPUB member size changed while read: {normalized_name}"
+                    )
+                digests.add(digest.digest())
+            if len(digests) != 1:
+                raise RuntimeError(
+                    "EPUB contains conflicting duplicate normalized member name: "
+                    f"{normalized_name}"
+                )
+        unique.append((normalized_name, group[0]))
+    return sorted(unique, key=lambda item: item[0])
+
+
 def inspect_epub_content(
     path,
     *,
@@ -906,25 +1025,25 @@ def inspect_epub_content(
                 normalized_names = [
                     unicodedata.normalize("NFC", info.filename) for info in infos
                 ]
-                if len(normalized_names) != len(set(normalized_names)):
-                    raise RuntimeError("EPUB contains duplicate normalized member names")
-                uncompressed_size = sum(int(info.file_size) for info in infos)
-                if uncompressed_size > int(max_uncompressed_bytes):
+                archive_uncompressed_size = sum(
+                    int(info.file_size) for info in infos
+                )
+                if archive_uncompressed_size > int(max_uncompressed_bytes):
                     raise RuntimeError(
                         "EPUB uncompressed limit exceeded: "
-                        f"{uncompressed_size}>{max_uncompressed_bytes}"
+                        f"{archive_uncompressed_size}>{max_uncompressed_bytes}"
                     )
+                ordered = _unique_epub_member_pairs(
+                    archive, infos, normalized_names, budget=budget
+                )
+                uncompressed_size = sum(
+                    int(info.file_size) for _name, info in ordered
+                )
                 if budget is not None:
                     budget.reserve_pass(uncompressed_size)
 
                 digest = hashlib.sha256()
-                ordered = sorted(zip(normalized_names, infos), key=lambda item: item[0])
                 for normalized_name, info in ordered:
-                    if info.flag_bits & 0x1:
-                        raise RuntimeError("encrypted EPUB member is unsupported")
-                    member_mode = (info.external_attr >> 16) & 0o170000
-                    if member_mode == stat.S_IFLNK:
-                        raise RuntimeError("EPUB symlink member is unsupported")
                     name_bytes = normalized_name.encode("utf-8", "surrogatepass")
                     digest.update(struct.pack(">Q", len(name_bytes)))
                     digest.update(name_bytes)
@@ -962,7 +1081,7 @@ def inspect_epub_content(
         return EpubContentEvidence(
             file_evidence=_identity(after, raw_sha),
             content_sha256=digest.hexdigest(),
-            member_count=len(infos),
+            member_count=len(ordered),
             uncompressed_size=uncompressed_size,
         )
     finally:
@@ -1060,26 +1179,26 @@ def inspect_epub_reading_payload(
                 normalized_names = [
                     unicodedata.normalize("NFC", info.filename) for info in infos
                 ]
-                if len(normalized_names) != len(set(normalized_names)):
-                    raise RuntimeError("EPUB contains duplicate normalized member names")
-                uncompressed_size = sum(int(info.file_size) for info in infos)
-                if uncompressed_size > int(max_uncompressed_bytes):
+                archive_uncompressed_size = sum(
+                    int(info.file_size) for info in infos
+                )
+                if archive_uncompressed_size > int(max_uncompressed_bytes):
                     raise RuntimeError(
                         "EPUB uncompressed limit exceeded: "
-                        f"{uncompressed_size}>{max_uncompressed_bytes}"
+                        f"{archive_uncompressed_size}>{max_uncompressed_bytes}"
                     )
+                ordered = _unique_epub_member_pairs(
+                    archive, infos, normalized_names, budget=budget
+                )
+                uncompressed_size = sum(
+                    int(info.file_size) for _name, info in ordered
+                )
                 if budget is not None:
                     budget.reserve_pass(uncompressed_size)
 
                 digest = hashlib.sha256()
                 included_members = 0
-                ordered = sorted(zip(normalized_names, infos), key=lambda item: item[0])
                 for normalized_name, info in ordered:
-                    if info.flag_bits & 0x1:
-                        raise RuntimeError("encrypted EPUB member is unsupported")
-                    member_mode = (info.external_attr >> 16) & 0o170000
-                    if member_mode == stat.S_IFLNK:
-                        raise RuntimeError("EPUB symlink member is unsupported")
                     folded_name = normalized_name.casefold()
                     if folded_name in _EPUB_READING_STATE_MEMBERS:
                         consumed = 0
@@ -1290,20 +1409,19 @@ def inspect_epub_spine_text(
                         f"EPUB member limit exceeded: {len(infos)}>{max_members}"
                     )
                 names = [_epub_member_name(info.filename) for info in infos]
-                if len(names) != len(set(names)):
-                    raise RuntimeError("EPUB contains duplicate normalized member names")
-                uncompressed_size = sum(int(info.file_size) for info in infos)
-                if uncompressed_size > int(max_uncompressed_bytes):
+                archive_uncompressed_size = sum(
+                    int(info.file_size) for info in infos
+                )
+                if archive_uncompressed_size > int(max_uncompressed_bytes):
                     raise RuntimeError(
                         "EPUB uncompressed limit exceeded: "
-                        f"{uncompressed_size}>{max_uncompressed_bytes}"
+                        f"{archive_uncompressed_size}>{max_uncompressed_bytes}"
                     )
-                info_by_name = dict(zip(names, infos))
-                for info in infos:
-                    if info.flag_bits & 0x1:
-                        raise RuntimeError("encrypted EPUB member is unsupported")
-                    if ((info.external_attr >> 16) & 0o170000) == stat.S_IFLNK:
-                        raise RuntimeError("EPUB symlink member is unsupported")
+                ordered = _unique_epub_member_pairs(
+                    archive, infos, names, budget=budget
+                )
+                names = [name for name, _info in ordered]
+                info_by_name = dict(ordered)
 
                 def read_member(name, *, structural_limit=None):
                     info = info_by_name.get(name)

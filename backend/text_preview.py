@@ -33,6 +33,15 @@ MIN_STRONG_TEXT_CHARS = 512
 DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_READ_BYTES = 20 * 1024 * 1024 * 1024
 DEFAULT_NFC_CARRY_CHARS = 1024 * 1024
+LOSSLESS_LEGACY_STATUS = "lossless_legacy_text"
+# Strict decoding remains the normal path.  This bounded fallback exists only
+# for otherwise-readable legacy novels with a very small number of malformed
+# bytes.  The digest uses surrogate escapes under a separate domain, so no bad
+# byte is replaced or silently made equal to clean Unicode text.
+LOSSLESS_LEGACY_DIGEST_DOMAIN = b"file-check-lossless-legacy-text-v1\0"
+DEFAULT_MAX_LEGACY_FILE_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_LEGACY_ESCAPE_BYTES = 4_096
+DEFAULT_MAX_LEGACY_DAMAGE_PPM = 1_000  # 0.1%
 ORDERED_BODY_MATCH_THRESHOLD_PPM = 950_000
 ORDERED_BODY_MIN_SOURCE_CHARS = 100_000
 ORDERED_BODY_MAX_GAP_PPM = 20_000
@@ -431,6 +440,128 @@ def normalized_text_fingerprint(
     }
 
 
+def lossless_legacy_text_fingerprint_bytes(
+    raw,
+    *,
+    max_file_bytes=DEFAULT_MAX_LEGACY_FILE_BYTES,
+    max_escape_bytes=DEFAULT_MAX_LEGACY_ESCAPE_BYTES,
+    max_damage_ppm=DEFAULT_MAX_LEGACY_DAMAGE_PPM,
+):
+    """Return a collision-separated, reversible fingerprint for lightly damaged text.
+
+    This is intentionally *not* a repair decoder.  Invalid UTF-8/CP949 bytes are
+    represented by Python's reserved surrogate-escape code points, and an odd
+    trailing UTF-16 byte is represented the same way.  Encoding the decoded
+    value back with the selected codec must reproduce every original byte.
+    Files with too much undecodable/control data are rejected as unreadable.
+    """
+    raw = bytes(raw)
+    size = len(raw)
+    if size == 0 or size > int(max_file_bytes):
+        return None
+
+    candidates = []
+
+    def add_surrogate_candidate(label, payload, encoding, bom=b""):
+        try:
+            decoded = payload.decode(encoding, errors="surrogateescape")
+            if bom + decoded.encode(encoding, errors="surrogateescape") != raw:
+                return
+        except (UnicodeDecodeError, UnicodeEncodeError, LookupError):
+            return
+        escaped = sum(0xDC80 <= ord(char) <= 0xDCFF for char in decoded)
+        candidates.append((escaped, label, decoded))
+
+    if raw.startswith(codecs.BOM_UTF8):
+        add_surrogate_candidate(
+            "utf-8-sig", raw[len(codecs.BOM_UTF8):], "utf-8", codecs.BOM_UTF8
+        )
+    elif raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
+        if raw.startswith(codecs.BOM_UTF16_LE):
+            bom, encoding, label = codecs.BOM_UTF16_LE, "utf-16-le", "utf-16-le"
+        else:
+            bom, encoding, label = codecs.BOM_UTF16_BE, "utf-16-be", "utf-16-be"
+        payload = raw[len(bom):]
+        trailing = payload[-1:] if len(payload) % 2 else b""
+        even_payload = payload[:-1] if trailing else payload
+        try:
+            decoded = even_payload.decode(encoding, errors="strict")
+            if bom + decoded.encode(encoding, errors="strict") + trailing != raw:
+                decoded = None
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            decoded = None
+        if decoded is not None and trailing:
+            decoded += chr(0xDC00 + trailing[0])
+            candidates.append((1, label, decoded))
+    else:
+        add_surrogate_candidate("utf-8", raw, "utf-8")
+        add_surrogate_candidate("cp949", raw, "cp949")
+
+    if not candidates:
+        return None
+    escaped, encoding, decoded = min(
+        candidates,
+        key=lambda item: (item[0], 0 if item[1] == "utf-8" else 1, item[1]),
+    )
+    controls = sum(
+        1
+        for char in decoded
+        if (ord(char) < 32 and not char.isspace()) or 0x7F <= ord(char) <= 0x9F
+    )
+    damage = escaped + controls
+    damage_ppm = damage * 1_000_000 // max(1, size)
+    if (
+        escaped == 0
+        or escaped > int(max_escape_bytes)
+        or damage_ppm > int(max_damage_ppm)
+    ):
+        return None
+
+    normalized = unicodedata.normalize("NFC", decoded).lstrip("\ufeff")
+    normalized = _WHITESPACE_RE.sub("", normalized)
+    if not normalized:
+        return None
+    digest = hashlib.sha256()
+    digest.update(LOSSLESS_LEGACY_DIGEST_DOMAIN)
+    digest.update(normalized.encode("utf-8", errors="surrogatepass"))
+    return {
+        "normalized_sha256": digest.hexdigest(),
+        "normalized_length": len(normalized),
+        "encoding": encoding,
+        "escaped_bytes": escaped,
+        "control_chars": controls,
+        "damage_ppm": damage_ppm,
+    }
+
+
+def lossless_legacy_text_fingerprint(
+    path,
+    *,
+    budget=None,
+    max_file_bytes=DEFAULT_MAX_LEGACY_FILE_BYTES,
+):
+    """Read one bounded file and compute the reversible legacy-text fingerprint."""
+    budget = budget or ReadBudget()
+    size = os.path.getsize(path)
+    if size > int(max_file_bytes):
+        return None
+    budget.reserve_pass(size)
+    raw = bytearray()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(_CHUNK_BYTES)
+            if not chunk:
+                break
+            budget.consume(len(chunk))
+            raw.extend(chunk)
+    result = lossless_legacy_text_fingerprint_bytes(
+        raw, max_file_bytes=max_file_bytes
+    )
+    if result is not None:
+        result["raw_sha256"] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
 def analyze_text_file(
     path,
     budget=None,
@@ -470,6 +601,30 @@ def analyze_text_file(
             except UnicodeDecodeError as exc:
                 decode_errors.append(f"{candidate}: {exc}")
         if encoding is None or values is None:
+            legacy = lossless_legacy_text_fingerprint(
+                path,
+                budget=budget,
+                max_file_bytes=min(max_file_bytes, DEFAULT_MAX_LEGACY_FILE_BYTES),
+            )
+            if legacy is not None and legacy["normalized_length"] >= min_strong_chars:
+                current = os.stat(path, follow_symlinks=False)
+                status = LOSSLESS_LEGACY_STATUS
+                if current.st_size != size or current.st_mtime_ns != mtime_ns:
+                    status = "stale"
+                detail = (
+                    "strict decode failed; reversible byte escape used: "
+                    f"encoding={legacy['encoding']}, "
+                    f"escaped_bytes={legacy['escaped_bytes']}, "
+                    f"control_chars={legacy['control_chars']}, "
+                    f"damage_ppm={legacy['damage_ppm']}"
+                )
+                return TextAnalysis(
+                    resolved, size, mtime_ns,
+                    f"lossless:{legacy['encoding']}", False, detail,
+                    legacy["raw_sha256"], legacy["normalized_sha256"],
+                    legacy["normalized_length"], "", "", status,
+                    budget.read_bytes - before,
+                )
             return TextAnalysis(
                 resolved, size, mtime_ns, None, True, "; ".join(decode_errors), None, None, 0, "", "",
                 "decode_lossy", budget.read_bytes - before,

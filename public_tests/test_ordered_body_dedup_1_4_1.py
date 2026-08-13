@@ -15,6 +15,7 @@ from text_preview import (
     analyze_text_file,
     ordered_body_coverage,
 )
+from mutation_io import inspect_ordered_text
 
 
 def _lines(count=5_000, changed=None):
@@ -181,6 +182,26 @@ def test_ordered_match_graph_is_bounded_before_node_allocation():
         raise AssertionError("oversized ordered-match graph was not rejected")
 
 
+def test_pinned_revalidation_short_circuits_exact_normalized_large_graph(tmp_path):
+    tokens = [
+        f"{index:03d} 반복은 제한 안이지만 서로 구분되는 충분히 긴 본문 문장"
+        for index in range(123)
+        for _ in range(64)
+    ]
+    source = tmp_path / "source.txt"
+    target = tmp_path / "target.txt"
+    source.write_text("\n".join(tokens), encoding="utf-8")
+    target.write_text(" \n".join(tokens) + " \n", encoding="utf-8")
+
+    proof = inspect_ordered_text(source, target)
+
+    assert proof.source_file_evidence.sha256 != proof.target_file_evidence.sha256
+    assert proof.source_normalized_sha256 == proof.target_normalized_sha256
+    assert proof.source_normalized_length == proof.target_normalized_length
+    assert proof.coverage.coverage_ppm == 1_000_000
+    assert proof.coverage.max_unmatched_chars == 0
+
+
 def test_ordered_quarantine_has_a_readonly_catalog_category(tmp_path):
     temp = tmp_path / "temp"
     quarantined = temp / "trash_bin" / "ordered_body_duplicates" / "격리본.txt"
@@ -296,6 +317,45 @@ def test_full_house_run_quarantines_existing_nested_duplicate(tmp_path):
     record = _assert_ordered_quarantine(summary, temp)
     assert not old.exists() and (house / longer_name).exists()
     assert record["coordinate_mode"] == "contained_coordinates"
+
+
+def test_same_run_ingested_keep_is_not_reprocessed_by_second_relation(tmp_path):
+    incoming_body = _lines()
+    first_body = _lines(changed=range(0, 5_000, 30))
+    second_body = _lines(changed=range(1, 5_000, 30))
+    second_name = "합성다중 1~150화 [작가].txt"
+    house, temp, state_db, index, first = _prepare_managed_reference(
+        tmp_path,
+        "합성다중 1-150화 [작가].txt",
+        first_body,
+        extra_house_files=[(second_name, second_body)],
+    )
+    incoming = temp / "합성다중 1-150화 완결.txt"
+    incoming.write_text(incoming_body, encoding="utf-8")
+
+    summary = _run(house, temp, state_db, index)
+
+    adopted = house / incoming.name
+    assert summary["ordered_body_quarantine_count"] == 1
+    assert adopted.read_text(encoding="utf-8") == incoming_body
+    assert not incoming.exists()
+    assert not first.exists()
+    assert (house / second_name).read_text(encoding="utf-8") == second_body
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        ingest = conn.execute(
+            """
+            SELECT operation_id, state FROM operations
+            WHERE action = 'house_ingest' AND dest_path = ?
+            ORDER BY operation_id DESC LIMIT 1
+            """,
+            (str(adopted),),
+        ).fetchone()
+        assert ingest is not None and ingest["state"] == "committed"
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
 
 
 def test_episode_to_volume_96_percent_uses_choose_keep(tmp_path):

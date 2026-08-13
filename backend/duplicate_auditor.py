@@ -24,7 +24,10 @@ from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from dedup_episode_relation import classify_dedup_coordinate_relation
+from dedup_episode_relation import (
+    classify_dedup_coordinate_relation,
+    classify_loose_title_upgrade_relation,
+)
 from normalizer import (
     NORMALIZER_VERSION,
     analyze_name,
@@ -41,6 +44,7 @@ from text_preview import (
     DEFAULT_ANCHOR_CHARS,
     DEFAULT_MAX_FILE_BYTES,
     DEFAULT_MAX_READ_BYTES,
+    LOSSLESS_LEGACY_STATUS,
     MIN_STRONG_TEXT_CHARS,
     ORDERED_BODY_MATCH_THRESHOLD_PPM,
     ORDERED_BODY_MIN_SOURCE_CHARS,
@@ -86,12 +90,14 @@ FINGERPRINT_POLICY_VERSION = "1.4.2"
 # a title-only NORMALIZER_VERSION bump so 100+ GiB of valid body fingerprints
 # are not invalidated.
 FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
-# Pair classification/evidence also has its own compatibility lifetime. 1.4.12
-# adds exact OPF-spine visible-text proof and stable package identity checks.
+# Pair classification/evidence also has its own compatibility lifetime.  The
+# 1.4.16 suffix admits reversible legacy-byte fingerprints only to exact digest
+# equality; it never enables fuzzy/containment comparison for damaged text.
 # This invalidates pair decisions only; the base fingerprint policy stays 1.4.2.
-PAIR_POLICY_VERSION = "1.4.12"
+PAIR_POLICY_VERSION = "1.4.16-lossless-legacy-v3"
+LEGACY_ESCAPE_FINGERPRINT_SUFFIX = ":lossless-legacy-v1"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.16"
+AUDITOR_VERSION = "1.4.17"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -1007,7 +1013,9 @@ def generate_fingerprint_candidates(entries, analyses, config):
             groups[("raw", entry.ext, analysis.raw_sha256)].append(entry)
         if not analysis.normalized_sha256:
             continue
-        if entry.ext == ".txt" and analysis.status == "ok":
+        if entry.ext == ".txt" and analysis.status in {
+            "ok", LOSSLESS_LEGACY_STATUS,
+        }:
             groups[("normalized", entry.ext, analysis.normalized_sha256)].append(entry)
         elif entry.ext == ".epub" and analysis.status == "epub_content":
             groups[("epub_content", entry.ext, analysis.normalized_sha256)].append(entry)
@@ -1315,6 +1323,18 @@ class PersistentAuditCache:
         )
 
     @staticmethod
+    def _legacy_fingerprint_version(base_version):
+        return f"{base_version}{LEGACY_ESCAPE_FINGERPRINT_SUFFIX}"
+
+    def _accepted_identity_fingerprint_versions(self, current):
+        base = self._identity_fingerprint_version(current)
+        return (base, self._legacy_fingerprint_version(base))
+
+    def _accepted_entry_fingerprint_versions(self, entry):
+        base = self._entry_fingerprint_version(entry)
+        return (base, self._legacy_fingerprint_version(base))
+
+    @staticmethod
     def _identity(current):
         return (
             current.st_dev,
@@ -1382,9 +1402,11 @@ class PersistentAuditCache:
             """
             SELECT * FROM fingerprints
             WHERE file_id = ? AND canonical_path = ? AND size = ? AND mtime_ns = ?
-              AND normalizer_version = ? AND fingerprint_version = ?
+              AND normalizer_version = ? AND fingerprint_version IN (?, ?)
               AND analysis_policy_hash = ?
               AND dev = ? AND ino = ? AND ctime_ns = ?
+            ORDER BY CASE WHEN fingerprint_version = ? THEN 0 ELSE 1 END
+            LIMIT 1
             """,
             (
                 file_id,
@@ -1392,11 +1414,14 @@ class PersistentAuditCache:
                 entry.size,
                 entry.mtime_ns,
                 FINGERPRINT_NORMALIZER_COMPAT_VERSION,
-                self._identity_fingerprint_version(current),
+                *self._accepted_identity_fingerprint_versions(current),
                 self.analysis_policy_hash,
                 current.st_dev,
                 current.st_ino,
                 current.st_ctime_ns,
+                self._legacy_fingerprint_version(
+                    self._identity_fingerprint_version(current)
+                ),
             ),
         ).fetchone()
         if (
@@ -1404,6 +1429,7 @@ class PersistentAuditCache:
             and retry_deferred
             and row["status"] in {
                 "oversize_deferred", "normalization_deferred", "epub_error",
+                "decode_lossy",
             }
         ):
             row = None
@@ -1462,7 +1488,7 @@ class PersistentAuditCache:
                 and row["size"] == entry.size
                 and row["mtime_ns"] == entry.mtime_ns
                 and row["fingerprint_version"]
-                == self._entry_fingerprint_version(entry)
+                in self._accepted_entry_fingerprint_versions(entry)
                 and (row["dev"], row["ino"], row["ctime_ns"])
                 == (entry.dev, entry.ino, entry.ctime_ns)
                 and (
@@ -1486,6 +1512,7 @@ class PersistentAuditCache:
                     retry_deferred
                     and row["status"] in {
                         "oversize_deferred", "normalization_deferred", "epub_error",
+                        "decode_lossy",
                     }
                 )
             )
@@ -1519,6 +1546,10 @@ class PersistentAuditCache:
             return
         canonical_path = self.canonical_paths[entry.path]
         fingerprint_version = self._identity_fingerprint_version(current)
+        if analysis.status == LOSSLESS_LEGACY_STATUS:
+            fingerprint_version = self._legacy_fingerprint_version(
+                fingerprint_version
+            )
         with self.store.transaction(self.conn):
             cursor = self.conn.execute(
                 """
@@ -1765,7 +1796,8 @@ class PersistentAuditCache:
             "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
             "contained_version", "ordered_body_match", "ordered_body_review",
             "longer_unresolved", "boilerplate_only", "different",
-            "decode_lossy", "empty_text", "insufficient_text", "metadata_only",
+            "decode_lossy", "lossless_identity_mismatch",
+            "empty_text", "insufficient_text", "metadata_only",
         }
         by_pair = {result.pair_id: result for result in results}
         needs_open_review_snapshot = any(
@@ -1819,6 +1851,9 @@ class PersistentAuditCache:
             left_id, right_id = sorted((left_id, right_id))
             if candidate.pair_id in self.cache_hit_pair_ids:
                 self.stats["pair_cache_write_skips"] += 1
+                if result.classification == "lossless_identity_mismatch":
+                    review_repairs.append((candidate, result, left_id, right_id))
+                    continue
                 evidence_json = json.dumps(
                     result.evidence, ensure_ascii=False, sort_keys=True
                 )
@@ -1926,6 +1961,19 @@ class PersistentAuditCache:
                 self._store_review_item(candidate, result)
 
     def _store_review_item(self, candidate, result):
+        if result.classification == "lossless_identity_mismatch":
+            left_file = self.file_ids.get(candidate.left.path)
+            right_file = self.file_ids.get(candidate.right.path)
+            if left_file is not None and right_file is not None:
+                self.stats["lossless_mismatch_reviews_superseded"] += (
+                    supersede_open_pair_reviews(
+                        self.conn,
+                        candidate_file_id=left_file,
+                        reference_file_id=right_file,
+                        classification="decode_lossy",
+                    )
+                )
+            return
         if result.classification not in _REVIEWABLE_CLASSIFICATIONS:
             return
         if (
@@ -1977,6 +2025,16 @@ class PersistentAuditCache:
         evidence_json = json.dumps(
             result.evidence, ensure_ascii=False, sort_keys=True
         )
+        distinct_decision_id = (
+            self.store.suppress_open_reviews_for_active_distinct_decision(
+                self.conn,
+                candidate_file,
+                reference_file,
+            )
+        )
+        if distinct_decision_id is not None:
+            self.stats["active_decision_cache_hits"] += 1
+            return
         existing = self.conn.execute(
             """
             SELECT review_id, classification, evidence_json FROM review_items
@@ -1995,6 +2053,22 @@ class PersistentAuditCache:
             # the strong review row even though the current auditor report has
             # already proved equivalence.  Preserve the review identity/state
             # but refresh its current classification and evidence.
+            if existing["classification"] == result.classification:
+                try:
+                    previous_evidence = json.loads(
+                        existing["evidence_json"] or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    previous_evidence = {}
+                proof_marker = previous_evidence.get(
+                    "current_proof_not_sufficient"
+                )
+                if isinstance(proof_marker, dict):
+                    merged_evidence = dict(result.evidence)
+                    merged_evidence["current_proof_not_sufficient"] = proof_marker
+                    evidence_json = json.dumps(
+                        merged_evidence, ensure_ascii=False, sort_keys=True
+                    )
             if (
                 existing["classification"] != result.classification
                 or (existing["evidence_json"] or "") != evidence_json
@@ -2020,6 +2094,7 @@ class PersistentAuditCache:
             reference_raw_sha256=self._raw_sha_for_fingerprint(
                 reference_fp, reference_entry.path
             ),
+            current_classification=result.classification,
         ):
             self.stats["human_disposition_cache_hits"] += 1
             return
@@ -2178,6 +2253,10 @@ def load_persisted_analyses_readonly(
             f"{FINGERPRINT_VERSION}:{analysis_policy_hash}:"
             f"{entry.dev}:{entry.ino}:{entry.ctime_ns}"
         )
+        accepted_versions = {
+            expected_version,
+            f"{expected_version}{LEGACY_ESCAPE_FINGERPRINT_SUFFIX}",
+        }
         valid = bool(
             row is not None
             and entry.dev is not None
@@ -2185,7 +2264,7 @@ def load_persisted_analyses_readonly(
             and entry.ctime_ns is not None
             and row["size"] == entry.size
             and row["mtime_ns"] == entry.mtime_ns
-            and row["fingerprint_version"] == expected_version
+            and row["fingerprint_version"] in accepted_versions
             and (row["dev"], row["ino"], row["ctime_ns"])
             == (entry.dev, entry.ino, entry.ctime_ns)
             and (
@@ -2209,6 +2288,7 @@ def load_persisted_analyses_readonly(
                 retry_deferred
                 and row["status"] in {
                     "oversize_deferred", "normalization_deferred", "epub_error",
+                    "decode_lossy",
                 }
             )
         )
@@ -2342,6 +2422,7 @@ def _analyze_entry_set(
     retry_deferred=False,
     text_phase="text_analysis",
     epub_phase="epub_analysis",
+    epub_analysis_errors=None,
 ):
     analyses = analyses if analyses is not None else {}
     budget = budget or ReadBudget(max_bytes=config.max_read_bytes)
@@ -2393,7 +2474,9 @@ def _analyze_entry_set(
             if not _analysis_matches_current(entry, analysis):
                 raise StaleInputDuringAnalysis(path)
             analyses[path] = analysis
-            if analysis.status not in {"ok", "insufficient_text", "empty_text"}:
+            if analysis.status not in {
+                "ok", "insufficient_text", "empty_text", LOSSLESS_LEGACY_STATUS,
+            }:
                 stats["failed_txt"] += 1
         except BodyBudgetExceeded:
             budget_exhausted = True
@@ -2473,9 +2556,8 @@ def _analyze_entry_set(
             stop_reasons.append("stale_input")
             break
         except (RuntimeError, zipfile.BadZipFile) as exc:
-            stop_reasons.append("epub_analysis_error")
             stats["failed_epub"] += 1
-            analyses[path] = TextAnalysis(
+            analysis = TextAnalysis(
                 path=path,
                 size=entry.size,
                 mtime_ns=entry.mtime_ns,
@@ -2490,6 +2572,19 @@ def _analyze_entry_set(
                 status="epub_error",
                 read_bytes=0,
             )
+            analyses[path] = analysis
+            if epub_analysis_errors is not None:
+                epub_analysis_errors.append({
+                    "source": entry.source,
+                    "name": entry.name,
+                    "rel_path": entry.rel_path,
+                    "error": str(exc),
+                })
+            # A malformed incoming EPUB can be held as a standalone warning
+            # before intake. A house EPUB has no safe automatic disposition,
+            # so it continues to make the whole audit incomplete.
+            if entry.source != "temp":
+                stop_reasons.append("epub_analysis_error")
         if item_index % 100 == 0 or item_index == len(epub_items):
             _emit_audit_progress(
                 config, epub_phase, item_index, len(epub_items), budget
@@ -2668,15 +2763,23 @@ def _ordered_body_relation(candidate):
     left, right = candidate.left, candidate.right
     if left.ext != ".txt" or right.ext != ".txt":
         return None
-    if not left.core_title or normalize_nfc(left.core_title).casefold() != normalize_nfc(
-        right.core_title
-    ).casefold():
-        return None
+    exact_core = bool(
+        left.core_title
+        and normalize_nfc(left.core_title).casefold()
+        == normalize_nfc(right.core_title).casefold()
+    )
     left_authors = _ordered_author_tokens(left.author)
     right_authors = _ordered_author_tokens(right.author)
     if left_authors and right_authors and not (left_authors & right_authors):
         return None
-    return classify_dedup_coordinate_relation(
+    if exact_core:
+        return classify_dedup_coordinate_relation(
+            left.name,
+            right.name,
+            left_span_ambiguous=left.span_ambiguous,
+            right_span_ambiguous=right.span_ambiguous,
+        )
+    return classify_loose_title_upgrade_relation(
         left.name,
         right.name,
         left_span_ambiguous=left.span_ambiguous,
@@ -3191,6 +3294,34 @@ def analyze_candidates(
             if blocked in {"stale", "normalization_deferred", "oversize_deferred"}:
                 stop_reasons.append(blocked)
             continue
+        if (
+            left.status == LOSSLESS_LEGACY_STATUS
+            or right.status == LOSSLESS_LEGACY_STATUS
+        ):
+            evidence["lossless_identity_only"] = True
+            if (
+                left.status == LOSSLESS_LEGACY_STATUS
+                and right.status == LOSSLESS_LEGACY_STATUS
+                and left.normalized_sha256
+                and left.normalized_sha256 == right.normalized_sha256
+            ):
+                classification = (
+                    "marker_recheck"
+                    if candidate.left.disambig != candidate.right.disambig
+                    else "text_equivalent"
+                )
+                evidence["text_classification"] = "text_equivalent"
+                results[candidate.pair_id] = _basic_result(
+                    candidate, classification, evidence
+                )
+            else:
+                # No fuzzy/contained/ordered inference is safe across even a
+                # small decoding defect. Exact reversible equality above is
+                # the sole automatic relation admitted for this status.
+                results[candidate.pair_id] = _basic_result(
+                    candidate, "lossless_identity_mismatch", evidence
+                )
+            continue
         if left.normalized_sha256 == right.normalized_sha256:
             classification = "marker_recheck" if candidate.left.disambig != candidate.right.disambig else "text_equivalent"
             evidence["text_classification"] = "text_equivalent"
@@ -3387,6 +3518,7 @@ def run_audit(args):
     sweep_stats = Counter()
     managed_fingerprint_stats = Counter()
     temp_fingerprint_stats = Counter()
+    epub_analysis_errors = []
     runtime_stats = Counter()
     sweep_read_bytes = 0
     managed_preparation_read_bytes = 0
@@ -3457,6 +3589,7 @@ def run_audit(args):
                 retry_deferred=True,
                 text_phase="full_sweep_text",
                 epub_phase="full_sweep_epub",
+                epub_analysis_errors=epub_analysis_errors,
             )
             sweep_stats.update(analyzed_stats)
             sweep_stats["eligible_files"] = len(house_fingerprint_entries)
@@ -3471,7 +3604,10 @@ def run_audit(args):
                 or (
                     entry.ext == ".txt"
                     and preloaded_analyses[entry.path].status
-                    not in {"ok", "insufficient_text", "empty_text"}
+                    not in {
+                        "ok", "insufficient_text", "empty_text",
+                        LOSSLESS_LEGACY_STATUS,
+                    }
                 )
                 or (
                     entry.ext == ".epub"
@@ -3501,6 +3637,7 @@ def run_audit(args):
                 cache=main_cache,
                 retry_deferred=True,
                 text_phase="managed_representative_text",
+                epub_analysis_errors=epub_analysis_errors,
             )
             managed_fingerprint_stats.update(analyzed_stats)
             managed_fingerprint_stats["eligible_files"] = len(
@@ -3541,6 +3678,7 @@ def run_audit(args):
                 retry_deferred=True,
                 text_phase="temp_fingerprint_text",
                 epub_phase="temp_fingerprint_epub",
+                epub_analysis_errors=epub_analysis_errors,
             )
             temp_fingerprint_stats.update(analyzed_stats)
             temp_fingerprint_stats["eligible_files"] = len(
@@ -3559,7 +3697,10 @@ def run_audit(args):
                 or (
                     entry.ext == ".txt"
                     and preloaded_analyses[entry.path].status
-                    not in {"ok", "insufficient_text", "empty_text"}
+                    not in {
+                        "ok", "insufficient_text", "empty_text",
+                        LOSSLESS_LEGACY_STATUS,
+                    }
                 )
                 or (
                     entry.ext == ".epub"
@@ -3798,6 +3939,16 @@ def run_audit(args):
         "temp_fingerprint_failed_files": temp_fingerprint_stats.get(
             "failed_files", 0
         ),
+        "epub_analysis_errors": [
+            record for _key, record in sorted({
+                (
+                    record["source"],
+                    record["rel_path"],
+                    record["error"],
+                ): record
+                for record in epub_analysis_errors
+            }.items())
+        ],
         "temp_fingerprint_read_bytes": temp_fingerprint_stats.get(
             "read_bytes", 0
         ),
@@ -3862,8 +4013,14 @@ def run_audit(args):
         "stale_open_reviews_superseded": persistent_stats.get(
             "stale_open_reviews_superseded", 0
         ),
+        "lossless_mismatch_reviews_superseded": persistent_stats.get(
+            "lossless_mismatch_reviews_superseded", 0
+        ),
         "human_disposition_cache_hits": persistent_stats.get(
             "human_disposition_cache_hits", 0
+        ),
+        "active_decision_cache_hits": persistent_stats.get(
+            "active_decision_cache_hits", 0
         ),
         "ordered_body_cache_peak_items": runtime_stats.get(
             "ordered_body_cache_peak_items", 0
@@ -3919,7 +4076,8 @@ def _text_report(report, include_details=True):
         "text_equivalent", "epub_equivalent", "near_identical", "contained_exact", "contained_version",
         "ordered_body_match", "ordered_body_review",
         "marker_recheck", "boilerplate_only", "longer_unresolved", "metadata_only",
-        "decode_lossy", "empty_text", "insufficient_text", "oversize_deferred",
+        "decode_lossy", "lossless_identity_mismatch", "empty_text",
+        "insufficient_text", "oversize_deferred",
         "normalization_deferred", "deep_check_deferred", "body_budget_exhausted", "different",
     ):
         lines.append(f"  {key}: {counts.get(key, 0)}쌍")

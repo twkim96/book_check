@@ -37,6 +37,20 @@ def test_mutation_text_hash_matches_utf8_and_utf16_bom(tmp_path):
     assert utf16_hash == utf8_hash
 
 
+def test_mutation_text_hash_revalidates_lightly_damaged_bytes(tmp_path):
+    first = tmp_path / "legacy-a.txt"
+    second = tmp_path / "legacy-b.txt"
+    raw = ("재검증 가능한 CP949 본문 " * 300).encode("cp949") + b"\x81"
+    first.write_bytes(raw)
+    second.write_bytes(raw)
+
+    first_evidence, first_hash = inspect_normalized_text(first)
+    second_evidence, second_hash = inspect_normalized_text(second)
+
+    assert first_hash == second_hash
+    assert first_evidence.sha256 == second_evidence.sha256
+
+
 def test_exact_keep_prefers_representative_over_protected_nonrepresentative(tmp_path):
     protected = tmp_path / "보호 비대표.epub"
     representative = tmp_path / "대표.epub"

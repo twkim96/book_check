@@ -93,7 +93,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.16"
+SERVER_VERSION = "1.4.17"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -171,6 +171,80 @@ class LibraryServerConfig:
     runtime_dir: Path
     frontend_dist: Path
     project_root: Path
+
+
+def _interrupted_folderling_run_id(store: JobStore, record) -> str | None:
+    if record.get("job_type") != "service_folderling":
+        return None
+    run_ids = [
+        event.get("run_id")
+        for event in store.events(str(record["job_id"]))
+        if event.get("phase") == "actual_run_started"
+        and event.get("status") == "running"
+        and event.get("run_id")
+    ]
+    return str(run_ids[-1]) if run_ids else None
+
+
+def _recover_interrupted_folderling_jobs(
+    config: LibraryServerConfig,
+    store: JobStore,
+    records,
+) -> int:
+    """Auto-close only interrupted Folderling runs with zero journal entries."""
+    recovered = 0
+    for record in records:
+        run_id = _interrupted_folderling_run_id(store, record)
+        if run_id is None:
+            continue
+        try:
+            with mutation_lock_for_roots(
+                config.house_dir,
+                config.temp_dir,
+                "library-server-interrupted-folderling-cleanup",
+            ):
+                conn = decision_store.connect_state_db(config.state_db)
+                try:
+                    result = decision_store.close_interrupted_pre_mutation_run(
+                        conn,
+                        run_id,
+                        house_dir=config.house_dir,
+                        temp_dir=config.temp_dir,
+                    )
+                finally:
+                    conn.close()
+        except Exception as exc:  # keep mutation-time interruptions manual
+            store.append_log(
+                record["job_id"],
+                f"automatic interrupted-run cleanup deferred: {exc}",
+            )
+            store.append_event(record["job_id"], {
+                "phase": "interrupted_run_recovery_required",
+                "status": "blocked",
+                "run_id": run_id,
+                "error_code": type(exc).__name__,
+                "error_message": str(exc),
+            })
+            continue
+        store.update(
+            record["job_id"],
+            message="서버 재시작으로 중단 · 파일 이동 전 상태 자동 정리 완료",
+            error={
+                "code": "server_restarted_before_mutation",
+                "message": "파일 이동 전 중단 상태를 자동 정리했습니다. 다시 실행할 수 있습니다.",
+            },
+        )
+        store.append_log(
+            record["job_id"],
+            f"interrupted pre-mutation actual run closed: {run_id}",
+        )
+        store.append_event(record["job_id"], {
+            "phase": "interrupted_run_recovered",
+            "status": "succeeded",
+            **result,
+        })
+        recovered += 1
+    return recovered
 
 
 def _ensure_server_schema(config: LibraryServerConfig) -> Path | None:
@@ -427,12 +501,13 @@ def create_app(
         project_root=Path(project_root).expanduser().resolve(),
     )
     _ensure_server_schema(config)
+    store = JobStore(config.runtime_dir)
+    interrupted_records = store.mark_interrupted_records()
+    _recover_interrupted_folderling_jobs(config, store, interrupted_records)
     readonly_keeper = (
         _open_state_db_readonly_keeper(config.state_db)
         if config.state_db.is_file() else None
     )
-    store = JobStore(config.runtime_dir)
-    store.mark_interrupted()
     runner = JobRunner(store)
     registry = ReviewProviderRegistry()
     title_provider = TitleCorrectionProvider(

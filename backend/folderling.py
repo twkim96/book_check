@@ -32,7 +32,14 @@ from scanner import (
     validate_index_snapshot,
     validate_index_generation,
 )
-from deduplicator import clean_duplicates, unique_path
+from deduplicator import (
+    clean_duplicates,
+    cleanup_pending_active_distinct_decision_reviews,
+    cleanup_post_intake_exact_duplicates,
+    cleanup_pending_queue_strong_reviews,
+    cleanup_relationship_preserving_queue_exact_duplicates,
+    unique_path,
+)
 from project_paths import HOUSE_DIR, PROJECT_ROOT, TEMP_DIR
 
 
@@ -1478,6 +1485,10 @@ def _process_items_authorized(
         normalize_nfc(os.path.abspath(os.fspath(path)))
         for path in dedup_summary.get("blocked_intake_paths", ())
     }
+    post_intake_exact_candidate_paths = {
+        normalize_nfc(os.path.abspath(os.fspath(path)))
+        for path in dedup_summary.get("post_intake_exact_candidate_paths", ())
+    }
 
     # The auditor may run read-only in standalone configurations. Ensure the
     # journal DB still has the same context-proven temp core/coordinate before
@@ -1510,6 +1521,11 @@ def _process_items_authorized(
     unpack_cleanup_issue_count = 0
     unpack_discarded_file_count = 0
     unpack_discarded_bytes = 0
+    post_intake_exact_records = []
+    post_intake_exact_resolved_skip_count = 0
+    queue_exact_records = []
+    queue_strong_records = []
+    decided_review_cleanup_records = []
 
     stage_started_at = time.perf_counter()
     with open(success_log, "w", encoding="utf-8") as s_log, \
@@ -1775,6 +1791,149 @@ def _process_items_authorized(
                     next_action="경로·권한 확인 후 재실행",
                 )
 
+        # A temp-temp exact group has no canonical house keep during the
+        # initial snapshot.  If this run just ingested the retained copy, close
+        # the now-provable temp-house duplicate before unpack cleanup so one
+        # Folderling run reaches a stable result instead of requiring a rerun.
+        post_intake_exact_records = cleanup_post_intake_exact_duplicates(
+            state_db_path,
+            src_dir,
+            actual_run_id,
+            candidate_paths=post_intake_exact_candidate_paths,
+        )
+        post_intake_exact_resolved_skip_count = sum(
+            normalize_nfc(os.path.abspath(record["source_path"]))
+            in blocked_intake_paths
+            for record in post_intake_exact_records
+        )
+        dedup_summary["post_intake_exact_quarantine_count"] = len(
+            post_intake_exact_records
+        )
+        for record in post_intake_exact_records:
+            s_log.write(
+                f"[{get_now()}] [post-intake-exact] "
+                f"{record['source_path']} -> {record['dest_path']} | "
+                f"keep={record['keep_path']} sha256={record['raw_sha256']}\n"
+            )
+            emit_folderling_event(
+                event_callback,
+                "file_result",
+                stage="post_intake_exact",
+                status="exact_duplicate",
+                reason="same_run_intake_convergence",
+                source_path=record["source_path"],
+                destination_path=record["dest_path"],
+                existing_paths=[record["keep_path"]],
+                operation_id=record["operation_id"],
+                keep_origin_operation_id=record["keep_origin_operation_id"],
+                duplicate_basis="raw_sha256_revalidated",
+            )
+        emit_folderling_event(
+            event_callback,
+            "post_intake_exact_result",
+            status="succeeded",
+            quarantine_count=len(post_intake_exact_records),
+            resolved_skip_count=post_intake_exact_resolved_skip_count,
+        )
+
+        queue_exact_records = (
+            cleanup_relationship_preserving_queue_exact_duplicates(
+                state_db_path,
+                src_dir,
+                actual_run_id,
+            )
+        )
+        dedup_summary["queue_exact_quarantine_count"] = len(
+            queue_exact_records
+        )
+        for record in queue_exact_records:
+            s_log.write(
+                f"[{get_now()}] [queue-exact] "
+                f"{record['source_path']} -> {record['dest_path']} | "
+                f"keep={record['keep_path']} sha256={record['raw_sha256']}\n"
+            )
+            emit_folderling_event(
+                event_callback,
+                "file_result",
+                stage="queue_exact",
+                status="exact_duplicate",
+                reason="relationship_preserving_queue_convergence",
+                source_path=record["source_path"],
+                destination_path=record["dest_path"],
+                existing_paths=[record["keep_path"]],
+                operation_id=record["operation_id"],
+                duplicate_basis="raw_sha256_revalidated",
+            )
+        emit_folderling_event(
+            event_callback,
+            "queue_exact_result",
+            status="succeeded",
+            quarantine_count=len(queue_exact_records),
+        )
+
+        queue_strong_records = cleanup_pending_queue_strong_reviews(
+            state_db_path,
+            dst_dir,
+            src_dir,
+            actual_run_id,
+        )
+        dedup_summary["queue_strong_quarantine_count"] = len(
+            queue_strong_records
+        )
+        for record in queue_strong_records:
+            s_log.write(
+                f"[{get_now()}] [queue-strong] "
+                f"{record['source_path']} -> {record['dest_path']} | "
+                f"keep={record['keep_path']} "
+                f"classification={record['classification']}\n"
+            )
+            emit_folderling_event(
+                event_callback,
+                "file_result",
+                stage="queue_strong",
+                status=record["status"],
+                reason="relationship_preserving_queue_strong_convergence",
+                source_path=record["source_path"],
+                destination_path=record["dest_path"],
+                existing_paths=[record["keep_path"]],
+                operation_id=record["operation_id"],
+                review_id=record["review_id"],
+                duplicate_basis=record["classification"],
+            )
+        emit_folderling_event(
+            event_callback,
+            "queue_strong_result",
+            status="succeeded",
+            quarantine_count=len(queue_strong_records),
+        )
+
+        # A fully warm pair cache can bypass the auditor's review-write path.
+        # Close any machine review already vetoed by an active human edition
+        # decision independently so a successful rerun never asks again.
+        decided_review_cleanup_records = (
+            cleanup_pending_active_distinct_decision_reviews(state_db_path)
+        )
+        decided_review_count = sum(
+            len(record["review_ids"])
+            for record in decided_review_cleanup_records
+        )
+        dedup_summary["active_decision_review_suppression_count"] = (
+            decided_review_count
+        )
+        for record in decided_review_cleanup_records:
+            s_log.write(
+                f"[{get_now()}] [active-decision-review] "
+                f"{record['candidate_path']} <-> {record['reference_path']} | "
+                f"decision={record['decision_id']} reviews={record['review_ids']}\n"
+            )
+        emit_folderling_event(
+            event_callback,
+            "active_decision_review_result",
+            status="succeeded",
+            pair_count=len(decided_review_cleanup_records),
+            review_count=decided_review_count,
+        )
+
         unpack_cleanup_results = cleanup_unpack_sources(src_dir)
         for cleanup in unpack_cleanup_results:
             status = cleanup["status"]
@@ -1823,6 +1982,7 @@ def _process_items_authorized(
             move_count=move_count,
             pass_count=pass_count,
             skipped_count=skipped_count,
+            resolved_skip_count=post_intake_exact_resolved_skip_count,
             excluded_count=excluded_count,
             failure_count=failure_count,
             volume_conflict_hold_count=volume_conflict_hold_count,
@@ -2183,6 +2343,13 @@ def _process_items_authorized(
         "unpack_cleanup_issue_count": unpack_cleanup_issue_count,
         "unpack_discarded_file_count": unpack_discarded_file_count,
         "unpack_discarded_bytes": unpack_discarded_bytes,
+        "post_intake_exact_records": post_intake_exact_records,
+        "queue_exact_records": queue_exact_records,
+        "queue_strong_records": queue_strong_records,
+        "decided_review_cleanup_records": decided_review_cleanup_records,
+        "post_intake_exact_resolved_skip_count": (
+            post_intake_exact_resolved_skip_count
+        ),
         "pre_index_mode": pre_index_mode,
         "pre_index_fallback_reason": snapshot["reason"],
         "index_mode": index_mode,
@@ -2195,7 +2362,7 @@ def _process_items_authorized(
         + volume_conflict_hold_count
         + unpack_cleanup_issue_count
         + legacy_pass_count
-        + skipped_count
+        + max(0, skipped_count - post_intake_exact_resolved_skip_count)
         + int(
             auto_volume_summary["remaining_summary"].get("review_required", 0)
         )

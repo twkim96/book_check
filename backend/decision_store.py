@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import unicodedata
 import uuid
+from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional, Tuple
@@ -473,6 +474,312 @@ def issue_prevalidated_actual_run_token(
         )
     _PREFLIGHT_VALIDATION_RECEIPTS[receipt.state_db] = receipt
     return run_id, receipt
+
+
+def rebind_mount_device_identities(
+    conn: sqlite3.Connection,
+    *,
+    backup_path: os.PathLike | str,
+    house_dir: os.PathLike | str,
+    temp_dir: os.PathLike | str,
+    current_file_ids: tuple[str, ...] = (),
+) -> dict:
+    """Repair a mount-wide ``st_dev`` renumbering without trusting changed files.
+
+    Darwin may assign a different device number to the same mounted APFS data
+    volume after a reboot/remount.  Doctor must continue to reject ordinary
+    identity changes, so this maintenance path is deliberately narrower than a
+    Scanner reconcile: every current file/folder must retain inode, ctime, size,
+    and mtime, and every affected stored device must move as one complete,
+    one-to-one population to a configured root's current device.
+
+    The caller must already own the roots mutation lock and a verified backup.
+    Immutable fingerprints, decisions, reviews, and operation evidence are not
+    rewritten; only the current active file/folder projection is rebound.
+    """
+    from mutation_io import (
+        assert_mutation_lock_for_roots_held,
+        canonical_absolute_path,
+        opened_directory_nofollow,
+        opened_regular_file_nofollow,
+    )
+
+    assert_mutation_lock_for_roots_held(house_dir, temp_dir)
+    roots = tuple(
+        canonical_absolute_path(Path(value).expanduser())
+        for value in (house_dir, temp_dir)
+    )
+    root_devices = {}
+    for root in roots:
+        with opened_directory_nofollow(root) as root_fd:
+            info = os.fstat(root_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"automatic device rebind root is not a directory: {root}")
+        root_devices[root] = info.st_dev
+
+    backup_sha256 = _verify_backup_evidence(str(backup_path))
+    pending_actual = conn.execute(
+        """
+        SELECT run_id, state FROM actual_runs
+        WHERE state IN ('approved', 'active')
+        ORDER BY approved_at LIMIT 1
+        """
+    ).fetchone()
+    if pending_actual is not None:
+        raise RuntimeError(
+            "automatic device rebind requires no approved or active actual run: "
+            f"{pending_actual['run_id']} ({pending_actual['state']})"
+        )
+    gate = conn.execute(
+        "SELECT value FROM settings WHERE key = 'actual_mutation_enabled'"
+    ).fetchone()
+    approved_setting = conn.execute(
+        "SELECT value FROM settings WHERE key = 'approved_run_id'"
+    ).fetchone()
+    if (gate is not None and gate["value"] != "0") or approved_setting is not None:
+        raise RuntimeError(
+            "automatic device rebind requires the actual mutation gate to be disabled"
+        )
+    def owning_root(path: Path) -> Path:
+        matches = []
+        for root in roots:
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            matches.append(root)
+        if not matches:
+            raise RuntimeError(
+                f"automatic device rebind path is outside configured roots: {path}"
+            )
+        return max(matches, key=lambda value: len(value.parts))
+
+    file_query = """
+        SELECT file_id, canonical_path, dev, ino, ctime_ns, size, mtime_ns
+        FROM files WHERE active = 1 AND dev IS NOT NULL
+        ORDER BY canonical_path
+    """
+    folder_query = """
+        SELECT folder_id, canonical_path, dev, ino, ctime_ns
+        FROM work_folders WHERE state = 'active' AND dev IS NOT NULL
+        ORDER BY canonical_path
+    """
+    file_rows = conn.execute(file_query).fetchall()
+    folder_rows = conn.execute(folder_query).fetchall()
+    if all(
+        row["dev"] == root_devices[owning_root(Path(row["canonical_path"]))]
+        for row in file_rows
+    ) and all(
+        row["dev"] == root_devices[owning_root(Path(row["canonical_path"]))]
+        for row in folder_rows
+    ):
+        return {
+            "applied": False,
+            "file_count": 0,
+            "folder_count": 0,
+            "device_mappings": [],
+            "backup_sha256": backup_sha256,
+        }
+
+    issues = doctor_issues(conn)
+    allowed_issue_kinds = {
+        "stale_identity",
+        "managed_folder_identity_stale",
+    }
+    unexpected = [
+        issue for issue in issues if issue["kind"] not in allowed_issue_kinds
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "automatic device rebind blocked by non-device Doctor issue: "
+            f"{unexpected[0]['kind']}"
+        )
+
+    allowed_current_file_ids = frozenset(current_file_ids)
+
+    # The rows below are retained as the exact pre-transaction DB snapshot and
+    # checked again after acquiring SQLite's writer reservation.
+    file_rows = conn.execute(
+        """
+        SELECT file_id, canonical_path, dev, ino, ctime_ns, size, mtime_ns
+        FROM files WHERE active = 1 AND dev IS NOT NULL
+        ORDER BY canonical_path
+        """
+    ).fetchall()
+    folder_rows = conn.execute(
+        """
+        SELECT folder_id, canonical_path, dev, ino, ctime_ns
+        FROM work_folders WHERE state = 'active' AND dev IS NOT NULL
+        ORDER BY canonical_path
+        """
+    ).fetchall()
+
+    file_changes = []
+    folder_changes = []
+    populations = defaultdict(
+        lambda: {"total": 0, "changed": 0, "old": set()}
+    )
+
+    for row in file_rows:
+        path = Path(row["canonical_path"])
+        root = owning_root(path)
+        with opened_regular_file_nofollow(path) as file_fd:
+            info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_dev != root_devices[root]:
+            raise RuntimeError(
+                f"automatic device rebind file is not on its configured root: {path}"
+            )
+        if (
+            row["ino"] != info.st_ino
+            or row["ctime_ns"] != info.st_ctime_ns
+            or row["size"] != info.st_size
+            or row["mtime_ns"] != info.st_mtime_ns
+        ):
+            raise RuntimeError(
+                f"automatic device rebind found a non-device file change: {path}"
+            )
+        population = populations[info.st_dev]
+        if row["file_id"] not in allowed_current_file_ids:
+            population["total"] += 1
+            population["old"].add(row["dev"])
+        if row["dev"] != info.st_dev:
+            if row["file_id"] in allowed_current_file_ids:
+                raise RuntimeError(
+                    "claimed review action is not current during device rebind: "
+                    f"{path}"
+                )
+            population["changed"] += 1
+            file_changes.append((info.st_dev, row["file_id"], row["dev"]))
+
+    for row in folder_rows:
+        path = Path(row["canonical_path"])
+        root = owning_root(path)
+        with opened_directory_nofollow(path) as folder_fd:
+            info = os.fstat(folder_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_dev != root_devices[root]:
+            raise RuntimeError(
+                f"automatic device rebind folder is not on its configured root: {path}"
+            )
+        if row["ino"] != info.st_ino or row["ctime_ns"] != info.st_ctime_ns:
+            raise RuntimeError(
+                f"automatic device rebind found a non-device folder change: {path}"
+            )
+        population = populations[info.st_dev]
+        population["total"] += 1
+        population["old"].add(row["dev"])
+        if row["dev"] != info.st_dev:
+            population["changed"] += 1
+            folder_changes.append((info.st_dev, row["folder_id"], row["dev"]))
+
+    if not file_changes and not folder_changes:
+        raise RuntimeError(
+            "automatic device rebind found Doctor identity issues without a device change"
+        )
+
+    mappings = {}
+    reverse_mappings = {}
+    roots_by_device = defaultdict(set)
+    for root, device in root_devices.items():
+        roots_by_device[device].add(str(root))
+    for new_dev, population in populations.items():
+        if not population["changed"]:
+            continue
+        if population["changed"] != population["total"] or len(population["old"]) != 1:
+            raise RuntimeError(
+                "automatic device rebind requires a complete mount-wide device change"
+            )
+        old_dev = next(iter(population["old"]))
+        if old_dev == new_dev:
+            raise RuntimeError(
+                "automatic device rebind found a mixed current device population"
+            )
+        if new_dev in reverse_mappings and reverse_mappings[new_dev] != old_dev:
+            raise RuntimeError(
+                "automatic device rebind requires one-to-one device mappings"
+            )
+        if old_dev in mappings and mappings[old_dev] != new_dev:
+            raise RuntimeError(
+                "automatic device rebind requires one-to-one device mappings"
+            )
+        mappings[old_dev] = new_dev
+        reverse_mappings[new_dev] = old_dev
+
+    issue_files = {
+        issue["file_id"] for issue in issues if issue["kind"] == "stale_identity"
+    }
+    issue_folders = {
+        issue["folder_id"]
+        for issue in issues
+        if issue["kind"] == "managed_folder_identity_stale"
+    }
+    if issue_files != {row[1] for row in file_changes} or issue_folders != {
+        row[1] for row in folder_changes
+    }:
+        raise RuntimeError(
+            "automatic device rebind changes do not exactly match Doctor evidence"
+        )
+
+    with transaction(conn):
+        _verify_backup_evidence(str(backup_path), backup_sha256)
+        if [tuple(row) for row in conn.execute(file_query)] != [
+            tuple(row) for row in file_rows
+        ] or [tuple(row) for row in conn.execute(folder_query)] != [
+            tuple(row) for row in folder_rows
+        ]:
+            raise RuntimeError(
+                "active identity rows changed during automatic device rebind"
+            )
+        if doctor_issues(conn) != issues:
+            raise RuntimeError(
+                "Doctor evidence changed during automatic device rebind"
+            )
+        for new_dev, file_id, old_dev in file_changes:
+            cursor = conn.execute(
+                """
+                UPDATE files SET dev = ?, last_seen_at = CURRENT_TIMESTAMP
+                WHERE file_id = ? AND active = 1 AND dev = ?
+                """,
+                (new_dev, file_id, old_dev),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"active file changed during automatic device rebind: {file_id}"
+                )
+        for new_dev, folder_id, old_dev in folder_changes:
+            cursor = conn.execute(
+                """
+                UPDATE work_folders SET dev = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE folder_id = ? AND state = 'active' AND dev = ?
+                """,
+                (new_dev, folder_id, old_dev),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "active managed folder changed during automatic device rebind: "
+                    f"{folder_id}"
+                )
+
+        remaining = doctor_issues(conn)
+        if remaining:
+            raise RuntimeError(
+                "Doctor failed after automatic device rebind: "
+                f"{remaining[0]['kind']}"
+            )
+
+    return {
+        "applied": True,
+        "file_count": len(file_changes),
+        "folder_count": len(folder_changes),
+        "device_mappings": [
+            {
+                "roots": sorted(roots_by_device[new_dev]),
+                "old_dev": old_dev,
+                "new_dev": new_dev,
+            }
+            for old_dev, new_dev in sorted(mappings.items())
+        ],
+        "backup_sha256": backup_sha256,
+    }
 
 
 def consume_preflight_validation_receipt(path, house_dir, temp_dir):
@@ -943,6 +1250,127 @@ def finish_actual_run(conn, run_id, *, success: bool, error: Optional[str] = Non
         if current is not None and current["state"] == "cancelled":
             return
         transition_actual_run(conn, run_id, target, error=error)
+
+
+def close_interrupted_pre_mutation_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    house_dir: os.PathLike | str,
+    temp_dir: os.PathLike | str,
+) -> dict:
+    """Close one server-interrupted actual run only before any operation exists.
+
+    A Folderling audit may populate immutable fingerprint caches while the
+    actual run is active, but every filesystem mutation is journaled first.
+    Therefore an exact zero operation/group count proves that recovery has no
+    filesystem step to replay.  Every other interrupted run remains manual.
+    """
+    from mutation_io import assert_mutation_lock_for_roots_held
+
+    assert_mutation_lock_for_roots_held(house_dir, temp_dir)
+    expected_house = canonicalize_real_path(house_dir)
+    expected_temp = canonicalize_real_path(temp_dir)
+    run = conn.execute(
+        "SELECT * FROM actual_runs WHERE run_id = ? AND state = 'active'",
+        (run_id,),
+    ).fetchone()
+    if run is None:
+        raise RuntimeError("interrupted actual run is not active")
+    if run["house_root"] != expected_house or run["temp_root"] != expected_temp:
+        raise RuntimeError("interrupted actual run roots do not match this server")
+    if not run["manifest_path"] or not run["manifest_sha256"]:
+        raise RuntimeError("interrupted actual run manifest evidence is missing")
+    if _regular_file_identity(run["backup_path"]) != _stored_identity(run, "backup"):
+        raise RuntimeError("interrupted actual run backup identity is stale")
+    if _regular_file_identity(run["manifest_path"]) != _stored_identity(run, "manifest"):
+        raise RuntimeError("interrupted actual run manifest identity is stale")
+    _verify_backup_evidence(run["backup_path"], run["backup_sha256"])
+    if sha256_file(run["manifest_path"]) != run["manifest_sha256"]:
+        raise RuntimeError("interrupted actual run manifest SHA-256 mismatch")
+
+    def operation_counts():
+        return (
+            conn.execute(
+                "SELECT COUNT(*) FROM operations WHERE run_id = ?", (run_id,)
+            ).fetchone()[0],
+            conn.execute(
+                "SELECT COUNT(*) FROM operation_groups WHERE run_id = ?", (run_id,)
+            ).fetchone()[0],
+        )
+
+    operation_count, group_count = operation_counts()
+    if operation_count or group_count:
+        raise RuntimeError(
+            "interrupted actual run requires manual recovery: "
+            f"operations={operation_count}, groups={group_count}"
+        )
+    other = conn.execute(
+        """
+        SELECT run_id, state FROM actual_runs
+        WHERE state IN ('approved', 'active') AND run_id != ?
+        ORDER BY approved_at LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    if other is not None:
+        raise RuntimeError(
+            "another approved or active actual run blocks interrupted cleanup"
+        )
+    gate = conn.execute(
+        "SELECT value FROM settings WHERE key = 'actual_mutation_enabled'"
+    ).fetchone()
+    approved = conn.execute(
+        "SELECT value FROM settings WHERE key = 'approved_run_id'"
+    ).fetchone()
+    if (gate is not None and gate["value"] != "0") or approved is not None:
+        raise RuntimeError(
+            "interrupted cleanup requires the actual mutation gate to be disabled"
+        )
+    issues = doctor_issues(conn)
+    if len(issues) != 1 or issues[0].get("kind") != "active_actual_run" or (
+        issues[0].get("run_id") != run_id
+    ):
+        first = issues[0]["kind"] if issues else "none"
+        raise RuntimeError(
+            "interrupted cleanup requires only its active-run Doctor issue: "
+            f"count={len(issues)}, first={first}"
+        )
+
+    with transaction(conn):
+        current = conn.execute(
+            "SELECT state, house_root, temp_root FROM actual_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["state"] != "active"
+            or current["house_root"] != expected_house
+            or current["temp_root"] != expected_temp
+            or operation_counts() != (0, 0)
+            or doctor_issues(conn) != issues
+        ):
+            raise RuntimeError(
+                "interrupted actual run changed during automatic cleanup"
+            )
+        transition_actual_run(
+            conn,
+            run_id,
+            "failed",
+            error="library server restarted before the first journaled mutation",
+        )
+        remaining = doctor_issues(conn)
+        if remaining:
+            raise RuntimeError(
+                "Doctor failed after interrupted pre-mutation cleanup: "
+                f"{remaining[0]['kind']}"
+            )
+    return {
+        "run_id": run_id,
+        "operation_count": 0,
+        "operation_group_count": 0,
+        "doctor_issue_count": 0,
+    }
 
 
 STATE_BACKUP_RETENTION = 10
@@ -1729,6 +2157,7 @@ def _recover_interrupted_queue_operation(conn: sqlite3.Connection, operation_id:
         "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
         "library_file_relocate",
         "volume_coordinate_hold",
+        "epub_analysis_hold",
     }:
         raise ValueError("operation is not a queue move")
     if row["state"] not in {"planned", "fs_done", "db_done"}:
@@ -2030,6 +2459,7 @@ def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) 
         "title_cleanup_requeue", "user_title_requeue", "volume_group_merge",
         "library_file_relocate",
         "volume_coordinate_hold",
+        "epub_analysis_hold",
     }:
         return _recover_interrupted_queue_operation(conn, operation_id)
     if row["action"] == "quarantine_purge":
@@ -2555,7 +2985,7 @@ def _quarantine_decided_review(conn: sqlite3.Connection, review_id: int):
         or source_evidence.mtime_ns != discard["mtime_ns"]
     ):
         raise RuntimeError("same_content discard snapshot is stale")
-    destination = _unique_destination(quarantine_dir, source_path.name)
+    destination = _unique_destination(conn, quarantine_dir, source_path.name)
     with transaction(conn):
         operation_id = create_operation(
             conn,
@@ -2952,13 +3382,22 @@ def human_disposition_suppresses_review(
     reference_file_id: str,
     candidate_raw_sha256: Optional[str],
     reference_raw_sha256: Optional[str],
+    current_classification: Optional[str] = None,
 ) -> bool:
-    """Return true only for the same stable pair and the approved raw bytes."""
+    """Return true only for the same stable pair and the approved raw bytes.
+
+    A restore made while the pair was ``decode_lossy`` is an informed choice
+    about file retention, but not an informed decision that the two bodies are
+    distinct.  If a later decoder can produce a strong content classification,
+    let that new review be stored so the mutation boundary can replay the
+    current proof.  Explicit variant decisions are handled independently by
+    :func:`active_distinct_decision_for_pair` and remain authoritative.
+    """
     if not candidate_raw_sha256 or not reference_raw_sha256:
         return False
     rows = conn.execute(
         """
-        SELECT evidence_json FROM review_items
+        SELECT classification, evidence_json FROM review_items
         WHERE state = 'superseded'
           AND ((candidate_file_id = ? AND reference_file_id = ?)
             OR (candidate_file_id = ? AND reference_file_id = ?))
@@ -2972,6 +3411,10 @@ def human_disposition_suppresses_review(
         candidate_file_id: candidate_raw_sha256,
         reference_file_id: reference_raw_sha256,
     }
+    strong_after_decode_recovery = current_classification in {
+        "text_equivalent", "epub_equivalent", "contained_exact",
+        "contained_version", "ordered_body_match", "near_identical",
+    }
     for row in rows:
         try:
             payload = json.loads(row["evidence_json"] or "{}")
@@ -2979,9 +3422,111 @@ def human_disposition_suppresses_review(
             continue
         if payload.get("human_disposition") != "user_selected_restore":
             continue
+        if row["classification"] == "decode_lossy" and strong_after_decode_recovery:
+            continue
         if payload.get("human_disposition_raw_sha256") == current:
             return True
     return False
+
+
+def active_distinct_decision_for_pair(
+    conn: sqlite3.Connection,
+    candidate_file_id: str,
+    reference_file_id: str,
+):
+    """Return a current variant-level human veto for two representatives.
+
+    A representative can be replaced by a later strong-match intake while the
+    human decision intentionally remains attached to the managed variants.  A
+    new auditor review between the current representatives must therefore honor
+    the active variant relation instead of requiring the old decision's exact
+    file ids to remain current.
+    """
+
+    if candidate_file_id == reference_file_id:
+        return None
+    endpoints = conn.execute(
+        """
+        SELECT f.file_id, f.variant_id, f.assignment_state, f.active,
+               CASE WHEN r.file_id IS NULL THEN 0 ELSE 1 END AS representative
+        FROM files AS f
+        LEFT JOIN representatives AS r ON r.file_id = f.file_id
+        WHERE f.file_id IN (?, ?)
+        """,
+        (candidate_file_id, reference_file_id),
+    ).fetchall()
+    if len(endpoints) != 2 or any(
+        not row["active"]
+        or row["assignment_state"] != "managed"
+        or row["variant_id"] is None
+        or not row["representative"]
+        for row in endpoints
+    ):
+        return None
+    variants = {int(row["variant_id"]) for row in endpoints}
+    if len(variants) != 2:
+        return None
+    left_variant, right_variant = sorted(variants)
+    return conn.execute(
+        """
+        SELECT decision_id, verdict, left_variant_id, right_variant_id, note
+        FROM decisions
+        WHERE active = 1
+          AND verdict IN ('same_work_distinct_variant', 'distinct_work')
+          AND ((left_variant_id = ? AND right_variant_id = ?)
+            OR (left_variant_id = ? AND right_variant_id = ?))
+        ORDER BY decision_id DESC LIMIT 1
+        """,
+        (left_variant, right_variant, right_variant, left_variant),
+    ).fetchone()
+
+
+def suppress_open_reviews_for_active_distinct_decision(
+    conn: sqlite3.Connection,
+    candidate_file_id: str,
+    reference_file_id: str,
+) -> Optional[int]:
+    """Close current machine reviews vetoed by an active human variant decision."""
+
+    decision = active_distinct_decision_for_pair(
+        conn, candidate_file_id, reference_file_id
+    )
+    if decision is None:
+        return None
+    rows = conn.execute(
+        """
+        SELECT review_id, evidence_json FROM review_items
+        WHERE state IN ('pending', 'deferred')
+          AND ((candidate_file_id = ? AND reference_file_id = ?)
+            OR (candidate_file_id = ? AND reference_file_id = ?))
+        """,
+        (
+            candidate_file_id, reference_file_id,
+            reference_file_id, candidate_file_id,
+        ),
+    ).fetchall()
+    for row in rows:
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {"previous_evidence": row["evidence_json"]}
+        evidence["active_decision_suppression"] = {
+            "decision_id": int(decision["decision_id"]),
+            "verdict": decision["verdict"],
+        }
+        conn.execute(
+            """
+            UPDATE review_items
+            SET state = 'superseded', decision_id = NULL,
+                evidence_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE review_id = ? AND state IN ('pending', 'deferred')
+            """,
+            (
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                row["review_id"],
+            ),
+        )
+    return int(decision["decision_id"])
 
 
 def list_review_items(

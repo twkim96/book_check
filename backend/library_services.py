@@ -40,10 +40,10 @@ SERVICE_DEFINITIONS = (
         "folderling",
         "service_folderling",
         "Folderling 실제 입고",
-        "txt_temp의 신규 파일을 중복 판정하고 house·warning·index·DB에 안전하게 반영합니다.",
+        "txt_temp의 신규 파일과 자동 정리 가능한 강한 중복을 판정하고 house·warning·index·DB에 안전하게 반영합니다.",
         "입고",
         True,
-        "입고 대기",
+        "입고/자동 정리 대기",
         ("txt_temp", "txt_house", "SQLite", "현재 index"),
         ("txt_house", "warning 격리", "SQLite", "file_list/index"),
         ("전체 입고 대기 파일", "doctor 사전·사후 검증", "backup + journal + recovery"),
@@ -414,7 +414,30 @@ class LibraryServiceRegistry:
         else:
             try:
                 if service_id == "folderling":
-                    target_count = _count_supported(self.temp_dir, intake_only=True)
+                    from deduplicator import (
+                        count_actionable_pending_strong_reviews,
+                        count_pending_active_distinct_decision_reviews,
+                    )
+
+                    intake_count = _count_supported(
+                        self.temp_dir, intake_only=True
+                    )
+                    strong_review_count = (
+                        count_actionable_pending_strong_reviews(self.state_db)
+                    )
+                    decided_review_count = (
+                        count_pending_active_distinct_decision_reviews(
+                            self.state_db
+                        )
+                    )
+                    target_count = (
+                        intake_count + strong_review_count + decided_review_count
+                    )
+                    preview = {
+                        "intake_count": intake_count,
+                        "actionable_strong_review_count": strong_review_count,
+                        "decided_review_cleanup_count": decided_review_count,
+                    }
                     if not doctor_ok:
                         ready = False
                         blocked_code = "doctor_failed"
@@ -422,7 +445,7 @@ class LibraryServiceRegistry:
                     elif target_count == 0:
                         ready = False
                         blocked_code = "no_targets"
-                        blocked_reason = "현재 txt_temp에 입고할 파일이 없습니다."
+                        blocked_reason = "현재 입고 또는 자동 정리할 대상이 없습니다."
                 elif service_id == "scanner":
                     target_count = int(context.get("supported_house_files") or 0)
                     if not self.house_dir.is_dir():

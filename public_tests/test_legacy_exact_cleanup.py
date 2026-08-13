@@ -131,6 +131,59 @@ def test_unassigned_temp_exact_is_quarantined_against_unassigned_house_keep(tmp_
     assert not Path(duplicate["canonical_path"]).exists()
 
 
+def test_exact_cleanup_skips_inactive_db_reserved_quarantine_path(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add(conn, house / "예약 충돌.txt", "house")
+        duplicate = _add(
+            conn, temp / "incoming" / "예약 충돌.txt", "temp"
+        )
+        reserved_path = (
+            temp / "trash_bin" / "exact_quarantine" / "예약 충돌.txt"
+        )
+        retired = _add(conn, reserved_path, "quarantine", b"old quarantine bytes")
+        reserved_path.unlink()
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET active = 0 WHERE file_id = ?",
+                (retired["file_id"],),
+            )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    expected = reserved_path.with_name("예약 충돌_1.txt")
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        moved = conn.execute(
+            "SELECT canonical_path, active FROM files WHERE file_id = ?",
+            (duplicate["file_id"],),
+        ).fetchone()
+        old_owner = conn.execute(
+            "SELECT canonical_path, active FROM files WHERE file_id = ?",
+            (retired["file_id"],),
+        ).fetchone()
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert moved["canonical_path"] == str(expected)
+        assert moved["active"] == 0
+        assert old_owner["canonical_path"] == str(reserved_path)
+        assert old_owner["active"] == 0
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert record["dest_path"] == str(expected)
+    assert expected.is_file()
+    assert not Path(duplicate["canonical_path"]).exists()
+
+
 def test_state_enrichment_matches_macos_nfd_path_to_nfc_db_row(tmp_path):
     state_db = tmp_path / ".state" / "dedup.sqlite3"
     physical = tmp_path / unicodedata.normalize("NFD", "한글 제목.txt")
@@ -213,6 +266,196 @@ def test_raw_exact_can_finalize_a_queue_hold(tmp_path):
         conn.close()
     assert Path(result["dest_path"]).is_file()
     assert not Path(queued["canonical_path"]).exists()
+
+
+def _add_open_review(conn, candidate, reference, classification="contained_version"):
+    with decision_store.transaction(conn):
+        return conn.execute(
+            """
+            INSERT INTO review_items(
+                candidate_file_id, reference_file_id,
+                left_fingerprint_id, right_fingerprint_id,
+                classification, evidence_json
+            ) VALUES (?, ?, ?, ?, ?, '{}')
+            """,
+            (
+                candidate["file_id"], reference["file_id"],
+                candidate["current_fingerprint_id"],
+                reference["current_fingerprint_id"], classification,
+            ),
+        ).lastrowid
+
+
+def test_exact_queue_duplicates_collapse_only_with_preserved_external_reviews(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        reference = _add(conn, house / "이어지는 작품 2부.txt", "house", b"other")
+        keep = _add(conn, temp / "trash_bin" / "warning" / "작품.txt", "queue")
+        duplicate = _add(
+            conn, temp / "trash_bin" / "warning" / "작품_1.txt", "queue"
+        )
+        keep_review = _add_open_review(conn, keep, reference)
+        duplicate_review = _add_open_review(conn, duplicate, reference)
+        direct_review = _add_open_review(
+            conn, duplicate, keep, classification="ordered_body_match"
+        )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        states = {
+            row["review_id"]: row["state"]
+            for row in conn.execute(
+                "SELECT review_id, state FROM review_items "
+                "WHERE review_id IN (?, ?, ?)",
+                (keep_review, duplicate_review, direct_review),
+            )
+        }
+        duplicate_row = conn.execute(
+            "SELECT active, source FROM files WHERE file_id = ?",
+            (duplicate["file_id"],),
+        ).fetchone()
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert record["action"] == "exact_quarantine"
+    assert duplicate_row["active"] == 0
+    assert duplicate_row["source"] == "quarantine"
+    assert states[keep_review] == "pending"
+    assert states[duplicate_review] == "superseded"
+    assert states[direct_review] == "superseded"
+
+
+def test_queue_exact_cleanup_finds_excluded_warning_pair_from_state_db(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        reference = _add(conn, house / "이어지는 작품 2부.txt", "house", b"other")
+        keep = _add(conn, temp / "trash_bin" / "warning" / "작품.txt", "queue")
+        duplicate = _add(
+            conn, temp / "trash_bin" / "warning" / "작품_1.txt", "queue"
+        )
+        _add_open_review(conn, keep, reference)
+        _add_open_review(conn, duplicate, reference)
+        _add_open_review(conn, duplicate, keep, classification="ordered_body_match")
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    records = deduplicator.cleanup_relationship_preserving_queue_exact_duplicates(
+        str(state_db), str(temp), run_id
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        active_queue_count = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE active = 1 AND source = 'queue'"
+        ).fetchone()[0]
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert len(records) == 1
+    assert records[0]["source_file_id"] == duplicate["file_id"]
+    assert records[0]["keep_file_id"] == keep["file_id"]
+    assert active_queue_count == 1
+
+
+def test_exact_queue_duplicates_stay_report_only_if_external_review_would_be_lost(
+    tmp_path,
+):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        reference = _add(conn, house / "별도 관계.txt", "house", b"other")
+        keep = _add(conn, temp / "trash_bin" / "warning" / "작품.txt", "queue")
+        duplicate = _add(
+            conn, temp / "trash_bin" / "warning" / "작품_1.txt", "queue"
+        )
+        _add_open_review(conn, duplicate, reference)
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    record = _run_exact_group(state_db, temp, run_id, keep, duplicate)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+    finally:
+        conn.close()
+
+    assert record["action"] == "managed_report_only"
+    assert record["reason"] == "queue_review_relationship_conflict"
+    assert Path(keep["canonical_path"]).is_file()
+    assert Path(duplicate["canonical_path"]).is_file()
+
+
+def test_post_intake_exact_cleanup_converges_same_run_temp_pair(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        retained = _add(conn, temp / "batch-a" / "완결작.txt", "temp")
+        duplicate = _add(conn, temp / "batch-b" / "완결작.txt", "temp")
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        ingested = dedup_mutations.ingest_to_house(
+            conn,
+            source_file_id=retained["file_id"],
+            destination=house / "ㅇ" / "완결작.txt",
+            run_id=run_id,
+        )
+    finally:
+        conn.close()
+
+    records = deduplicator.cleanup_post_intake_exact_duplicates(
+        str(state_db), str(temp), run_id
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        duplicate_row = conn.execute(
+            "SELECT active, source FROM files WHERE file_id = ?",
+            (duplicate["file_id"],),
+        ).fetchone()
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert ingested["operation_id"] > 0
+    assert ingested["dest_path"] == str(house / "ㅇ" / "완결작.txt")
+    assert len(records) == 1
+    assert records[0]["source_file_id"] == duplicate["file_id"]
+    assert records[0]["keep_file_id"] == retained["file_id"]
+    assert duplicate_row["active"] == 0
+    assert duplicate_row["source"] == "quarantine"
+    assert Path(records[0]["dest_path"]).is_file()
 
 
 def test_unassigned_house_exact_duplicate_is_cleaned_by_same_pipeline(tmp_path):

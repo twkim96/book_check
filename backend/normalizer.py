@@ -351,6 +351,11 @@ def read_disambig_marker(name):
     return int(match.group(1)) if match else 1
 
 
+def has_legacy_marker(name):
+    """Return whether a filename carries an explicit pass/disambiguation suffix."""
+    return has_pass_marker(name) or read_disambig_marker(name) > 1
+
+
 def strip_disambig_marker(name):
     """`〔Dn〕` 마커를 떼어낸 이름을 반환한다(표시/검색/core_title용)."""
     return _DISAMBIG_SUFFIX_RE.sub("", normalize_nfc(name or ""), count=1)

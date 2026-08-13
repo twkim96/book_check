@@ -155,12 +155,12 @@ class JobStore:
             records.sort(key=lambda item: item.get("created_at") or "", reverse=True)
             return records[: max(1, min(int(limit), 200))]
 
-    def mark_interrupted(self) -> int:
-        count = 0
+    def mark_interrupted_records(self) -> list[dict]:
+        interrupted = []
         for record in self.list(limit=200):
             if record.get("state") not in ACTIVE_STATES:
                 continue
-            self.update(
+            restored = self.update(
                 record["job_id"],
                 state="interrupted",
                 stage="interrupted",
@@ -179,8 +179,12 @@ class JobStore:
                     "작업 실행 중 서버가 종료되었습니다. operation 복구 상태를 확인하세요."
                 ),
             })
-            count += 1
-        return count
+            interrupted.append(restored)
+        return interrupted
+
+    def mark_interrupted(self) -> int:
+        """Keep the established count API for non-server callers and tests."""
+        return len(self.mark_interrupted_records())
 
 
 class JobRunner:
