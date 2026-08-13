@@ -14,8 +14,10 @@
 - macOS/APFS 재마운트로 활성 파일 17,681개와 관리 폴더 1개의 `st_dev`만 함께 바뀐 것이
   17,682건 `stale_identity`의 원인이었다. 경로·inode·ctime·size·mtime가 모두 같은 완전한
   device 재번호만 백업 후 자동 재결합하며, 부분 변경이나 다른 Doctor 문제는 계속 차단한다.
-- 사용자가 서버를 재시작해 작업이 끊긴 경우, mutation 전이고 operation이 0건인 run만 자동
-  종료한다. 파일 이동이 시작된 run은 기존 `disable → recover → doctor` 절차를 유지한다.
+- job에 actual run ID를 직접 보존하고 active job은 표시 개수와 무관하게 전부 검색한다. 이벤트 기록
+  직전 중단도 유일한 실행만 보수적으로 연결한다.
+- 사용자가 서버를 재시작해 작업이 끊긴 경우, durable mutation 표식과 operation/group이 모두 없는
+  run만 자동 종료한다. 파일·관계 변경이 시작된 run은 기존 수동 복구 절차를 유지한다.
 
 ### Auditor와 입력 파일
 

@@ -1239,6 +1239,35 @@ def transition_actual_run(conn, run_id, new_state, *, error=None):
     )
     if cursor.rowcount != 1:
         raise RuntimeError(f"actual run transition lost: {current} -> {new_state}")
+    if new_state in {"finished", "failed", "cancelled"}:
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?",
+            (f"actual_run_mutation_started:{run_id}",),
+        )
+
+
+def mark_actual_run_mutation_started(conn: sqlite3.Connection, run_id: str) -> None:
+    """Persist that non-cache state or filesystem mutation is about to begin."""
+    row = conn.execute(
+        "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if row is None or row["state"] != "active":
+        raise RuntimeError("mutation phase requires an active actual run")
+    conn.execute(
+        """
+        INSERT INTO settings(key, value) VALUES (?, '1')
+        ON CONFLICT(key) DO UPDATE SET value = '1',
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (f"actual_run_mutation_started:{run_id}",),
+    )
+
+
+def actual_run_mutation_started(conn: sqlite3.Connection, run_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM settings WHERE key = ?",
+        (f"actual_run_mutation_started:{run_id}",),
+    ).fetchone() is not None
 
 
 def finish_actual_run(conn, run_id, *, success: bool, error: Optional[str] = None) -> None:
@@ -1299,6 +1328,10 @@ def close_interrupted_pre_mutation_run(
             ).fetchone()[0],
         )
 
+    if actual_run_mutation_started(conn, run_id):
+        raise RuntimeError(
+            "interrupted actual run requires manual recovery: mutation phase started"
+        )
     operation_count, group_count = operation_counts()
     if operation_count or group_count:
         raise RuntimeError(
@@ -1347,6 +1380,7 @@ def close_interrupted_pre_mutation_run(
             or current["state"] != "active"
             or current["house_root"] != expected_house
             or current["temp_root"] != expected_temp
+            or actual_run_mutation_started(conn, run_id)
             or operation_counts() != (0, 0)
             or doctor_issues(conn) != issues
         ):

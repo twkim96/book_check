@@ -9,7 +9,7 @@ import pytest
 import decision_store
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_jobs import JobActiveError, JobNeedsReview, JobRunner, JobStore
-from library_server import create_app
+from library_server import _interrupted_folderling_run_id, create_app
 
 
 def _server_fixture(tmp_path):
@@ -1119,7 +1119,9 @@ def test_job_store_marks_running_records_interrupted_after_restart(tmp_path):
     assert event["status"] == "interrupted"
 
 
-def _interrupted_folderling_fixture(tmp_path, *, with_operation=False):
+def _interrupted_folderling_fixture(
+    tmp_path, *, with_operation=False, with_event=True, mutation_started=False
+):
     state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
     house = tmp_path / "house"
     temp = tmp_path / "temp"
@@ -1156,15 +1158,24 @@ def _interrupted_folderling_fixture(tmp_path, *, with_operation=False):
                 item_count=1,
             )
         conn.close()
+    if mutation_started:
+        conn = decision_store.connect_state_db(state_db)
+        with decision_store.transaction(conn):
+            decision_store.mark_actual_run_mutation_started(conn, run_id)
+        conn.close()
 
     store = JobStore(runtime)
     job = store.create("service_folderling", {"source": "fixture"})
-    store.update(job["job_id"], state="running", stage="running")
-    store.append_event(job["job_id"], {
-        "phase": "actual_run_started",
-        "status": "running",
-        "run_id": run_id,
-    })
+    store.update(
+        job["job_id"], state="running", stage="running",
+        started_at="2026-08-13T00:00:00+00:00",
+    )
+    if with_event:
+        store.append_event(job["job_id"], {
+            "phase": "actual_run_started",
+            "status": "running",
+            "run_id": run_id,
+        })
     return state_db, house, temp, frontend, runtime, job["job_id"], run_id
 
 
@@ -1197,6 +1208,95 @@ def test_server_restart_closes_folderling_run_before_first_operation(tmp_path):
     ).fetchone()["state"] == "failed"
     assert not decision_store.doctor_issues(conn)
     conn.close()
+
+
+def test_server_restart_recovers_unique_active_run_before_start_event(tmp_path):
+    state_db, house, temp, frontend, runtime, job_id, run_id = (
+        _interrupted_folderling_fixture(tmp_path, with_event=False)
+    )
+    store = JobStore(runtime)
+    store.create("service_folderling", {"source": "queued fixture"})
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+        project_root=tmp_path,
+    )
+    restored = app.extensions["library_job_runner"].store.get(job_id)
+    assert restored["actual_run_id"] == run_id
+    assert restored["error"]["code"] == "server_restarted_before_mutation"
+
+
+def test_server_restart_keeps_zero_operation_run_after_mutation_phase(tmp_path):
+    state_db, house, temp, frontend, runtime, job_id, run_id = (
+        _interrupted_folderling_fixture(tmp_path, mutation_started=True)
+    )
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+        project_root=tmp_path,
+    )
+    store = app.extensions["library_job_runner"].store
+    restored = store.get(job_id)
+    assert restored["error"]["code"] == "server_restarted"
+    assert store.events(job_id)[-1]["phase"] == "interrupted_run_recovery_required"
+    assert "mutation phase started" in store.events(job_id)[-1]["error_message"]
+
+    conn = decision_store.connect_state_db(state_db)
+    assert conn.execute(
+        "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()["state"] == "active"
+    decision_store.disable_actual_run(conn)
+    conn.close()
+
+
+def test_job_store_interrupt_scan_and_legacy_event_lookup_are_unbounded(tmp_path):
+    store = JobStore(tmp_path / "runtime")
+    old = store.create("service_folderling", {})
+    store.update(old["job_id"], state="running", stage="running")
+    store.append_event(old["job_id"], {
+        "phase": "actual_run_started",
+        "status": "running",
+        "run_id": "legacy-run-id",
+    })
+    store.update(old["job_id"], actual_run_id=None)
+    for index in range(501):
+        store.append_event(old["job_id"], {"phase": "progress", "index": index})
+    for _ in range(201):
+        recent = store.create("completed", {})
+        store.update(recent["job_id"], state="succeeded")
+
+    interrupted = store.mark_interrupted_records()
+
+    assert [record["job_id"] for record in interrupted] == [old["job_id"]]
+    assert _interrupted_folderling_run_id(store, store.get(old["job_id"])) == (
+        "legacy-run-id"
+    )
+
+
+def test_exclusive_start_sees_active_job_beyond_display_limit(tmp_path):
+    runner = JobRunner(JobStore(tmp_path / "runtime"))
+    runner.register("synthetic", lambda _payload, _progress: {})
+    active = runner.store.create("synthetic", {"old": True})
+    runner.store.update(active["job_id"], state="running", stage="running")
+    for index in range(201):
+        recent = runner.store.create("synthetic", {"recent": index})
+        runner.store.update(recent["job_id"], state="succeeded")
+
+    with pytest.raises(JobActiveError) as exc_info:
+        runner.start_exclusive("synthetic", {"new": True})
+
+    assert exc_info.value.job_id == active["job_id"]
+    runner.shutdown()
 
 
 def test_server_restart_keeps_journaled_folderling_run_for_manual_recovery(tmp_path):

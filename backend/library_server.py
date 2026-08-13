@@ -176,9 +176,11 @@ class LibraryServerConfig:
 def _interrupted_folderling_run_id(store: JobStore, record) -> str | None:
     if record.get("job_type") != "service_folderling":
         return None
+    if record.get("actual_run_id"):
+        return str(record["actual_run_id"])
     run_ids = [
         event.get("run_id")
-        for event in store.events(str(record["job_id"]))
+        for event in store.events(str(record["job_id"]), limit=None)
         if event.get("phase") == "actual_run_started"
         and event.get("status") == "running"
         and event.get("run_id")
@@ -193,8 +195,42 @@ def _recover_interrupted_folderling_jobs(
 ) -> int:
     """Auto-close only interrupted Folderling runs with zero journal entries."""
     recovered = 0
+    bindings = {
+        str(record["job_id"]): _interrupted_folderling_run_id(store, record)
+        for record in records
+        if record.get("job_type") == "service_folderling"
+    }
+    unresolved = [
+        str(record["job_id"])
+        for record in records
+        if record.get("job_type") == "service_folderling"
+        and bindings.get(str(record["job_id"])) is None
+        and record.get("started_at") is not None
+        and record.get("interrupted_from_state") != "queued"
+    ]
+    if len(unresolved) == 1:
+        conn = decision_store.connect_state_db(config.state_db)
+        try:
+            rows = conn.execute(
+                """
+                SELECT run_id FROM actual_runs
+                WHERE state = 'active' AND house_root = ? AND temp_root = ?
+                """,
+                (
+                    decision_store.canonicalize_real_path(config.house_dir),
+                    decision_store.canonicalize_real_path(config.temp_dir),
+                ),
+            ).fetchall()
+        finally:
+            conn.close()
+        claimed = {run_id for run_id in bindings.values() if run_id is not None}
+        candidates = [str(row["run_id"]) for row in rows if row["run_id"] not in claimed]
+        if len(candidates) == 1:
+            job_id = unresolved[0]
+            bindings[job_id] = candidates[0]
+            store.update(job_id, actual_run_id=candidates[0])
     for record in records:
-        run_id = _interrupted_folderling_run_id(store, record)
+        run_id = bindings.get(str(record["job_id"]))
         if run_id is None:
             continue
         try:

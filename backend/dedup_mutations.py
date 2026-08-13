@@ -1916,6 +1916,7 @@ def apply_contained_upgrade(
         raise RuntimeError("contained upgrade keep endpoint is not in house")
 
     with decision_store.transaction(conn):
+        decision_store.mark_actual_run_mutation_started(conn, run_id)
         if shorter["source"] == "house" and shorter["variant_id"] is not None:
             if shorter["assignment_state"] != "managed":
                 raise RuntimeError("contained upgrade source has an unresolved relationship")
@@ -2255,6 +2256,7 @@ def apply_ordered_body_quarantine(
         raise RuntimeError("ordered body keep endpoint is not in house")
 
     with decision_store.transaction(conn):
+        decision_store.mark_actual_run_mutation_started(conn, run_id)
         if discard["source"] == "house" and discard["variant_id"] is not None:
             if discard["assignment_state"] != "managed":
                 raise RuntimeError("ordered body discard has unresolved relationships")

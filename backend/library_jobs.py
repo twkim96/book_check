@@ -84,6 +84,7 @@ class JobStore:
                 "log_path": str(self.logs_dir / f"{job_id}.log"),
                 "event_path": str(self.events_dir / f"{job_id}.jsonl"),
                 "last_event": None,
+                "actual_run_id": None,
             }
             return self._write(record)
 
@@ -121,15 +122,23 @@ class JobStore:
                 stream.write(line)
 
     def append_event(self, job_id: str, event: Mapping[str, object]) -> None:
-        record = self.get(job_id)
         value = {"recorded_at": _now(), **dict(event)}
         line = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str) + "\n"
         with self._lock:
+            record = self.get(job_id)
             with Path(record["event_path"]).open("a", encoding="utf-8") as stream:
                 stream.write(line)
-            self.update(job_id, last_event=value)
+            record["last_event"] = value
+            if (
+                value.get("phase") == "actual_run_started"
+                and value.get("status") == "running"
+                and value.get("run_id")
+            ):
+                record["actual_run_id"] = str(value["run_id"])
+            record["updated_at"] = _now()
+            self._write(record)
 
-    def events(self, job_id: str, *, limit: int = 500) -> list[dict]:
+    def events(self, job_id: str, *, limit: int | None = 500) -> list[dict]:
         record = self.get(job_id)
         path = Path(record.get("event_path") or "")
         if not path.is_file():
@@ -142,28 +151,42 @@ class JobStore:
                 continue
             if isinstance(value, dict):
                 values.append(value)
+        if limit is None:
+            return values
         return values[-max(1, min(int(limit), 2000)):]
+
+    def _all_records(self) -> list[dict]:
+        records = []
+        for path in self.jobs_dir.glob("*.json"):
+            try:
+                records.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
+        records.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        return records
 
     def list(self, *, limit: int = 50) -> list[dict]:
         with self._lock:
-            records = []
-            for path in self.jobs_dir.glob("*.json"):
-                try:
-                    records.append(json.loads(path.read_text(encoding="utf-8")))
-                except (OSError, json.JSONDecodeError):
-                    continue
-            records.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+            records = self._all_records()
             return records[: max(1, min(int(limit), 200))]
+
+    def active_records(self) -> list[dict]:
+        """Return every active record; lifecycle decisions must not be paginated."""
+        with self._lock:
+            return [
+                record for record in self._all_records()
+                if record.get("state") in ACTIVE_STATES
+            ]
 
     def mark_interrupted_records(self) -> list[dict]:
         interrupted = []
-        for record in self.list(limit=200):
-            if record.get("state") not in ACTIVE_STATES:
-                continue
+        for record in self.active_records():
             restored = self.update(
                 record["job_id"],
                 state="interrupted",
                 stage="interrupted",
+                interrupted_from_state=record.get("state"),
+                interrupted_from_stage=record.get("stage"),
                 message="서버 재시작으로 작업 상태 확인 필요",
                 finished_at=_now(),
                 error={
@@ -217,7 +240,7 @@ class JobRunner:
             raise KeyError(job_type)
         normalized_payload = dict(payload)
         with self._start_lock:
-            for record in self.store.list(limit=200):
+            for record in self.store.active_records():
                 if (
                     record.get("state") in ACTIVE_STATES
                     and record.get("job_type") == job_type
@@ -229,19 +252,13 @@ class JobRunner:
     def start_exclusive(self, job_type: str, payload: Mapping[str, object]) -> dict:
         """Start a non-queueable service only when no work is active or waiting."""
         with self._start_lock:
-            active = [
-                record for record in self.store.list(limit=200)
-                if record.get("state") in ACTIVE_STATES
-            ]
+            active = self.store.active_records()
             if active:
                 raise JobActiveError(str(active[0]["job_id"]))
             return self.start(job_type, payload)
 
     def _active_in_order(self) -> list[dict]:
-        values = [
-            record for record in self.store.list(limit=200)
-            if record.get("state") in ACTIVE_STATES
-        ]
+        values = self.store.active_records()
         values.sort(key=lambda item: (
             item.get("created_at") or "", item.get("job_id") or ""
         ))

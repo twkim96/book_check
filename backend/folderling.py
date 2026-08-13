@@ -390,7 +390,7 @@ def _cleanup_unpack_tree_owned(root, *, reusable, files, directories):
             os.close(root_fd)
 
 
-def cleanup_unpack_sources(src_dir):
+def cleanup_unpack_sources(src_dir, *, before_mutation=None):
     """Discard unpack wrappers only after every supported file left safely.
 
     ``txt_temp/unpack`` remains as the reusable inbox. Legacy ``___*`` wrapper
@@ -425,6 +425,8 @@ def cleanup_unpack_sources(src_dir):
             })
             continue
         try:
+            if before_mutation is not None:
+                before_mutation()
             discarded_files, discarded_bytes = _cleanup_unpack_tree_owned(
                 root,
                 reusable=reusable,
@@ -1934,7 +1936,29 @@ def _process_items_authorized(
             review_count=decided_review_count,
         )
 
-        unpack_cleanup_results = cleanup_unpack_sources(src_dir)
+        mutation_phase_marked = False
+
+        def mark_mutation_phase():
+            nonlocal mutation_phase_marked
+            if mutation_phase_marked:
+                return
+            marker_conn = decision_store.connect_state_db(state_db_path)
+            try:
+                with decision_store.transaction(marker_conn):
+                    decision_store.mark_actual_run_mutation_started(
+                        marker_conn, actual_run_id
+                    )
+            finally:
+                marker_conn.close()
+            mutation_phase_marked = True
+
+        # Wrapper cleanup and index publication are not per-file operations.
+        # Mark this boundary durably so a server restart cannot mistake them
+        # for a pre-mutation interruption merely because operation counts are 0.
+        mark_mutation_phase()
+        unpack_cleanup_results = cleanup_unpack_sources(
+            src_dir, before_mutation=mark_mutation_phase
+        )
         for cleanup in unpack_cleanup_results:
             status = cleanup["status"]
             if status == "cleaned":
