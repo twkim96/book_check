@@ -847,12 +847,18 @@ def select_existing_metric_targets(
     *,
     limit: Optional[int] = None,
 ) -> List[RefreshTarget]:
-    """Select only active, successful platforms that already have a count."""
+    """Select active successful metrics together with their remote identity snapshot."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     if limit == 0:
         return []
     stats = _stats_by_title(conn)
+    title_rows = {
+        row["title_key"]: row
+        for row in conn.execute(
+            "SELECT title_key, query_title, updated_at FROM catalog_titles"
+        )
+    }
     targets = []
     for title in sorted(discover_catalog_titles(conn), key=lambda item: item.title_key):
         rows = stats.get(title.title_key, {})
@@ -862,10 +868,26 @@ def select_existing_metric_targets(
             if rows.get(platform) is not None
             and rows[platform]["status"] == "ok"
             and _row_has_growth_metric(platform, rows[platform])
+            and rows[platform]["remote_id"] is not None
         )
         if not platforms:
             continue
-        targets.append(RefreshTarget(title=title, platforms=platforms))
+        title_row = title_rows.get(title.title_key)
+        if title_row is None or title_row["query_title"] != title.query_title:
+            continue
+        targets.append(RefreshTarget(
+            title=title,
+            platforms=platforms,
+            title_updated_at=title_row["updated_at"],
+            remote_hints=tuple(
+                (
+                    platform,
+                    rows[platform]["remote_id"],
+                    rows[platform]["remote_title"],
+                )
+                for platform in platforms
+            ),
+        ))
         if limit is not None and len(targets) >= limit:
             break
     return targets
@@ -1034,7 +1056,9 @@ def preview_existing_metric_refresh(
         conn.close()
 
 
-def _validate_stat(stat: PlatformStat) -> PlatformStat:
+def _validate_stat(
+    stat: PlatformStat, *, require_metrics: bool = True
+) -> PlatformStat:
     if stat.platform not in PLATFORMS:
         raise ValueError(f"unknown platform: {stat.platform}")
     if stat.status not in {"ok", "not_found", "error", "skipped"}:
@@ -1059,7 +1083,7 @@ def _validate_stat(stat: PlatformStat) -> PlatformStat:
             raise ValueError(
                 f"invalid {stat.platform} rating: {stat.rating!r} exceeds {scale}"
             )
-    if stat.status == "ok" and not _has_metrics(stat):
+    if require_metrics and stat.status == "ok" and not _has_metrics(stat):
         raise ValueError("ok platform stat requires at least one metric")
     if stat.genre is not None:
         stat = replace(stat, genre=_normalize_genre(stat.genre))
@@ -1124,10 +1148,12 @@ def record_platform_metadata_results(
     now: Optional[datetime] = None,
     expected_target: Optional[RefreshTarget] = None,
 ) -> Dict[str, str]:
-    """Persist authoritative genre/tag snapshots without changing popularity metrics."""
+    """Persist metadata only when the current row still names the same remote object."""
     moment = now or utc_now()
     collected_at = _utc_text(moment)
-    validated = [_validate_stat(stat) for stat in stats]
+    validated = [
+        _validate_stat(stat, require_metrics=False) for stat in stats
+    ]
     if len({stat.platform for stat in validated}) != len(validated):
         raise ValueError("at most one stat per platform may be recorded per title")
     outcomes: Dict[str, str] = {}
@@ -1152,8 +1178,8 @@ def record_platform_metadata_results(
                 return {stat.platform: "stale_target" for stat in validated}
         for stat in validated:
             row = conn.execute(
-                "SELECT status, remote_id FROM catalog_platform_stats "
-                "WHERE title_key = ? AND platform = ?",
+                "SELECT status, remote_id, remote_title, remote_url "
+                "FROM catalog_platform_stats WHERE title_key = ? AND platform = ?",
                 (title_key, stat.platform),
             ).fetchone()
             if row is None or row["status"] != "ok":
@@ -1167,30 +1193,42 @@ def record_platform_metadata_results(
                 outcomes[stat.platform] = "stale_target"
                 continue
             if stat.status != "ok":
-                outcomes[stat.platform] = stat.status
+                if stat.metadata_lookup_mode == "direct_mismatch":
+                    outcomes[stat.platform] = "identity_conflict"
+                elif stat.metadata_lookup_mode == "direct_unavailable":
+                    outcomes[stat.platform] = "unavailable"
+                else:
+                    outcomes[stat.platform] = stat.status
+                continue
+            if (
+                row["remote_id"] is None
+                or stat.remote_id is None
+                or str(stat.remote_id) != str(row["remote_id"])
+            ):
+                outcomes[stat.platform] = "identity_conflict"
                 continue
 
-            identity_repaired = False
-            if stat.remote_id is not None and stat.remote_id != row["remote_id"]:
-                if not stat.remote_title or not stat.remote_url:
-                    outcomes[stat.platform] = "unavailable"
-                    continue
+            identity_refreshed = bool(
+                (stat.remote_title and stat.remote_title != row["remote_title"])
+                or (stat.remote_url and stat.remote_url != row["remote_url"])
+            )
+            if identity_refreshed:
                 conn.execute(
                     """
                     UPDATE catalog_platform_stats
-                    SET remote_id = ?, remote_title = ?, remote_url = ?,
+                    SET remote_title = COALESCE(?, remote_title),
+                        remote_url = COALESCE(?, remote_url),
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE title_key = ? AND platform = ?
+                    WHERE title_key = ? AND platform = ? AND remote_id = ?
                     """,
                     (
-                        stat.remote_id,
                         stat.remote_title,
                         stat.remote_url,
                         title_key,
                         stat.platform,
+                        row["remote_id"],
                     ),
                 )
-                identity_repaired = True
 
             updated = False
             if stat.genre is not None:
@@ -1211,10 +1249,12 @@ def record_platform_metadata_results(
                     collected_at,
                 )
                 updated = True
-            if identity_repaired:
-                outcomes[stat.platform] = "identity_repaired"
+            if updated:
+                outcomes[stat.platform] = "updated"
+            elif identity_refreshed:
+                outcomes[stat.platform] = "identity_refreshed"
             else:
-                outcomes[stat.platform] = "updated" if updated else "unavailable"
+                outcomes[stat.platform] = "unavailable"
     return outcomes
 
 
@@ -1335,27 +1375,65 @@ def record_increased_platform_stats(
     stats: Sequence[PlatformStat],
     *,
     now: Optional[datetime] = None,
+    expected_target: Optional[RefreshTarget] = None,
 ) -> Dict[str, str]:
-    """Atomically apply successful results only when a popularity count grew."""
+    """Atomically increase metrics only for the same snapshotted remote object."""
     outcomes: Dict[str, str] = {}
     moment = now or utc_now()
     attempted_at = _utc_text(moment)
     validated = [_validate_stat(stat) for stat in stats]
     if len({stat.platform for stat in validated}) != len(validated):
         raise ValueError("at most one stat per platform may be recorded per title")
+    expected_remote_ids = (
+        {
+            platform: remote_id
+            for platform, remote_id, _remote_title in expected_target.remote_hints
+        }
+        if expected_target is not None else {}
+    )
 
     with decision_store.transaction(conn):
+        if expected_target is not None:
+            current_title = conn.execute(
+                "SELECT query_title, updated_at FROM catalog_titles WHERE title_key = ?",
+                (title_key,),
+            ).fetchone()
+            if (
+                current_title is None
+                or current_title["query_title"] != expected_target.title.query_title
+                or current_title["updated_at"] != expected_target.title_updated_at
+            ):
+                return {stat.platform: "stale_target" for stat in validated}
         for stat in validated:
             row = conn.execute(
                 "SELECT * FROM catalog_platform_stats "
                 "WHERE title_key = ? AND platform = ?",
                 (title_key, stat.platform),
             ).fetchone()
-            if stat.status != "ok":
-                outcomes[stat.platform] = stat.status
-                continue
             if row is None or row["status"] != "ok":
                 outcomes[stat.platform] = "skipped"
+                continue
+            if (
+                expected_target is not None
+                and stat.platform in expected_remote_ids
+                and row["remote_id"] != expected_remote_ids[stat.platform]
+            ):
+                outcomes[stat.platform] = "stale_target"
+                continue
+            if stat.status != "ok":
+                if stat.metadata_lookup_mode == "direct_mismatch":
+                    outcomes[stat.platform] = "identity_conflict"
+                elif stat.metadata_lookup_mode == "direct_unavailable":
+                    outcomes[stat.platform] = "unavailable"
+                else:
+                    outcomes[stat.platform] = stat.status
+                continue
+            if (
+                row["remote_id"] is None
+                or stat.remote_id is None
+                or str(stat.remote_id) != str(row["remote_id"])
+            ):
+                outcomes[stat.platform] = "identity_conflict"
                 continue
 
             has_growth_metric = _row_has_growth_metric(stat.platform, row)
@@ -1366,17 +1444,18 @@ def record_increased_platform_stats(
                 conn.execute(
                     """
                     UPDATE catalog_platform_stats
-                    SET remote_id = ?, remote_title = ?, remote_url = ?,
+                    SET remote_title = COALESCE(?, remote_title),
+                        remote_url = COALESCE(?, remote_url),
                         download_count = ?, view_count = ?, recommend_count = ?,
                         rating = ?, rating_count = ?,
                         last_attempt_at = ?, last_success_at = ?, retry_after = NULL,
                         error_message = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE title_key = ? AND platform = ? AND status = 'ok'
+                      AND remote_id = ?
                     """,
                     (
-                        stat.remote_id or row["remote_id"],
-                        stat.remote_title or row["remote_title"],
-                        stat.remote_url or row["remote_url"],
+                        stat.remote_title,
+                        stat.remote_url,
                         _monotonic_count(row["download_count"], stat.download_count),
                         _monotonic_count(row["view_count"], stat.view_count),
                         _monotonic_count(
@@ -1389,6 +1468,7 @@ def record_increased_platform_stats(
                         stat.message or None,
                         title_key,
                         stat.platform,
+                        row["remote_id"],
                     ),
                 )
                 outcomes[stat.platform] = "updated"
@@ -1504,8 +1584,10 @@ def _lookup_series_remote(
         fetch_text(detail_url, timeout)
     )
     matched_title = detail_title or str(fallback_title or "")
-    if not matched_title or not titles_match(title, matched_title):
-        return _not_found("series")
+    if not matched_title:
+        raise ValueError("Naver detail response has no title")
+    if not titles_match(title, matched_title):
+        return _not_found("series", "stored remote title mismatch")
     stat = PlatformStat(
         platform="series",
         status="ok",
@@ -1517,6 +1599,34 @@ def _lookup_series_remote(
         genre=genre,
     )
     return stat if _has_metrics(stat) else _error("series", RuntimeError("지표를 찾지 못했습니다"))
+
+
+def _lookup_series_metadata_remote(
+    title: str,
+    remote_id: str,
+    fetch_text: Callable[[str, float], str],
+    *,
+    timeout: float,
+) -> PlatformStat:
+    """Read title/genre from one stored Series ID without requiring popularity fields."""
+    detail_url = "https://series.naver.com/novel/detail.series?" + urlencode(
+        {"productNo": remote_id}
+    )
+    detail_title, _download_count, _rating_value, genre = _parse_series_detail(
+        fetch_text(detail_url, timeout)
+    )
+    if not detail_title:
+        raise ValueError("Naver detail response has no title")
+    if not titles_match(title, detail_title):
+        return _not_found("series", "stored remote title mismatch")
+    return PlatformStat(
+        platform="series",
+        status="ok",
+        remote_id=str(remote_id),
+        remote_title=detail_title,
+        remote_url=detail_url,
+        genre=genre,
+    )
 
 
 def lookup_series(
@@ -1635,8 +1745,10 @@ def _lookup_kakao_remote(
         fetch_json(overview_url, timeout)
     )
     matched_title = detail_title
-    if not matched_title or not titles_match(title, matched_title):
-        return _not_found("kakao")
+    if not matched_title:
+        raise ValueError("Kakao overview response has no title")
+    if not titles_match(title, matched_title):
+        return _not_found("kakao", "stored remote title mismatch")
     tags = None
     try:
         about_url = (
@@ -1663,72 +1775,40 @@ def _lookup_kakao_remote(
     return stat if _has_metrics(stat) else _error("kakao", RuntimeError("지표를 찾지 못했습니다"))
 
 
-def _lookup_kakao_identity_remote(
+def _lookup_kakao_metadata_remote(
     title: str,
     remote_id: str,
     fetch_json: Callable[[str, float], object],
     *,
     timeout: float,
-    fallback_view_count: Optional[int] = None,
 ) -> PlatformStat:
-    """Verify one Kakao series ID from overview without fetching theme tags."""
+    """Read authoritative genre/tags from one stored Kakao ID."""
     content_id = str(remote_id)
     overview_url = (
         f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/overview?"
         + urlencode({"series_id": content_id})
     )
-    detail_title, views, rating, rating_count, _genre = _parse_kakao_overview(
+    detail_title, _views, _rating, _rating_count, genre = _parse_kakao_overview(
         fetch_json(overview_url, timeout)
     )
-    if not detail_title or not titles_match(title, detail_title):
-        return _not_found("kakao")
-    stat = PlatformStat(
+    if not detail_title:
+        raise ValueError("Kakao overview response has no title")
+    if not titles_match(title, detail_title):
+        return _not_found("kakao", "stored remote title mismatch")
+    about_url = (
+        f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/about?"
+        + urlencode({"series_id": content_id})
+    )
+    tags = _parse_kakao_tags(fetch_json(about_url, timeout))
+    return PlatformStat(
         platform="kakao",
         status="ok",
         remote_id=content_id,
         remote_title=detail_title,
         remote_url=f"https://page.kakao.com/content/{content_id}",
-        view_count=views if views is not None else fallback_view_count,
-        rating=rating,
-        rating_count=rating_count,
+        genre=genre,
+        tags=tags,
     )
-    return stat if _has_metrics(stat) else _error(
-        "kakao", RuntimeError("지표를 찾지 못했습니다")
-    )
-
-
-def lookup_kakao_identity(
-    title: str,
-    fetch_json: Callable[[str, float], object] = _http_json,
-    *,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> PlatformStat:
-    """Search Kakao only far enough to verify the canonical content identity."""
-    params = {
-        "keyword": title,
-        "category_uid": "11",
-        "is_complete": "false",
-        "sort_type": "ACCURACY",
-        "page": "0",
-        "size": "5",
-    }
-    candidates = _kakao_api_candidates(fetch_json(
-        f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v2/search/series?" + urlencode(params),
-        timeout,
-    ))
-    matched = [item for item in candidates if titles_match(title, str(item["title"]))]
-    for candidate in matched[:3]:
-        stat = _lookup_kakao_identity_remote(
-            title,
-            str(candidate["id"]),
-            fetch_json,
-            timeout=timeout,
-            fallback_view_count=candidate.get("view_count"),
-        )
-        if stat.status == "not_found":
-            continue
-        return stat
-    return _not_found("kakao")
 
 
 def lookup_kakao(
@@ -1937,7 +2017,7 @@ def lookup_platform_metadata(
     fetch_json: Callable[[str, float], object] = _http_json,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> List[PlatformStat]:
-    """Prefer verified remote IDs for metadata backfill, then fall back to search."""
+    """Collect metadata without ever switching away from an existing remote ID."""
     if not platforms:
         return []
     if len(set(platforms)) != len(platforms):
@@ -1947,54 +2027,47 @@ def lookup_platform_metadata(
             raise ValueError(f"unknown platform: {platform}")
 
     ids = remote_ids or {}
-    full_lookups = {
-        "series": lambda: lookup_series(title, fetch_text, timeout=timeout),
-        "kakao": lambda: lookup_kakao(title, fetch_json, timeout=timeout),
-        "novelpia": lambda: lookup_novelpia(
-            title,
-            fetch_json,
-            fetch_text,
-            timeout=timeout,
-        ),
-    }
+
+    def direct_result(platform: str, remote_id: str) -> PlatformStat:
+        try:
+            if platform == "series":
+                stat = _lookup_series_metadata_remote(
+                    title, remote_id, fetch_text, timeout=timeout
+                )
+            elif platform == "kakao":
+                stat = _lookup_kakao_metadata_remote(
+                    title, remote_id, fetch_json, timeout=timeout
+                )
+            else:
+                raise ValueError(f"direct metadata lookup unsupported: {platform}")
+        except Exception as exc:
+            return replace(_error(platform, exc), metadata_lookup_mode="direct_unavailable")
+        if stat.status == "not_found":
+            return replace(stat, metadata_lookup_mode="direct_mismatch")
+        return replace(stat, metadata_lookup_mode="direct")
 
     def lookup_one(platform: str) -> PlatformStat:
         remote_id = ids.get(platform)
-        if platform == "series" and remote_id:
-            try:
-                stat = _lookup_series_remote(
-                    title,
-                    str(remote_id),
-                    fetch_text,
-                    timeout=timeout,
-                )
-            except Exception:
-                stat = None
-            if stat is not None and stat.status == "ok":
-                return replace(stat, metadata_lookup_mode="direct")
-        elif platform == "kakao" and remote_id:
-            try:
-                stat = _lookup_kakao_remote(
-                    title,
-                    str(remote_id),
-                    fetch_json,
-                    timeout=timeout,
-                )
-            except Exception:
-                stat = None
-            if stat is not None and stat.status == "ok":
-                return replace(stat, metadata_lookup_mode="direct")
-        result = full_lookups[platform]()
-        mode = (
-            "fallback"
-            if remote_id and platform in {"series", "kakao"}
-            else "search"
+        if platform in {"series", "kakao"} and remote_id:
+            # A transport/parser failure is not evidence that the stored ID is
+            # wrong. Likewise a positive title mismatch is reported for review;
+            # neither condition may silently search and switch identities.
+            return direct_result(platform, str(remote_id))
+        if platform == "series":
+            return replace(
+                lookup_series(title, fetch_text, timeout=timeout),
+                metadata_lookup_mode="search",
+            )
+        if platform == "kakao":
+            return replace(
+                lookup_kakao(title, fetch_json, timeout=timeout),
+                metadata_lookup_mode="search",
+            )
+        return replace(
+            lookup_novelpia(title, fetch_json, fetch_text, timeout=timeout),
+            metadata_lookup_mode="search",
         )
-        return replace(result, metadata_lookup_mode=mode)
 
-    # Preserve the existing per-title concurrency: direct Series/Kakao detail
-    # requests and the NovelPia search can run in parallel, while each platform
-    # still performs at most one request chain at a time.
     with ThreadPoolExecutor(
         max_workers=min(len(platforms), len(PLATFORMS)),
         thread_name_prefix="platform-metadata",
@@ -2005,8 +2078,70 @@ def lookup_platform_metadata(
             try:
                 results.append(futures[platform].result())
             except Exception as exc:
-                results.append(_error(platform, exc))
+                results.append(
+                    replace(_error(platform, exc), metadata_lookup_mode="direct_unavailable")
+                )
         return results
+
+
+def lookup_existing_platform_metrics(
+    title: str,
+    platforms: Sequence[str],
+    *,
+    remote_ids: Optional[Dict[str, str]] = None,
+    fetch_text: Callable[[str, float], str] = _http_text,
+    fetch_json: Callable[[str, float], object] = _http_json,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> List[PlatformStat]:
+    """Refresh metrics without permitting a Series/Kakao identity search fallback."""
+    if not platforms:
+        return []
+    if len(set(platforms)) != len(platforms):
+        raise ValueError("platform metric lookup list must not contain duplicates")
+    ids = remote_ids or {}
+
+    def lookup_one(platform: str) -> PlatformStat:
+        if platform not in PLATFORMS:
+            raise ValueError(f"unknown platform: {platform}")
+        remote_id = ids.get(platform)
+        if platform in {"series", "kakao"}:
+            if not remote_id:
+                return replace(
+                    _error(platform, RuntimeError("stored remote ID is missing")),
+                    metadata_lookup_mode="direct_unavailable",
+                )
+            try:
+                if platform == "series":
+                    stat = _lookup_series_remote(
+                        title, str(remote_id), fetch_text, timeout=timeout
+                    )
+                else:
+                    stat = _lookup_kakao_remote(
+                        title, str(remote_id), fetch_json, timeout=timeout
+                    )
+            except Exception as exc:
+                return replace(
+                    _error(platform, exc), metadata_lookup_mode="direct_unavailable"
+                )
+            if stat.status == "not_found":
+                return replace(stat, metadata_lookup_mode="direct_mismatch")
+            if stat.status != "ok":
+                return replace(stat, metadata_lookup_mode="direct_unavailable")
+            return replace(stat, metadata_lookup_mode="direct")
+        try:
+            return replace(
+                lookup_novelpia(title, fetch_json, fetch_text, timeout=timeout),
+                metadata_lookup_mode="search",
+            )
+        except Exception as exc:
+            return replace(_error(platform, exc), metadata_lookup_mode="search")
+
+    with ThreadPoolExecutor(
+        max_workers=min(len(platforms), len(PLATFORMS)),
+        thread_name_prefix="platform-existing",
+    ) as executor:
+        futures = {platform: executor.submit(lookup_one, platform) for platform in platforms}
+        return [futures[platform].result() for platform in platforms]
 
 
 def lookup_platform_identities(
@@ -2018,7 +2153,7 @@ def lookup_platform_identities(
     fetch_json: Callable[[str, float], object] = _http_json,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> List[PlatformStat]:
-    """Verify Series/Kakao identities without collecting optional metadata."""
+    """Revalidate stored Series/Kakao IDs and metadata from that exact object."""
     if not platforms:
         return []
     if len(set(platforms)) != len(platforms):
@@ -2031,33 +2166,25 @@ def lookup_platform_identities(
 
     def lookup_one(platform: str) -> PlatformStat:
         remote_id = ids.get(platform)
-        if platform == "series":
-            if remote_id:
-                try:
-                    stat = _lookup_series_remote(
-                        title, str(remote_id), fetch_text, timeout=timeout
-                    )
-                except Exception:
-                    stat = None
-                if stat is not None and stat.status == "ok":
-                    return replace(stat, metadata_lookup_mode="direct")
+        if not remote_id:
             return replace(
-                lookup_series(title, fetch_text, timeout=timeout),
-                metadata_lookup_mode="fallback" if remote_id else "search",
+                _error(platform, RuntimeError("stored remote ID is missing")),
+                metadata_lookup_mode="direct_unavailable",
             )
-        if remote_id:
-            try:
-                stat = _lookup_kakao_identity_remote(
+        try:
+            if platform == "series":
+                stat = _lookup_series_metadata_remote(
+                    title, str(remote_id), fetch_text, timeout=timeout
+                )
+            else:
+                stat = _lookup_kakao_metadata_remote(
                     title, str(remote_id), fetch_json, timeout=timeout
                 )
-            except Exception:
-                stat = None
-            if stat is not None and stat.status == "ok":
-                return replace(stat, metadata_lookup_mode="direct")
-        return replace(
-            lookup_kakao_identity(title, fetch_json, timeout=timeout),
-            metadata_lookup_mode="fallback" if remote_id else "search",
-        )
+        except Exception as exc:
+            return replace(_error(platform, exc), metadata_lookup_mode="direct_unavailable")
+        if stat.status == "not_found":
+            return replace(stat, metadata_lookup_mode="direct_mismatch")
+        return replace(stat, metadata_lookup_mode="direct")
 
     with ThreadPoolExecutor(
         max_workers=min(len(platforms), len(IDENTITY_AUDIT_PLATFORMS)),
@@ -2069,7 +2196,9 @@ def lookup_platform_identities(
             try:
                 results.append(futures[platform].result())
             except Exception as exc:
-                results.append(_error(platform, exc))
+                results.append(
+                    replace(_error(platform, exc), metadata_lookup_mode="direct_unavailable")
+                )
         return results
 
 
@@ -2285,7 +2414,12 @@ def repair_metadata_identities(
     now: Callable[[], datetime] = utc_now,
     progress: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Dict[str, object]:
-    """Verify Series/Kakao remote IDs and repair only verified identity drift."""
+    """Revalidate Series/Kakao metadata from the exact stored remote object.
+
+    Despite the compatibility function name, this pass never switches remote IDs.
+    A positive title mismatch is reported as an identity conflict, while transport
+    or parser failures leave the existing snapshot untouched and retryable.
+    """
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     if delay_seconds < 0:
@@ -2304,13 +2438,12 @@ def repair_metadata_identities(
         targets = select_metadata_identity_targets(conn, limit=limit)
         selected_platforms = sum(len(target.platforms) for target in targets)
         outcome_counts = {
-            "verified_direct": 0,
-            "verified_fallback": 0,
-            "identity_repaired": 0,
+            "revalidated": 0,
+            "identity_refreshed": 0,
+            "identity_conflict": 0,
             "stale_target": 0,
-            "not_found": 0,
-            "error": 0,
             "unavailable": 0,
+            "error": 0,
             "skipped": 0,
         }
         if progress is not None:
@@ -2338,25 +2471,31 @@ def repair_metadata_identities(
                     "identity lookup did not return exactly the requested platforms"
                 )
             for result in results:
-                if result.status != "ok":
-                    outcome_counts[result.status] = (
-                        outcome_counts.get(result.status, 0) + 1
+                candidate = result
+                if result.status == "ok":
+                    metadata_complete = (
+                        result.genre is not None
+                        and (
+                            result.platform != "kakao"
+                            or result.tags is not None
+                        )
                     )
-                    continue
-                expected_id = expected_ids.get(result.platform)
-                if result.metadata_lookup_mode == "direct":
-                    outcome_counts["verified_direct"] += 1
-                    continue
-                if result.remote_id == expected_id:
-                    outcome_counts["verified_fallback"] += 1
-                    continue
+                    if not metadata_complete:
+                        candidate = replace(
+                            result,
+                            status="error",
+                            message="stored-ID metadata response is incomplete",
+                            metadata_lookup_mode="direct_unavailable",
+                        )
                 outcome = record_platform_metadata_results(
                     conn,
                     target.title.title_key,
-                    [replace(result, genre=None, tags=None)],
+                    [candidate],
                     now=now(),
                     expected_target=target,
                 )[result.platform]
+                if outcome == "updated":
+                    outcome = "revalidated"
                 outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
             completed_titles += 1
             if progress is not None:
@@ -2414,7 +2553,8 @@ def refresh_missing_metadata(
         selected_platforms = sum(len(target.platforms) for target in targets)
         outcome_counts = {
             "updated": 0,
-            "identity_repaired": 0,
+            "identity_refreshed": 0,
+            "identity_conflict": 0,
             "stale_target": 0,
             "empty": 0,
             "unavailable": 0,
@@ -2422,7 +2562,13 @@ def refresh_missing_metadata(
             "error": 0,
             "skipped": 0,
         }
-        lookup_mode_counts = {"direct": 0, "fallback": 0, "search": 0, "authenticated": 0}
+        lookup_mode_counts = {
+            "direct": 0,
+            "direct_mismatch": 0,
+            "direct_unavailable": 0,
+            "search": 0,
+            "authenticated": 0,
+        }
         if progress is not None:
             progress({
                 "phase": "metadata_start",
@@ -2597,6 +2743,9 @@ def refresh_existing_metrics(
         outcome_counts = {
             "updated": 0,
             "unchanged": 0,
+            "identity_conflict": 0,
+            "stale_target": 0,
+            "unavailable": 0,
             "not_found": 0,
             "error": 0,
             "skipped": 0,
@@ -2626,6 +2775,7 @@ def refresh_existing_metrics(
                 target.title.title_key,
                 final_results,
                 now=now(),
+                expected_target=target,
             )
             for outcome in outcomes.values():
                 outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
@@ -2666,7 +2816,23 @@ def refresh_existing_metrics(
             pending_authenticated.clear()
 
         for index, target in enumerate(targets):
-            results = lookup(target.title.query_title, target.platforms, timeout=timeout)
+            if lookup is lookup_platforms:
+                results = lookup_existing_platform_metrics(
+                    target.title.query_title,
+                    target.platforms,
+                    remote_ids={
+                        platform: str(remote_id)
+                        for platform, remote_id, _remote_title in target.remote_hints
+                        if remote_id is not None
+                    },
+                    timeout=timeout,
+                )
+            else:
+                results = lookup(
+                    target.title.query_title,
+                    target.platforms,
+                    timeout=timeout,
+                )
             if {result.platform for result in results} != set(target.platforms):
                 raise RuntimeError(
                     "platform lookup did not return exactly the requested platforms"

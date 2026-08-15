@@ -222,7 +222,7 @@ def test_platform_lookups_collect_tags_without_making_tag_failure_fatal():
     assert stat.tags is None
 
 
-def test_metadata_lookup_prefers_verified_remote_ids_and_falls_back_to_search():
+def test_metadata_lookup_uses_stored_remote_ids_without_identity_fallback():
     title = "테스트 작품"
     text_calls = []
     json_calls = []
@@ -299,19 +299,63 @@ def test_metadata_lookup_prefers_verified_remote_ids_and_falls_back_to_search():
             )
         raise AssertionError(url)
 
-    [fallback] = platform_catalog.lookup_platform_metadata(
+    [mismatch] = platform_catalog.lookup_platform_metadata(
         title,
         ("series",),
         remote_ids={"series": "99"},
         fetch_text=fallback_text,
         timeout=1,
     )
-    assert fallback.status == "ok"
-    assert fallback.remote_id == "11"
-    assert any("search/search.series" in url for url in fallback_calls)
+    assert mismatch.status == "not_found"
+    assert mismatch.metadata_lookup_mode == "direct_mismatch"
+    assert not any("search/search.series" in url for url in fallback_calls)
 
 
-def test_identity_lookup_uses_kakao_overview_without_refetching_tags():
+def test_metadata_lookup_does_not_fallback_after_transport_failure():
+    calls = []
+
+    def timeout_text(url, _timeout):
+        calls.append(url)
+        if "productNo=99" in url:
+            raise TimeoutError("fixture timeout")
+        raise AssertionError(f"unexpected fallback request: {url}")
+
+    [result] = platform_catalog.lookup_platform_metadata(
+        "테스트 작품",
+        ("series",),
+        remote_ids={"series": "99"},
+        fetch_text=timeout_text,
+        timeout=1,
+    )
+    assert result.status == "error"
+    assert result.metadata_lookup_mode == "direct_unavailable"
+    assert len(calls) == 1
+    assert "productNo=99" in calls[0]
+
+
+def test_metadata_lookup_accepts_matching_title_even_when_metrics_are_missing():
+    def no_metric_detail(_url, _timeout):
+        return (
+            '<meta property="og:title" content="테스트 작품">'
+            '<ul class="end_info"><li><a href="/novel/categoryProductList.series?'
+            'categoryTypeCode=genre&amp;genreCode=208">현판</a></li></ul>'
+            '<div class="end_dsc">설명</div>'
+        )
+
+    [result] = platform_catalog.lookup_platform_metadata(
+        "테스트 작품",
+        ("series",),
+        remote_ids={"series": "11"},
+        fetch_text=no_metric_detail,
+        timeout=1,
+    )
+    assert result.status == "ok"
+    assert result.remote_id == "11"
+    assert result.genre == "현판"
+    assert result.metadata_lookup_mode == "direct"
+
+
+def test_consistency_lookup_refetches_kakao_genre_and_tags_from_stored_id():
     calls = []
 
     def data(url, _timeout):
@@ -319,9 +363,14 @@ def test_identity_lookup_uses_kakao_overview_without_refetching_tags():
         if "/content/overview" in url:
             return {"result": {"content": {
                 "title": "테스트 작품",
-                "service_property": {"viewCount": 123},
+                "sub_category": "판타지",
+                "service_property": {},
             }}}
-        raise AssertionError(f"identity audit made an unnecessary request: {url}")
+        if "/content/about" in url:
+            return {"result": {"theme_keyword_list": [
+                {"title": "성장"}, {"title": "먼치킨"},
+            ]}}
+        raise AssertionError(url)
 
     [stat] = platform_catalog.lookup_platform_identities(
         "테스트 작품",
@@ -333,10 +382,54 @@ def test_identity_lookup_uses_kakao_overview_without_refetching_tags():
     assert stat.status == "ok"
     assert stat.remote_id == "22"
     assert stat.metadata_lookup_mode == "direct"
-    assert stat.genre is None
-    assert stat.tags is None
+    assert stat.genre == "판타지"
+    assert stat.tags == ("성장", "먼치킨")
+    assert len(calls) == 2
+
+
+def test_existing_metric_lookup_uses_stored_series_id_without_search_fallback():
+    calls = []
+
+    def detail(url, _timeout):
+        calls.append(url)
+        assert "search/search.series" not in url
+        return (
+            '<meta property="og:title" content="테스트 작품">'
+            '<button class="btn_download"><span>1,234</span></button>'
+        )
+
+    [result] = platform_catalog.lookup_existing_platform_metrics(
+        "테스트 작품",
+        ("series",),
+        remote_ids={"series": "11"},
+        fetch_text=detail,
+        timeout=1,
+    )
+    assert result.status == "ok"
+    assert result.remote_id == "11"
+    assert result.download_count == 1234
+    assert result.metadata_lookup_mode == "direct"
     assert len(calls) == 1
-    assert "/content/overview" in calls[0]
+
+
+def test_existing_metric_lookup_does_not_search_after_direct_timeout():
+    calls = []
+
+    def timeout_detail(url, _timeout):
+        calls.append(url)
+        assert "search/search.series" not in url
+        raise TimeoutError("fixture timeout")
+
+    [result] = platform_catalog.lookup_existing_platform_metrics(
+        "테스트 작품",
+        ("series",),
+        remote_ids={"series": "11"},
+        fetch_text=timeout_detail,
+        timeout=1,
+    )
+    assert result.status == "error"
+    assert result.metadata_lookup_mode == "direct_unavailable"
+    assert len(calls) == 1
 
 
 def test_metadata_progress_persistence_is_throttled():
@@ -459,10 +552,13 @@ def test_metadata_backfill_reuses_stored_remote_ids(tmp_path, monkeypatch):
 
     def metadata_lookup(title, platforms, *, remote_ids, timeout):
         captured.append((title, tuple(platforms), dict(remote_ids or {}), timeout))
+        ids = {"series": "9197875", "kakao": "69475645"}
         return [
             platform_catalog.PlatformStat(
                 platform,
                 "ok",
+                remote_id=ids[platform],
+                remote_title="원격 ID 작품",
                 download_count=8 if platform == "series" else None,
                 view_count=101 if platform == "kakao" else None,
                 genre="현판" if platform == "series" else "무협",
@@ -505,10 +601,17 @@ def test_metadata_backfill_targets_missing_genre_or_tags_and_preserves_metrics(t
             conn,
             title_key,
             [
-                platform_catalog.PlatformStat("series", "ok", download_count=7),
-                platform_catalog.PlatformStat("kakao", "ok", view_count=100),
                 platform_catalog.PlatformStat(
-                    "novelpia", "ok", view_count=200, recommend_count=20,
+                    "series", "ok", remote_id="11", remote_title="태그 작품",
+                    download_count=7
+                ),
+                platform_catalog.PlatformStat(
+                    "kakao", "ok", remote_id="22", remote_title="태그 작품",
+                    view_count=100
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", remote_id="33", remote_title="태그 작품",
+                    view_count=200, recommend_count=20,
                     genre="판타지", tags=(),
                 ),
             ],
@@ -525,10 +628,12 @@ def test_metadata_backfill_targets_missing_genre_or_tags_and_preserves_metrics(t
         calls.append((title, tuple(platforms), timeout))
         values = {
             "series": platform_catalog.PlatformStat(
-                "series", "ok", download_count=999, rating=9.9, genre="현판"
+                "series", "ok", remote_id="11", remote_title="태그 작품",
+                download_count=999, rating=9.9, genre="현판"
             ),
             "kakao": platform_catalog.PlatformStat(
-                "kakao", "ok", view_count=999, rating=9.9,
+                "kakao", "ok", remote_id="22", remote_title="태그 작품",
+                view_count=999, rating=9.9,
                 genre="판타지", tags=("게임", "성장", "게임"),
             ),
         }
@@ -632,7 +737,7 @@ def test_ambiguous_rekey_discards_source_tags_instead_of_blessing_one(tmp_path):
         conn.close()
 
 
-def test_metadata_identity_repair_updates_remote_identity_but_preserves_metrics(tmp_path):
+def test_metadata_writer_rejects_cross_id_result_without_mixing_fields(tmp_path):
     _db_path, conn = _catalog_db(tmp_path)
     try:
         platform_catalog.record_platform_stats(
@@ -667,11 +772,11 @@ def test_metadata_identity_repair_updates_remote_identity_but_preserves_metrics(
                 view_count=999,
                 genre="판타지",
                 tags=("성장",),
-                metadata_lookup_mode="fallback",
+                metadata_lookup_mode="search",
             )],
             expected_target=target,
         )
-        assert outcomes == {"kakao": "identity_repaired"}
+        assert outcomes == {"kakao": "identity_conflict"}
         row = conn.execute(
             """
             SELECT remote_id, remote_title, remote_url, view_count, genre
@@ -680,9 +785,9 @@ def test_metadata_identity_repair_updates_remote_identity_but_preserves_metrics(
             """
         ).fetchone()
         assert tuple(row) == (
-            "11", "작품", "https://page.kakao.com/content/11", 100, "판타지"
+            "99", "작품", "https://page.kakao.com/content/99", 100, None
         )
-        assert _tags(conn, "kakao") == ["성장"]
+        assert _tags(conn, "kakao") == []
     finally:
         conn.close()
 
@@ -782,9 +887,18 @@ def test_metadata_auth_failure_keeps_public_platform_partial_success(tmp_path):
             conn,
             title_key,
             [
-                platform_catalog.PlatformStat("series", "ok", download_count=10),
-                platform_catalog.PlatformStat("kakao", "ok", view_count=20),
-                platform_catalog.PlatformStat("novelpia", "ok", view_count=30),
+                platform_catalog.PlatformStat(
+                    "series", "ok", remote_id="11", remote_title="인증 부분 성공",
+                    download_count=10
+                ),
+                platform_catalog.PlatformStat(
+                    "kakao", "ok", remote_id="22", remote_title="인증 부분 성공",
+                    view_count=20
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", remote_id="33", remote_title="인증 부분 성공",
+                    view_count=30
+                ),
             ],
         )
     finally:
@@ -793,13 +907,16 @@ def test_metadata_auth_failure_keeps_public_platform_partial_success(tmp_path):
     def public_lookup(_title, platforms, *, timeout):
         values = {
             "series": platform_catalog.PlatformStat(
-                "series", "ok", download_count=999, genre="현판"
+                "series", "ok", remote_id="11", remote_title="인증 부분 성공",
+                download_count=999, genre="현판"
             ),
             "kakao": platform_catalog.PlatformStat(
-                "kakao", "ok", view_count=999, genre="판타지", tags=("성장",)
+                "kakao", "ok", remote_id="22", remote_title="인증 부분 성공",
+                view_count=999, genre="판타지", tags=("성장",)
             ),
             "novelpia": platform_catalog.PlatformStat(
-                "novelpia", "ok", view_count=999, genre=None, tags=None
+                "novelpia", "ok", remote_id="33", remote_title="인증 부분 성공",
+                view_count=999, genre=None, tags=None
             ),
         }
         return [values[platform] for platform in platforms]
@@ -849,7 +966,7 @@ def test_metadata_auth_failure_keeps_public_platform_partial_success(tmp_path):
         conn.close()
 
 
-def test_identity_audit_repairs_only_remote_identity_and_preserves_metadata(tmp_path):
+def test_consistency_pass_rewrites_metadata_from_same_stored_id_only(tmp_path):
     house = tmp_path / "house"
     house.mkdir()
     path = house / "ID 검증 작품 1-10화.txt"
@@ -868,27 +985,15 @@ def test_identity_audit_repairs_only_remote_identity_and_preserves_metadata(tmp_
                 platform_catalog.PlatformStat(
                     "series", "ok", remote_id="11", remote_title="ID 검증 작품",
                     remote_url="https://series.naver.com/novel/detail.series?productNo=11",
-                    download_count=100, genre="현판",
+                    download_count=100, genre="오염 장르",
                 ),
                 platform_catalog.PlatformStat(
                     "kakao", "ok", remote_id="99", remote_title="ID 검증 작품",
                     remote_url="https://page.kakao.com/content/99",
-                    view_count=200, genre="판타지", tags=("성장",),
+                    view_count=200, genre="오염 장르", tags=("오염태그",),
                 ),
             ],
         )
-        before = {
-            row["platform"]: tuple(row)
-            for row in conn.execute(
-                """
-                SELECT platform, download_count, view_count, genre,
-                       genre_collected_at, tags_collected_at
-                FROM catalog_platform_stats WHERE title_key = ?
-                ORDER BY platform
-                """,
-                (title_key,),
-            )
-        }
     finally:
         conn.close()
 
@@ -898,15 +1003,15 @@ def test_identity_audit_repairs_only_remote_identity_and_preserves_metadata(tmp_
         calls.append((title, tuple(platforms), dict(remote_ids), timeout))
         values = {
             "series": platform_catalog.PlatformStat(
-                "series", "ok", remote_id="11", remote_title="ID 검증 작품",
+                "series", "ok", remote_id="11", remote_title="ID 검증 작품 최신표기",
                 remote_url="https://series.naver.com/novel/detail.series?productNo=11",
-                download_count=999, genre="무협", metadata_lookup_mode="direct",
+                genre="현판", metadata_lookup_mode="direct",
             ),
             "kakao": platform_catalog.PlatformStat(
-                "kakao", "ok", remote_id="22", remote_title="ID 검증 작품",
-                remote_url="https://page.kakao.com/content/22",
-                view_count=999, genre="무협", tags=("회귀",),
-                metadata_lookup_mode="fallback",
+                "kakao", "ok", remote_id="99", remote_title="ID 검증 작품",
+                remote_url="https://page.kakao.com/content/99",
+                genre="판타지", tags=("성장", "먼치킨"),
+                metadata_lookup_mode="direct",
             ),
         }
         return [values[platform] for platform in platforms]
@@ -917,8 +1022,7 @@ def test_identity_audit_repairs_only_remote_identity_and_preserves_metadata(tmp_
     )
     assert result["selected_titles"] == 1
     assert result["selected_platforms"] == 2
-    assert result["outcome_counts"]["verified_direct"] == 1
-    assert result["outcome_counts"]["identity_repaired"] == 1
+    assert result["outcome_counts"]["revalidated"] == 2
     assert len(calls) == 1
     assert calls[0][2] == {"series": "11", "kakao": "99"}
 
@@ -929,7 +1033,7 @@ def test_identity_audit_repairs_only_remote_identity_and_preserves_metadata(tmp_
             row["platform"]: row
             for row in conn.execute(
                 """
-                SELECT platform, remote_id, remote_url, download_count, view_count,
+                SELECT platform, remote_id, remote_title, download_count, view_count,
                        genre, genre_collected_at, tags_collected_at
                 FROM catalog_platform_stats WHERE title_key = ?
                 """,
@@ -937,17 +1041,131 @@ def test_identity_audit_repairs_only_remote_identity_and_preserves_metadata(tmp_
             )
         }
         assert rows["series"]["remote_id"] == "11"
-        assert rows["kakao"]["remote_id"] == "22"
-        assert rows["kakao"]["remote_url"].endswith("/22")
+        assert rows["kakao"]["remote_id"] == "99"
+        assert rows["series"]["remote_title"] == "ID 검증 작품 최신표기"
         assert rows["series"]["download_count"] == 100
         assert rows["kakao"]["view_count"] == 200
-        assert rows["series"]["genre"] == before["series"][3]
-        assert rows["kakao"]["genre"] == before["kakao"][3]
-        assert rows["series"]["genre_collected_at"] == before["series"][4]
-        assert rows["kakao"]["genre_collected_at"] == before["kakao"][4]
-        assert rows["kakao"]["tags_collected_at"] == before["kakao"][5]
+        assert rows["series"]["genre"] == "현판"
+        assert rows["kakao"]["genre"] == "판타지"
+        assert rows["series"]["genre_collected_at"] is not None
+        assert rows["kakao"]["genre_collected_at"] is not None
+        assert rows["kakao"]["tags_collected_at"] is not None
         assert [
             row[0] for row in conn.execute(
+                "SELECT tag FROM catalog_platform_tags "
+                "WHERE title_key = ? AND platform = 'kakao' ORDER BY position",
+                (title_key,),
+            )
+        ] == ["성장", "먼치킨"]
+    finally:
+        conn.close()
+
+
+def test_consistency_pass_rechecks_cas_before_counting_verified_result(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    path = house / "CAS 검증 작품 1-10화.txt"
+    path.write_text("fixture", encoding="utf-8")
+    db_path = tmp_path / ".dedup_state" / "identity-cas.sqlite3"
+    conn = decision_store.initialize_state_db(db_path)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, path, source="house")
+        platform_catalog.sync_catalog_titles(conn)
+        title_key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            title_key,
+            [platform_catalog.PlatformStat(
+                "series", "ok", remote_id="11", remote_title="CAS 검증 작품",
+                remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+                download_count=100, genre="기존",
+            )],
+        )
+    finally:
+        conn.close()
+
+    def stale_lookup(_title, platforms, *, remote_ids, timeout):
+        assert remote_ids == {"series": "11"}
+        worker = decision_store.connect_state_db(db_path)
+        try:
+            with decision_store.transaction(worker):
+                worker.execute(
+                    "UPDATE catalog_titles SET query_title = '변경된 제목', "
+                    "updated_at = '2099-01-01 00:00:00' WHERE title_key = ?",
+                    (title_key,),
+                )
+        finally:
+            worker.close()
+        return [platform_catalog.PlatformStat(
+            "series", "ok", remote_id="11", remote_title="CAS 검증 작품",
+            remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+            genre="현판", metadata_lookup_mode="direct",
+        ) for _platform in platforms]
+
+    result = platform_catalog.repair_metadata_identities(
+        str(db_path), limit=None, delay_seconds=0, timeout=1,
+        lookup=stale_lookup,
+    )
+    assert result["outcome_counts"]["stale_target"] == 1
+    assert result["outcome_counts"]["revalidated"] == 0
+    conn = decision_store.connect_state_db(db_path)
+    try:
+        assert conn.execute(
+            "SELECT genre FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'series'",
+            (title_key,),
+        ).fetchone()[0] == "기존"
+    finally:
+        conn.close()
+
+
+def test_consistency_pass_never_switches_remote_id_on_title_mismatch(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    path = house / "ID 충돌 작품 1-10화.txt"
+    path.write_text("fixture", encoding="utf-8")
+    db_path = tmp_path / ".dedup_state" / "identity-conflict.sqlite3"
+    conn = decision_store.initialize_state_db(db_path)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, path, source="house")
+        platform_catalog.sync_catalog_titles(conn)
+        title_key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            title_key,
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="99", remote_title="ID 충돌 작품",
+                remote_url="https://page.kakao.com/content/99", view_count=200,
+                genre="판타지", tags=("성장",),
+            )],
+        )
+    finally:
+        conn.close()
+
+    def mismatch_lookup(_title, platforms, *, remote_ids, timeout):
+        assert remote_ids == {"kakao": "99"}
+        return [platform_catalog.PlatformStat(
+            "kakao", "not_found", message="stored remote title mismatch",
+            metadata_lookup_mode="direct_mismatch",
+        ) for _platform in platforms]
+
+    result = platform_catalog.repair_metadata_identities(
+        str(db_path), limit=None, delay_seconds=0, timeout=1,
+        lookup=mismatch_lookup,
+    )
+    assert result["outcome_counts"]["identity_conflict"] == 1
+    conn = decision_store.connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT remote_id, view_count, genre FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'kakao'",
+            (title_key,),
+        ).fetchone()
+        assert tuple(row) == ("99", 200, "판타지")
+        assert [
+            item[0] for item in conn.execute(
                 "SELECT tag FROM catalog_platform_tags "
                 "WHERE title_key = ? AND platform = 'kakao' ORDER BY position",
                 (title_key,),
@@ -964,14 +1182,18 @@ def test_existing_metric_refresh_still_updates_metadata_without_growth_counter(t
             conn,
             "작품",
             [platform_catalog.PlatformStat(
-                "kakao", "ok", rating=8.0, genre="판타지", tags=("성장",)
+                "kakao", "ok", remote_id="22", remote_title="작품",
+                remote_url="https://page.kakao.com/content/22",
+                rating=8.0, genre="판타지", tags=("성장",)
             )],
         )
         outcomes = platform_catalog.record_increased_platform_stats(
             conn,
             "작품",
             [platform_catalog.PlatformStat(
-                "kakao", "ok", rating=8.5, genre="무협", tags=("회귀",)
+                "kakao", "ok", remote_id="22", remote_title="작품",
+                remote_url="https://page.kakao.com/content/22",
+                rating=8.5, genre="무협", tags=("회귀",)
             )],
         )
         assert outcomes == {"kakao": "skipped"}
@@ -985,6 +1207,70 @@ def test_existing_metric_refresh_still_updates_metadata_without_growth_counter(t
         conn.close()
 
 
+def test_existing_metric_writer_rejects_cross_id_growth_and_metadata(tmp_path):
+    _db_path, conn = _catalog_db(tmp_path)
+    try:
+        platform_catalog.record_platform_stats(
+            conn,
+            "작품",
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="22", remote_title="작품",
+                remote_url="https://page.kakao.com/content/22",
+                view_count=100, genre="판타지", tags=("성장",),
+            )],
+        )
+        outcomes = platform_catalog.record_increased_platform_stats(
+            conn,
+            "작품",
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="99", remote_title="작품",
+                remote_url="https://page.kakao.com/content/99",
+                view_count=200, genre="무협", tags=("회귀",),
+            )],
+        )
+        assert outcomes == {"kakao": "identity_conflict"}
+        row = conn.execute(
+            "SELECT remote_id, view_count, genre FROM catalog_platform_stats "
+            "WHERE title_key = '작품' AND platform = 'kakao'"
+        ).fetchone()
+        assert tuple(row) == ("22", 100, "판타지")
+        assert _tags(conn, "kakao") == ["성장"]
+    finally:
+        conn.close()
+
+
+def test_existing_metric_writer_rejects_cross_id_without_growth(tmp_path):
+    _db_path, conn = _catalog_db(tmp_path)
+    try:
+        platform_catalog.record_platform_stats(
+            conn,
+            "작품",
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="22", remote_title="작품",
+                remote_url="https://page.kakao.com/content/22",
+                view_count=100, genre="판타지", tags=("성장",),
+            )],
+        )
+        outcomes = platform_catalog.record_increased_platform_stats(
+            conn,
+            "작품",
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="99", remote_title="작품",
+                remote_url="https://page.kakao.com/content/99",
+                view_count=90, genre="무협", tags=("회귀",),
+            )],
+        )
+        assert outcomes == {"kakao": "identity_conflict"}
+        row = conn.execute(
+            "SELECT remote_id, view_count, genre FROM catalog_platform_stats "
+            "WHERE title_key = '작품' AND platform = 'kakao'"
+        ).fetchone()
+        assert tuple(row) == ("22", 100, "판타지")
+        assert _tags(conn, "kakao") == ["성장"]
+    finally:
+        conn.close()
+
+
 def test_existing_metric_refresh_updates_metadata_even_when_count_is_unchanged(tmp_path):
     _db_path, conn = _catalog_db(tmp_path)
     try:
@@ -992,7 +1278,9 @@ def test_existing_metric_refresh_updates_metadata_even_when_count_is_unchanged(t
             conn,
             "작품",
             [platform_catalog.PlatformStat(
-                "novelpia", "ok", view_count=100, recommend_count=10,
+                "novelpia", "ok", remote_id="33", remote_title="작품",
+                remote_url="https://novelpia.com/novel/33",
+                view_count=100, recommend_count=10,
                 genre="판타지", tags=("판타지",),
             )],
         )
@@ -1000,7 +1288,9 @@ def test_existing_metric_refresh_updates_metadata_even_when_count_is_unchanged(t
             conn,
             "작품",
             [platform_catalog.PlatformStat(
-                "novelpia", "ok", view_count=100, recommend_count=10,
+                "novelpia", "ok", remote_id="33", remote_title="작품",
+                remote_url="https://novelpia.com/novel/33",
+                view_count=100, recommend_count=10,
                 genre="무협", tags=("판타지", "먼치킨"),
             )],
         )

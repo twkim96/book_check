@@ -128,14 +128,14 @@ SERVICE_DEFINITIONS = (
     ServiceDefinition(
         "platform-identity",
         "service_platform_identity",
-        "플랫폼 remote ID 검증·교정",
-        "시리즈·카카오 성공 행의 저장된 remote ID를 원문 제목으로 다시 검증하고, 다른 ID가 확인된 경우 identity 필드만 교정합니다.",
+        "플랫폼 metadata consistency 재검증",
+        "시리즈·카카오 성공 행을 저장된 remote ID에서 다시 읽어 제목과 장르·태그 provenance를 같은 원격 객체 기준으로 재검증합니다.",
         "메타데이터",
         False,
-        "identity 감사 작품",
-        ("기존 Series/Kakao 성공 remote ID", "플랫폼 상세/검색"),
-        ("remote_id", "remote_title", "remote_url"),
-        ("기존 인기 지표·장르·태그는 변경하지 않음", "제목/remote ID CAS 검증", "불일치만 교정"),
+        "consistency 재검증 작품",
+        ("기존 Series/Kakao 성공 remote ID", "같은 ID의 플랫폼 상세/BFF"),
+        ("같은 ID의 remote_title/remote_url", "장르", "카카오 태그", "수집 시각"),
+        ("다른 remote ID로 자동 전환 금지", "인기 지표 변경 금지", "제목/remote ID CAS 검증"),
         True,
     ),
     ServiceDefinition(
@@ -233,7 +233,7 @@ class LibraryServiceRegistry:
                 "refresh-metadata", ("--all",), progress
             ),
             "platform-identity": lambda payload, progress: self._run_platform(
-                "repair-metadata-identities", ("--all",), progress
+                "revalidate-metadata-consistency", ("--all",), progress
             ),
             "novelpia-auth-retry": lambda payload, progress: self._run_platform(
                 "retry-novelpia-auth", (), progress
@@ -637,8 +637,8 @@ class LibraryServiceRegistry:
             "existing_progress": "기존 인기값 갱신",
             "metadata_start": "플랫폼 메타데이터 backfill 시작",
             "metadata_progress": "플랫폼 메타데이터 backfill",
-            "identity_start": "플랫폼 remote ID 검증 시작",
-            "identity_progress": "플랫폼 remote ID 검증·교정",
+            "identity_start": "플랫폼 metadata consistency 재검증 시작",
+            "identity_progress": "플랫폼 metadata consistency 재검증",
             "sheet_snapshot": "SQLite Sheet snapshot 준비",
             "sheet_write_start": "Google Sheet 임시 탭 쓰기 시작",
             "sheet_temp_tabs_created": "Google Sheet 임시 탭 생성",
@@ -678,10 +678,36 @@ class LibraryServiceRegistry:
         progress(0, 0, f"{command} 실행 준비", stage="validating", event={"phase": "validating"})
         try:
             result = run_platform_catalog.run(args, progress=report)
+            terminal_state = "succeeded"
+            terminal_message = "작업 완료"
+            if command == "revalidate-metadata-consistency":
+                counts = dict(result.get("outcome_counts") or {})
+                unresolved = sum(
+                    int(counts.get(key, 0) or 0)
+                    for key in (
+                        "identity_conflict",
+                        "unavailable",
+                        "stale_target",
+                        "error",
+                        "skipped",
+                    )
+                )
+                if unresolved:
+                    terminal_state = "needs_review"
+                    terminal_message = (
+                        "metadata consistency 재검증 완료 · "
+                        f"잔여 {unresolved:,}건 검토 필요"
+                    )
+                    result = {
+                        **result,
+                        "unresolved_count": unresolved,
+                        "_job_state": terminal_state,
+                        "_job_message": terminal_message,
+                    }
             result_phase = "sheet_result" if command == "sheet-sync" else "platform_result"
             progress(1, 1, f"{command} 검증 완료", stage="verifying", event={
                 "phase": result_phase,
-                "status": "succeeded",
+                "status": terminal_state,
                 "elapsed_seconds": round(max(0.0, time.monotonic() - started_at), 3),
                 **result,
             })

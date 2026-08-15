@@ -1751,5 +1751,22 @@ def unlink_owned(path, *, expected: FileEvidence):
         os.close(parent_fd)
 
 
+def unlink_owned_at(directory_fd: int, leaf: str, *, expected: FileEvidence):
+    """Unlink one single-component owned file beneath a pinned directory FD."""
+    current = inspect_regular_file_at(directory_fd, leaf)
+    if not evidence_matches(current, expected):
+        raise SourceIdentityChanged(f"unlink source identity changed: {leaf}")
+    final = os.stat(leaf, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or final.st_nlink != 1
+        or (final.st_dev, final.st_ino, final.st_ctime_ns)
+        != (expected.dev, expected.ino, expected.ctime_ns)
+    ):
+        raise SourceIdentityChanged(f"unlink pathname identity changed: {leaf}")
+    os.unlink(leaf, dir_fd=directory_fd)
+    os.fsync(directory_fd)
+
+
 def evidence_dict(prefix: str, evidence: FileEvidence):
     return {f"{prefix}_{key}": value for key, value in asdict(evidence).items()}

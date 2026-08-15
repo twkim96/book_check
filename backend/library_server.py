@@ -93,7 +93,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.18"
+SERVER_VERSION = "1.4.19"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -206,36 +206,26 @@ def _recover_interrupted_folderling_jobs(
         for record in records
         if record.get("job_type") == "service_folderling"
     }
-    unresolved = [
-        str(record["job_id"])
-        for record in records
-        if record.get("job_type") == "service_folderling"
-        and bindings.get(str(record["job_id"])) is None
-        and record.get("started_at") is not None
-        and record.get("interrupted_from_state") != "queued"
-    ]
-    if len(unresolved) == 1:
-        conn = decision_store.connect_state_db(config.state_db)
-        try:
-            rows = conn.execute(
-                """
-                SELECT run_id FROM actual_runs
-                WHERE state IN ('approved', 'active')
-                  AND house_root = ? AND temp_root = ?
-                """,
-                (
-                    decision_store.canonicalize_real_path(config.house_dir),
-                    decision_store.canonicalize_real_path(config.temp_dir),
+    jobs_by_run = {}
+    for job_id, run_id in bindings.items():
+        if run_id is not None:
+            jobs_by_run.setdefault(run_id, []).append(job_id)
+    duplicate_run_ids = {
+        run_id for run_id, job_ids in jobs_by_run.items() if len(job_ids) > 1
+    }
+    for run_id in duplicate_run_ids:
+        for job_id in jobs_by_run[run_id]:
+            bindings[job_id] = None
+            store.append_event(job_id, {
+                "phase": "interrupted_run_recovery_required",
+                "status": "blocked",
+                "run_id": run_id,
+                "error_code": "ambiguous_job_binding",
+                "error_message": (
+                    "둘 이상의 interrupted Folderling job이 같은 actual run을 "
+                    "가리켜 자동 job reconciliation을 중단했습니다."
                 ),
-            ).fetchall()
-        finally:
-            conn.close()
-        claimed = {run_id for run_id in bindings.values() if run_id is not None}
-        candidates = [str(row["run_id"]) for row in rows if row["run_id"] not in claimed]
-        if len(candidates) == 1:
-            job_id = unresolved[0]
-            bindings[job_id] = candidates[0]
-            store.update(job_id, actual_run_id=candidates[0])
+            })
     for record in records:
         run_id = bindings.get(str(record["job_id"]))
         if run_id is None:

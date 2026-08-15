@@ -819,6 +819,30 @@ def _manifest_relative_path_key(value: str) -> str:
     return unicodedata.normalize("NFC", value)
 
 
+def _canonical_uuid_component(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{label} is missing")
+    try:
+        parsed = str(uuid.UUID(value))
+    except (ValueError, AttributeError) as exc:
+        raise RuntimeError(f"{label} is not a canonical UUID") from exc
+    if parsed != value:
+        raise RuntimeError(f"{label} is not a canonical UUID")
+    return parsed
+
+
+def _activation_manifest_leaf(run_id: str, claim_id: str) -> str:
+    prefix = "actual-"
+    if not isinstance(run_id, str) or not run_id.startswith(prefix):
+        raise RuntimeError("actual run ID has an invalid format")
+    _canonical_uuid_component(run_id[len(prefix):], label="actual run UUID")
+    _canonical_uuid_component(claim_id, label="activation claim UUID")
+    leaf = f"{run_id}-{claim_id}.json"
+    if Path(leaf).name != leaf or leaf in {"", ".", ".."}:
+        raise RuntimeError("activation manifest leaf is invalid")
+    return leaf
+
+
 def _manifest_lookup_from_records(records):
     lookup = {}
     for record in records:
@@ -836,7 +860,7 @@ def _manifest_lookup_from_records(records):
 
 def prepare_actual_run(
     path, house_dir, temp_dir, *, manifest_paths=None,
-    preflight_receipt=None,
+    preflight_receipt=None, _test_failpoint=None,
 ):
     """Consume one approval before any filesystem mutation and record its manifest."""
     _validated_receipt_run_id(
@@ -876,6 +900,7 @@ def prepare_actual_run(
                 raise RuntimeError("approved actual run roots do not match this invocation")
             _verify_backup_evidence(row["backup_path"], row["backup_sha256"])
             run_id = row["run_id"]
+            manifest_leaf = _activation_manifest_leaf(run_id, claim_id)
             claimed = conn.execute(
                 """
                 UPDATE actual_runs SET activation_claim = ?
@@ -892,6 +917,8 @@ def prepare_actual_run(
             conn.execute("DELETE FROM settings WHERE key = 'approved_run_id'")
     finally:
         conn.close()
+    if _test_failpoint is not None:
+        _test_failpoint("claim_committed")
 
     manifest_path = None
     manifest_created = False
@@ -950,16 +977,56 @@ def prepare_actual_run(
                         record["raw_rel_path"] = raw_rel_path
                     records.append(record)
         manifest_dir = Path(path).resolve().parent / "manifests"
-        manifest_dir.mkdir(parents=True, exist_ok=True)
-        manifest_path = manifest_dir / f"{run_id}-{claim_id}.json"
-        with open(manifest_path, "x", encoding="utf-8") as manifest:
-            json.dump(
-                {"run_id": run_id, "files": records}, manifest,
-                ensure_ascii=False, indent=2,
+        from mutation_io import (
+            ensure_directory_nofollow,
+            inspect_regular_file_at,
+            opened_directory_nofollow,
+        )
+        ensure_directory_nofollow(manifest_dir, mode=0o700)
+        manifest_path = manifest_dir / manifest_leaf
+        with opened_directory_nofollow(manifest_dir) as manifest_dir_fd:
+            flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
             )
-        manifest_created = True
-        from mutation_io import inspect_regular_file
-        manifest_created_evidence = inspect_regular_file(manifest_path)
+            manifest_fd = os.open(manifest_leaf, flags, 0o600, dir_fd=manifest_dir_fd)
+            manifest_created = True
+            if _test_failpoint is not None:
+                _test_failpoint("manifest_opened")
+            with os.fdopen(manifest_fd, "w", encoding="utf-8") as manifest:
+                if _test_failpoint is None:
+                    json.dump(
+                        {"run_id": run_id, "files": records}, manifest,
+                        ensure_ascii=False, indent=2,
+                    )
+                else:
+                    class _FailpointWriter:
+                        def __init__(self, handle):
+                            self.handle = handle
+                            self.triggered = False
+
+                        def write(self, text):
+                            written = self.handle.write(text)
+                            if text and not self.triggered:
+                                self.handle.flush()
+                                self.triggered = True
+                                _test_failpoint("manifest_partial")
+                            return written
+
+                    json.dump(
+                        {"run_id": run_id, "files": records},
+                        _FailpointWriter(manifest),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                manifest.flush()
+                os.fsync(manifest.fileno())
+            os.fsync(manifest_dir_fd)
+            if _test_failpoint is not None:
+                _test_failpoint("manifest_fsynced")
+            manifest_created_evidence = inspect_regular_file_at(
+                manifest_dir_fd, manifest_leaf
+            )
         manifest_sha256 = manifest_created_evidence.sha256
 
         conn = connect_state_db(path)
@@ -994,6 +1061,8 @@ def prepare_actual_run(
                 )
         finally:
             conn.close()
+        if _test_failpoint is not None:
+            _test_failpoint("active_committed")
     except Exception as exc:
         state_record_error = None
         try:
@@ -1022,10 +1091,20 @@ def prepare_actual_run(
         cleanup_error = None
         try:
             if manifest_created and manifest_path is not None:
-                from mutation_io import unlink_owned
-                if manifest_created_evidence is None:
-                    raise OSError("activation manifest evidence unavailable for cleanup")
-                unlink_owned(manifest_path, expected=manifest_created_evidence)
+                from mutation_io import (
+                    inspect_regular_file_at,
+                    opened_directory_nofollow,
+                    unlink_owned_at,
+                )
+                with opened_directory_nofollow(manifest_path.parent) as manifest_dir_fd:
+                    evidence = manifest_created_evidence or inspect_regular_file_at(
+                        manifest_dir_fd, manifest_leaf
+                    )
+                    unlink_owned_at(
+                        manifest_dir_fd,
+                        manifest_leaf,
+                        expected=evidence,
+                    )
         except FileNotFoundError:
             pass
         except OSError as unlink_exc:
@@ -1518,8 +1597,9 @@ def close_interrupted_claimed_approved_run(
     """Cancel an activation-claimed approval that never reached active state."""
     from mutation_io import (
         assert_mutation_lock_for_roots_held,
-        inspect_regular_file,
-        unlink_owned,
+        inspect_regular_file_at,
+        opened_directory_nofollow,
+        unlink_owned_at,
     )
 
     assert_mutation_lock_for_roots_held(house_dir, temp_dir)
@@ -1576,30 +1656,36 @@ def close_interrupted_claimed_approved_run(
     db_row = conn.execute("PRAGMA database_list").fetchone()
     if db_row is None or not db_row[2]:
         raise RuntimeError("interrupted claimed run requires file-backed state DB")
-    manifest_path = (
-        Path(db_row[2]).resolve().parent / "manifests" /
-        f"{run_id}-{claim_id}.json"
-    )
+    manifest_dir = Path(db_row[2]).resolve().parent / "manifests"
+    manifest_leaf = _activation_manifest_leaf(run_id, str(claim_id))
+    manifest_path = manifest_dir / manifest_leaf
     manifest_evidence = None
     try:
-        info = os.lstat(manifest_path)
-    except FileNotFoundError:
-        pass
-    else:
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_nlink != 1
-        ):
-            raise RuntimeError(
-                f"interrupted claimed run manifest is not an owned regular file: {manifest_path}"
+        with opened_directory_nofollow(manifest_dir) as manifest_dir_fd:
+            info = os.stat(
+                manifest_leaf, dir_fd=manifest_dir_fd, follow_symlinks=False
             )
-        manifest_evidence = inspect_regular_file(manifest_path)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+            ):
+                raise RuntimeError(
+                    "interrupted claimed run manifest is not an owned regular file: "
+                    f"{manifest_path}"
+                )
+            manifest_evidence = inspect_regular_file_at(
+                manifest_dir_fd, manifest_leaf
+            )
+            unlink_owned_at(
+                manifest_dir_fd,
+                manifest_leaf,
+                expected=manifest_evidence,
+            )
+    except FileNotFoundError:
+        manifest_evidence = None
 
-    manifest_removed = False
-    if manifest_evidence is not None:
-        unlink_owned(manifest_path, expected=manifest_evidence)
-        manifest_removed = True
+    manifest_removed = manifest_evidence is not None
 
     with transaction(conn):
         current = load_evidence()

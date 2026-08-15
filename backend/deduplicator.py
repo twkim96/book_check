@@ -1060,6 +1060,7 @@ def move_suspect_group(group, temp_dir, dry_run):
 def run_auditor_queue_report(
     index_path, house_dir, temp_dir, state_db_path=None, cache_write=True,
     progress_callback=None, rebaseline=False, verified_house_inventory=None,
+    before_non_cache_mutation=None,
 ):
     """folderling 검토 큐용 read-only auditor 실행. 파일 이동은 호출 측에서만 한다."""
     import duplicate_auditor
@@ -1097,6 +1098,7 @@ def run_auditor_queue_report(
     args.cache_write = cache_write
     args.progress_callback = progress_callback
     args.verified_house_inventory = verified_house_inventory
+    args.before_non_cache_mutation = before_non_cache_mutation
     return duplicate_auditor.run_audit(args)
 
 
@@ -3460,6 +3462,7 @@ def _clean_duplicates_impl(
     event_callback=None,
     verified_index_entries=None,
     verified_house_inventory=None,
+    before_non_cache_mutation=None,
 ):
     performance_metrics = {}
     auditor_rebaseline_retry = False
@@ -3537,6 +3540,7 @@ def _clean_duplicates_impl(
             cache_write=not pure_plan,
             progress_callback=auditor_progress_callback,
             verified_house_inventory=verified_house_inventory,
+            before_non_cache_mutation=before_non_cache_mutation,
         )
         rebaseline_reasons = _auditor_rebaseline_reasons(auditor_report)
         if (
@@ -3577,6 +3581,7 @@ def _clean_duplicates_impl(
                 progress_callback=auditor_progress_callback,
                 rebaseline=True,
                 verified_house_inventory=verified_house_inventory,
+                before_non_cache_mutation=before_non_cache_mutation,
             )
             if isinstance(getattr(auditor_report, "stats", None), dict):
                 retry_read_bytes = int(
@@ -3989,6 +3994,7 @@ def clean_duplicates(
     event_callback=None,
     verified_index_entries=None,
     verified_house_inventory=None,
+    before_non_cache_mutation=None,
 ):
     """Public entry point; actual managed runs require a DB-backed active capability."""
     if not dry_run and not require_state_db:
@@ -4014,6 +4020,7 @@ def clean_duplicates(
         event_callback=event_callback,
         verified_index_entries=verified_index_entries,
         verified_house_inventory=verified_house_inventory,
+        before_non_cache_mutation=before_non_cache_mutation,
     )
     if dry_run or not require_state_db:
         return _clean_duplicates_impl(**kwargs, actual_run_id=None)

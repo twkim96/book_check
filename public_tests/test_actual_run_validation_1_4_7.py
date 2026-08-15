@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import decision_store
 import duplicate_auditor
 
@@ -107,6 +109,42 @@ def test_receipt_bound_auditor_initialization_uses_structural_validation(
     cache.close()
 
     assert calls == [False]
+
+
+def test_auditor_marks_actual_run_before_non_cache_review_mutation(
+    tmp_path, monkeypatch,
+):
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    conn.close()
+    markers = []
+    cache = duplicate_auditor.PersistentAuditCache(
+        state_db,
+        [],
+        "pair-config",
+        "analysis-config",
+        before_non_cache_mutation=lambda: markers.append("marked"),
+    )
+    cache.file_ids = {"left": 1, "right": 2}
+
+    def fake_supersede(*_args, **_kwargs):
+        assert markers == ["marked"]
+        return 1
+
+    monkeypatch.setattr(
+        duplicate_auditor, "supersede_open_pair_reviews", fake_supersede
+    )
+    candidate = SimpleNamespace(
+        left=SimpleNamespace(path="left"),
+        right=SimpleNamespace(path="right"),
+    )
+    result = SimpleNamespace(
+        classification="lossless_identity_mismatch",
+        evidence={},
+    )
+    cache._store_review_item(candidate, result)
+    assert cache.stats["lossless_mismatch_reviews_superseded"] == 1
+    cache.close()
 
 
 def test_standalone_auditor_initialization_keeps_full_integrity_validation(

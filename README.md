@@ -686,17 +686,43 @@ version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, archive `1.
 - 선택 메타데이터가 일시 실패해도 기존 조회 수·추천 수·평점과 과거 성공 장르/태그를 지우지 않는다.
 - 기존 성공 행은 `run_platform_catalog.py refresh-metadata` 또는 도서 관리의 `플랫폼 메타데이터 backfill`
   서비스로 popularity metric을 바꾸지 않고 빠진 장르/태그만 채운다.
-- metadata backfill은 Series/Kakao의 저장된 `remote_id`로 상세/BFF를 직접 조회해 검색 요청을 줄이고,
-  상세 제목 불일치·요청 실패 시 기존 제목 검색으로 안전하게 fallback한다. fallback이 다른 verified ID를 찾으면 popularity는 보존한 채 remote identity와 metadata를 같은 transaction에서 교정하고, target의 query/revision/expected ID가 바뀌었으면 `stale_target`으로 쓰지 않는다. 장시간 서비스 진행 로그는 10작품 단위로 throttle한다.
-- 운영 backfill 뒤에는 `repair-metadata-identities --all` 또는 도서 관리의 `플랫폼 remote ID 검증·교정` 서비스로 Series/Kakao 성공 ID를 전수 재검증할 수 있다. 이 감사에서는 popularity와 기존 장르/태그 snapshot을 변경하지 않으며 Kakao direct 검증은 overview만 읽는다.
+- 1.4.18 metadata backfill은 Series/Kakao의 저장된 `remote_id` direct 조회를 도입해 검색 요청을 줄였다.
+  운영 리뷰에서 direct 실패 뒤 다른 ID로 fallback하는 provenance 문제가 확인되어, 현재 동작은 아래 1.4.19
+  계약으로 대체한다. 장시간 서비스 진행 로그의 10작품 단위 throttle은 유지한다.
+- 1.4.18 운영 backfill 결과의 Series/Kakao metadata provenance는 1.4.19의 stored-ID consistency pass로
+  다시 확정한 뒤 최종 운영 snapshot으로 승인한다.
 - 카탈로그 UI/API와 Google Sheet에서 플랫폼별 장르를 표시하고, 카카오·노벨피아 태그는 원 순서를 보존한다. 두 projection은 한 SQLite read transaction에서 동일 snapshot을 읽는다.
 
 운영 리뷰 hotfix는 Folderling activation claim 중단 상태와 이미 `interrupted`로 남은 persistent job을 재시작마다 반복 reconciliation하고, journal 밖 side effect 전에 actual-run mutation marker를 남긴다. 따라서 claim 직후·manifest 작성 중 crash는 증명 가능한 pre-mutation 상태에서만 자동 종료하고, mutation evidence가 있으면 계속 fail-closed한다.
 
-배포/UI/platform catalog는 `1.4.18`, schema는 `v16`이다. `NORMALIZER_VERSION=1.3.3`, fingerprint
+### 1.4.19 production-safety hotfix
+
+1.4.19는 1.4.18 운영 backfill 중 받은 두 차례 production-safety 리뷰의 remote-object provenance와
+Folderling restart 경계를 보강한다. schema와 중복 판정 의미는 바꾸지 않는다.
+
+- Series/Kakao에 저장된 `remote_id`가 있으면 metadata backfill과 기존 popularity refresh 모두 그 ID를
+  직접 검증한다. timeout/403/5xx/parser failure는 ID 오류 증거가 아니므로 검색 fallback이나 ID 교체를
+  하지 않고 기존 값을 보존한다. positive title mismatch도 `identity_conflict`로 남기며 자동 ID 전환을
+  금지한다.
+- `platform-identity` 서비스는 호환 ID를 유지하지만 동작은 **metadata consistency 재검증**이다.
+  Series는 저장 ID detail의 장르, Kakao는 같은 저장 ID의 overview 장르와 about 태그를 다시 읽어
+  a332 backfill에서 발생했을 수 있는 metadata provenance 혼합을 같은 remote object 기준으로 덮어쓴다.
+  popularity metric은 변경하지 않는다.
+- popularity refresh는 Series/Kakao 저장 ID direct 결과만 사용하고, 어떤 경로에서든 lookup 결과의
+  `remote_id`가 현재 row와 다르면 metric·genre·tag를 모두 쓰지 않는다. title revision과 expected ID도
+  writer transaction에서 CAS한다.
+- activation manifest는 canonical `actual-UUID`/claim UUID만 허용하고 pinned manifest directory 아래의
+  단일 leaf로 생성·검증·삭제한다. active DB commit 전에 manifest file과 parent directory를 fsync한다.
+- interrupted job과 actual run은 명시적 `actual_run_id`/preflight/start event 없이는 추정 연결하지 않는다.
+  중복 job binding은 history reconciliation을 보류하되 actual run 자체의 orphan safety cleanup은 독립적으로
+  수행한다.
+- duplicate auditor는 fingerprint/pair cache만 쓰는 동안에는 pre-mutation auto-recovery 가능성을 유지한다.
+  최초 `review_items` 같은 non-cache mutation 직전에 Folderling mutation marker를 영속화한다.
+
+배포/UI/platform catalog는 `1.4.19`, schema는 계속 `v16`이다. `NORMALIZER_VERSION=1.3.3`, fingerprint
 version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, duplicate auditor contract `1.4.17`,
-archive `1.4.10`은 의미가 바뀌지 않아 유지한다. 운영 migration/backfill과 장시간 Folderling 검증 절차는
-[`update_1.4.18.md`](update_1.4.18.md)에 기록한다.
+archive `1.4.10`은 의미가 바뀌지 않아 유지한다. 1.4.18의 실제 backfill이 끝난 뒤 1.4.19 서버를 올리고
+stored-ID metadata consistency pass를 완료한 다음에만 Folderling 운영 인수를 진행한다.
 
 ## 구조
 

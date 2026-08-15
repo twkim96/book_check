@@ -27,10 +27,22 @@ def _make_db(tmp_path, *names):
 
 def _stat(platform):
     if platform == "series":
-        return platform_catalog.PlatformStat(platform, "ok", download_count=123, rating=9.1)
+        return platform_catalog.PlatformStat(
+            platform, "ok", remote_id="11", remote_title="합성작품",
+            remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+            download_count=123, rating=9.1,
+        )
     if platform == "kakao":
-        return platform_catalog.PlatformStat(platform, "ok", view_count=456, rating=8.2)
-    return platform_catalog.PlatformStat(platform, "ok", view_count=789, recommend_count=22)
+        return platform_catalog.PlatformStat(
+            platform, "ok", remote_id="22", remote_title="합성작품",
+            remote_url="https://page.kakao.com/content/22",
+            view_count=456, rating=8.2,
+        )
+    return platform_catalog.PlatformStat(
+        platform, "ok", remote_id="33", remote_title="합성작품",
+        remote_url="https://novelpia.com/novel/33",
+        view_count=789, recommend_count=22,
+    )
 
 
 def test_catalog_keeps_six_platform_metrics_without_touching_files(tmp_path):
@@ -192,10 +204,10 @@ def test_existing_metric_refresh_selects_only_successful_platforms_with_counts(t
             key,
             [
                 platform_catalog.PlatformStat(
-                    "series", "ok", rating=9.0
+                    "series", "ok", remote_id="11", rating=9.0
                 ),
                 platform_catalog.PlatformStat(
-                    "kakao", "ok", view_count=456, rating=8.2
+                    "kakao", "ok", remote_id="22", view_count=456, rating=8.2
                 ),
                 platform_catalog.PlatformStat(
                     "novelpia", "not_found"
@@ -220,11 +232,12 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
             key,
             [
                 platform_catalog.PlatformStat(
-                    "series", "ok", download_count=100,
+                    "series", "ok", remote_id="11", download_count=100,
                     rating=9.0, rating_count=20,
                 ),
                 platform_catalog.PlatformStat(
-                    "novelpia", "ok", view_count=1000, recommend_count=100,
+                    "novelpia", "ok", remote_id="33",
+                    view_count=1000, recommend_count=100,
                 ),
             ],
         )
@@ -233,11 +246,12 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
             key,
             [
                 platform_catalog.PlatformStat(
-                    "series", "ok", download_count=120,
+                    "series", "ok", remote_id="11", download_count=120,
                     rating=8.7, rating_count=18,
                 ),
                 platform_catalog.PlatformStat(
-                    "novelpia", "ok", view_count=1100, recommend_count=95,
+                    "novelpia", "ok", remote_id="33",
+                    view_count=1100, recommend_count=95,
                 ),
             ],
         )
@@ -257,7 +271,7 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
             key,
             [
                 platform_catalog.PlatformStat(
-                    "series", "ok", download_count=119, rating=9.9
+                    "series", "ok", remote_id="11", download_count=119, rating=9.9
                 ),
                 platform_catalog.PlatformStat(
                     "novelpia", "error", message="temporary"
@@ -285,7 +299,9 @@ def test_existing_metric_update_serializes_concurrent_writers(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             key,
-            [platform_catalog.PlatformStat("series", "ok", download_count=100)],
+            [platform_catalog.PlatformStat(
+                "series", "ok", remote_id="11", download_count=100
+            )],
         )
     finally:
         conn.close()
@@ -301,7 +317,7 @@ def test_existing_metric_update_serializes_concurrent_writers(tmp_path):
                 worker,
                 key,
                 [platform_catalog.PlatformStat(
-                    "series", "ok", download_count=value
+                    "series", "ok", remote_id="11", download_count=value
                 )],
             )
         except Exception as exc:
@@ -343,10 +359,11 @@ def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallbac
             key,
             [
                 platform_catalog.PlatformStat(
-                    "kakao", "ok", view_count=100, rating=8.0
+                    "kakao", "ok", remote_id="22", view_count=100, rating=8.0
                 ),
                 platform_catalog.PlatformStat(
-                    "novelpia", "ok", view_count=200, recommend_count=20
+                    "novelpia", "ok", remote_id="33",
+                    view_count=200, recommend_count=20
                 ),
             ],
         )
@@ -360,7 +377,7 @@ def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallbac
         calls.append(tuple(platforms))
         return [
             platform_catalog.PlatformStat(
-                "kakao", "ok", view_count=150, rating=8.3
+                "kakao", "ok", remote_id="22", view_count=150, rating=8.3
             ),
             platform_catalog.PlatformStat("novelpia", "not_found"),
         ]
@@ -368,7 +385,7 @@ def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallbac
     def authenticated(title, *, timeout):
         auth_calls.append(title)
         return platform_catalog.PlatformStat(
-            "novelpia", "ok", view_count=250, recommend_count=25
+            "novelpia", "ok", remote_id="33", view_count=250, recommend_count=25
         )
 
     result = platform_catalog.refresh_existing_metrics(
@@ -979,7 +996,7 @@ def test_authenticated_novelpia_retry_dry_run_needs_no_credentials(tmp_path):
     assert result["selected_titles"] == 1
 
 
-def test_metadata_identity_repair_cli_dry_run_selects_successful_series_kakao(tmp_path):
+def test_metadata_consistency_cli_dry_run_selects_successful_series_kakao(tmp_path):
     state_db = _make_db(tmp_path, "ID 감사 작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)
     try:
@@ -1009,7 +1026,7 @@ def test_metadata_identity_repair_cli_dry_run_selects_successful_series_kakao(tm
 
     args = run_platform_catalog.build_parser().parse_args([
         "--state-db", str(state_db),
-        "repair-metadata-identities", "--all", "--dry-run",
+        "revalidate-metadata-consistency", "--all", "--dry-run",
     ])
     result = run_platform_catalog.run(args)
     assert result["dry_run"] is True

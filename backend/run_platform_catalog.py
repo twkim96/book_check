@@ -109,8 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     repair_identity = subparsers.add_parser(
-        "repair-metadata-identities",
-        help="Series/Kakao 성공 행의 remote ID를 재검증하고 identity drift만 교정합니다.",
+        "revalidate-metadata-consistency",
+        aliases=["repair-metadata-identities"],
+        help=(
+            "Series/Kakao 성공 행을 저장된 remote ID에서 다시 읽어 "
+            "identity와 장르/태그 provenance를 재검증합니다."
+        ),
     )
     repair_identity.add_argument(
         "--limit", type=int, default=platform_catalog.DEFAULT_LIMIT
@@ -126,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
     )
     repair_identity.add_argument(
-        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 identity 감사 대상만 확인"
+        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 consistency 재검증 대상만 확인"
     )
 
     retry_failed = subparsers.add_parser(
@@ -308,7 +312,7 @@ def _progress_reporter():
         if phase == "identity_start":
             started_at = time.monotonic()
             print(
-                "🔎 플랫폼 remote ID 감사 시작: "
+                "🔎 플랫폼 metadata consistency 재검증 시작: "
                 f"전체 제목 {event['discovered_titles']:,}개, "
                 f"이번 대상 {event['selected_titles']:,}개 / "
                 f"플랫폼 {event['selected_platforms']:,}건",
@@ -347,7 +351,7 @@ def _progress_reporter():
                 "🏷️ 메타데이터 진행 "
                 + f"{completed:,}/{total:,} ({percent:.1f}%) | "
                 f"updated={counts.get('updated', 0):,} "
-                f"identity_repaired={counts.get('identity_repaired', 0):,} "
+                f"identity_conflict={counts.get('identity_conflict', 0):,} "
                 f"stale={counts.get('stale_target', 0):,} "
                 f"unavailable={counts.get('unavailable', 0):,} "
                 f"error={counts.get('error', 0):,} | "
@@ -358,11 +362,11 @@ def _progress_reporter():
         if phase == "identity_progress":
             counts = event["outcome_counts"]
             print(
-                "🔎 remote ID 감사 진행 "
+                "🔎 metadata consistency 재검증 "
                 + f"{completed:,}/{total:,} ({percent:.1f}%) | "
-                f"direct={counts.get('verified_direct', 0):,} "
-                f"fallback={counts.get('verified_fallback', 0):,} "
-                f"repaired={counts.get('identity_repaired', 0):,} "
+                f"revalidated={counts.get('revalidated', 0):,} "
+                f"conflict={counts.get('identity_conflict', 0):,} "
+                f"unavailable={counts.get('unavailable', 0):,} "
                 f"stale={counts.get('stale_target', 0):,} "
                 f"error={counts.get('error', 0):,} | "
                 f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
@@ -929,7 +933,9 @@ def run(args: argparse.Namespace, *, progress=None):
                     progress=progress,
                 )
             result = {"file_metadata": metadata, **result}
-    elif args.command == "repair-metadata-identities":
+    elif args.command in {
+        "revalidate-metadata-consistency", "repair-metadata-identities"
+    }:
         limit = None if args.all else args.limit
         if args.dry_run:
             backup = None
@@ -955,7 +961,7 @@ def run(args: argparse.Namespace, *, progress=None):
         else:
             backup, metadata = sync_file_metadata(args.state_db, progress=progress)
             with _platform_refresh_lock(
-                args.state_db, "platform-metadata-identity-repair"
+                args.state_db, "platform-metadata-consistency-revalidation"
             ):
                 result = platform_catalog.repair_metadata_identities(
                     args.state_db,

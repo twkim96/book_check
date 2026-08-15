@@ -1487,6 +1487,7 @@ def _process_items_authorized(
         verified_house_inventory=(
             snapshot["auditor_inventory"] if snapshot["valid"] else None
         ),
+        before_non_cache_mutation=mark_mutation_phase,
     )
     performance_metrics["dedup_seconds"] = round(
         time.perf_counter() - stage_started_at, 6

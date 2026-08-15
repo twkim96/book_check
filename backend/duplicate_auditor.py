@@ -1194,6 +1194,7 @@ class PersistentAuditCache:
     def __init__(
         self, state_db_path, entries, configuration_hash,
         analysis_policy_hash=None, trust_entry_identity=False,
+        before_non_cache_mutation=None,
     ):
         import decision_store
 
@@ -1208,6 +1209,7 @@ class PersistentAuditCache:
         self.configuration_hash = configuration_hash
         self.analysis_policy_hash = analysis_policy_hash or configuration_hash
         self.trust_entry_identity = bool(trust_entry_identity)
+        self.before_non_cache_mutation = before_non_cache_mutation
         self.fingerprint_version = (
             f"{FINGERPRINT_VERSION}:{self.analysis_policy_hash}"
         )
@@ -1948,6 +1950,8 @@ class PersistentAuditCache:
                     review_result.classification == "different"
                     and review_result.evidence.get("epub_distinct_edition") is True
                 ):
+                    if self.before_non_cache_mutation is not None:
+                        self.before_non_cache_mutation()
                     self.stats["distinct_epub_reviews_superseded"] += (
                         supersede_open_pair_reviews(
                             self.conn,
@@ -1962,6 +1966,8 @@ class PersistentAuditCache:
 
     def _store_review_item(self, candidate, result):
         if result.classification == "lossless_identity_mismatch":
+            if self.before_non_cache_mutation is not None:
+                self.before_non_cache_mutation()
             left_file = self.file_ids.get(candidate.left.path)
             right_file = self.file_ids.get(candidate.right.path)
             if left_file is not None and right_file is not None:
@@ -2025,6 +2031,11 @@ class PersistentAuditCache:
         evidence_json = json.dumps(
             result.evidence, ensure_ascii=False, sort_keys=True
         )
+        # Review rows are user-visible non-cache state. Mark the actual run at
+        # the first point where the auditor may suppress/update/create one,
+        # while leaving long fingerprint/pair-cache-only work auto-recoverable.
+        if self.before_non_cache_mutation is not None:
+            self.before_non_cache_mutation()
         distinct_decision_id = (
             self.store.suppress_open_reviews_for_active_distinct_decision(
                 self.conn,
@@ -3464,7 +3475,9 @@ def analyze_candidates(
 def _configuration(args):
     return {
         key: value for key, value in vars(args).items()
-        if key not in {"write_report", "verified_house_inventory"}
+        if key not in {
+            "write_report", "verified_house_inventory", "before_non_cache_mutation"
+        }
     }
 
 
@@ -3538,6 +3551,9 @@ def run_audit(args):
                 _pair_configuration_hash(args),
                 analysis_policy_hash,
                 trust_entry_identity=verified_house_inventory is not None,
+                before_non_cache_mutation=getattr(
+                    args, "before_non_cache_mutation", None
+                ),
             )
             retry_house = bool(getattr(args, "full_fingerprint_sweep", False))
             preloaded_analyses.update(persistent.peek_many(
