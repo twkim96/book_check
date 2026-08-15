@@ -179,11 +179,17 @@ def _interrupted_folderling_run_id(store: JobStore, record) -> str | None:
     if record.get("actual_run_id"):
         return str(record["actual_run_id"])
     run_ids = [
-        event.get("run_id")
+        event.get("run_id") or event.get("approved_run_id")
         for event in store.events(str(record["job_id"]), limit=None)
-        if event.get("phase") == "actual_run_started"
-        and event.get("status") == "running"
-        and event.get("run_id")
+        if (
+            event.get("phase") == "actual_run_started"
+            and event.get("status") == "running"
+            and event.get("run_id")
+        ) or (
+            event.get("phase") == "preflight_result"
+            and event.get("status") == "succeeded"
+            and event.get("approved_run_id")
+        )
     ]
     return str(run_ids[-1]) if run_ids else None
 
@@ -214,7 +220,8 @@ def _recover_interrupted_folderling_jobs(
             rows = conn.execute(
                 """
                 SELECT run_id FROM actual_runs
-                WHERE state = 'active' AND house_root = ? AND temp_root = ?
+                WHERE state IN ('approved', 'active')
+                  AND house_root = ? AND temp_root = ?
                 """,
                 (
                     decision_store.canonicalize_real_path(config.house_dir),
@@ -233,6 +240,74 @@ def _recover_interrupted_folderling_jobs(
         run_id = bindings.get(str(record["job_id"]))
         if run_id is None:
             continue
+        conn = decision_store.connect_state_db(config.state_db)
+        try:
+            run = conn.execute(
+                "SELECT state, error FROM actual_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if run is None:
+            continue
+        if run["state"] in {"finished", "failed", "cancelled"}:
+            events = store.events(str(record["job_id"]), limit=None)
+            summary = next(
+                (
+                    event for event in reversed(events)
+                    if event.get("phase") == "folderling_summary"
+                ),
+                None,
+            )
+            if run["state"] == "finished":
+                needs_review = summary is None or summary.get("status") != "succeeded"
+                state = "needs_review" if needs_review else "succeeded"
+                message = (
+                    "Folderling 완료 · 검토할 결과 있음"
+                    if needs_review else "Folderling 작업 완료"
+                )
+                error = None
+            elif run["state"] == "failed":
+                if summary is not None:
+                    # Folderling reports partial failures and final-Doctor
+                    # findings as a completed result that needs review. Match
+                    # the normal JobRunner outcome instead of inventing a hard
+                    # job failure after a restart.
+                    state = "needs_review"
+                    message = "Folderling 완료 · 검토할 결과 있음"
+                    error = None
+                else:
+                    state = "failed"
+                    message = "Folderling actual run 실패"
+                    error = {
+                        "code": "actual_run_failed",
+                        "message": str(run["error"] or "actual run failed"),
+                    }
+            else:
+                state = "cancelled"
+                message = "Folderling actual run 취소됨"
+                error = None
+            result = None
+            if summary is not None:
+                result = {
+                    key: value for key, value in summary.items()
+                    if key not in {"recorded_at", "phase", "status"}
+                }
+            store.update(
+                record["job_id"],
+                state=state,
+                stage=state,
+                message=message,
+                result=result,
+                error=error,
+            )
+            store.append_event(record["job_id"], {
+                "phase": "interrupted_run_terminal_reconciled",
+                "status": state,
+                "run_id": run_id,
+                "actual_run_state": run["state"],
+            })
+            recovered += 1
+            continue
         try:
             with mutation_lock_for_roots(
                 config.house_dir,
@@ -241,12 +316,20 @@ def _recover_interrupted_folderling_jobs(
             ):
                 conn = decision_store.connect_state_db(config.state_db)
                 try:
-                    result = decision_store.close_interrupted_pre_mutation_run(
-                        conn,
-                        run_id,
-                        house_dir=config.house_dir,
-                        temp_dir=config.temp_dir,
-                    )
+                    if run["state"] == "approved":
+                        result = decision_store.close_interrupted_approved_run(
+                            conn,
+                            run_id,
+                            house_dir=config.house_dir,
+                            temp_dir=config.temp_dir,
+                        )
+                    else:
+                        result = decision_store.close_interrupted_pre_mutation_run(
+                            conn,
+                            run_id,
+                            house_dir=config.house_dir,
+                            temp_dir=config.temp_dir,
+                        )
                 finally:
                     conn.close()
         except Exception as exc:  # keep mutation-time interruptions manual
@@ -262,12 +345,24 @@ def _recover_interrupted_folderling_jobs(
                 "error_message": str(exc),
             })
             continue
+        approved_cleanup = result.get("state") == "cancelled"
         store.update(
             record["job_id"],
-            message="서버 재시작으로 중단 · 파일 이동 전 상태 자동 정리 완료",
+            message=(
+                "서버 재시작으로 중단 · 승인 상태 자동 정리 완료"
+                if approved_cleanup
+                else "서버 재시작으로 중단 · 파일 이동 전 상태 자동 정리 완료"
+            ),
             error={
-                "code": "server_restarted_before_mutation",
-                "message": "파일 이동 전 중단 상태를 자동 정리했습니다. 다시 실행할 수 있습니다.",
+                "code": (
+                    "server_restarted_before_activation"
+                    if approved_cleanup else "server_restarted_before_mutation"
+                ),
+                "message": (
+                    "실행 활성화 전 승인 상태를 자동 정리했습니다. 다시 실행할 수 있습니다."
+                    if approved_cleanup
+                    else "파일 이동 전 중단 상태를 자동 정리했습니다. 다시 실행할 수 있습니다."
+                ),
             },
         )
         store.append_log(

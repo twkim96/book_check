@@ -34,7 +34,8 @@
 - 같은 run에서 입고 뒤 생긴 exact/ordered 중복과 queue exact 중복도 현재 identity·SHA·review
   관계를 다시 확인한 뒤 journal 격리한다.
 - normalized exact, contained, ordered-body, 제한된 양방향 near-identical 증거를 mutation 직전에
-  다시 계산한다. 명시적 개정판·외전·회차 범위 차이와 기존 사용자 판정은 자동 격리하지 않는다.
+  다시 계산한다. 파일명의 판본·작가·배포 표시는 단독 veto로 사용하지 않으며, 현재 bytes의 강한
+  본문 증거와 좌표 관계를 우선한다. 기존 사용자의 distinct-variant 판정과 증거 불충분 관계는 보존한다.
 - 모든 자동 처리는 backup, manifest, no-clobber 이동, operation journal, recovery와 최종
   Doctor 0건을 요구한다. 원본 bytes를 영구 삭제하지 않는다.
 
@@ -74,7 +75,7 @@
 
 ## 검증
 
-- 공개+운영 Python 전체 회귀: `920 passed`
+- 공개+운영 Python 전체 회귀: `931 passed`
 - backend/tools compileall, pyflakes, frontend typecheck·production build, normalizer parity,
   `git diff --check`: 통과
 - 로컬 Anaconda에는 `coverage` 모듈이 없어 coverage 수치는 재측정하지 않았으며, push CI의

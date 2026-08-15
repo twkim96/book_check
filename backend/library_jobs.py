@@ -135,6 +135,12 @@ class JobStore:
                 and value.get("run_id")
             ):
                 record["actual_run_id"] = str(value["run_id"])
+            elif (
+                value.get("phase") == "preflight_result"
+                and value.get("status") == "succeeded"
+                and value.get("approved_run_id")
+            ):
+                record["actual_run_id"] = str(value["approved_run_id"])
             record["updated_at"] = _now()
             self._write(record)
 
@@ -264,12 +270,21 @@ class JobRunner:
         ))
         return values
 
-    def _decorate(self, record: Mapping[str, object]) -> dict:
+    def _decorate(
+        self,
+        record: Mapping[str, object],
+        *,
+        active_in_order: list[dict] | None = None,
+    ) -> dict:
         value = dict(record)
         value["queue_position"] = None
         value["jobs_ahead"] = 0
         if value.get("state") == "queued":
-            active = self._active_in_order()
+            active = (
+                active_in_order
+                if active_in_order is not None
+                else self._active_in_order()
+            )
             for index, item in enumerate(active):
                 if item.get("job_id") == value.get("job_id"):
                     value["queue_position"] = index + 1
@@ -396,7 +411,13 @@ class JobRunner:
         return self._decorate(self.store.get(job_id))
 
     def list(self, *, limit: int = 50) -> list[dict]:
-        return [self._decorate(record) for record in self.store.list(limit=limit)]
+        records = self.store.list(limit=limit)
+        active = self._active_in_order() if any(
+            record.get("state") == "queued" for record in records
+        ) else []
+        return [
+            self._decorate(record, active_in_order=active) for record in records
+        ]
 
     def shutdown(self) -> None:
         self.executor.shutdown(wait=False)

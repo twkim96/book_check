@@ -1407,6 +1407,107 @@ def close_interrupted_pre_mutation_run(
     }
 
 
+def close_interrupted_approved_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    house_dir: os.PathLike | str,
+    temp_dir: os.PathLike | str,
+) -> dict:
+    """Cancel one unactivated approval left behind by a server interruption."""
+    from mutation_io import assert_mutation_lock_for_roots_held
+
+    assert_mutation_lock_for_roots_held(house_dir, temp_dir)
+    expected_house = canonicalize_real_path(house_dir)
+    expected_temp = canonicalize_real_path(temp_dir)
+
+    def load_evidence():
+        run = conn.execute(
+            "SELECT * FROM actual_runs WHERE run_id = ? AND state = 'approved'",
+            (run_id,),
+        ).fetchone()
+        gate = conn.execute(
+            "SELECT value FROM settings WHERE key = 'actual_mutation_enabled'"
+        ).fetchone()
+        approved = conn.execute(
+            "SELECT value FROM settings WHERE key = 'approved_run_id'"
+        ).fetchone()
+        operation_count = conn.execute(
+            "SELECT COUNT(*) FROM operations WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        group_count = conn.execute(
+            "SELECT COUNT(*) FROM operation_groups WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        other_count = conn.execute(
+            """
+            SELECT COUNT(*) FROM actual_runs
+            WHERE state IN ('approved', 'active') AND run_id != ?
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        return run, gate, approved, operation_count, group_count, other_count
+
+    run, gate, approved, operation_count, group_count, other_count = load_evidence()
+    if run is None:
+        raise RuntimeError("interrupted approved run is not approved")
+    if run["house_root"] != expected_house or run["temp_root"] != expected_temp:
+        raise RuntimeError("interrupted approved run roots do not match this server")
+    if run["activation_claim"] is not None or run["activated_at"] is not None:
+        raise RuntimeError("interrupted approved run has activation evidence")
+    if run["manifest_path"] is not None or run["manifest_sha256"] is not None:
+        raise RuntimeError("interrupted approved run has manifest evidence")
+    if gate is None or gate["value"] != "1" or approved is None or (
+        approved["value"] != run_id
+    ):
+        raise RuntimeError("interrupted approved run gate evidence does not match")
+    if operation_count or group_count or actual_run_mutation_started(conn, run_id):
+        raise RuntimeError(
+            "interrupted approved run requires manual recovery: "
+            f"operations={operation_count}, groups={group_count}"
+        )
+    if other_count:
+        raise RuntimeError("another approved or active run blocks approval cleanup")
+    # Approval rows gain pinned backup identity only during activation. Before
+    # that point, verify the regular file, SHA-256 and SQLite integrity directly.
+    _verify_backup_evidence(run["backup_path"], run["backup_sha256"])
+
+    with transaction(conn):
+        current = load_evidence()
+        if (
+            current[0] is None
+            or current[0]["activation_claim"] is not None
+            or current[0]["manifest_path"] is not None
+            or current[1] is None
+            or current[1]["value"] != "1"
+            or current[2] is None
+            or current[2]["value"] != run_id
+            or current[3:] != (0, 0, 0)
+            or actual_run_mutation_started(conn, run_id)
+        ):
+            raise RuntimeError("interrupted approved run changed during cleanup")
+        _verify_backup_evidence(
+            current[0]["backup_path"], current[0]["backup_sha256"]
+        )
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("DELETE FROM settings WHERE key = 'approved_run_id'")
+        transition_actual_run(
+            conn,
+            run_id,
+            "cancelled",
+            error="library server restarted before actual run activation",
+        )
+        remaining = doctor_issues(conn)
+        if remaining:
+            raise RuntimeError(
+                "Doctor failed after interrupted approval cleanup: "
+                f"{remaining[0]['kind']}"
+            )
+    return {"run_id": run_id, "doctor_issue_count": 0, "state": "cancelled"}
+
+
 STATE_BACKUP_RETENTION = 10
 
 
