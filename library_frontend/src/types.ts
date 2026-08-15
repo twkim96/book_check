@@ -288,6 +288,10 @@ export interface CatalogPlatform {
   recommend_count?: number | null;
   rating?: number | null;
   rating_count?: number | null;
+  genre?: string | null;
+  genre_collected_at?: string | null;
+  tags?: string[] | null;
+  tags_collected_at?: string | null;
   last_attempt_at?: string | null;
   last_success_at?: string | null;
   retry_after?: string | null;

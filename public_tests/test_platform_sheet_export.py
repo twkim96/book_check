@@ -65,13 +65,14 @@ def _sheet_db(tmp_path):
                 platform_catalog.PlatformStat(
                     "series", "ok", remote_title="합성 작품",
                     remote_url="https://series.example/1",
-                    download_count=1234, rating=9.2
+                    download_count=1234, rating=9.2, genre="현판"
                 ),
                 platform_catalog.PlatformStat("kakao", "not_found"),
                 platform_catalog.PlatformStat(
                     "novelpia", "ok", remote_title="합성 작품",
                     remote_url="https://novelpia.example/1",
-                    view_count=4567, recommend_count=88
+                    view_count=4567, recommend_count=88, genre="판타지",
+                    tags=("판타지", "먼치킨"),
                 ),
             ],
             now=datetime(2026, 7, 17, tzinfo=timezone.utc),
@@ -93,28 +94,33 @@ def test_sheet_projection_is_read_only_groups_titles_and_blanks_not_found(tmp_pa
     assert snapshot.works.title == "도서 목록"
     assert snapshot.works.headers == (
         "원본 도서명", "보유 범위", "작가",
-        "작품명", "다운로드 수", "평점", "링크",
-        "작품명", "조회 수", "평점", "링크",
-        "작품명", "조회 수", "좋아요 수", "링크",
+        "작품명", "장르", "다운로드 수", "평점", "링크",
+        "작품명", "장르", "조회 수", "평점", "태그", "링크",
+        "작품명", "장르", "조회 수", "좋아요 수", "태그", "링크",
     )
     assert snapshot.works.group_headers == (
         "메타데이터", None, None,
-        "시리즈", None, None, None,
-        "카카오", None, None, None,
-        "노벨피아", None, None, None,
+        "시리즈", None, None, None, None,
+        "카카오", None, None, None, None, None,
+        "노벨피아", None, None, None, None, None,
     )
     assert len(snapshot.works.rows) == 1
     work = snapshot.works.rows[0]
     assert work[0] == "합성 작품"
     assert work[1] == "30화"
     assert work[3] == "합성 작품"
-    assert work[6] == "https://series.example/1"
-    assert work[4] == 1234
-    assert work[7] == ""
-    assert work[10] == ""
+    assert work[4] == "현판"
+    assert work[5] == 1234
+    assert work[7] == "https://series.example/1"
     assert work[8] == ""
     assert work[9] == ""
-    assert work[13] == 88
+    assert work[10] == ""
+    assert work[11] == ""
+    assert work[12] == ""
+    assert work[15] == "판타지"
+    assert work[17] == 88
+    assert work[18] == "#판타지 #먼치킨"
+    assert work[19] == "https://novelpia.example/1"
     assert snapshot.errors.rows == ()
 
 
@@ -150,7 +156,7 @@ def test_sheet_sync_dry_run_never_loads_google_credentials(tmp_path, monkeypatch
     assert result["dry_run"] is True
     assert result["works_rows"] == 1
     assert result["error_rows"] == 0
-    assert result["works_columns"] == 15
+    assert result["works_columns"] == 20
     assert result["error_columns"] == 8
 
 
@@ -390,8 +396,8 @@ def test_google_value_write_retries_only_timeout_failures(monkeypatch):
 
 def test_sheet_writer_replaces_link_urls_with_hyperlink_formulas():
     row_values = [""] * len(platform_sheet_export.WORK_HEADERS)
-    row_values[6] = "https://series.example/1"
-    row_values[14] = "https://novelpia.example/1"
+    row_values[7] = "https://series.example/1"
+    row_values[19] = "https://novelpia.example/1"
     row = tuple(row_values)
     snapshot = platform_sheet_export.SheetSnapshot(
         works=platform_sheet_export.SheetTable(
@@ -413,7 +419,7 @@ def test_sheet_writer_replaces_link_urls_with_hyperlink_formulas():
         for item in call
     ]
     assert [item["range"].rsplit("!", 1)[1] for item in formula_ranges] == [
-        "G3", "K3", "O3"
+        "H3", "N3", "T3"
     ]
     assert formula_ranges[0]["values"] == [
         ['=HYPERLINK("https://series.example/1","열기")']
@@ -468,7 +474,7 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
         if "mergeCells" in request
     ]
     assert merged_columns == [
-        (0, 3), (3, 7), (7, 11), (11, 15),
+        (0, 3), (3, 8), (8, 14), (14, 20),
     ]
 
     widths = {
@@ -479,9 +485,9 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
     }
     assert widths == {
         0: 250, 1: 80, 2: 80,
-        3: 250, 4: 90, 5: 80, 6: 80,
-        7: 250, 8: 90, 9: 80, 10: 80,
-        11: 250, 12: 90, 14: 80,
+        3: 250, 4: 80, 5: 90, 6: 80, 7: 80,
+        8: 250, 9: 80, 10: 90, 11: 80, 13: 80,
+        14: 250, 15: 80, 16: 90, 19: 80,
     }
 
     comma_formats = [
@@ -493,7 +499,7 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
     ]
     assert [
         request["range"]["startColumnIndex"] for request in comma_formats
-    ] == [4, 8, 12, 13]
+    ] == [5, 10, 16, 17]
     assert all(request["range"]["startRowIndex"] == 2 for request in comma_formats)
     assert all(
         request["cell"]["userEnteredFormat"]["numberFormat"]
@@ -516,25 +522,25 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
     assert platform_fills[(0, 0, 3)] == {
         "red": 56 / 255, "green": 118 / 255, "blue": 218 / 255,
     }
-    assert platform_fills[(0, 3, 7)] == {
+    assert platform_fills[(0, 3, 8)] == {
         "red": 1 / 255, "green": 228 / 255, "blue": 79 / 255,
     }
-    assert platform_fills[(0, 7, 11)] == {
+    assert platform_fills[(0, 8, 14)] == {
         "red": 1, "green": 214 / 255, "blue": 23 / 255,
     }
-    assert platform_fills[(0, 11, 15)] == {
+    assert platform_fills[(0, 14, 20)] == {
         "red": 118 / 255, "green": 50 / 255, "blue": 1,
     }
     assert platform_fills[(1, 0, 3)] == {
         "red": 195 / 255, "green": 214 / 255, "blue": 244 / 255,
     }
-    assert platform_fills[(1, 3, 7)] == {
+    assert platform_fills[(1, 3, 8)] == {
         "red": 179 / 255, "green": 247 / 255, "blue": 202 / 255,
     }
-    assert platform_fills[(1, 7, 11)] == {
+    assert platform_fills[(1, 8, 14)] == {
         "red": 1, "green": 243 / 255, "blue": 185 / 255,
     }
-    assert platform_fills[(1, 11, 15)] == {
+    assert platform_fills[(1, 14, 20)] == {
         "red": 214 / 255, "green": 194 / 255, "blue": 1,
     }
 

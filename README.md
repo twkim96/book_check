@@ -670,6 +670,31 @@ APFS device 재번호, 서버 재시작 중단, cold-cache 예산과 신규 temp
 배포/auditor/UI는 `1.4.17`이며 schema `v15`, `NORMALIZER_VERSION=1.3.3`, fingerprint
 version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, archive `1.4.10`을 유지한다.
 
+### 플랫폼 장르·태그 수집과 정규화 저장 (1.4.18)
+
+세 플랫폼의 대표 장르와 카카오페이지·노벨피아 작품 태그를 기존 플랫폼 메타데이터와 함께 수집한다.
+장르는 플랫폼별 단일 분류값이므로 `catalog_platform_stats.genre`에 저장하고, 태그는 작품 공통 문자열
+배열이 아니라 플랫폼별 다대다 원격 메타데이터이므로 schema `v16`의
+`catalog_platform_tags(title_key, platform, tag, position)`에 정규화해 저장한다.
+`genre_collected_at`과 `tags_collected_at`으로 아직 미수집한 상태와 실제 빈 메타데이터를 구분한다.
+
+- 시리즈는 작품 상세 `ul.end_info` 안의 `categoryTypeCode=genre` 링크만 읽어 상단 추천장르 링크를 제외한다.
+- 카카오는 `content/overview`의 `result.content.sub_category`를 장르로, `content/about`의
+  `result.theme_keyword_list[*].title`을 태그로 사용한다.
+- 노벨피아는 검색 JSON의 `novel_genre_arr` 첫 항목을 대표 장르로 쓰고 배열 전체를 태그로 보존한다.
+  배열이 없는 예외 응답에서만 상세 페이지 `p.writer-tag > span.tag` parser를 fallback으로 사용한다.
+- 선택 메타데이터가 일시 실패해도 기존 조회 수·추천 수·평점과 과거 성공 장르/태그를 지우지 않는다.
+- 기존 성공 행은 `run_platform_catalog.py refresh-metadata` 또는 도서 관리의 `플랫폼 메타데이터 backfill`
+  서비스로 popularity metric을 바꾸지 않고 빠진 장르/태그만 채운다.
+- metadata backfill은 Series/Kakao의 저장된 `remote_id`로 상세/BFF를 직접 조회해 검색 요청을 줄이고,
+  상세 제목 불일치·요청 실패 시 기존 제목 검색으로 안전하게 fallback한다. 장시간 서비스 진행 로그는 10작품 단위로 throttle한다.
+- 카탈로그 UI/API와 Google Sheet에서 플랫폼별 장르를 표시하고, 카카오·노벨피아 태그는 원 순서를 보존한다.
+
+배포/UI/platform catalog는 `1.4.18`, schema는 `v16`이다. `NORMALIZER_VERSION=1.3.3`, fingerprint
+version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, duplicate auditor contract `1.4.17`,
+archive `1.4.10`은 의미가 바뀌지 않아 유지한다. 운영 migration/backfill과 장시간 Folderling 검증 절차는
+[`update_1.4.18.md`](update_1.4.18.md)에 기록한다.
+
 ## 구조
 
 ```text

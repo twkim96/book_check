@@ -18,6 +18,18 @@ from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DI
 
 SUPPORTED_EXTENSIONS = frozenset({".txt", ".epub", ".pdf"})
 PLATFORM_PREVIEW_CACHE_SECONDS = 15.0
+_PLATFORM_PROGRESS_THROTTLE_PHASES = frozenset({
+    "progress",
+    "auth_progress",
+    "existing_progress",
+    "metadata_progress",
+})
+
+
+def _should_emit_platform_progress(phase: str, current: int, total: int) -> bool:
+    if phase not in _PLATFORM_PROGRESS_THROTTLE_PHASES:
+        return True
+    return current in {1, total} or current % 10 == 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +109,19 @@ SERVICE_DEFINITIONS = (
         ("기존 성공 플랫폼 지표", "플랫폼 검색"),
         ("증가한 카운터", "조건 통과 시 평점"),
         ("현재 ok인 플랫폼만", "카운터 하향 금지", "평점은 상향 조건 통과 시 함께 갱신"),
+        True,
+    ),
+    ServiceDefinition(
+        "platform-metadata",
+        "service_platform_metadata",
+        "플랫폼 메타데이터 backfill",
+        "이미 성공한 작품 중 장르 또는 지원 태그 snapshot이 없는 플랫폼만 다시 조회해 메타데이터를 채웁니다.",
+        "메타데이터",
+        True,
+        "메타데이터 미수집 작품",
+        ("기존 성공 플랫폼 상태", "시리즈 상세", "카카오 BFF", "노벨피아 검색 JSON"),
+        ("플랫폼 장르", "카카오·노벨피아 태그", "수집 시각"),
+        ("기존 인기 지표는 변경하지 않음", "장르/태그 없음과 미수집 구분", "인증 노벨피아 보완 가능"),
         True,
     ),
     ServiceDefinition(
@@ -190,6 +215,9 @@ class LibraryServiceRegistry:
             "platform-refresh": lambda payload, progress: self._run_platform(
                 "refresh-existing", ("--all",), progress
             ),
+            "platform-metadata": lambda payload, progress: self._run_platform(
+                "refresh-metadata", ("--all",), progress
+            ),
             "novelpia-auth-retry": lambda payload, progress: self._run_platform(
                 "retry-novelpia-auth", (), progress
             ),
@@ -279,6 +307,9 @@ class LibraryServiceRegistry:
                 )
                 if platforms:
                     existing_targets.append((title, platforms))
+            metadata_targets = platform_catalog.select_metadata_backfill_targets(
+                conn, limit=None
+            )
 
             state = run_platform_catalog._novelpia_auth_retry_state(
                 str(self.state_db), create=False
@@ -326,6 +357,17 @@ class LibraryServiceRegistry:
                     "discovered_titles": len(titles),
                     "selected_titles": len(existing_targets),
                     "selected_platforms": sum(len(platforms) for _title, platforms in existing_targets),
+                },
+            ),
+            "platform-metadata": (
+                len(metadata_targets),
+                {
+                    "dry_run": True,
+                    "discovered_titles": len(titles),
+                    "selected_titles": len(metadata_targets),
+                    "selected_platforms": sum(
+                        len(item.platforms) for item in metadata_targets
+                    ),
                 },
             ),
             "novelpia-auth-retry": (
@@ -562,6 +604,8 @@ class LibraryServiceRegistry:
             "auth_progress": "인증 노벨피아 조회",
             "existing_start": "기존 인기값 갱신 시작",
             "existing_progress": "기존 인기값 갱신",
+            "metadata_start": "플랫폼 메타데이터 backfill 시작",
+            "metadata_progress": "플랫폼 메타데이터 backfill",
             "sheet_snapshot": "SQLite Sheet snapshot 준비",
             "sheet_write_start": "Google Sheet 임시 탭 쓰기 시작",
             "sheet_temp_tabs_created": "Google Sheet 임시 탭 생성",
@@ -594,9 +638,8 @@ class LibraryServiceRegistry:
                     round(max(0.0, (total - current) / rate), 3)
                     if rate else None
                 )
-            if phase in {"progress", "auth_progress", "existing_progress"}:
-                if current not in {1, total} and current % 10:
-                    return
+            if not _should_emit_platform_progress(phase, current, total):
+                return
             progress(current, total, message, stage=phase, event=enriched)
 
         progress(0, 0, f"{command} 실행 준비", stage="validating", event={"phase": "validating"})

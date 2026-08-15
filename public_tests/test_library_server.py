@@ -289,7 +289,7 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     client = app.test_client()
     health = client.get("/health").get_json()
     assert health["ok"] is True
-    assert health["version"] == "1.4.17"
+    assert health["version"] == "1.4.18"
     providers = client.get("/api/providers").get_json()["data"]
     assert providers == [
         {"id": "title_correction", "label": "제목 교정", "enabled": True},
@@ -842,6 +842,7 @@ def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
         "platform-update",
         "platform-retry",
         "platform-refresh",
+        "platform-metadata",
         "novelpia-auth-retry",
         "google-sheet",
     ]

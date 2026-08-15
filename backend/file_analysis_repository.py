@@ -649,8 +649,8 @@ def migrate_catalog_title_keys(
     stat_columns = (
         "platform, status, remote_id, remote_title, remote_url, "
         "download_count, interest_count, view_count, recommend_count, "
-        "rating, rating_count, last_attempt_at, last_success_at, retry_after, "
-        "error_message, created_at, updated_at"
+        "rating, rating_count, genre, genre_collected_at, tags_collected_at, last_attempt_at, "
+        "last_success_at, retry_after, error_message, created_at, updated_at"
     )
     for old_key, new_key in sorted(mapping.items()):
         if old_key in active_keys:
@@ -725,6 +725,15 @@ def migrate_catalog_title_keys(
                 SELECT ?, {stat_columns}
                 FROM catalog_platform_stats
                 WHERE title_key = ? AND platform = ? AND status = 'ok'
+                """,
+                (new_key, old_key, platform),
+            )
+            conn.execute(
+                """
+                INSERT INTO catalog_platform_tags(title_key, platform, tag, position)
+                SELECT ?, platform, tag, position
+                FROM catalog_platform_tags
+                WHERE title_key = ? AND platform = ?
                 """,
                 (new_key, old_key, platform),
             )

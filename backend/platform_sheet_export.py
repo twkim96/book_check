@@ -39,24 +39,29 @@ WORK_HEADERS = (
     "보유 범위",
     "작가",
     "작품명",
+    "장르",
     "다운로드 수",
     "평점",
     "링크",
     "작품명",
+    "장르",
     "조회 수",
     "평점",
+    "태그",
     "링크",
     "작품명",
+    "장르",
     "조회 수",
     "좋아요 수",
+    "태그",
     "링크",
 )
 
 WORK_GROUP_HEADERS = (
     "메타데이터", None, None,
-    "시리즈", None, None, None,
-    "카카오", None, None, None,
-    "노벨피아", None, None, None,
+    "시리즈", None, None, None, None,
+    "카카오", None, None, None, None, None,
+    "노벨피아", None, None, None, None, None,
 )
 
 ERROR_HEADERS = (
@@ -246,6 +251,17 @@ def build_sheet_snapshot(
             "SELECT * FROM catalog_platform_stats ORDER BY title_key, platform"
         ):
             stats.setdefault(row["title_key"], {})[row["platform"]] = row
+        tags: Dict[Tuple[str, str], List[str]] = {}
+        for row in conn.execute(
+            """
+            SELECT title_key, platform, tag
+            FROM catalog_platform_tags
+            ORDER BY title_key, platform, position
+            """
+        ):
+            tags.setdefault((row["title_key"], row["platform"]), []).append(
+                str(row["tag"])
+            )
 
         grouped: Dict[str, dict] = {}
         for row in file_rows:
@@ -291,6 +307,17 @@ def build_sheet_snapshot(
                     return ""
                 return _empty(row[name])
 
+            def platform_tags(row, platform):
+                if (
+                    row is None
+                    or row["status"] != "ok"
+                    or row["tags_collected_at"] is None
+                ):
+                    return ""
+                return " ".join(
+                    f"#{tag}" for tag in tags.get((title_key, platform), [])
+                )
+
             known_ranges = [
                 item for item in group["ranges"] if item[0] > 0
             ]
@@ -313,16 +340,21 @@ def build_sheet_snapshot(
                 range_text,
                 ", ".join(sorted(group["authors"])),
                 platform_field(series, "remote_title"),
+                platform_field(series, "genre"),
                 platform_field(series, "download_count"),
                 platform_field(series, "rating"),
                 platform_field(series, "remote_url"),
                 platform_field(kakao, "remote_title"),
+                platform_field(kakao, "genre"),
                 platform_field(kakao, "view_count"),
                 platform_field(kakao, "rating"),
+                platform_tags(kakao, "kakao"),
                 platform_field(kakao, "remote_url"),
                 platform_field(novelpia, "remote_title"),
+                platform_field(novelpia, "genre"),
                 platform_field(novelpia, "view_count"),
                 platform_field(novelpia, "recommend_count"),
+                platform_tags(novelpia, "novelpia"),
                 platform_field(novelpia, "remote_url"),
             ))
 
@@ -718,7 +750,7 @@ def _format_requests(
 
         for index, header in enumerate(headers):
             pixel_size = 250 if header in {"원본 도서명", "작품명"} else None
-            if header in {"보유 범위", "작가", "평점", "링크"}:
+            if header in {"보유 범위", "작가", "장르", "평점", "링크"}:
                 pixel_size = 80
             if header in {"다운로드 수", "조회 수"}:
                 pixel_size = 90

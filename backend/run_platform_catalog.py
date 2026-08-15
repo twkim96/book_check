@@ -83,6 +83,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="인증 환경변수가 없거나 로그인이 실패하면 갱신 전에 종료",
     )
 
+    refresh_tags = subparsers.add_parser(
+        "refresh-metadata",
+        help="기존 성공 행 중 아직 장르/태그 snapshot이 없는 플랫폼 메타데이터만 채웁니다.",
+    )
+    refresh_tags.add_argument(
+        "--limit", type=int, default=platform_catalog.DEFAULT_LIMIT
+    )
+    refresh_tags.add_argument(
+        "--all", action="store_true", help="안전 기본 batch 제한 없이 모든 대상"
+    )
+    refresh_tags.add_argument(
+        "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
+        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 1초)",
+    )
+    refresh_tags.add_argument(
+        "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
+    )
+    refresh_tags.add_argument(
+        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 미수집 장르/태그 대상만 확인"
+    )
+    refresh_tags.add_argument(
+        "--require-novelpia-auth", action="store_true",
+        help="인증 환경변수가 없거나 로그인이 실패하면 메타데이터 backfill 전에 종료",
+    )
+
     retry_failed = subparsers.add_parser(
         "retry-failed",
         help="현재 not_found/error 플랫폼 행을 플랫폼 쌍 규칙으로 재검사합니다.",
@@ -249,7 +274,17 @@ def _progress_reporter():
                 flush=True,
             )
             return
-        if phase not in {"progress", "auth_progress", "existing_progress"}:
+        if phase == "metadata_start":
+            started_at = time.monotonic()
+            print(
+                "🏷️ 플랫폼 메타데이터 backfill 시작: "
+                f"전체 제목 {event['discovered_titles']:,}개, "
+                f"이번 대상 {event['selected_titles']:,}개 / "
+                f"플랫폼 {event['selected_platforms']:,}건",
+                flush=True,
+            )
+            return
+        if phase not in {"progress", "auth_progress", "existing_progress", "metadata_progress"}:
             return
         completed = int(event["completed_titles"])
         total = int(event["selected_titles"])
@@ -267,6 +302,19 @@ def _progress_reporter():
                 f"updated={counts.get('updated', 0):,} "
                 f"unchanged={counts.get('unchanged', 0):,} "
                 f"not_found={counts.get('not_found', 0):,} "
+                f"error={counts.get('error', 0):,} | "
+                f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
+                flush=True,
+            )
+            return
+        if phase == "metadata_progress":
+            counts = event["outcome_counts"]
+            print(
+                "🏷️ 메타데이터 진행 "
+                + f"{completed:,}/{total:,} ({percent:.1f}%) | "
+                f"updated={counts.get('updated', 0):,} "
+                f"empty={counts.get('empty', 0):,} "
+                f"unavailable={counts.get('unavailable', 0):,} "
                 f"error={counts.get('error', 0):,} | "
                 f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
                 flush=True,
@@ -775,6 +823,53 @@ def run(args: argparse.Namespace, *, progress=None):
                 args.state_db, "platform-existing-metrics-refresh"
             ):
                 result = platform_catalog.refresh_existing_metrics(
+                    args.state_db,
+                    limit=limit,
+                    delay_seconds=args.delay_seconds,
+                    timeout=args.timeout,
+                    authenticated_novelpia_lookup=(
+                        auth_client.lookup if auth_client is not None else None
+                    ),
+                    progress=progress,
+                )
+            result = {"file_metadata": metadata, **result}
+    elif args.command == "refresh-metadata":
+        limit = None if args.all else args.limit
+        auth_client = platform_catalog.AuthenticatedNovelpiaClient.from_environment(
+            timeout=args.timeout,
+            required=args.require_novelpia_auth,
+        )
+        if args.dry_run:
+            backup = None
+            metadata = file_metadata_status(args.state_db)
+            if (
+                not metadata["schema_ready"]
+                or metadata["stale"]
+                or metadata["missing_files"]
+                or metadata["index_missing_db"]
+            ):
+                result = {
+                    "dry_run": True,
+                    "platform_preview_blocked": True,
+                    "reason": "file metadata sync required",
+                    "file_metadata": metadata,
+                }
+            else:
+                result = platform_catalog.preview_metadata_backfill(
+                    args.state_db,
+                    limit=limit,
+                )
+                result.pop("titles", None)
+            result = {
+                **result,
+                "authenticated_novelpia_configured": auth_client is not None,
+            }
+        else:
+            if auth_client is not None:
+                auth_client.login()
+            backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+            with _platform_refresh_lock(args.state_db, "platform-tag-backfill"):
+                result = platform_catalog.refresh_missing_metadata(
                     args.state_db,
                     limit=limit,
                     delay_seconds=args.delay_seconds,

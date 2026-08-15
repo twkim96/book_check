@@ -6,7 +6,7 @@ This module is declarative: importing it must never open or migrate SQLite.
 from __future__ import annotations
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 ASSIGNMENT_STATES = (
     "unassigned",
     "managed",
@@ -51,6 +51,7 @@ REQUIRED_TABLES = frozenset({
     "file_analysis",
     "catalog_titles",
     "catalog_platform_stats",
+    "catalog_platform_tags",
 })
 REQUIRED_VIEWS = frozenset({
     "catalog_title_metrics",
@@ -107,6 +108,9 @@ CREATE TABLE IF NOT EXISTS catalog_platform_stats (
     recommend_count INTEGER CHECK (recommend_count IS NULL OR recommend_count >= 0),
     rating REAL CHECK (rating IS NULL OR rating >= 0),
     rating_count INTEGER CHECK (rating_count IS NULL OR rating_count >= 0),
+    genre TEXT,
+    genre_collected_at TEXT,
+    tags_collected_at TEXT,
     last_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_success_at TEXT,
     retry_after TEXT,
@@ -118,6 +122,21 @@ CREATE TABLE IF NOT EXISTS catalog_platform_stats (
 
 CREATE INDEX IF NOT EXISTS catalog_platform_stats_refresh
 ON catalog_platform_stats(platform, status, retry_after);
+
+CREATE TABLE IF NOT EXISTS catalog_platform_tags (
+    title_key TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    tag TEXT NOT NULL CHECK (TRIM(tag) <> ''),
+    position INTEGER NOT NULL CHECK (position >= 1),
+    PRIMARY KEY (title_key, platform, tag),
+    UNIQUE (title_key, platform, position),
+    FOREIGN KEY (title_key, platform)
+        REFERENCES catalog_platform_stats(title_key, platform)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS catalog_platform_tags_tag
+ON catalog_platform_tags(tag);
 
 DROP VIEW IF EXISTS catalog_title_metrics;
 CREATE VIEW catalog_title_metrics AS

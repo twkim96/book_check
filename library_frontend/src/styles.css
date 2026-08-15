@@ -158,6 +158,7 @@ input:focus, select:focus { border-color: var(--blue-2); box-shadow: 0 0 0 3px v
 .catalog-table td > strong, .catalog-table td > small, .catalog-table td > b, .catalog-table td > span, .catalog-table td > a { display: block; }
 .catalog-table td > strong { margin-bottom: 7px; line-height: 1.4; overflow-wrap: anywhere; }
 .catalog-table td > small { margin-top: 6px; color: var(--muted); }
+.catalog-table .catalog-tags, .catalog-platform-detail .catalog-tags { color: var(--blue); line-height: 1.45; overflow-wrap: anywhere; }
 .catalog-table td > span:not(.status) { margin-top: 7px; color: var(--neutral-text); font-size: 13px; line-height: 1.4; }
 .catalog-table td > a { margin-top: 7px; color: var(--link); font-size: 13px; text-decoration: none; }
 .catalog-detail-row:hover { background: transparent; }

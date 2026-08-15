@@ -18,7 +18,7 @@ EXTRACTED_MODULES = (
 
 def test_decision_store_preserves_the_public_compatibility_facade():
     assert not hasattr(decision_store, "__all__")
-    assert decision_store.SCHEMA_VERSION == state_schema.SCHEMA_VERSION == 15
+    assert decision_store.SCHEMA_VERSION == state_schema.SCHEMA_VERSION == 16
     assert decision_store.connect_state_db is state_repository.connect_state_db
     assert decision_store.transaction is state_repository.transaction
     assert (
@@ -66,6 +66,6 @@ def test_repository_schema_roundtrip_through_the_facade(tmp_path):
     conn = decision_store.initialize_state_db(state_db)
     try:
         decision_store.validate_schema(conn)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
     finally:
         conn.close()

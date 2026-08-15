@@ -540,6 +540,35 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 15")
         conn.commit()
         version = 15
+    if version == 15:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(catalog_platform_stats)")
+        }
+        for name in ("genre", "genre_collected_at", "tags_collected_at"):
+            if name not in columns:
+                conn.execute(
+                    f"ALTER TABLE catalog_platform_stats ADD COLUMN {name} TEXT"
+                )
+        conn.executescript(CATALOG_SCHEMA_SQL)
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v16 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute(
+            "DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')"
+        )
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 16")
+        conn.commit()
+        version = 16
     schema_validator(conn, check_integrity=check_integrity)
     return conn
 
@@ -595,6 +624,13 @@ def validate_schema(
             "plan_sha256", "payload_json", "actor", "supersedes_event_id",
             "active",
         },
+        "catalog_platform_stats": {
+            "title_key", "platform", "status", "genre", "genre_collected_at",
+            "tags_collected_at",
+        },
+        "catalog_platform_tags": {
+            "title_key", "platform", "tag", "position",
+        },
     }
     for table, expected in required_columns.items():
         actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -616,6 +652,7 @@ def validate_schema(
         "work_aliases_work_active",
         "work_management_events_work",
         "operations_group_state",
+        "catalog_platform_tags_tag",
     }
     missing_indexes = required_indexes - indexes
     if missing_indexes:

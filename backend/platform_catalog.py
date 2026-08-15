@@ -31,6 +31,7 @@ from normalizer import (
 
 
 PLATFORMS = ("series", "kakao", "novelpia")
+TAG_PLATFORMS = ("kakao", "novelpia")
 GROWTH_METRICS = {
     "series": ("download_count",),
     "kakao": ("view_count",),
@@ -225,6 +226,12 @@ class AuthenticatedNovelpiaClient:
             self._email = ""
             self._password = ""
 
+    def fetch_text(self, url: str, timeout: float) -> str:
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self.timeout = timeout
+        return self._request_text(url)
+
     def fetch_json(self, url: str, timeout: float) -> object:
         if timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -235,7 +242,12 @@ class AuthenticatedNovelpiaClient:
         self, title: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
     ) -> PlatformStat:
         try:
-            return lookup_novelpia(title, self.fetch_json, timeout=timeout)
+            return lookup_novelpia(
+                title,
+                self.fetch_json,
+                self.fetch_text,
+                timeout=timeout,
+            )
         except NovelpiaAuthenticationError:
             raise
         except Exception as exc:
@@ -313,6 +325,8 @@ class PlatformStat:
     recommend_count: Optional[int] = None
     rating: Optional[float] = None
     rating_count: Optional[int] = None
+    genre: Optional[str] = None
+    tags: Optional[Tuple[str, ...]] = None
     message: str = ""
 
 
@@ -447,6 +461,28 @@ def _strip_tags(value: object) -> str:
     text = re.sub(r"<style\b[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _normalize_genre(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"platform genre must be text: {value!r}")
+    genre = re.sub(r"\s+", " ", html.unescape(value)).strip()
+    return re.sub(r"^#+\s*", "", genre).strip()
+
+
+def _normalize_tags(values: Iterable[str]) -> Tuple[str, ...]:
+    tags = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"platform tag must be text: {value!r}")
+        tag = re.sub(r"\s+", " ", html.unescape(value)).strip()
+        tag = re.sub(r"^#+\s*", "", tag).strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+    return tuple(tags)
 
 
 def _has_metrics(stat: PlatformStat) -> bool:
@@ -831,6 +867,60 @@ def select_existing_metric_targets(
     return targets
 
 
+def select_metadata_backfill_targets(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+) -> List[RefreshTarget]:
+    """Select successful rows missing a genre or supported tag snapshot."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return []
+    stats = _stats_by_title(conn)
+    targets = []
+    for title in sorted(discover_catalog_titles(conn), key=lambda item: item.title_key):
+        rows = stats.get(title.title_key, {})
+        platforms = tuple(
+            platform
+            for platform in PLATFORMS
+            if rows.get(platform) is not None
+            and rows[platform]["status"] == "ok"
+            and (
+                rows[platform]["genre_collected_at"] is None
+                or (
+                    platform in TAG_PLATFORMS
+                    and rows[platform]["tags_collected_at"] is None
+                )
+            )
+        )
+        if not platforms:
+            continue
+        targets.append(RefreshTarget(title=title, platforms=platforms))
+        if limit is not None and len(targets) >= limit:
+            break
+    return targets
+
+
+def preview_metadata_backfill(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = None,
+) -> Dict[str, object]:
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        targets = select_metadata_backfill_targets(conn, limit=limit)
+        return {
+            "dry_run": True,
+            "selected_titles": len(targets),
+            "selected_platforms": sum(len(target.platforms) for target in targets),
+            "titles": [target.title.display_title for target in targets],
+        }
+    finally:
+        conn.close()
+
+
 def preview_existing_metric_refresh(
     state_db_path: str,
     *,
@@ -877,7 +967,109 @@ def _validate_stat(stat: PlatformStat) -> PlatformStat:
             )
     if stat.status == "ok" and not _has_metrics(stat):
         raise ValueError("ok platform stat requires at least one metric")
+    if stat.genre is not None:
+        stat = replace(stat, genre=_normalize_genre(stat.genre))
+    if stat.tags is not None:
+        stat = replace(stat, tags=_normalize_tags(stat.tags))
     return stat
+
+
+def _replace_platform_genre(
+    conn: sqlite3.Connection,
+    title_key: str,
+    platform: str,
+    genre: str,
+    collected_at: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE catalog_platform_stats
+        SET genre = ?, genre_collected_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE title_key = ? AND platform = ?
+        """,
+        (genre, collected_at, title_key, platform),
+    )
+
+
+def _replace_platform_tags(
+    conn: sqlite3.Connection,
+    title_key: str,
+    platform: str,
+    tags: Tuple[str, ...],
+    collected_at: str,
+) -> None:
+    conn.execute(
+        "DELETE FROM catalog_platform_tags WHERE title_key = ? AND platform = ?",
+        (title_key, platform),
+    )
+    conn.executemany(
+        """
+        INSERT INTO catalog_platform_tags(title_key, platform, tag, position)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            (title_key, platform, tag, position)
+            for position, tag in enumerate(tags, start=1)
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE catalog_platform_stats
+        SET tags_collected_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE title_key = ? AND platform = ?
+        """,
+        (collected_at, title_key, platform),
+    )
+
+
+def record_platform_metadata_results(
+    conn: sqlite3.Connection,
+    title_key: str,
+    stats: Sequence[PlatformStat],
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, str]:
+    """Persist authoritative genre/tag snapshots without changing popularity metrics."""
+    moment = now or utc_now()
+    collected_at = _utc_text(moment)
+    validated = [_validate_stat(stat) for stat in stats]
+    if len({stat.platform for stat in validated}) != len(validated):
+        raise ValueError("at most one stat per platform may be recorded per title")
+    outcomes: Dict[str, str] = {}
+    with decision_store.transaction(conn):
+        for stat in validated:
+            row = conn.execute(
+                "SELECT status FROM catalog_platform_stats "
+                "WHERE title_key = ? AND platform = ?",
+                (title_key, stat.platform),
+            ).fetchone()
+            if row is None or row["status"] != "ok":
+                outcomes[stat.platform] = "skipped"
+                continue
+            if stat.status != "ok":
+                outcomes[stat.platform] = stat.status
+                continue
+            updated = False
+            if stat.genre is not None:
+                _replace_platform_genre(
+                    conn,
+                    title_key,
+                    stat.platform,
+                    stat.genre,
+                    collected_at,
+                )
+                updated = True
+            if stat.platform in TAG_PLATFORMS and stat.tags is not None:
+                _replace_platform_tags(
+                    conn,
+                    title_key,
+                    stat.platform,
+                    stat.tags,
+                    collected_at,
+                )
+                updated = True
+            outcomes[stat.platform] = "updated" if updated else "unavailable"
+    return outcomes
 
 
 def record_platform_stats(
@@ -957,6 +1149,22 @@ def record_platform_stats(
                     stat.message or None,
                 ),
             )
+            if stat.status == "ok" and stat.genre is not None:
+                _replace_platform_genre(
+                    conn,
+                    title_key,
+                    stat.platform,
+                    stat.genre,
+                    attempted_at,
+                )
+            if stat.status == "ok" and stat.platform in TAG_PLATFORMS and stat.tags is not None:
+                _replace_platform_tags(
+                    conn,
+                    title_key,
+                    stat.platform,
+                    stat.tags,
+                    attempted_at,
+                )
 
 
 def _monotonic_count(old: Optional[int], new: Optional[int]) -> Optional[int]:
@@ -985,6 +1193,8 @@ def record_increased_platform_stats(
     """Apply successful results only when a platform's popularity count grew."""
     outcomes: Dict[str, str] = {}
     accepted = []
+    metadata_updates = []
+    moment = now or utc_now()
     for raw_stat in stats:
         stat = _validate_stat(raw_stat)
         row = conn.execute(
@@ -995,6 +1205,15 @@ def record_increased_platform_stats(
         if stat.status != "ok":
             outcomes[stat.platform] = stat.status
             continue
+        if (
+            row is not None
+            and row["status"] == "ok"
+            and (
+                stat.genre is not None
+                or (stat.platform in TAG_PLATFORMS and stat.tags is not None)
+            )
+        ):
+            metadata_updates.append(stat)
         if (
             row is None
             or row["status"] != "ok"
@@ -1024,7 +1243,18 @@ def record_increased_platform_stats(
         ))
         outcomes[stat.platform] = "updated"
     if accepted:
-        record_platform_stats(conn, title_key, accepted, now=now)
+        record_platform_stats(conn, title_key, accepted, now=moment)
+    accepted_platforms = {stat.platform for stat in accepted}
+    metadata_only = [
+        stat for stat in metadata_updates if stat.platform not in accepted_platforms
+    ]
+    if metadata_only:
+        record_platform_metadata_results(
+            conn,
+            title_key,
+            metadata_only,
+            now=moment,
+        )
     return outcomes
 
 
@@ -1058,7 +1288,32 @@ def _parse_series_candidates(page: str) -> List[Dict[str, str]]:
     return candidates
 
 
-def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float]]:
+def _parse_series_genre(page: str) -> Optional[str]:
+    info_start = re.search(
+        r"<ul\b[^>]*class=[\"'][^\"']*\bend_info\b[^\"']*[\"'][^>]*>",
+        page,
+        flags=re.IGNORECASE,
+    )
+    if info_start is None:
+        return None
+    remainder = page[info_start.start():]
+    description_start = re.search(
+        r"<div\b[^>]*class=[\"'][^\"']*\bend_dsc\b[^\"']*[\"'][^>]*>",
+        remainder,
+        flags=re.IGNORECASE,
+    )
+    block = remainder[:description_start.start()] if description_start else remainder[:5000]
+    genre = re.search(
+        r"<a\b[^>]*href=[\"'][^\"']*categoryProductList\.series\?"
+        r"[^\"']*categoryTypeCode=genre(?:&amp;|&)genreCode=[^\"']+[\"'][^>]*>"
+        r"([\s\S]*?)</a>",
+        block,
+        flags=re.IGNORECASE,
+    )
+    return _normalize_genre(_strip_tags(genre.group(1))) if genre else None
+
+
+def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float], Optional[str]]:
     title_match = (
         re.search(r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']", page, flags=re.IGNORECASE)
         or re.search(r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:title[\"']", page, flags=re.IGNORECASE)
@@ -1080,7 +1335,38 @@ def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float]
         title,
         _count(_strip_tags(download.group(1))) if download else None,
         _rating(rating.group(1), maximum=RATING_SCALES["series"]) if rating else None,
+        _parse_series_genre(page),
     )
+
+
+def _lookup_series_remote(
+    title: str,
+    remote_id: str,
+    fetch_text: Callable[[str, float], str],
+    *,
+    timeout: float,
+    fallback_title: Optional[str] = None,
+) -> PlatformStat:
+    detail_url = "https://series.naver.com/novel/detail.series?" + urlencode(
+        {"productNo": remote_id}
+    )
+    detail_title, download_count, rating, genre = _parse_series_detail(
+        fetch_text(detail_url, timeout)
+    )
+    matched_title = detail_title or str(fallback_title or "")
+    if not matched_title or not titles_match(title, matched_title):
+        return _not_found("series")
+    stat = PlatformStat(
+        platform="series",
+        status="ok",
+        remote_id=str(remote_id),
+        remote_title=matched_title,
+        remote_url=detail_url,
+        download_count=download_count,
+        rating=rating,
+        genre=genre,
+    )
+    return stat if _has_metrics(stat) else _error("series", RuntimeError("지표를 찾지 못했습니다"))
 
 
 def lookup_series(
@@ -1101,22 +1387,13 @@ def lookup_series(
     candidate = next((item for item in candidates if titles_match(title, item["title"])), None)
     if candidate is None:
         return _not_found("series")
-    detail_url = "https://series.naver.com/novel/detail.series?" + urlencode(
-        {"productNo": candidate["id"]}
+    return _lookup_series_remote(
+        title,
+        str(candidate["id"]),
+        fetch_text,
+        timeout=timeout,
+        fallback_title=str(candidate["title"]),
     )
-    detail_title, download_count, rating = _parse_series_detail(fetch_text(detail_url, timeout))
-    if not titles_match(title, detail_title or candidate["title"]):
-        return _not_found("series")
-    stat = PlatformStat(
-        platform="series",
-        status="ok",
-        remote_id=candidate["id"],
-        remote_title=detail_title or candidate["title"],
-        remote_url=detail_url,
-        download_count=download_count,
-        rating=rating,
-    )
-    return stat if _has_metrics(stat) else _error("series", RuntimeError("지표를 찾지 못했습니다"))
 
 
 def _kakao_api_candidates(data: object) -> List[Dict[str, object]]:
@@ -1148,7 +1425,7 @@ def _kakao_api_candidates(data: object) -> List[Dict[str, object]]:
 
 def _parse_kakao_overview(
     data: object,
-) -> Tuple[str, Optional[int], Optional[float], Optional[int]]:
+) -> Tuple[str, Optional[int], Optional[float], Optional[int], Optional[str]]:
     result = data.get("result") if isinstance(data, dict) else None
     content = result.get("content") if isinstance(result, dict) else None
     if not isinstance(content, dict):
@@ -1160,12 +1437,80 @@ def _parse_kakao_overview(
         rating_sum = _number(_first_value(props, ("ratingSum", "rating_sum")))
         if rating_sum is not None and rating_count:
             rating_value = rating_sum / rating_count
+    genre_value = _first_value(content, ("sub_category", "subCategory"))
     return (
         str(_first_value(content, ("title", "name", "seoTitle")) or ""),
         _count(_first_value(props, ("viewCount", "view_count", "readCount", "read_count"))),
         _rating(rating_value, maximum=RATING_SCALES["kakao"]),
         rating_count,
+        _normalize_genre(str(genre_value)) if genre_value is not None else None,
     )
+
+
+def _parse_kakao_tags(data: object) -> Tuple[str, ...]:
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        raise ValueError("Kakao about response has no result object")
+    if "theme_keyword_list" not in result:
+        raise ValueError("Kakao about response has no theme_keyword_list")
+    items = result.get("theme_keyword_list")
+    if not isinstance(items, list):
+        raise ValueError("Kakao about theme_keyword_list is not an array")
+    values = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Kakao about theme keyword item is not an object")
+        title = item.get("title")
+        if title is None:
+            raise ValueError("Kakao about theme keyword item has no title")
+        values.append(str(title))
+    return _normalize_tags(values)
+
+
+def _lookup_kakao_remote(
+    title: str,
+    remote_id: str,
+    fetch_json: Callable[[str, float], object],
+    *,
+    timeout: float,
+    fallback_view_count: Optional[int] = None,
+) -> PlatformStat:
+    content_id = str(remote_id)
+    detail_url = f"https://page.kakao.com/content/{content_id}"
+    overview_url = (
+        f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/overview?"
+        + urlencode({"series_id": content_id})
+    )
+    detail_title, views, rating, rating_count, genre = _parse_kakao_overview(
+        fetch_json(overview_url, timeout)
+    )
+    matched_title = detail_title
+    if not matched_title or not titles_match(title, matched_title):
+        return _not_found("kakao")
+    tags = None
+    try:
+        about_url = (
+            f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/about?"
+            + urlencode({"series_id": content_id})
+        )
+        tags = _parse_kakao_tags(fetch_json(about_url, timeout))
+    except Exception:
+        # Theme keywords are optional metadata. A transient about-response
+        # failure must not discard otherwise valid popularity metrics.
+        tags = None
+    stat = PlatformStat(
+        platform="kakao",
+        status="ok",
+        remote_id=content_id,
+        remote_title=matched_title,
+        remote_url=detail_url,
+        view_count=views if views is not None else fallback_view_count,
+        rating=rating,
+        rating_count=rating_count,
+        genre=genre,
+        tags=tags,
+    )
+    return stat if _has_metrics(stat) else _error("kakao", RuntimeError("지표를 찾지 못했습니다"))
 
 
 def lookup_kakao(
@@ -1189,28 +1534,16 @@ def lookup_kakao(
     ))
     matched = [item for item in candidates if titles_match(title, str(item["title"]))]
     for candidate in matched[:3]:
-        content_id = str(candidate["id"])
-        detail_url = f"https://page.kakao.com/content/{content_id}"
-        overview_url = (
-            f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/overview?"
-            + urlencode({"series_id": content_id})
+        stat = _lookup_kakao_remote(
+            title,
+            str(candidate["id"]),
+            fetch_json,
+            timeout=timeout,
+            fallback_view_count=candidate.get("view_count"),
         )
-        detail_title, views, rating, rating_count = _parse_kakao_overview(
-            fetch_json(overview_url, timeout)
-        )
-        if not titles_match(title, detail_title):
+        if stat.status == "not_found":
             continue
-        stat = PlatformStat(
-            platform="kakao",
-            status="ok",
-            remote_id=content_id,
-            remote_title=detail_title,
-            remote_url=detail_url,
-            view_count=views if views is not None else candidate.get("view_count"),
-            rating=rating,
-            rating_count=rating_count,
-        )
-        return stat if _has_metrics(stat) else _error("kakao", RuntimeError("지표를 찾지 못했습니다"))
+        return stat
     return _not_found("kakao")
 
 
@@ -1218,9 +1551,55 @@ def _novelpia_title(record: object) -> str:
     return str(_first_value(record, ("novel_name", "novelName", "title", "name", "subject")) or "")
 
 
+def _novelpia_genre_tags(record: object) -> Optional[Tuple[str, ...]]:
+    if not isinstance(record, dict):
+        return None
+    if "novel_genre_arr" in record:
+        values = record.get("novel_genre_arr")
+        if not isinstance(values, list):
+            raise ValueError("Novelpia novel_genre_arr is not an array")
+        return _normalize_tags(values)
+    raw = record.get("novel_genre")
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return _normalize_tags(raw)
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Novelpia novel_genre is not valid JSON") from exc
+        if not isinstance(decoded, list):
+            raise ValueError("Novelpia novel_genre JSON is not an array")
+        return _normalize_tags(decoded)
+    raise ValueError("Novelpia novel_genre has an unexpected type")
+
+
+def _parse_novelpia_tags(page: str) -> Tuple[str, ...]:
+    blocks = re.findall(
+        r"<p\b[^>]*class=[\"'][^\"']*\bwriter-tag\b[^\"']*[\"'][^>]*>"
+        r"([\s\S]*?)</p>",
+        page,
+        flags=re.IGNORECASE,
+    )
+    if not blocks:
+        raise ValueError("Novelpia detail response has no writer-tag block")
+    values = []
+    for block in blocks:
+        for match in re.finditer(
+            r"<span\b[^>]*class=[\"'][^\"']*\btag\b[^\"']*[\"'][^>]*>"
+            r"([\s\S]*?)</span>",
+            block,
+            flags=re.IGNORECASE,
+        ):
+            values.append(_strip_tags(match.group(1)))
+    return _normalize_tags(values)
+
+
 def lookup_novelpia(
     title: str,
     fetch_json: Callable[[str, float], object] = _http_json,
+    fetch_text: Optional[Callable[[str, float], str]] = None,
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> PlatformStat:
@@ -1256,6 +1635,23 @@ def lookup_novelpia(
         return _not_found("novelpia")
     remote_id = _first_value(candidate, ("novel_no", "novelNo", "novel_id", "novelId", "id"))
     remote_id_text = str(remote_id) if remote_id is not None else None
+    try:
+        tags = _novelpia_genre_tags(candidate)
+    except Exception:
+        tags = None
+    detail_fetch = fetch_text
+    if tags is None:
+        if detail_fetch is None and fetch_json is _http_json:
+            detail_fetch = _http_text
+        if remote_id_text and detail_fetch is not None:
+            try:
+                tags = _parse_novelpia_tags(
+                    detail_fetch(f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout)
+                )
+            except Exception:
+                # Search metrics remain valid even if optional metadata cannot be read.
+                tags = None
+    genre = tags[0] if tags else ("" if tags is not None else None)
     stat = PlatformStat(
         platform="novelpia",
         status="ok",
@@ -1266,6 +1662,8 @@ def lookup_novelpia(
         recommend_count=_count(_first_value(candidate, ("count_good", "good_count", "goodCount", "recommend", "recommend_count"))),
         rating=_rating(_first_value(candidate, ("rating", "rating_average", "ratingAverage", "score"))),
         rating_count=_count(_first_value(candidate, ("rating_count", "ratingCount", "count_rating"))),
+        genre=genre,
+        tags=tags,
     )
     return stat if _has_metrics(stat) else _error("novelpia", RuntimeError("지표를 찾지 못했습니다"))
 
@@ -1285,7 +1683,12 @@ def lookup_platforms(
     lookups = {
         "series": lambda: lookup_series(title, fetch_text, timeout=timeout),
         "kakao": lambda: lookup_kakao(title, fetch_json, timeout=timeout),
-        "novelpia": lambda: lookup_novelpia(title, fetch_json, timeout=timeout),
+        "novelpia": lambda: lookup_novelpia(
+            title,
+            fetch_json,
+            fetch_text,
+            timeout=timeout,
+        ),
     }
     for platform in platforms:
         if platform not in lookups:
@@ -1298,6 +1701,81 @@ def lookup_platforms(
         thread_name_prefix="platform-catalog",
     ) as executor:
         futures = {platform: executor.submit(lookups[platform]) for platform in platforms}
+        results = []
+        for platform in platforms:
+            try:
+                results.append(futures[platform].result())
+            except Exception as exc:
+                results.append(_error(platform, exc))
+        return results
+
+
+def lookup_platform_metadata(
+    title: str,
+    platforms: Sequence[str],
+    *,
+    remote_ids: Optional[Dict[str, str]] = None,
+    fetch_text: Callable[[str, float], str] = _http_text,
+    fetch_json: Callable[[str, float], object] = _http_json,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> List[PlatformStat]:
+    """Prefer verified remote IDs for metadata backfill, then fall back to search."""
+    if not platforms:
+        return []
+    if len(set(platforms)) != len(platforms):
+        raise ValueError("platform lookup list must not contain duplicates")
+    for platform in platforms:
+        if platform not in PLATFORMS:
+            raise ValueError(f"unknown platform: {platform}")
+
+    ids = remote_ids or {}
+    full_lookups = {
+        "series": lambda: lookup_series(title, fetch_text, timeout=timeout),
+        "kakao": lambda: lookup_kakao(title, fetch_json, timeout=timeout),
+        "novelpia": lambda: lookup_novelpia(
+            title,
+            fetch_json,
+            fetch_text,
+            timeout=timeout,
+        ),
+    }
+
+    def lookup_one(platform: str) -> PlatformStat:
+        remote_id = ids.get(platform)
+        if platform == "series" and remote_id:
+            try:
+                stat = _lookup_series_remote(
+                    title,
+                    str(remote_id),
+                    fetch_text,
+                    timeout=timeout,
+                )
+            except Exception:
+                stat = None
+            if stat is not None and stat.status == "ok":
+                return stat
+        elif platform == "kakao" and remote_id:
+            try:
+                stat = _lookup_kakao_remote(
+                    title,
+                    str(remote_id),
+                    fetch_json,
+                    timeout=timeout,
+                )
+            except Exception:
+                stat = None
+            if stat is not None and stat.status == "ok":
+                return stat
+        return full_lookups[platform]()
+
+    # Preserve the existing per-title concurrency: direct Series/Kakao detail
+    # requests and the NovelPia search can run in parallel, while each platform
+    # still performs at most one request chain at a time.
+    with ThreadPoolExecutor(
+        max_workers=min(len(platforms), len(PLATFORMS)),
+        thread_name_prefix="platform-metadata",
+    ) as executor:
+        futures = {platform: executor.submit(lookup_one, platform) for platform in platforms}
         results = []
         for platform in platforms:
             try:
@@ -1502,6 +1980,179 @@ def refresh_authenticated_novelpia(
             "selected_platforms": len(targets),
             "status_counts": status_counts,
             "authenticated_novelpia_relogins": client.relogin_count,
+        }
+    finally:
+        conn.close()
+
+
+def refresh_missing_metadata(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = DEFAULT_LIMIT,
+    delay_seconds: float = DEFAULT_DELAY_SECONDS,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    dry_run: bool = False,
+    authenticated_novelpia_lookup: Optional[Callable[..., PlatformStat]] = None,
+    lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    progress: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> Dict[str, object]:
+    """Fill missing genre/tag snapshots without changing stored popularity metrics."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if dry_run:
+        return preview_metadata_backfill(state_db_path, limit=limit)
+
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        if progress is not None:
+            progress({"phase": "sync_start"})
+        synced = sync_catalog_titles(conn)
+        targets = select_metadata_backfill_targets(conn, limit=limit)
+        selected_platforms = sum(len(target.platforms) for target in targets)
+        outcome_counts = {
+            "updated": 0,
+            "empty": 0,
+            "unavailable": 0,
+            "not_found": 0,
+            "error": 0,
+            "skipped": 0,
+        }
+        if progress is not None:
+            progress({
+                "phase": "metadata_start",
+                "discovered_titles": synced["discovered"],
+                "selected_titles": len(targets),
+                "selected_platforms": selected_platforms,
+            })
+        completed_titles = 0
+        authenticated_novelpia_attempts = 0
+        pending_authenticated = []
+        remote_ids_by_title: Dict[str, Dict[str, str]] = {}
+        if lookup is lookup_platforms:
+            for row in conn.execute(
+                """
+                SELECT title_key, platform, remote_id
+                FROM catalog_platform_stats
+                WHERE status = 'ok' AND remote_id IS NOT NULL
+                """
+            ):
+                remote_ids_by_title.setdefault(row["title_key"], {})[
+                    row["platform"]
+                ] = str(row["remote_id"])
+
+        def report_completed(target, results, authenticated=None):
+            nonlocal completed_titles, authenticated_novelpia_attempts
+            final_results = list(results)
+            if authenticated is not None:
+                final_results = [
+                    result
+                    for result in final_results
+                    if result.platform != "novelpia"
+                ] + [authenticated]
+                authenticated_novelpia_attempts += 1
+            outcomes = record_platform_metadata_results(
+                conn,
+                target.title.title_key,
+                final_results,
+                now=now(),
+            )
+            for outcome in outcomes.values():
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            completed_titles += 1
+            if progress is not None:
+                progress({
+                    "phase": "metadata_progress",
+                    "completed_titles": completed_titles,
+                    "selected_titles": len(targets),
+                    "completed_platforms": sum(outcome_counts.values()),
+                    "selected_platforms": selected_platforms,
+                    "outcome_counts": dict(outcome_counts),
+                    "authenticated_novelpia_attempts": (
+                        authenticated_novelpia_attempts
+                    ),
+                })
+
+        def flush_authenticated():
+            if not pending_authenticated:
+                return
+            authenticated_results = _authenticated_lookup_batch(
+                authenticated_novelpia_lookup,
+                [target.title.query_title for target, _results in pending_authenticated],
+                timeout=timeout,
+                delay_seconds=delay_seconds,
+                sleep=sleep,
+            )
+            if len(authenticated_results) != len(pending_authenticated) or any(
+                result.platform != "novelpia" for result in authenticated_results
+            ):
+                raise RuntimeError(
+                    "authenticated lookup batch returned invalid NovelPia results"
+                )
+            for (target, results), authenticated in zip(
+                pending_authenticated, authenticated_results
+            ):
+                report_completed(target, results, authenticated)
+            pending_authenticated.clear()
+
+        for index, target in enumerate(targets):
+            if lookup is lookup_platforms:
+                results = lookup_platform_metadata(
+                    target.title.query_title,
+                    target.platforms,
+                    remote_ids=remote_ids_by_title.get(target.title.title_key),
+                    timeout=timeout,
+                )
+            else:
+                results = lookup(
+                    target.title.query_title,
+                    target.platforms,
+                    timeout=timeout,
+                )
+            if {result.platform for result in results} != set(target.platforms):
+                raise RuntimeError(
+                    "platform lookup did not return exactly the requested platforms"
+                )
+            if (
+                authenticated_novelpia_lookup is not None
+                and "novelpia" in target.platforms
+            ):
+                novelpia_result = next(
+                    result for result in results if result.platform == "novelpia"
+                )
+                if (
+                    novelpia_result.status != "ok"
+                    or novelpia_result.genre is None
+                    or novelpia_result.tags is None
+                ):
+                    pending_authenticated.append((target, results))
+                    if len(pending_authenticated) >= NOVELPIA_AUTH_BATCH_SIZE:
+                        flush_authenticated()
+                else:
+                    report_completed(target, results)
+            else:
+                report_completed(target, results)
+            if index + 1 < len(targets) and delay_seconds:
+                sleep(delay_seconds)
+        flush_authenticated()
+        return {
+            "dry_run": False,
+            **synced,
+            "selected_titles": len(targets),
+            "selected_platforms": selected_platforms,
+            "outcome_counts": outcome_counts,
+            "authenticated_novelpia_attempts": authenticated_novelpia_attempts,
+            "authenticated_novelpia_relogins": int(getattr(
+                getattr(authenticated_novelpia_lookup, "__self__", None),
+                "relogin_count",
+                0,
+            )),
         }
     finally:
         conn.close()

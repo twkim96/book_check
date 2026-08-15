@@ -125,6 +125,7 @@ def catalog_listing(
         keys = [row["title_key"] for row in rows]
         files_by_key = {key: [] for key in keys}
         stats_by_key = {key: {} for key in keys}
+        tags_by_key_platform = {}
         relations_by_key = {
             key: {"work_bucket_ids": set(), "variant_ids": set(), "folders": set(), "representative_file_ids": []}
             for key in keys
@@ -167,6 +168,19 @@ def catalog_listing(
                     "unit": row["unit"],
                     "complete": bool(row["complete"]),
                 })
+            tag_rows = conn.execute(
+                f"""
+                SELECT title_key, platform, tag
+                FROM catalog_platform_tags
+                WHERE title_key IN ({placeholders})
+                ORDER BY title_key, platform, position
+                """,
+                keys,
+            ).fetchall()
+            for tag_row in tag_rows:
+                tags_by_key_platform.setdefault(
+                    (tag_row["title_key"], tag_row["platform"]), []
+                ).append(tag_row["tag"])
             stat_rows = conn.execute(
                 f"""
                 SELECT * FROM catalog_platform_stats
@@ -176,15 +190,21 @@ def catalog_listing(
                 keys,
             ).fetchall()
             for row in stat_rows:
-                stats_by_key[row["title_key"]][row["platform"]] = {
+                platform_payload = {
                     key: row[key]
                     for key in (
                         "platform", "status", "remote_title", "remote_url",
                         "download_count", "view_count", "recommend_count", "rating",
-                        "rating_count", "last_attempt_at", "last_success_at", "retry_after",
-                        "error_message",
+                        "rating_count", "genre", "genre_collected_at", "tags_collected_at", "last_attempt_at",
+                        "last_success_at", "retry_after", "error_message",
                     )
                 }
+                platform_payload["tags"] = (
+                    list(tags_by_key_platform.get((row["title_key"], row["platform"]), []))
+                    if row["tags_collected_at"] is not None
+                    else None
+                )
+                stats_by_key[row["title_key"]][row["platform"]] = platform_payload
         items = []
         for row in rows:
             key = row["title_key"]
