@@ -687,8 +687,11 @@ version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, archive `1.
 - 기존 성공 행은 `run_platform_catalog.py refresh-metadata` 또는 도서 관리의 `플랫폼 메타데이터 backfill`
   서비스로 popularity metric을 바꾸지 않고 빠진 장르/태그만 채운다.
 - metadata backfill은 Series/Kakao의 저장된 `remote_id`로 상세/BFF를 직접 조회해 검색 요청을 줄이고,
-  상세 제목 불일치·요청 실패 시 기존 제목 검색으로 안전하게 fallback한다. 장시간 서비스 진행 로그는 10작품 단위로 throttle한다.
-- 카탈로그 UI/API와 Google Sheet에서 플랫폼별 장르를 표시하고, 카카오·노벨피아 태그는 원 순서를 보존한다.
+  상세 제목 불일치·요청 실패 시 기존 제목 검색으로 안전하게 fallback한다. fallback이 다른 verified ID를 찾으면 popularity는 보존한 채 remote identity와 metadata를 같은 transaction에서 교정하고, target의 query/revision/expected ID가 바뀌었으면 `stale_target`으로 쓰지 않는다. 장시간 서비스 진행 로그는 10작품 단위로 throttle한다.
+- 운영 backfill 뒤에는 `repair-metadata-identities --all` 또는 도서 관리의 `플랫폼 remote ID 검증·교정` 서비스로 Series/Kakao 성공 ID를 전수 재검증할 수 있다. 이 감사에서는 popularity와 기존 장르/태그 snapshot을 변경하지 않으며 Kakao direct 검증은 overview만 읽는다.
+- 카탈로그 UI/API와 Google Sheet에서 플랫폼별 장르를 표시하고, 카카오·노벨피아 태그는 원 순서를 보존한다. 두 projection은 한 SQLite read transaction에서 동일 snapshot을 읽는다.
+
+운영 리뷰 hotfix는 Folderling activation claim 중단 상태와 이미 `interrupted`로 남은 persistent job을 재시작마다 반복 reconciliation하고, journal 밖 side effect 전에 actual-run mutation marker를 남긴다. 따라서 claim 직후·manifest 작성 중 crash는 증명 가능한 pre-mutation 상태에서만 자동 종료하고, mutation evidence가 있으면 계속 fail-closed한다.
 
 배포/UI/platform catalog는 `1.4.18`, schema는 `v16`이다. `NORMALIZER_VERSION=1.3.3`, fingerprint
 version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, duplicate auditor contract `1.4.17`,

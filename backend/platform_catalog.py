@@ -32,6 +32,7 @@ from normalizer import (
 
 PLATFORMS = ("series", "kakao", "novelpia")
 TAG_PLATFORMS = ("kakao", "novelpia")
+IDENTITY_AUDIT_PLATFORMS = ("series", "kakao")
 GROWTH_METRICS = {
     "series": ("download_count",),
     "kakao": ("view_count",),
@@ -311,6 +312,8 @@ class CatalogTitle:
 class RefreshTarget:
     title: CatalogTitle
     platforms: Tuple[str, ...]
+    title_updated_at: Optional[str] = None
+    remote_hints: Tuple[Tuple[str, Optional[str], Optional[str]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -328,6 +331,7 @@ class PlatformStat:
     genre: Optional[str] = None
     tags: Optional[Tuple[str, ...]] = None
     message: str = ""
+    metadata_lookup_mode: Optional[str] = None
 
 
 def utc_now() -> datetime:
@@ -878,6 +882,12 @@ def select_metadata_backfill_targets(
     if limit == 0:
         return []
     stats = _stats_by_title(conn)
+    title_rows = {
+        row["title_key"]: row
+        for row in conn.execute(
+            "SELECT title_key, query_title, updated_at FROM catalog_titles"
+        )
+    }
     targets = []
     for title in sorted(discover_catalog_titles(conn), key=lambda item: item.title_key):
         rows = stats.get(title.title_key, {})
@@ -896,10 +906,94 @@ def select_metadata_backfill_targets(
         )
         if not platforms:
             continue
-        targets.append(RefreshTarget(title=title, platforms=platforms))
+        title_row = title_rows.get(title.title_key)
+        if title_row is None or title_row["query_title"] != title.query_title:
+            continue
+        targets.append(RefreshTarget(
+            title=title,
+            platforms=platforms,
+            title_updated_at=title_row["updated_at"],
+            remote_hints=tuple(
+                (
+                    platform,
+                    rows[platform]["remote_id"],
+                    rows[platform]["remote_title"],
+                )
+                for platform in platforms
+            ),
+        ))
         if limit is not None and len(targets) >= limit:
             break
     return targets
+
+
+def select_metadata_identity_targets(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+) -> List[RefreshTarget]:
+    """Select active successful Series/Kakao rows for remote identity audit."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return []
+    stats = _stats_by_title(conn)
+    title_rows = {
+        row["title_key"]: row
+        for row in conn.execute(
+            "SELECT title_key, query_title, updated_at FROM catalog_titles"
+        )
+    }
+    targets = []
+    for title in sorted(discover_catalog_titles(conn), key=lambda item: item.title_key):
+        rows = stats.get(title.title_key, {})
+        platforms = tuple(
+            platform
+            for platform in IDENTITY_AUDIT_PLATFORMS
+            if rows.get(platform) is not None
+            and rows[platform]["status"] == "ok"
+            and rows[platform]["remote_id"] is not None
+        )
+        if not platforms:
+            continue
+        title_row = title_rows.get(title.title_key)
+        if title_row is None or title_row["query_title"] != title.query_title:
+            continue
+        targets.append(RefreshTarget(
+            title=title,
+            platforms=platforms,
+            title_updated_at=title_row["updated_at"],
+            remote_hints=tuple(
+                (
+                    platform,
+                    rows[platform]["remote_id"],
+                    rows[platform]["remote_title"],
+                )
+                for platform in platforms
+            ),
+        ))
+        if limit is not None and len(targets) >= limit:
+            break
+    return targets
+
+
+def preview_metadata_identity_audit(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = None,
+) -> Dict[str, object]:
+    conn = decision_store.connect_state_db_readonly(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        targets = select_metadata_identity_targets(conn, limit=limit)
+        return {
+            "dry_run": True,
+            "selected_titles": len(targets),
+            "selected_platforms": sum(len(target.platforms) for target in targets),
+            "titles": [target.title.display_title for target in targets],
+        }
+    finally:
+        conn.close()
 
 
 def preview_metadata_backfill(
@@ -1028,6 +1122,7 @@ def record_platform_metadata_results(
     stats: Sequence[PlatformStat],
     *,
     now: Optional[datetime] = None,
+    expected_target: Optional[RefreshTarget] = None,
 ) -> Dict[str, str]:
     """Persist authoritative genre/tag snapshots without changing popularity metrics."""
     moment = now or utc_now()
@@ -1036,19 +1131,67 @@ def record_platform_metadata_results(
     if len({stat.platform for stat in validated}) != len(validated):
         raise ValueError("at most one stat per platform may be recorded per title")
     outcomes: Dict[str, str] = {}
+    expected_remote_ids = (
+        {
+            platform: remote_id
+            for platform, remote_id, _remote_title in expected_target.remote_hints
+        }
+        if expected_target is not None else {}
+    )
     with decision_store.transaction(conn):
+        if expected_target is not None:
+            current_title = conn.execute(
+                "SELECT query_title, updated_at FROM catalog_titles WHERE title_key = ?",
+                (title_key,),
+            ).fetchone()
+            if (
+                current_title is None
+                or current_title["query_title"] != expected_target.title.query_title
+                or current_title["updated_at"] != expected_target.title_updated_at
+            ):
+                return {stat.platform: "stale_target" for stat in validated}
         for stat in validated:
             row = conn.execute(
-                "SELECT status FROM catalog_platform_stats "
+                "SELECT status, remote_id FROM catalog_platform_stats "
                 "WHERE title_key = ? AND platform = ?",
                 (title_key, stat.platform),
             ).fetchone()
             if row is None or row["status"] != "ok":
                 outcomes[stat.platform] = "skipped"
                 continue
+            if (
+                expected_target is not None
+                and stat.platform in expected_remote_ids
+                and row["remote_id"] != expected_remote_ids[stat.platform]
+            ):
+                outcomes[stat.platform] = "stale_target"
+                continue
             if stat.status != "ok":
                 outcomes[stat.platform] = stat.status
                 continue
+
+            identity_repaired = False
+            if stat.remote_id is not None and stat.remote_id != row["remote_id"]:
+                if not stat.remote_title or not stat.remote_url:
+                    outcomes[stat.platform] = "unavailable"
+                    continue
+                conn.execute(
+                    """
+                    UPDATE catalog_platform_stats
+                    SET remote_id = ?, remote_title = ?, remote_url = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE title_key = ? AND platform = ?
+                    """,
+                    (
+                        stat.remote_id,
+                        stat.remote_title,
+                        stat.remote_url,
+                        title_key,
+                        stat.platform,
+                    ),
+                )
+                identity_repaired = True
+
             updated = False
             if stat.genre is not None:
                 _replace_platform_genre(
@@ -1068,7 +1211,10 @@ def record_platform_metadata_results(
                     collected_at,
                 )
                 updated = True
-            outcomes[stat.platform] = "updated" if updated else "unavailable"
+            if identity_repaired:
+                outcomes[stat.platform] = "identity_repaired"
+            else:
+                outcomes[stat.platform] = "updated" if updated else "unavailable"
     return outcomes
 
 
@@ -1190,71 +1336,75 @@ def record_increased_platform_stats(
     *,
     now: Optional[datetime] = None,
 ) -> Dict[str, str]:
-    """Apply successful results only when a platform's popularity count grew."""
+    """Atomically apply successful results only when a popularity count grew."""
     outcomes: Dict[str, str] = {}
-    accepted = []
-    metadata_updates = []
     moment = now or utc_now()
-    for raw_stat in stats:
-        stat = _validate_stat(raw_stat)
-        row = conn.execute(
-            "SELECT * FROM catalog_platform_stats "
-            "WHERE title_key = ? AND platform = ?",
-            (title_key, stat.platform),
-        ).fetchone()
-        if stat.status != "ok":
-            outcomes[stat.platform] = stat.status
-            continue
-        if (
-            row is not None
-            and row["status"] == "ok"
-            and (
-                stat.genre is not None
-                or (stat.platform in TAG_PLATFORMS and stat.tags is not None)
+    attempted_at = _utc_text(moment)
+    validated = [_validate_stat(stat) for stat in stats]
+    if len({stat.platform for stat in validated}) != len(validated):
+        raise ValueError("at most one stat per platform may be recorded per title")
+
+    with decision_store.transaction(conn):
+        for stat in validated:
+            row = conn.execute(
+                "SELECT * FROM catalog_platform_stats "
+                "WHERE title_key = ? AND platform = ?",
+                (title_key, stat.platform),
+            ).fetchone()
+            if stat.status != "ok":
+                outcomes[stat.platform] = stat.status
+                continue
+            if row is None or row["status"] != "ok":
+                outcomes[stat.platform] = "skipped"
+                continue
+
+            has_growth_metric = _row_has_growth_metric(stat.platform, row)
+            increased = (
+                _growth_metric_increased(row, stat) if has_growth_metric else False
             )
-        ):
-            metadata_updates.append(stat)
-        if (
-            row is None
-            or row["status"] != "ok"
-            or not _row_has_growth_metric(stat.platform, row)
-        ):
-            outcomes[stat.platform] = "skipped"
-            continue
-        if not _growth_metric_increased(row, stat):
-            outcomes[stat.platform] = "unchanged"
-            continue
-        accepted.append(replace(
-            stat,
-            remote_id=stat.remote_id or row["remote_id"],
-            remote_title=stat.remote_title or row["remote_title"],
-            remote_url=stat.remote_url or row["remote_url"],
-            download_count=_monotonic_count(
-                row["download_count"], stat.download_count
-            ),
-            view_count=_monotonic_count(row["view_count"], stat.view_count),
-            recommend_count=_monotonic_count(
-                row["recommend_count"], stat.recommend_count
-            ),
-            rating=stat.rating if stat.rating is not None else row["rating"],
-            rating_count=_monotonic_count(
-                row["rating_count"], stat.rating_count
-            ),
-        ))
-        outcomes[stat.platform] = "updated"
-    if accepted:
-        record_platform_stats(conn, title_key, accepted, now=moment)
-    accepted_platforms = {stat.platform for stat in accepted}
-    metadata_only = [
-        stat for stat in metadata_updates if stat.platform not in accepted_platforms
-    ]
-    if metadata_only:
-        record_platform_metadata_results(
-            conn,
-            title_key,
-            metadata_only,
-            now=moment,
-        )
+            if increased:
+                conn.execute(
+                    """
+                    UPDATE catalog_platform_stats
+                    SET remote_id = ?, remote_title = ?, remote_url = ?,
+                        download_count = ?, view_count = ?, recommend_count = ?,
+                        rating = ?, rating_count = ?,
+                        last_attempt_at = ?, last_success_at = ?, retry_after = NULL,
+                        error_message = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE title_key = ? AND platform = ? AND status = 'ok'
+                    """,
+                    (
+                        stat.remote_id or row["remote_id"],
+                        stat.remote_title or row["remote_title"],
+                        stat.remote_url or row["remote_url"],
+                        _monotonic_count(row["download_count"], stat.download_count),
+                        _monotonic_count(row["view_count"], stat.view_count),
+                        _monotonic_count(
+                            row["recommend_count"], stat.recommend_count
+                        ),
+                        stat.rating if stat.rating is not None else row["rating"],
+                        _monotonic_count(row["rating_count"], stat.rating_count),
+                        attempted_at,
+                        attempted_at,
+                        stat.message or None,
+                        title_key,
+                        stat.platform,
+                    ),
+                )
+                outcomes[stat.platform] = "updated"
+            elif has_growth_metric:
+                outcomes[stat.platform] = "unchanged"
+            else:
+                outcomes[stat.platform] = "skipped"
+
+            if stat.genre is not None:
+                _replace_platform_genre(
+                    conn, title_key, stat.platform, stat.genre, attempted_at
+                )
+            if stat.platform in TAG_PLATFORMS and stat.tags is not None:
+                _replace_platform_tags(
+                    conn, title_key, stat.platform, stat.tags, attempted_at
+                )
     return outcomes
 
 
@@ -1513,6 +1663,74 @@ def _lookup_kakao_remote(
     return stat if _has_metrics(stat) else _error("kakao", RuntimeError("지표를 찾지 못했습니다"))
 
 
+def _lookup_kakao_identity_remote(
+    title: str,
+    remote_id: str,
+    fetch_json: Callable[[str, float], object],
+    *,
+    timeout: float,
+    fallback_view_count: Optional[int] = None,
+) -> PlatformStat:
+    """Verify one Kakao series ID from overview without fetching theme tags."""
+    content_id = str(remote_id)
+    overview_url = (
+        f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/overview?"
+        + urlencode({"series_id": content_id})
+    )
+    detail_title, views, rating, rating_count, _genre = _parse_kakao_overview(
+        fetch_json(overview_url, timeout)
+    )
+    if not detail_title or not titles_match(title, detail_title):
+        return _not_found("kakao")
+    stat = PlatformStat(
+        platform="kakao",
+        status="ok",
+        remote_id=content_id,
+        remote_title=detail_title,
+        remote_url=f"https://page.kakao.com/content/{content_id}",
+        view_count=views if views is not None else fallback_view_count,
+        rating=rating,
+        rating_count=rating_count,
+    )
+    return stat if _has_metrics(stat) else _error(
+        "kakao", RuntimeError("지표를 찾지 못했습니다")
+    )
+
+
+def lookup_kakao_identity(
+    title: str,
+    fetch_json: Callable[[str, float], object] = _http_json,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> PlatformStat:
+    """Search Kakao only far enough to verify the canonical content identity."""
+    params = {
+        "keyword": title,
+        "category_uid": "11",
+        "is_complete": "false",
+        "sort_type": "ACCURACY",
+        "page": "0",
+        "size": "5",
+    }
+    candidates = _kakao_api_candidates(fetch_json(
+        f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v2/search/series?" + urlencode(params),
+        timeout,
+    ))
+    matched = [item for item in candidates if titles_match(title, str(item["title"]))]
+    for candidate in matched[:3]:
+        stat = _lookup_kakao_identity_remote(
+            title,
+            str(candidate["id"]),
+            fetch_json,
+            timeout=timeout,
+            fallback_view_count=candidate.get("view_count"),
+        )
+        if stat.status == "not_found":
+            continue
+        return stat
+    return _not_found("kakao")
+
+
 def lookup_kakao(
     title: str,
     fetch_json: Callable[[str, float], object] = _http_json,
@@ -1753,7 +1971,7 @@ def lookup_platform_metadata(
             except Exception:
                 stat = None
             if stat is not None and stat.status == "ok":
-                return stat
+                return replace(stat, metadata_lookup_mode="direct")
         elif platform == "kakao" and remote_id:
             try:
                 stat = _lookup_kakao_remote(
@@ -1765,8 +1983,14 @@ def lookup_platform_metadata(
             except Exception:
                 stat = None
             if stat is not None and stat.status == "ok":
-                return stat
-        return full_lookups[platform]()
+                return replace(stat, metadata_lookup_mode="direct")
+        result = full_lookups[platform]()
+        mode = (
+            "fallback"
+            if remote_id and platform in {"series", "kakao"}
+            else "search"
+        )
+        return replace(result, metadata_lookup_mode=mode)
 
     # Preserve the existing per-title concurrency: direct Series/Kakao detail
     # requests and the NovelPia search can run in parallel, while each platform
@@ -1774,6 +1998,70 @@ def lookup_platform_metadata(
     with ThreadPoolExecutor(
         max_workers=min(len(platforms), len(PLATFORMS)),
         thread_name_prefix="platform-metadata",
+    ) as executor:
+        futures = {platform: executor.submit(lookup_one, platform) for platform in platforms}
+        results = []
+        for platform in platforms:
+            try:
+                results.append(futures[platform].result())
+            except Exception as exc:
+                results.append(_error(platform, exc))
+        return results
+
+
+def lookup_platform_identities(
+    title: str,
+    platforms: Sequence[str],
+    *,
+    remote_ids: Optional[Dict[str, str]] = None,
+    fetch_text: Callable[[str, float], str] = _http_text,
+    fetch_json: Callable[[str, float], object] = _http_json,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> List[PlatformStat]:
+    """Verify Series/Kakao identities without collecting optional metadata."""
+    if not platforms:
+        return []
+    if len(set(platforms)) != len(platforms):
+        raise ValueError("platform identity lookup list must not contain duplicates")
+    for platform in platforms:
+        if platform not in IDENTITY_AUDIT_PLATFORMS:
+            raise ValueError(f"unsupported identity audit platform: {platform}")
+
+    ids = remote_ids or {}
+
+    def lookup_one(platform: str) -> PlatformStat:
+        remote_id = ids.get(platform)
+        if platform == "series":
+            if remote_id:
+                try:
+                    stat = _lookup_series_remote(
+                        title, str(remote_id), fetch_text, timeout=timeout
+                    )
+                except Exception:
+                    stat = None
+                if stat is not None and stat.status == "ok":
+                    return replace(stat, metadata_lookup_mode="direct")
+            return replace(
+                lookup_series(title, fetch_text, timeout=timeout),
+                metadata_lookup_mode="fallback" if remote_id else "search",
+            )
+        if remote_id:
+            try:
+                stat = _lookup_kakao_identity_remote(
+                    title, str(remote_id), fetch_json, timeout=timeout
+                )
+            except Exception:
+                stat = None
+            if stat is not None and stat.status == "ok":
+                return replace(stat, metadata_lookup_mode="direct")
+        return replace(
+            lookup_kakao_identity(title, fetch_json, timeout=timeout),
+            metadata_lookup_mode="fallback" if remote_id else "search",
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=min(len(platforms), len(IDENTITY_AUDIT_PLATFORMS)),
+        thread_name_prefix="platform-identity",
     ) as executor:
         futures = {platform: executor.submit(lookup_one, platform) for platform in platforms}
         results = []
@@ -1985,6 +2273,114 @@ def refresh_authenticated_novelpia(
         conn.close()
 
 
+def repair_metadata_identities(
+    state_db_path: str,
+    *,
+    limit: Optional[int] = DEFAULT_LIMIT,
+    delay_seconds: float = DEFAULT_DELAY_SECONDS,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    dry_run: bool = False,
+    lookup: Callable[..., List[PlatformStat]] = lookup_platform_identities,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    progress: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> Dict[str, object]:
+    """Verify Series/Kakao remote IDs and repair only verified identity drift."""
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    if dry_run:
+        return preview_metadata_identity_audit(state_db_path, limit=limit)
+
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        if progress is not None:
+            progress({"phase": "sync_start"})
+        synced = sync_catalog_titles(conn)
+        targets = select_metadata_identity_targets(conn, limit=limit)
+        selected_platforms = sum(len(target.platforms) for target in targets)
+        outcome_counts = {
+            "verified_direct": 0,
+            "verified_fallback": 0,
+            "identity_repaired": 0,
+            "stale_target": 0,
+            "not_found": 0,
+            "error": 0,
+            "unavailable": 0,
+            "skipped": 0,
+        }
+        if progress is not None:
+            progress({
+                "phase": "identity_start",
+                "discovered_titles": synced["discovered"],
+                "selected_titles": len(targets),
+                "selected_platforms": selected_platforms,
+            })
+        completed_titles = 0
+        for index, target in enumerate(targets):
+            expected_ids = {
+                platform: str(remote_id)
+                for platform, remote_id, _remote_title in target.remote_hints
+                if remote_id is not None
+            }
+            results = lookup(
+                target.title.query_title,
+                target.platforms,
+                remote_ids=expected_ids,
+                timeout=timeout,
+            )
+            if {result.platform for result in results} != set(target.platforms):
+                raise RuntimeError(
+                    "identity lookup did not return exactly the requested platforms"
+                )
+            for result in results:
+                if result.status != "ok":
+                    outcome_counts[result.status] = (
+                        outcome_counts.get(result.status, 0) + 1
+                    )
+                    continue
+                expected_id = expected_ids.get(result.platform)
+                if result.metadata_lookup_mode == "direct":
+                    outcome_counts["verified_direct"] += 1
+                    continue
+                if result.remote_id == expected_id:
+                    outcome_counts["verified_fallback"] += 1
+                    continue
+                outcome = record_platform_metadata_results(
+                    conn,
+                    target.title.title_key,
+                    [replace(result, genre=None, tags=None)],
+                    now=now(),
+                    expected_target=target,
+                )[result.platform]
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            completed_titles += 1
+            if progress is not None:
+                progress({
+                    "phase": "identity_progress",
+                    "completed_titles": completed_titles,
+                    "selected_titles": len(targets),
+                    "completed_platforms": sum(outcome_counts.values()),
+                    "selected_platforms": selected_platforms,
+                    "outcome_counts": dict(outcome_counts),
+                })
+            if index + 1 < len(targets) and delay_seconds:
+                sleep(delay_seconds)
+        return {
+            "dry_run": False,
+            **synced,
+            "selected_titles": len(targets),
+            "selected_platforms": selected_platforms,
+            "outcome_counts": outcome_counts,
+        }
+    finally:
+        conn.close()
+
+
 def refresh_missing_metadata(
     state_db_path: str,
     *,
@@ -2018,12 +2414,15 @@ def refresh_missing_metadata(
         selected_platforms = sum(len(target.platforms) for target in targets)
         outcome_counts = {
             "updated": 0,
+            "identity_repaired": 0,
+            "stale_target": 0,
             "empty": 0,
             "unavailable": 0,
             "not_found": 0,
             "error": 0,
             "skipped": 0,
         }
+        lookup_mode_counts = {"direct": 0, "fallback": 0, "search": 0, "authenticated": 0}
         if progress is not None:
             progress({
                 "phase": "metadata_start",
@@ -2034,37 +2433,24 @@ def refresh_missing_metadata(
         completed_titles = 0
         authenticated_novelpia_attempts = 0
         pending_authenticated = []
-        remote_ids_by_title: Dict[str, Dict[str, str]] = {}
-        if lookup is lookup_platforms:
-            for row in conn.execute(
-                """
-                SELECT title_key, platform, remote_id
-                FROM catalog_platform_stats
-                WHERE status = 'ok' AND remote_id IS NOT NULL
-                """
-            ):
-                remote_ids_by_title.setdefault(row["title_key"], {})[
-                    row["platform"]
-                ] = str(row["remote_id"])
 
-        def report_completed(target, results, authenticated=None):
-            nonlocal completed_titles, authenticated_novelpia_attempts
-            final_results = list(results)
-            if authenticated is not None:
-                final_results = [
-                    result
-                    for result in final_results
-                    if result.platform != "novelpia"
-                ] + [authenticated]
-                authenticated_novelpia_attempts += 1
+        def persist_results(target, results):
             outcomes = record_platform_metadata_results(
                 conn,
                 target.title.title_key,
-                final_results,
+                list(results),
                 now=now(),
+                expected_target=target,
             )
+            for result in results:
+                if result.metadata_lookup_mode in lookup_mode_counts:
+                    lookup_mode_counts[result.metadata_lookup_mode] += 1
             for outcome in outcomes.values():
                 outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            return outcomes
+
+        def report_completed():
+            nonlocal completed_titles
             completed_titles += 1
             if progress is not None:
                 progress({
@@ -2074,17 +2460,19 @@ def refresh_missing_metadata(
                     "completed_platforms": sum(outcome_counts.values()),
                     "selected_platforms": selected_platforms,
                     "outcome_counts": dict(outcome_counts),
+                    "lookup_mode_counts": dict(lookup_mode_counts),
                     "authenticated_novelpia_attempts": (
                         authenticated_novelpia_attempts
                     ),
                 })
 
         def flush_authenticated():
+            nonlocal authenticated_novelpia_attempts
             if not pending_authenticated:
                 return
             authenticated_results = _authenticated_lookup_batch(
                 authenticated_novelpia_lookup,
-                [target.title.query_title for target, _results in pending_authenticated],
+                [target.title.query_title for target in pending_authenticated],
                 timeout=timeout,
                 delay_seconds=delay_seconds,
                 sleep=sleep,
@@ -2095,10 +2483,15 @@ def refresh_missing_metadata(
                 raise RuntimeError(
                     "authenticated lookup batch returned invalid NovelPia results"
                 )
-            for (target, results), authenticated in zip(
+            for target, authenticated in zip(
                 pending_authenticated, authenticated_results
             ):
-                report_completed(target, results, authenticated)
+                authenticated_novelpia_attempts += 1
+                persist_results(
+                    target,
+                    [replace(authenticated, metadata_lookup_mode="authenticated")],
+                )
+                report_completed()
             pending_authenticated.clear()
 
         for index, target in enumerate(targets):
@@ -2106,7 +2499,11 @@ def refresh_missing_metadata(
                 results = lookup_platform_metadata(
                     target.title.query_title,
                     target.platforms,
-                    remote_ids=remote_ids_by_title.get(target.title.title_key),
+                    remote_ids={
+                        platform: str(remote_id)
+                        for platform, remote_id, _remote_title in target.remote_hints
+                        if remote_id is not None
+                    },
                     timeout=timeout,
                 )
             else:
@@ -2131,13 +2528,20 @@ def refresh_missing_metadata(
                     or novelpia_result.genre is None
                     or novelpia_result.tags is None
                 ):
-                    pending_authenticated.append((target, results))
+                    public_results = [
+                        result for result in results if result.platform != "novelpia"
+                    ]
+                    if public_results:
+                        persist_results(target, public_results)
+                    pending_authenticated.append(target)
                     if len(pending_authenticated) >= NOVELPIA_AUTH_BATCH_SIZE:
                         flush_authenticated()
                 else:
-                    report_completed(target, results)
+                    persist_results(target, results)
+                    report_completed()
             else:
-                report_completed(target, results)
+                persist_results(target, results)
+                report_completed()
             if index + 1 < len(targets) and delay_seconds:
                 sleep(delay_seconds)
         flush_authenticated()
@@ -2147,6 +2551,7 @@ def refresh_missing_metadata(
             "selected_titles": len(targets),
             "selected_platforms": selected_platforms,
             "outcome_counts": outcome_counts,
+            "lookup_mode_counts": lookup_mode_counts,
             "authenticated_novelpia_attempts": authenticated_novelpia_attempts,
             "authenticated_novelpia_relogins": int(getattr(
                 getattr(authenticated_novelpia_lookup, "__self__", None),

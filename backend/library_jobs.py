@@ -184,6 +184,16 @@ class JobStore:
                 if record.get("state") in ACTIVE_STATES
             ]
 
+    def interrupted_records(self, *, job_type: str | None = None) -> list[dict]:
+        """Return all unresolved interrupted jobs so restart recovery is repeatable."""
+        with self._lock:
+            return [
+                record for record in self._all_records()
+                if record.get("state") == "interrupted"
+                and not record.get("recovery_complete")
+                and (job_type is None or record.get("job_type") == job_type)
+            ]
+
     def mark_interrupted_records(self) -> list[dict]:
         interrupted = []
         for record in self.active_records():

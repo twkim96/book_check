@@ -108,6 +108,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="인증 환경변수가 없거나 로그인이 실패하면 메타데이터 backfill 전에 종료",
     )
 
+    repair_identity = subparsers.add_parser(
+        "repair-metadata-identities",
+        help="Series/Kakao 성공 행의 remote ID를 재검증하고 identity drift만 교정합니다.",
+    )
+    repair_identity.add_argument(
+        "--limit", type=int, default=platform_catalog.DEFAULT_LIMIT
+    )
+    repair_identity.add_argument(
+        "--all", action="store_true", help="안전 기본 batch 제한 없이 모든 대상"
+    )
+    repair_identity.add_argument(
+        "--delay-seconds", type=float, default=platform_catalog.DEFAULT_DELAY_SECONDS,
+        help="한 제목 처리 뒤 다음 제목까지의 최소 지연 (기본 1초)",
+    )
+    repair_identity.add_argument(
+        "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
+    )
+    repair_identity.add_argument(
+        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 identity 감사 대상만 확인"
+    )
+
     retry_failed = subparsers.add_parser(
         "retry-failed",
         help="현재 not_found/error 플랫폼 행을 플랫폼 쌍 규칙으로 재검사합니다.",
@@ -284,7 +305,20 @@ def _progress_reporter():
                 flush=True,
             )
             return
-        if phase not in {"progress", "auth_progress", "existing_progress", "metadata_progress"}:
+        if phase == "identity_start":
+            started_at = time.monotonic()
+            print(
+                "🔎 플랫폼 remote ID 감사 시작: "
+                f"전체 제목 {event['discovered_titles']:,}개, "
+                f"이번 대상 {event['selected_titles']:,}개 / "
+                f"플랫폼 {event['selected_platforms']:,}건",
+                flush=True,
+            )
+            return
+        if phase not in {
+            "progress", "auth_progress", "existing_progress",
+            "metadata_progress", "identity_progress",
+        }:
             return
         completed = int(event["completed_titles"])
         total = int(event["selected_titles"])
@@ -313,8 +347,23 @@ def _progress_reporter():
                 "🏷️ 메타데이터 진행 "
                 + f"{completed:,}/{total:,} ({percent:.1f}%) | "
                 f"updated={counts.get('updated', 0):,} "
-                f"empty={counts.get('empty', 0):,} "
+                f"identity_repaired={counts.get('identity_repaired', 0):,} "
+                f"stale={counts.get('stale_target', 0):,} "
                 f"unavailable={counts.get('unavailable', 0):,} "
+                f"error={counts.get('error', 0):,} | "
+                f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
+                flush=True,
+            )
+            return
+        if phase == "identity_progress":
+            counts = event["outcome_counts"]
+            print(
+                "🔎 remote ID 감사 진행 "
+                + f"{completed:,}/{total:,} ({percent:.1f}%) | "
+                f"direct={counts.get('verified_direct', 0):,} "
+                f"fallback={counts.get('verified_fallback', 0):,} "
+                f"repaired={counts.get('identity_repaired', 0):,} "
+                f"stale={counts.get('stale_target', 0):,} "
                 f"error={counts.get('error', 0):,} | "
                 f"경과 {_duration_text(elapsed)} / 예상 잔여 {_duration_text(remaining)}",
                 flush=True,
@@ -877,6 +926,42 @@ def run(args: argparse.Namespace, *, progress=None):
                     authenticated_novelpia_lookup=(
                         auth_client.lookup if auth_client is not None else None
                     ),
+                    progress=progress,
+                )
+            result = {"file_metadata": metadata, **result}
+    elif args.command == "repair-metadata-identities":
+        limit = None if args.all else args.limit
+        if args.dry_run:
+            backup = None
+            metadata = file_metadata_status(args.state_db)
+            if (
+                not metadata["schema_ready"]
+                or metadata["stale"]
+                or metadata["missing_files"]
+                or metadata["index_missing_db"]
+            ):
+                result = {
+                    "dry_run": True,
+                    "platform_preview_blocked": True,
+                    "reason": "file metadata sync required",
+                    "file_metadata": metadata,
+                }
+            else:
+                result = platform_catalog.preview_metadata_identity_audit(
+                    args.state_db,
+                    limit=limit,
+                )
+                result.pop("titles", None)
+        else:
+            backup, metadata = sync_file_metadata(args.state_db, progress=progress)
+            with _platform_refresh_lock(
+                args.state_db, "platform-metadata-identity-repair"
+            ):
+                result = platform_catalog.repair_metadata_identities(
+                    args.state_db,
+                    limit=limit,
+                    delay_seconds=args.delay_seconds,
+                    timeout=args.timeout,
                     progress=progress,
                 )
             result = {"file_metadata": metadata, **result}

@@ -214,6 +214,7 @@ def build_sheet_snapshot(
     conn = decision_store.connect_state_db_readonly(state_db_path)
     try:
         decision_store.validate_schema(conn)
+        conn.execute("BEGIN")
         file_rows = conn.execute(
             """
             SELECT
@@ -386,6 +387,8 @@ def build_sheet_snapshot(
             synced_at=sync_text,
         )
     finally:
+        if conn.in_transaction:
+            conn.rollback()
         conn.close()
 
 

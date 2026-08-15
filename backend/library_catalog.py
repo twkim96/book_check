@@ -99,6 +99,7 @@ def catalog_listing(
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
         decision_store.validate_schema(conn, check_integrity=False)
+        conn.execute("BEGIN")
         total = conn.execute(
             f"SELECT COUNT(DISTINCT a.core_title) {base}", parameters
         ).fetchone()[0]
@@ -243,6 +244,8 @@ def catalog_listing(
             "readonly": True,
         }
     finally:
+        if conn.in_transaction:
+            conn.rollback()
         conn.close()
 
 

@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import decision_store
+import library_server
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_jobs import JobActiveError, JobNeedsReview, JobRunner, JobStore
 from library_server import _interrupted_folderling_run_id, create_app
@@ -843,6 +845,7 @@ def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
         "platform-retry",
         "platform-refresh",
         "platform-metadata",
+        "platform-identity",
         "novelpia-auth-retry",
         "google-sheet",
     ]
@@ -1180,6 +1183,53 @@ def _interrupted_folderling_fixture(
     return state_db, house, temp, frontend, runtime, job["job_id"], run_id
 
 
+def test_server_restart_recovers_unique_orphan_active_run_without_job(tmp_path):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    frontend = tmp_path / "dist"
+    runtime = tmp_path / "runtime"
+    house.mkdir()
+    temp.mkdir()
+    frontend.mkdir()
+    (frontend / "index.html").write_text("fixture", encoding="utf-8")
+    source = house / "orphan active fixture.txt"
+    source.write_text("stable bytes", encoding="utf-8")
+    conn = decision_store.initialize_state_db(state_db)
+    with decision_store.transaction(conn):
+        decision_store.reconcile_file_metadata(conn, source, source="house")
+    backup = decision_store.backup_state_db(
+        conn, state_db.parent / "before-orphan-active.sqlite3"
+    )
+    run_id = decision_store.issue_actual_run_token(
+        conn, str(backup), house_dir=house, temp_dir=temp
+    )
+    conn.close()
+    activated_run_id, _manifest = decision_store.prepare_actual_run(
+        state_db, house, temp
+    )
+    assert activated_run_id == run_id
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+        project_root=tmp_path,
+    )
+    assert app.extensions["library_job_runner"].store.list() == []
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        assert conn.execute(
+            "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()["state"] == "failed"
+        assert not decision_store.doctor_issues(conn)
+    finally:
+        conn.close()
+
+
 def test_server_restart_closes_folderling_run_before_first_operation(tmp_path):
     state_db, house, temp, frontend, runtime, job_id, run_id = (
         _interrupted_folderling_fixture(tmp_path)
@@ -1230,6 +1280,155 @@ def test_server_restart_recovers_unique_active_run_before_start_event(tmp_path):
     restored = app.extensions["library_job_runner"].store.get(job_id)
     assert restored["actual_run_id"] == run_id
     assert restored["error"]["code"] == "server_restarted_before_mutation"
+
+
+@pytest.mark.parametrize("manifest_text", [None, '{\"partial\":', '{\"complete\": true}'])
+def test_server_restart_cancels_claimed_approved_run_and_owned_orphan_manifest(
+    tmp_path, manifest_text
+):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    frontend = tmp_path / "dist"
+    runtime = tmp_path / "runtime"
+    house.mkdir()
+    temp.mkdir()
+    frontend.mkdir()
+    (frontend / "index.html").write_text("fixture", encoding="utf-8")
+    conn = decision_store.initialize_state_db(state_db)
+    backup = decision_store.backup_state_db(
+        conn, state_db.parent / "before-claimed-interruption.sqlite3"
+    )
+    run_id = decision_store.issue_actual_run_token(
+        conn, str(backup), house_dir=house, temp_dir=temp
+    )
+    claim_id = "fixture-activation-claim"
+    with decision_store.transaction(conn):
+        conn.execute(
+            "UPDATE actual_runs SET activation_claim = ? WHERE run_id = ?",
+            (claim_id, run_id),
+        )
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("DELETE FROM settings WHERE key = 'approved_run_id'")
+    conn.close()
+    manifest = state_db.parent / "manifests" / f"{run_id}-{claim_id}.json"
+    if manifest_text is not None:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with manifest.open("w", encoding="utf-8") as stream:
+            stream.write(manifest_text)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    store = JobStore(runtime)
+    job = store.create("service_folderling", {})
+    store.update(
+        job["job_id"], state="running", stage="preflight_result",
+        started_at="2026-08-15T00:00:00+00:00",
+    )
+    store.append_event(job["job_id"], {
+        "phase": "preflight_result",
+        "status": "succeeded",
+        "approved_run_id": run_id,
+    })
+
+    app = create_app(
+        state_db=state_db,
+        house_dir=house,
+        temp_dir=temp,
+        index_path=tmp_path / "file_index.json",
+        runtime_dir=runtime,
+        frontend_dist=frontend,
+        project_root=tmp_path,
+    )
+    restored = app.extensions["library_job_runner"].store.get(job["job_id"])
+    assert restored["recovery_complete"] is True
+    assert restored["error"]["code"] == "server_restarted_before_activation"
+    assert not manifest.exists()
+
+    conn = decision_store.connect_state_db(state_db)
+    assert conn.execute(
+        "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()["state"] == "cancelled"
+    assert not decision_store.doctor_issues(conn)
+    conn.close()
+
+
+def test_server_restart_retries_previously_interrupted_folderling_recovery(
+    tmp_path, monkeypatch
+):
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    frontend = tmp_path / "dist"
+    runtime = tmp_path / "runtime"
+    house.mkdir()
+    temp.mkdir()
+    frontend.mkdir()
+    (frontend / "index.html").write_text("fixture", encoding="utf-8")
+    conn = decision_store.initialize_state_db(state_db)
+    backup = decision_store.backup_state_db(
+        conn, state_db.parent / "before-retry-interruption.sqlite3"
+    )
+    run_id = decision_store.issue_actual_run_token(
+        conn, str(backup), house_dir=house, temp_dir=temp
+    )
+    conn.close()
+    store = JobStore(runtime)
+    job = store.create("service_folderling", {})
+    store.update(
+        job["job_id"], state="running", stage="preflight_result",
+        started_at="2026-08-15T00:00:00+00:00",
+    )
+    store.append_event(job["job_id"], {
+        "phase": "preflight_result", "status": "succeeded",
+        "approved_run_id": run_id,
+    })
+
+    class BusyLock:
+        def __enter__(self):
+            raise RuntimeError("fixture root lock busy")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        library_server, "mutation_lock_for_roots", lambda *_args, **_kwargs: BusyLock()
+    )
+    first = create_app(
+        state_db=state_db, house_dir=house, temp_dir=temp,
+        index_path=tmp_path / "file_index.json", runtime_dir=runtime,
+        frontend_dist=frontend, project_root=tmp_path,
+    )
+    first_store = first.extensions["library_job_runner"].store
+    assert first_store.get(job["job_id"])["state"] == "interrupted"
+    assert first_store.get(job["job_id"]).get("recovery_complete") is not True
+    assert first_store.events(job["job_id"])[-1]["phase"] == (
+        "interrupted_run_recovery_required"
+    )
+    first.extensions["library_job_runner"].shutdown()
+    keeper = first.extensions.get("library_state_db_readonly_keeper")
+    if keeper is not None:
+        keeper.close()
+
+    from mutation_io import mutation_lock_for_roots as real_lock
+    monkeypatch.setattr(library_server, "mutation_lock_for_roots", real_lock)
+    second = create_app(
+        state_db=state_db, house_dir=house, temp_dir=temp,
+        index_path=tmp_path / "file_index.json", runtime_dir=runtime,
+        frontend_dist=frontend, project_root=tmp_path,
+    )
+    second_store = second.extensions["library_job_runner"].store
+    restored = second_store.get(job["job_id"])
+    assert restored["recovery_complete"] is True
+    assert second_store.events(job["job_id"])[-1]["phase"] == "interrupted_run_recovered"
+    conn = decision_store.connect_state_db(state_db)
+    assert conn.execute(
+        "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()["state"] == "cancelled"
+    conn.close()
 
 
 def test_server_restart_cancels_bound_approved_run_before_activation(tmp_path):

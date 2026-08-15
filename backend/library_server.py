@@ -243,7 +243,8 @@ def _recover_interrupted_folderling_jobs(
         conn = decision_store.connect_state_db(config.state_db)
         try:
             run = conn.execute(
-                "SELECT state, error FROM actual_runs WHERE run_id = ?", (run_id,)
+                "SELECT state, error, activation_claim FROM actual_runs WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
         finally:
             conn.close()
@@ -317,7 +318,12 @@ def _recover_interrupted_folderling_jobs(
                 conn = decision_store.connect_state_db(config.state_db)
                 try:
                     if run["state"] == "approved":
-                        result = decision_store.close_interrupted_approved_run(
+                        closer = (
+                            decision_store.close_interrupted_claimed_approved_run
+                            if run["activation_claim"] is not None
+                            else decision_store.close_interrupted_approved_run
+                        )
+                        result = closer(
                             conn,
                             run_id,
                             house_dir=config.house_dir,
@@ -348,6 +354,7 @@ def _recover_interrupted_folderling_jobs(
         approved_cleanup = result.get("state") == "cancelled"
         store.update(
             record["job_id"],
+            recovery_complete=True,
             message=(
                 "서버 재시작으로 중단 · 승인 상태 자동 정리 완료"
                 if approved_cleanup
@@ -375,6 +382,66 @@ def _recover_interrupted_folderling_jobs(
             **result,
         })
         recovered += 1
+
+    bound_run_ids = {run_id for run_id in bindings.values() if run_id is not None}
+    if not config.state_db.is_file():
+        return recovered
+    conn = decision_store.connect_state_db_readonly(config.state_db)
+    try:
+        orphan_rows = conn.execute(
+            """
+            SELECT run_id, state, activation_claim FROM actual_runs
+            WHERE state IN ('approved', 'active')
+              AND house_root = ? AND temp_root = ?
+            ORDER BY approved_at
+            """,
+            (
+                decision_store.canonicalize_real_path(config.house_dir),
+                decision_store.canonicalize_real_path(config.temp_dir),
+            ),
+        ).fetchall()
+    finally:
+        conn.close()
+    orphan_rows = [
+        row for row in orphan_rows if str(row["run_id"]) not in bound_run_ids
+    ]
+    if len(orphan_rows) == 1:
+        orphan = orphan_rows[0]
+        try:
+            with mutation_lock_for_roots(
+                config.house_dir,
+                config.temp_dir,
+                "library-server-orphan-folderling-cleanup",
+            ):
+                conn = decision_store.connect_state_db(config.state_db)
+                try:
+                    if orphan["state"] == "approved":
+                        closer = (
+                            decision_store.close_interrupted_claimed_approved_run
+                            if orphan["activation_claim"] is not None
+                            else decision_store.close_interrupted_approved_run
+                        )
+                        closer(
+                            conn,
+                            str(orphan["run_id"]),
+                            house_dir=config.house_dir,
+                            temp_dir=config.temp_dir,
+                        )
+                    else:
+                        decision_store.close_interrupted_pre_mutation_run(
+                            conn,
+                            str(orphan["run_id"]),
+                            house_dir=config.house_dir,
+                            temp_dir=config.temp_dir,
+                        )
+                finally:
+                    conn.close()
+        except Exception:
+            # A busy root lock or mutation evidence deliberately leaves the run
+            # non-terminal so the next server startup can retry/review it.
+            pass
+        else:
+            recovered += 1
     return recovered
 
 
@@ -633,8 +700,12 @@ def create_app(
     )
     _ensure_server_schema(config)
     store = JobStore(config.runtime_dir)
-    interrupted_records = store.mark_interrupted_records()
-    _recover_interrupted_folderling_jobs(config, store, interrupted_records)
+    store.mark_interrupted_records()
+    _recover_interrupted_folderling_jobs(
+        config,
+        store,
+        store.interrupted_records(job_type="service_folderling"),
+    )
     readonly_keeper = (
         _open_state_db_readonly_keeper(config.state_db)
         if config.state_db.is_file() else None

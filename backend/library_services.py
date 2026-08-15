@@ -23,6 +23,7 @@ _PLATFORM_PROGRESS_THROTTLE_PHASES = frozenset({
     "auth_progress",
     "existing_progress",
     "metadata_progress",
+    "identity_progress",
 })
 
 
@@ -125,6 +126,19 @@ SERVICE_DEFINITIONS = (
         True,
     ),
     ServiceDefinition(
+        "platform-identity",
+        "service_platform_identity",
+        "플랫폼 remote ID 검증·교정",
+        "시리즈·카카오 성공 행의 저장된 remote ID를 원문 제목으로 다시 검증하고, 다른 ID가 확인된 경우 identity 필드만 교정합니다.",
+        "메타데이터",
+        False,
+        "identity 감사 작품",
+        ("기존 Series/Kakao 성공 remote ID", "플랫폼 상세/검색"),
+        ("remote_id", "remote_title", "remote_url"),
+        ("기존 인기 지표·장르·태그는 변경하지 않음", "제목/remote ID CAS 검증", "불일치만 교정"),
+        True,
+    ),
+    ServiceDefinition(
         "novelpia-auth-retry",
         "service_novelpia_auth_retry",
         "노벨피아 인증 누락 재검사",
@@ -218,6 +232,9 @@ class LibraryServiceRegistry:
             "platform-metadata": lambda payload, progress: self._run_platform(
                 "refresh-metadata", ("--all",), progress
             ),
+            "platform-identity": lambda payload, progress: self._run_platform(
+                "repair-metadata-identities", ("--all",), progress
+            ),
             "novelpia-auth-retry": lambda payload, progress: self._run_platform(
                 "retry-novelpia-auth", (), progress
             ),
@@ -310,6 +327,9 @@ class LibraryServiceRegistry:
             metadata_targets = platform_catalog.select_metadata_backfill_targets(
                 conn, limit=None
             )
+            identity_targets = platform_catalog.select_metadata_identity_targets(
+                conn, limit=None
+            )
 
             state = run_platform_catalog._novelpia_auth_retry_state(
                 str(self.state_db), create=False
@@ -367,6 +387,17 @@ class LibraryServiceRegistry:
                     "selected_titles": len(metadata_targets),
                     "selected_platforms": sum(
                         len(item.platforms) for item in metadata_targets
+                    ),
+                },
+            ),
+            "platform-identity": (
+                len(identity_targets),
+                {
+                    "dry_run": True,
+                    "discovered_titles": len(titles),
+                    "selected_titles": len(identity_targets),
+                    "selected_platforms": sum(
+                        len(item.platforms) for item in identity_targets
                     ),
                 },
             ),
@@ -606,6 +637,8 @@ class LibraryServiceRegistry:
             "existing_progress": "기존 인기값 갱신",
             "metadata_start": "플랫폼 메타데이터 backfill 시작",
             "metadata_progress": "플랫폼 메타데이터 backfill",
+            "identity_start": "플랫폼 remote ID 검증 시작",
+            "identity_progress": "플랫폼 remote ID 검증·교정",
             "sheet_snapshot": "SQLite Sheet snapshot 준비",
             "sheet_write_start": "Google Sheet 임시 탭 쓰기 시작",
             "sheet_temp_tabs_created": "Google Sheet 임시 탭 생성",

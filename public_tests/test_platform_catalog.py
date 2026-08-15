@@ -276,6 +276,62 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
         conn.close()
 
 
+def test_existing_metric_update_serializes_concurrent_writers(tmp_path):
+    state_db = _make_db(tmp_path, "동시 갱신 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat("series", "ok", download_count=100)],
+        )
+    finally:
+        conn.close()
+
+    barrier = threading.Barrier(3)
+    errors = []
+
+    def update(value):
+        worker = decision_store.connect_state_db(state_db)
+        try:
+            barrier.wait()
+            platform_catalog.record_increased_platform_stats(
+                worker,
+                key,
+                [platform_catalog.PlatformStat(
+                    "series", "ok", download_count=value
+                )],
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            worker.close()
+
+    threads = [
+        threading.Thread(target=update, args=(110,)),
+        threading.Thread(target=update, args=(120,)),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT download_count FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'series'",
+            (key,),
+        ).fetchone()[0] == 120
+    finally:
+        conn.close()
+
+
 def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallback(tmp_path):
     state_db = _make_db(tmp_path, "성인 합성작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)
@@ -921,6 +977,44 @@ def test_authenticated_novelpia_retry_dry_run_needs_no_credentials(tmp_path):
     _backup, result = run_platform_catalog.retry_novelpia_auth(args)
     assert result["dry_run"] is True
     assert result["selected_titles"] == 1
+
+
+def test_metadata_identity_repair_cli_dry_run_selects_successful_series_kakao(tmp_path):
+    state_db = _make_db(tmp_path, "ID 감사 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", remote_id="11", remote_title="ID 감사 작품",
+                    remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+                    download_count=10,
+                ),
+                platform_catalog.PlatformStat(
+                    "kakao", "ok", remote_id="22", remote_title="ID 감사 작품",
+                    remote_url="https://page.kakao.com/content/22", view_count=20,
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", remote_id="33", remote_title="ID 감사 작품",
+                    remote_url="https://novelpia.com/novel/33", view_count=30,
+                ),
+            ],
+        )
+    finally:
+        conn.close()
+
+    args = run_platform_catalog.build_parser().parse_args([
+        "--state-db", str(state_db),
+        "repair-metadata-identities", "--all", "--dry-run",
+    ])
+    result = run_platform_catalog.run(args)
+    assert result["dry_run"] is True
+    assert result["selected_titles"] == 1
+    assert result["selected_platforms"] == 2
 
 
 def test_plain_initializer_refuses_to_migrate_an_existing_old_schema(tmp_path):

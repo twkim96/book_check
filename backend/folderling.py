@@ -1062,7 +1062,7 @@ def _discard_index_deployment_snapshot(snapshot):
 
 def recover_pending_index_deployments(
     backup_parent, *, file_list_path, file_index_path, house_index_path,
-    extension_index_path,
+    extension_index_path, before_mutation=None,
 ):
     """Finish a crash-left validated generation or preserve its recovery data."""
     backup_parent = os.path.abspath(backup_parent)
@@ -1114,6 +1114,8 @@ def recover_pending_index_deployments(
         index_sha256 = inspect_regular_file(file_index_path).sha256
         manifest_path = os.path.join(backup_parent, INDEX_GENERATION_FILENAME)
         manifest_sha256 = inspect_regular_file(manifest_path).sha256
+        if before_mutation is not None:
+            before_mutation()
         _authorize_index_deployment(snapshot, {
             os.path.abspath(file_list_path): list_sha256,
             os.path.abspath(file_index_path): index_sha256,
@@ -1368,7 +1370,27 @@ def _process_items_authorized(
         destination_root=os.path.abspath(dst_dir),
     )
 
+    import decision_store
+
+    mutation_phase_marked = False
+
+    def mark_mutation_phase():
+        nonlocal mutation_phase_marked
+        if mutation_phase_marked:
+            return
+        marker_conn = decision_store.connect_state_db(state_db_path)
+        try:
+            with decision_store.transaction(marker_conn):
+                decision_store.mark_actual_run_mutation_started(
+                    marker_conn, actual_run_id
+                )
+        finally:
+            marker_conn.close()
+        mutation_phase_marked = True
+
     from mutation_io import ensure_directory_nofollow
+    if not os.path.isdir(dst_dir):
+        mark_mutation_phase()
     ensure_directory_nofollow(dst_dir)
     pending_deployments = recover_pending_index_deployments(
         script_dir,
@@ -1376,6 +1398,7 @@ def _process_items_authorized(
         file_index_path=file_index_json,
         house_index_path=os.path.join(dst_dir, HOUSE_INDEX_FILENAME),
         extension_index_path=os.path.join(script_dir, EXTENSION_INDEX_PATH),
+        before_mutation=mark_mutation_phase,
     )
     pending_review = [
         item for item in pending_deployments if item["status"] == "needs_review"
@@ -1495,8 +1518,7 @@ def _process_items_authorized(
     # The auditor may run read-only in standalone configurations. Ensure the
     # journal DB still has the same context-proven temp core/coordinate before
     # per-file routing and same-coordinate conflict checks begin.
-    import decision_store
-
+    mark_mutation_phase()
     context_conn = decision_store.connect_state_db(state_db_path)
     try:
         with decision_store.transaction(context_conn):
@@ -1653,6 +1675,7 @@ def _process_items_authorized(
                     and has_resumable_directory_intake(state_db_path, src_path)
                 )
                 if is_dir and not directory_has_files(src_path) and not resumable_directory:
+                    mark_mutation_phase()
                     removed = prune_empty_intake_tree(src_path)
                     empty_dir_cleanup_count += removed
                     s_log.write(
@@ -1679,6 +1702,7 @@ def _process_items_authorized(
                     is_pass=is_pass, state_db_path=state_db_path, run_id=intake_run_id,
                 )
                 if is_dir:
+                    mark_mutation_phase()
                     empty_dir_cleanup_count += prune_empty_intake_tree(src_path)
 
                 if is_pass:
@@ -1912,6 +1936,7 @@ def _process_items_authorized(
         # A fully warm pair cache can bypass the auditor's review-write path.
         # Close any machine review already vetoed by an active human edition
         # decision independently so a successful rerun never asks again.
+        mark_mutation_phase()
         decided_review_cleanup_records = (
             cleanup_pending_active_distinct_decision_reviews(state_db_path)
         )
@@ -1935,22 +1960,6 @@ def _process_items_authorized(
             pair_count=len(decided_review_cleanup_records),
             review_count=decided_review_count,
         )
-
-        mutation_phase_marked = False
-
-        def mark_mutation_phase():
-            nonlocal mutation_phase_marked
-            if mutation_phase_marked:
-                return
-            marker_conn = decision_store.connect_state_db(state_db_path)
-            try:
-                with decision_store.transaction(marker_conn):
-                    decision_store.mark_actual_run_mutation_started(
-                        marker_conn, actual_run_id
-                    )
-            finally:
-                marker_conn.close()
-            mutation_phase_marked = True
 
         # Wrapper cleanup and index publication are not per-file operations.
         # Mark this boundary durably so a server restart cannot mistake them
