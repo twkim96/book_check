@@ -724,6 +724,21 @@ version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, duplicate a
 archive `1.4.10`은 의미가 바뀌지 않아 유지한다. 1.4.18의 실제 backfill이 끝난 뒤 1.4.19 서버를 올리고
 stored-ID metadata consistency pass를 완료한 다음에만 Folderling 운영 인수를 진행한다.
 
+### 1.4.20 platform title identity follow-up
+
+1.4.20은 production consistency pass에서 드러난 제목 비교 false-negative만 좁게 보정한다. schema와
+remote-ID fail-closed 계약은 그대로 유지한다.
+
+- 플랫폼 제목 identity는 presentation suffix를 제거한 뒤 구두점/공백을 제외한 **전체 제목**이 같으면
+  같은 제목으로 본다. 이 full-title equality보다 더 공격적인 `extract_core_title()` 결과가 다르다는 이유만으로
+  같은 remote object를 거부하지 않는다.
+- Naver Series가 작품 detail 대신 `판매중지상품안내` system page를 반환하면 positive title mismatch가
+  아니라 `direct_unavailable`로 분류한다. 다른 ID 검색이나 자동 전환은 하지 않는다.
+- 실제 전체 제목이 다른 remote object는 계속 `identity_conflict`로 fail-closed하고 기존 값도 자동 교체하지 않는다.
+
+배포/UI/platform catalog는 `1.4.20`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive
+호환성 계약은 1.4.19와 동일하다.
+
 ## 구조
 
 ```text

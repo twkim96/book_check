@@ -770,11 +770,35 @@ def test_platform_title_match_strips_only_presentation_suffixes():
     )
     assert platform_catalog.titles_match(title, f"{title} [독점] (총 100화/완결)")
     assert platform_catalog.titles_match(title, f"{title} [미니노블]")
+    assert platform_catalog.titles_match(
+        "9이닝 야구의 찬가", "9이닝 : 야구의 찬가"
+    )
+    assert platform_catalog.titles_match(
+        "기프티드 GIFTED", "기프티드 (GIFTED)"
+    )
+    assert platform_catalog.titles_match(
+        "각성수선전覺醒修仙傳", "각성수선전(覺醒修仙傳)"
+    )
     assert not platform_catalog.titles_match(title, f"{title} 외전")
+    assert not platform_catalog.titles_match("어게인1997", "어게인")
     assert not platform_catalog.titles_match(
         "합성 메인 A: 같은 부제목",
         "합성 메인 B: 같은 부제목 [독점]",
     )
+
+
+def test_series_discontinued_detail_is_unavailable_not_identity_conflict():
+    page = "<html><head><title>네이버 시리즈2 : 판매중지상품안내</title></head></html>"
+    [stat] = platform_catalog.lookup_platform_identities(
+        "판매중지 작품",
+        ("series",),
+        remote_ids={"series": "11"},
+        fetch_text=lambda _url, _timeout: page,
+        timeout=1,
+    )
+    assert stat.status == "error"
+    assert stat.metadata_lookup_mode == "direct_unavailable"
+    assert "unavailable" in stat.message.lower()
 
 
 def test_changed_catalog_query_retries_not_found_but_preserves_success(tmp_path):

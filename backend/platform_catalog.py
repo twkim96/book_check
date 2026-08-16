@@ -358,14 +358,16 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
 
 
 def titles_match(requested_title: str, candidate_title: str) -> bool:
-    """Match normalized full titles and their dedup cores.
+    """Match normalized full titles without letting dedup-core parsing veto them.
 
     Platform responses commonly append presentation-only tags such as
     ``[단행본]``/``[독점]`` and total episode text.  Remove only that narrow
-    whitelist before the full-title comparison; the file normalizer is more
-    aggressive and would incorrectly collapse a real ``외전`` title.
+    whitelist before the full-title comparison.  The resulting alphanumeric
+    full title is already the stronger identity check; ``extract_core_title``
+    is intentionally more aggressive and can split punctuation-only variants
+    such as ``9이닝 야구의 찬가`` vs ``9이닝 : 야구의 찬가``.
     """
-    def normalized(value: str) -> Tuple[str, str]:
+    def normalized(value: str) -> str:
         text = html.unescape(str(value or "")).strip()
         text = re.sub(r"\s*:\s*네이버시리즈\s*$", "", text, flags=re.IGNORECASE)
         previous = None
@@ -384,20 +386,13 @@ def titles_match(requested_title: str, candidate_title: str) -> bool:
                 text,
                 flags=re.IGNORECASE,
             ).strip()
-        full_title = text
-        exact = re.sub(
-            r"[^a-z0-9가-힣\u3400-\u9fff\uf900-\ufaff]", "", full_title.lower()
+        return re.sub(
+            r"[^a-z0-9가-힣\u3400-\u9fff\uf900-\ufaff]", "", text.lower()
         )
-        core = extract_core_title(full_title)
-        return exact, core
 
-    requested_exact, requested_core = normalized(requested_title)
-    candidate_exact, candidate_core = normalized(candidate_title)
-    return bool(requested_exact) and (
-        requested_exact == candidate_exact
-        and bool(requested_core)
-        and requested_core == candidate_core
-    )
+    requested_exact = normalized(requested_title)
+    candidate_exact = normalized(candidate_title)
+    return bool(requested_exact) and requested_exact == candidate_exact
 
 
 def _safe_message(error: BaseException) -> str:
@@ -1569,6 +1564,12 @@ def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float]
     )
 
 
+def _series_detail_is_unavailable(title: str) -> bool:
+    """Recognize Series system pages that are not positive identity evidence."""
+    normalized = re.sub(r"\s+", "", str(title or ""))
+    return "판매중지상품안내" in normalized
+
+
 def _lookup_series_remote(
     title: str,
     remote_id: str,
@@ -1583,6 +1584,8 @@ def _lookup_series_remote(
     detail_title, download_count, rating, genre = _parse_series_detail(
         fetch_text(detail_url, timeout)
     )
+    if _series_detail_is_unavailable(detail_title):
+        raise ValueError("Naver Series product is unavailable")
     matched_title = detail_title or str(fallback_title or "")
     if not matched_title:
         raise ValueError("Naver detail response has no title")
@@ -1617,6 +1620,8 @@ def _lookup_series_metadata_remote(
     )
     if not detail_title:
         raise ValueError("Naver detail response has no title")
+    if _series_detail_is_unavailable(detail_title):
+        raise ValueError("Naver Series product is unavailable")
     if not titles_match(title, detail_title):
         return _not_found("series", "stored remote title mismatch")
     return PlatformStat(
