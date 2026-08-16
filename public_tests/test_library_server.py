@@ -295,7 +295,7 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     client = app.test_client()
     health = client.get("/health").get_json()
     assert health["ok"] is True
-    assert health["version"] == "1.4.20"
+    assert health["version"] == "1.4.21"
     providers = client.get("/api/providers").get_json()["data"]
     assert providers == [
         {"id": "title_correction", "label": "제목 교정", "enabled": True},
@@ -891,11 +891,15 @@ def test_service_catalog_exposes_readiness_and_fixed_scopes(tmp_path):
         "platform-update",
         "platform-retry",
         "platform-refresh",
-        "platform-metadata",
-        "platform-identity",
         "novelpia-auth-retry",
         "google-sheet",
     ]
+    maintenance = client.get("/api/services/platform-metadata")
+    assert maintenance.status_code == 200
+    assert maintenance.get_json()["data"]["quick_action"] is False
+    identity = client.get("/api/services/platform-identity")
+    assert identity.status_code == 200
+    assert "유지보수" in identity.get_json()["data"]["label"]
     scanner = next(item for item in services if item["id"] == "scanner")
     assert scanner["ready"] is True
     assert scanner["target_count"] == 1

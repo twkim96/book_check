@@ -684,8 +684,9 @@ version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, archive `1.
 - 노벨피아는 검색 JSON의 `novel_genre_arr` 첫 항목을 대표 장르로 쓰고 배열 전체를 태그로 보존한다.
   배열이 없는 예외 응답에서만 상세 페이지 `p.writer-tag > span.tag` parser를 fallback으로 사용한다.
 - 선택 메타데이터가 일시 실패해도 기존 조회 수·추천 수·평점과 과거 성공 장르/태그를 지우지 않는다.
-- 기존 성공 행은 `run_platform_catalog.py refresh-metadata` 또는 도서 관리의 `플랫폼 메타데이터 backfill`
-  서비스로 popularity metric을 바꾸지 않고 빠진 장르/태그만 채운다.
+- 신규/미수집 작품은 일반 `플랫폼 DB 업데이트`가 popularity와 장르/태그를 함께 저장하고, 같은 실행에서
+  성공했지만 metadata가 비어 있는 row만 한 번 추가 보완한다. 과거 성공 행의 `refresh-metadata`는 일반
+  서비스 목록에서 숨긴 수동 유지보수 명령으로만 남긴다.
 - 1.4.18 metadata backfill은 Series/Kakao의 저장된 `remote_id` direct 조회를 도입해 검색 요청을 줄였다.
   운영 리뷰에서 direct 실패 뒤 다른 ID로 fallback하는 provenance 문제가 확인되어, 현재 동작은 아래 1.4.19
   계약으로 대체한다. 장시간 서비스 진행 로그의 10작품 단위 throttle은 유지한다.
@@ -738,6 +739,28 @@ remote-ID fail-closed 계약은 그대로 유지한다.
 
 배포/UI/platform catalog는 `1.4.20`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive
 호환성 계약은 1.4.19와 동일하다.
+
+### 1.4.21 metadata workflow consolidation
+
+1.4.21은 1.4.18~1.4.20 운영 backfill과 provenance remediation이 끝난 뒤 평시 metadata workflow를
+하나로 정리한다. schema는 `v16` 그대로다.
+
+- 사용자용 `플랫폼 인기 DB 업데이트`를 **`플랫폼 DB 업데이트`**로 정리한다. 신규 작품/미수집 플랫폼의
+  status·popularity·remote identity·genre·tags를 한 job에서 수집한다.
+- 첫 수집이 `ok`였지만 선택 metadata가 비어 있으면, **그 job에서 실제로 조회한 title/platform pair만**
+  stored-ID 안전 규칙으로 한 번 보완한다. 과거 `not_found`/판매중지 residual 전체를 매 실행마다 sweep하지 않는다.
+- `platform-metadata`와 `platform-identity`는 CLI/direct service endpoint 호환을 유지하지만 일반 서비스 목록에서는
+  숨긴 유지보수 작업이다. migration성 전수 backfill/audit를 평시 버튼으로 노출하지 않는다.
+- 검증된 잘못된 성공 remote object는 `invalidate-platform-row` 유지보수 명령으로만 무효화한다. expected
+  remote ID/title CAS가 모두 맞을 때 backup을 만든 뒤 기존 identity/metric/genre/tag를 제거하고 clean
+  `not_found`를 기록한다. 다른 remote ID를 자동 설치하지 않는다.
+
+운영에서 확인된 `어게인1997` Kakao `57589258` 오매칭은 이 CAS 경로로 무효화했다. 삭제 전 값은
+view `839,048`, rating `9.4174`, rating_count `3,431`이었으며 현재 해당 row는 remote identity/metric이 없는
+`not_found`다.
+
+배포/UI/platform catalog는 `1.4.21`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive
+호환성 계약은 1.4.20과 동일하다.
 
 ## 구조
 

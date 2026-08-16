@@ -184,6 +184,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="DB 변경 없이 대상 수만 확인"
     )
 
+    invalidate = subparsers.add_parser(
+        "invalidate-platform-row",
+        help="검증된 오매칭 플랫폼 성공 행을 CAS 확인 뒤 clean not_found로 무효화합니다.",
+    )
+    invalidate.add_argument("--title-key", required=True)
+    invalidate.add_argument(
+        "--platform", choices=platform_catalog.PLATFORMS, required=True
+    )
+    invalidate.add_argument("--expected-remote-id", required=True)
+    invalidate.add_argument("--expected-remote-title")
+    invalidate.add_argument("--reason", required=True)
+    invalidate.add_argument(
+        "--dry-run", action="store_true", help="backup/DB 변경 없이 CAS 대상만 확인"
+    )
+
     sheet = subparsers.add_parser(
         "sheet-sync", help="SQLite 현재 상태를 조회용 Google Sheet에 단방향 복제합니다."
     )
@@ -220,6 +235,13 @@ def _metadata_rekey_backup_path(state_db: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return state_db.parent / "backups" / (
         f"before_normalizer_rekey_{stamp}_{uuid.uuid4().hex[:8]}.sqlite3"
+    )
+
+
+def _platform_data_repair_backup_path(state_db: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return state_db.parent / "backups" / (
+        f"before_platform_data_repair_{stamp}_{uuid.uuid4().hex[:8]}.sqlite3"
     )
 
 
@@ -982,6 +1004,76 @@ def run(args: argparse.Namespace, *, progress=None):
         else:
             backup, metadata = sync_file_metadata(args.state_db, progress=progress)
             result = {"dry_run": False, **metadata}
+    elif args.command == "invalidate-platform-row":
+        backup = None
+        with _platform_refresh_lock(args.state_db, "platform-identity-invalidation"):
+            connector = (
+                decision_store.connect_state_db_readonly
+                if args.dry_run else decision_store.connect_state_db
+            )
+            conn = connector(args.state_db)
+            try:
+                decision_store.validate_schema(conn)
+                row = conn.execute(
+                    "SELECT * FROM catalog_platform_stats "
+                    "WHERE title_key = ? AND platform = ?",
+                    (args.title_key, args.platform),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(
+                        f"platform row not found: {args.title_key}/{args.platform}"
+                    )
+                if row["status"] != "ok":
+                    raise RuntimeError(
+                        "platform identity is no longer an active success row"
+                    )
+                if str(row["remote_id"] or "") != str(args.expected_remote_id):
+                    raise RuntimeError("platform identity changed before invalidation")
+                if (
+                    args.expected_remote_title is not None
+                    and str(row["remote_title"] or "")
+                    != str(args.expected_remote_title)
+                ):
+                    raise RuntimeError(
+                        "platform remote title changed before invalidation"
+                    )
+                if args.dry_run:
+                    result = {
+                        "dry_run": True,
+                        "title_key": args.title_key,
+                        "platform": args.platform,
+                        "status": row["status"],
+                        "remote_id": row["remote_id"],
+                        "remote_title": row["remote_title"],
+                        "would_status": "not_found",
+                    }
+                else:
+                    state_db = Path(args.state_db).resolve()
+                    backup = decision_store.backup_state_db(
+                        conn, _platform_data_repair_backup_path(state_db)
+                    )
+                    result = platform_catalog.invalidate_platform_identity(
+                        conn,
+                        args.title_key,
+                        args.platform,
+                        expected_remote_id=args.expected_remote_id,
+                        expected_remote_title=args.expected_remote_title,
+                        reason=args.reason,
+                    )
+                    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                    foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+                    if integrity != "ok" or foreign_keys:
+                        raise RuntimeError(
+                            "platform identity invalidation failed DB verification"
+                        )
+                    result = {
+                        "dry_run": False,
+                        **result,
+                        "integrity": integrity,
+                        "foreign_key_issues": len(foreign_keys),
+                    }
+            finally:
+                conn.close()
     elif args.command == "sheet-sync":
         backup = None
         result = sync_google_sheet(

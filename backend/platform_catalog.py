@@ -1348,6 +1348,95 @@ def record_platform_stats(
                 )
 
 
+def invalidate_platform_identity(
+    conn: sqlite3.Connection,
+    title_key: str,
+    platform: str,
+    *,
+    expected_remote_id: str,
+    expected_remote_title: Optional[str] = None,
+    reason: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, object]:
+    """CAS-invalidate one proven-wrong successful identity without installing a replacement."""
+    if platform not in PLATFORMS:
+        raise ValueError(f"unknown platform: {platform}")
+    expected_id = str(expected_remote_id or "").strip()
+    if not expected_id:
+        raise ValueError("expected remote ID is required")
+    message = str(reason or "").strip()
+    if not message:
+        raise ValueError("invalidation reason is required")
+    attempted_at = _utc_text(now or utc_now())
+
+    with decision_store.transaction(conn):
+        row = conn.execute(
+            "SELECT * FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = ?",
+            (title_key, platform),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"platform row not found: {title_key}/{platform}")
+        if row["status"] != "ok":
+            raise RuntimeError("platform identity is no longer an active success row")
+        if str(row["remote_id"] or "") != expected_id:
+            raise RuntimeError("platform identity changed before invalidation")
+        if (
+            expected_remote_title is not None
+            and str(row["remote_title"] or "") != str(expected_remote_title)
+        ):
+            raise RuntimeError("platform remote title changed before invalidation")
+
+        before = {
+            key: row[key]
+            for key in (
+                "status",
+                "remote_id",
+                "remote_title",
+                "remote_url",
+                "download_count",
+                "view_count",
+                "recommend_count",
+                "rating",
+                "rating_count",
+                "genre",
+                "genre_collected_at",
+                "tags_collected_at",
+            )
+        }
+        deleted = conn.execute(
+            "DELETE FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = ? AND status = 'ok' AND remote_id = ?",
+            (title_key, platform, expected_id),
+        )
+        if deleted.rowcount != 1:
+            raise RuntimeError("platform identity changed during invalidation")
+        conn.execute(
+            """
+            INSERT INTO catalog_platform_stats(
+                title_key, platform, status,
+                last_attempt_at, error_message, created_at, updated_at
+            ) VALUES (?, ?, 'not_found', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (title_key, platform, attempted_at, message),
+        )
+        tag_count = conn.execute(
+            "SELECT COUNT(*) FROM catalog_platform_tags "
+            "WHERE title_key = ? AND platform = ?",
+            (title_key, platform),
+        ).fetchone()[0]
+        if tag_count:
+            raise RuntimeError("platform tag rows survived identity invalidation")
+
+    return {
+        "title_key": title_key,
+        "platform": platform,
+        "status": "not_found",
+        "reason": message,
+        "before": before,
+    }
+
+
 def _monotonic_count(old: Optional[int], new: Optional[int]) -> Optional[int]:
     if old is None:
         return new
@@ -2534,6 +2623,7 @@ def refresh_missing_metadata(
     dry_run: bool = False,
     authenticated_novelpia_lookup: Optional[Callable[..., PlatformStat]] = None,
     lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
+    target_pairs: Optional[set[Tuple[str, str]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
     progress: Optional[Callable[[Dict[str, object]], None]] = None,
@@ -2554,7 +2644,30 @@ def refresh_missing_metadata(
         if progress is not None:
             progress({"phase": "sync_start"})
         synced = sync_catalog_titles(conn)
-        targets = select_metadata_backfill_targets(conn, limit=limit)
+        targets = select_metadata_backfill_targets(
+            conn,
+            limit=None if target_pairs is not None else limit,
+        )
+        if target_pairs is not None:
+            filtered_targets = []
+            for target in targets:
+                platforms = tuple(
+                    platform for platform in target.platforms
+                    if (target.title.title_key, platform) in target_pairs
+                )
+                if not platforms:
+                    continue
+                remote_hints = tuple(
+                    hint for hint in target.remote_hints if hint[0] in platforms
+                )
+                filtered_targets.append(replace(
+                    target,
+                    platforms=platforms,
+                    remote_hints=remote_hints,
+                ))
+                if limit is not None and len(filtered_targets) >= limit:
+                    break
+            targets = filtered_targets
         selected_platforms = sum(len(target.platforms) for target in targets)
         outcome_counts = {
             "updated": 0,
@@ -2893,6 +3006,7 @@ def refresh_catalog(
     error_retry_seconds: int = DEFAULT_ERROR_RETRY_SECONDS,
     authenticated_novelpia_lookup: Optional[Callable[..., PlatformStat]] = None,
     lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
+    metadata_lookup: Optional[Callable[..., List[PlatformStat]]] = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
     progress: Optional[Callable[[Dict[str, object]], None]] = None,
@@ -3030,6 +3144,34 @@ def refresh_catalog(
             if index + 1 < len(targets) and delay_seconds:
                 sleep(delay_seconds)
         flush_authenticated()
+        processed_pairs = {
+            (target.title.title_key, platform)
+            for target in targets
+            for platform in target.platforms
+        }
+        should_complete_metadata = bool(processed_pairs) and (
+            metadata_lookup is not None or lookup is lookup_platforms
+        )
+        metadata_completion = refresh_missing_metadata(
+            state_db_path,
+            limit=None,
+            delay_seconds=delay_seconds,
+            timeout=timeout,
+            authenticated_novelpia_lookup=authenticated_novelpia_lookup,
+            lookup=metadata_lookup or lookup_platforms,
+            target_pairs=processed_pairs,
+            sleep=sleep,
+            now=now,
+            progress=progress,
+        ) if should_complete_metadata else {
+            "dry_run": False,
+            "selected_titles": 0,
+            "selected_platforms": 0,
+            "outcome_counts": {},
+            "lookup_mode_counts": {},
+            "authenticated_novelpia_attempts": 0,
+            "authenticated_novelpia_relogins": 0,
+        }
         return {
             "dry_run": False,
             **synced,
@@ -3043,6 +3185,7 @@ def refresh_catalog(
                 "relogin_count",
                 0,
             )),
+            "metadata_completion": metadata_completion,
         }
     finally:
         conn.close()

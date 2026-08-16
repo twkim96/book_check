@@ -46,6 +46,7 @@ class ServiceDefinition:
     write_scope: tuple[str, ...]
     defaults: tuple[str, ...]
     production_layout_required: bool = False
+    visible: bool = True
 
 
 SERVICE_DEFINITIONS = (
@@ -76,14 +77,14 @@ SERVICE_DEFINITIONS = (
     ServiceDefinition(
         "platform-update",
         "service_platform_update",
-        "플랫폼 인기 DB 업데이트",
-        "신규 작품과 아직 수집하지 않은 플랫폼만 조회하고 실패 결과는 자동 재시도하지 않습니다.",
+        "플랫폼 DB 업데이트",
+        "신규 작품과 미수집 플랫폼의 상태·인기 지표·장르·태그를 한 작업에서 수집하고, 이번 실행에서 성공했지만 메타데이터가 비어 있는 행만 한 번 보완합니다.",
         "메타데이터",
         True,
-        "대상 작품",
+        "신규/미수집 작품",
         ("SQLite 파일 메타데이터", "시리즈·카카오·노벨피아"),
-        ("플랫폼 상태·인기 지표",),
-        ("전체 미수집 대상", "제목 안에서 공개 플랫폼 최대 3개 병렬", "제목 간 안전 지연"),
+        ("플랫폼 상태·인기 지표", "장르", "카카오·노벨피아 태그"),
+        ("전체 미수집 대상", "현재 실행의 metadata 누락만 1회 보완", "과거 실패 자동 재시도 금지"),
         True,
     ),
     ServiceDefinition(
@@ -115,28 +116,30 @@ SERVICE_DEFINITIONS = (
     ServiceDefinition(
         "platform-metadata",
         "service_platform_metadata",
-        "플랫폼 메타데이터 backfill",
-        "이미 성공한 작품 중 장르 또는 지원 태그 snapshot이 없는 플랫폼만 다시 조회해 메타데이터를 채웁니다.",
+        "플랫폼 메타데이터 backfill (유지보수)",
+        "과거 성공 행 중 장르 또는 지원 태그 snapshot이 없는 플랫폼을 수동으로 재조회하는 유지보수 작업입니다.",
         "메타데이터",
-        True,
+        False,
         "메타데이터 미수집 작품",
         ("기존 성공 플랫폼 상태", "시리즈 상세", "카카오 BFF", "노벨피아 검색 JSON"),
         ("플랫폼 장르", "카카오·노벨피아 태그", "수집 시각"),
-        ("기존 인기 지표는 변경하지 않음", "장르/태그 없음과 미수집 구분", "인증 노벨피아 보완 가능"),
-        True,
+        ("기존 인기 지표는 변경하지 않음", "일반 DB 업데이트와 분리된 수동 유지보수", "자동 반복 실행 금지"),
+        production_layout_required=True,
+        visible=False,
     ),
     ServiceDefinition(
         "platform-identity",
         "service_platform_identity",
-        "플랫폼 metadata consistency 재검증",
-        "시리즈·카카오 성공 행을 저장된 remote ID에서 다시 읽어 제목과 장르·태그 provenance를 같은 원격 객체 기준으로 재검증합니다.",
+        "플랫폼 metadata consistency 재검증 (유지보수)",
+        "시리즈·카카오 성공 행을 저장된 remote ID에서 다시 읽어 제목과 장르·태그 provenance를 같은 원격 객체 기준으로 전수 감사하는 유지보수 작업입니다.",
         "메타데이터",
         False,
         "consistency 재검증 작품",
         ("기존 Series/Kakao 성공 remote ID", "같은 ID의 플랫폼 상세/BFF"),
         ("같은 ID의 remote_title/remote_url", "장르", "카카오 태그", "수집 시각"),
-        ("다른 remote ID로 자동 전환 금지", "인기 지표 변경 금지", "제목/remote ID CAS 검증"),
-        True,
+        ("다른 remote ID로 자동 전환 금지", "인기 지표 변경 금지", "일반 서비스 목록에서 숨김"),
+        production_layout_required=True,
+        visible=False,
     ),
     ServiceDefinition(
         "novelpia-auth-retry",
@@ -609,6 +612,7 @@ class LibraryServiceRegistry:
         return [
             self.descriptor(item.service_id, context=context)
             for item in SERVICE_DEFINITIONS
+            if item.visible
         ]
 
     def start(self, service_id: str, *, source: str) -> dict:

@@ -30,18 +30,18 @@ def _stat(platform):
         return platform_catalog.PlatformStat(
             platform, "ok", remote_id="11", remote_title="합성작품",
             remote_url="https://series.naver.com/novel/detail.series?productNo=11",
-            download_count=123, rating=9.1,
+            download_count=123, rating=9.1, genre="현판",
         )
     if platform == "kakao":
         return platform_catalog.PlatformStat(
             platform, "ok", remote_id="22", remote_title="합성작품",
             remote_url="https://page.kakao.com/content/22",
-            view_count=456, rating=8.2,
+            view_count=456, rating=8.2, genre="판타지", tags=("성장",),
         )
     return platform_catalog.PlatformStat(
         platform, "ok", remote_id="33", remote_title="합성작품",
         remote_url="https://novelpia.com/novel/33",
-        view_count=789, recommend_count=22,
+        view_count=789, recommend_count=22, genre="판타지", tags=("성장",),
     )
 
 
@@ -191,6 +191,188 @@ def test_catalog_refresh_only_requests_missing_platforms_and_waits_between_title
     )
     assert second["selected_titles"] == 0
     assert len(calls) == 2
+
+
+def test_catalog_refresh_completes_metadata_only_for_rows_touched_in_same_run(tmp_path):
+    state_db = _make_db(tmp_path, "통합 수집 작품 1-20화.txt")
+    public_calls = []
+    metadata_calls = []
+
+    def public_lookup(_title, platforms, *, timeout):
+        public_calls.append(tuple(platforms))
+        values = {
+            "series": platform_catalog.PlatformStat(
+                "series", "ok", remote_id="11", remote_title="통합 수집 작품",
+                remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+                download_count=123,
+            ),
+            "kakao": platform_catalog.PlatformStat("kakao", "not_found"),
+            "novelpia": platform_catalog.PlatformStat("novelpia", "not_found"),
+        }
+        return [values[platform] for platform in platforms]
+
+    def metadata_lookup(_title, platforms, *, timeout):
+        metadata_calls.append(tuple(platforms))
+        return [platform_catalog.PlatformStat(
+            "series", "ok", remote_id="11", remote_title="통합 수집 작품",
+            remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+            genre="현판",
+        ) for _platform in platforms]
+
+    result = platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        timeout=1,
+        lookup=public_lookup,
+        metadata_lookup=metadata_lookup,
+    )
+
+    assert public_calls == [("series", "kakao", "novelpia")]
+    assert metadata_calls == [("series",)]
+    assert result["metadata_completion"]["selected_platforms"] == 1
+    assert result["metadata_completion"]["outcome_counts"]["updated"] == 1
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        row = conn.execute(
+            "SELECT status, download_count, genre, genre_collected_at "
+            "FROM catalog_platform_stats WHERE platform = 'series'"
+        ).fetchone()
+        assert tuple(row[:3]) == ("ok", 123, "현판")
+        assert row["genre_collected_at"] is not None
+    finally:
+        conn.close()
+
+    second = platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        timeout=1,
+        lookup=public_lookup,
+        metadata_lookup=metadata_lookup,
+    )
+    assert second["selected_titles"] == 0
+    assert len(metadata_calls) == 1
+
+
+def test_catalog_refresh_does_not_sweep_historical_metadata_residuals(tmp_path):
+    state_db = _make_db(tmp_path, "기존 누락 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat(
+                "series", "ok", remote_id="11", remote_title="기존 누락 작품",
+                remote_url="https://series.naver.com/novel/detail.series?productNo=11",
+                download_count=100,
+            )],
+        )
+    finally:
+        conn.close()
+
+    metadata_calls = []
+
+    def public_lookup(_title, platforms, *, timeout):
+        return [platform_catalog.PlatformStat(platform, "not_found") for platform in platforms]
+
+    def metadata_lookup(_title, platforms, *, timeout):
+        metadata_calls.append(tuple(platforms))
+        raise AssertionError("historical metadata residual must not be swept")
+
+    result = platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        timeout=1,
+        lookup=public_lookup,
+        metadata_lookup=metadata_lookup,
+    )
+    assert result["selected_platforms"] == 2
+    assert result["metadata_completion"]["selected_platforms"] == 0
+    assert metadata_calls == []
+
+
+def test_invalidate_platform_identity_clears_wrong_remote_object_with_cas(tmp_path):
+    state_db = _make_db(tmp_path, "오매칭 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="57589258", remote_title="다른 작품",
+                remote_url="https://page.kakao.com/content/57589258",
+                view_count=839048, rating=9.4, rating_count=3431,
+                genre="판타지", tags=("오매칭",),
+            )],
+        )
+        result = platform_catalog.invalidate_platform_identity(
+            conn,
+            key,
+            "kakao",
+            expected_remote_id="57589258",
+            expected_remote_title="다른 작품",
+            reason="verified wrong remote object",
+            now=datetime(2026, 8, 16, tzinfo=timezone.utc),
+        )
+        assert result["before"]["view_count"] == 839048
+        row = conn.execute(
+            "SELECT * FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'kakao'",
+            (key,),
+        ).fetchone()
+        assert row["status"] == "not_found"
+        assert row["remote_id"] is None
+        assert row["remote_title"] is None
+        assert row["view_count"] is None
+        assert row["rating"] is None
+        assert row["genre"] is None
+        assert row["error_message"] == "verified wrong remote object"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM catalog_platform_tags "
+            "WHERE title_key = ? AND platform = 'kakao'",
+            (key,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_invalidate_platform_identity_rejects_stale_remote_id(tmp_path):
+    state_db = _make_db(tmp_path, "CAS 오매칭 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat(
+                "kakao", "ok", remote_id="current", remote_title="현재 작품",
+                remote_url="https://page.kakao.com/content/current",
+                view_count=10,
+            )],
+        )
+        with pytest.raises(RuntimeError, match="changed before invalidation"):
+            platform_catalog.invalidate_platform_identity(
+                conn,
+                key,
+                "kakao",
+                expected_remote_id="stale",
+                reason="must not apply",
+            )
+        row = conn.execute(
+            "SELECT status, remote_id, view_count FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'kakao'",
+            (key,),
+        ).fetchone()
+        assert tuple(row) == ("ok", "current", 10)
+    finally:
+        conn.close()
 
 
 def test_existing_metric_refresh_selects_only_successful_platforms_with_counts(tmp_path):
