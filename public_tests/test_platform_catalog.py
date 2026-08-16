@@ -60,6 +60,32 @@ def _stat(platform):
     )
 
 
+def test_catalog_preview_keeps_legacy_schema_read_only(tmp_path):
+    state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        conn.execute("DROP VIEW catalog_title_metrics")
+        conn.execute("DROP TABLE catalog_platform_stats")
+        conn.execute("DROP TABLE catalog_titles")
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+    finally:
+        conn.close()
+
+    preview = platform_catalog.preview_catalog_refresh(str(state_db), limit=1)
+
+    assert preview["dry_run"] is True
+    assert preview["selected_titles"] == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'catalog_titles'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_catalog_keeps_six_platform_metrics_without_touching_files(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)

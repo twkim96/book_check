@@ -1374,9 +1374,18 @@ def _process_items_authorized(
 
     mutation_phase_marked = False
 
-    def mark_mutation_phase():
+    def mark_mutation_phase(existing_conn=None):
         nonlocal mutation_phase_marked
         if mutation_phase_marked:
+            return
+        if existing_conn is not None and existing_conn.in_transaction:
+            # The auditor already owns a BEGIN IMMEDIATE transaction while it
+            # turns pair-cache evidence into user-visible review state.  Write
+            # the marker through that same transaction; opening a second
+            # writer connection here would deterministically self-lock.
+            decision_store.mark_actual_run_mutation_started(
+                existing_conn, actual_run_id
+            )
             return
         marker_conn = decision_store.connect_state_db(state_db_path)
         try:

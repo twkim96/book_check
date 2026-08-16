@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import decision_store
 import duplicate_auditor
+import folderling
+from scanner import generate_file_list
 
 
 def _approved_run(tmp_path, *, prevalidated=False):
@@ -123,12 +125,12 @@ def test_auditor_marks_actual_run_before_non_cache_review_mutation(
         [],
         "pair-config",
         "analysis-config",
-        before_non_cache_mutation=lambda: markers.append("marked"),
+        before_non_cache_mutation=lambda conn: markers.append(conn.in_transaction),
     )
     cache.file_ids = {"left": 1, "right": 2}
 
     def fake_supersede(*_args, **_kwargs):
-        assert markers == ["marked"]
+        assert markers == [True]
         return 1
 
     monkeypatch.setattr(
@@ -142,9 +144,55 @@ def test_auditor_marks_actual_run_before_non_cache_review_mutation(
         classification="lossless_identity_mismatch",
         evidence={},
     )
-    cache._store_review_item(candidate, result)
+    with decision_store.transaction(cache.conn):
+        cache._store_review_item(candidate, result)
     assert cache.stats["lossless_mismatch_reviews_superseded"] == 1
     cache.close()
+
+
+def test_folderling_review_marker_uses_auditor_writer_without_self_lock(tmp_path):
+    script = tmp_path / "script"
+    (script / ".dedup_state").mkdir(parents=True)
+    (script / "extension").mkdir()
+    state_db = script / ".dedup_state" / "dedup_decisions.sqlite3"
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    old = house / "ㄱ" / "교체통합 1-100화.txt"
+    old.parent.mkdir()
+    short = "공통 본문 " * 700
+    old.write_text(short, encoding="utf-8")
+    incoming = temp / "교체통합 1-200화 완.txt"
+    incoming.write_text(short + ("추가 회차 " * 400), encoding="utf-8")
+
+    generate_file_list(
+        [str(house)],
+        str(script / "file_list.json"),
+        str(script / "file_index.json"),
+        state_db_path=str(state_db),
+    )
+    conn = decision_store.connect_state_db(state_db)
+    backup = decision_store.backup_state_db(
+        conn, tmp_path / "fixture-backup.sqlite3"
+    )
+    decision_store.issue_actual_run_token(
+        conn, str(backup), house_dir=house, temp_dir=temp
+    )
+    conn.close()
+
+    result = folderling.process_items(str(temp), str(house), str(script))
+
+    assert result["dedup_summary"]["contained_upgrade_count"] == 1
+    assert not old.exists()
+    assert not incoming.exists()
+    assert (house / "ㄱ" / incoming.name).is_file()
+    assert (
+        temp / "trash_bin" / "superseded_versions" / old.name
+    ).is_file()
+    conn = decision_store.connect_state_db(state_db)
+    assert decision_store.doctor_issues(conn) == []
+    conn.close()
 
 
 def test_standalone_auditor_initialization_keeps_full_integrity_validation(

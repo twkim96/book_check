@@ -1106,8 +1106,13 @@ def preview_catalog_refresh(
             force=force,
             failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
-            title_rows=_catalog_title_rows(conn),
-            tombstones=_load_identity_tombstones(conn),
+            title_rows=(
+                _catalog_title_rows(conn) if "catalog_titles" in tables else {}
+            ),
+            tombstones=(
+                _load_identity_tombstones(conn)
+                if "catalog_platform_stats" in tables else {}
+            ),
         )
         return {
             "dry_run": True,

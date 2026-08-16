@@ -1951,7 +1951,7 @@ class PersistentAuditCache:
                     and review_result.evidence.get("epub_distinct_edition") is True
                 ):
                     if self.before_non_cache_mutation is not None:
-                        self.before_non_cache_mutation()
+                        self.before_non_cache_mutation(self.conn)
                     self.stats["distinct_epub_reviews_superseded"] += (
                         supersede_open_pair_reviews(
                             self.conn,
@@ -1967,7 +1967,7 @@ class PersistentAuditCache:
     def _store_review_item(self, candidate, result):
         if result.classification == "lossless_identity_mismatch":
             if self.before_non_cache_mutation is not None:
-                self.before_non_cache_mutation()
+                self.before_non_cache_mutation(self.conn)
             left_file = self.file_ids.get(candidate.left.path)
             right_file = self.file_ids.get(candidate.right.path)
             if left_file is not None and right_file is not None:
@@ -2035,7 +2035,7 @@ class PersistentAuditCache:
         # the first point where the auditor may suppress/update/create one,
         # while leaving long fingerprint/pair-cache-only work auto-recoverable.
         if self.before_non_cache_mutation is not None:
-            self.before_non_cache_mutation()
+            self.before_non_cache_mutation(self.conn)
         distinct_decision_id = (
             self.store.suppress_open_reviews_for_active_distinct_decision(
                 self.conn,

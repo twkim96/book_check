@@ -793,6 +793,17 @@ crash convergence, identity ambiguity, Folderling pathname race를 닫는다. sc
 배포/UI/platform catalog는 `1.4.22`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive
 호환성 계약은 1.4.21과 동일하다.
 
+#### 1.4.22 운영 마감 보강
+
+실제 Folderling 경로 점검에서 auditor가 `BEGIN IMMEDIATE`를 보유한 상태로 mutation marker callback이
+두 번째 SQLite writer를 열어 스스로 잠기는 결함을 확인했다. marker를 auditor의 기존 connection과 같은
+transaction에 기록하도록 수정하고, 완성본 교체·기존본 격리·최종 Doctor까지 수행하는 공개 회귀를 추가했다.
+구 schema DB의 read-only catalog preview도 아직 존재하지 않는 v16 table을 조회하지 않게 유지했다.
+
+최종 검증은 전체 `1006 passed`, 공개 `596 passed`, compileall/pyflakes, frontend typecheck/build를 통과했다.
+운영 read-only 확인은 `/health` 1.4.22, schema v16, integrity ok, FK/Doctor issue 0,
+approved·active run 및 unfinished operation/group 0, platform-update target 0이다.
+
 ## 구조
 
 ```text
