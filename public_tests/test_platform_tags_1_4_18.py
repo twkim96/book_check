@@ -692,6 +692,10 @@ def test_metadata_backfill_targets_missing_genre_or_tags_and_preserves_metrics(t
 
     listing = library_catalog.catalog_listing(db_path, search="태그 작품")
     [item] = listing["items"]
+    assert item["canonical_genre"] == "판타지"
+    assert item["genre_candidates"] == ["판타지", "현대판타지"]
+    assert item["genre_review_required"] is False
+    assert item["genre_resolution_state"] == "resolved"
     assert item["platforms"]["series"]["genre"] == "현판"
     assert item["platforms"]["kakao"]["genre"] == "판타지"
     assert item["platforms"]["kakao"]["tags"] == ["게임", "성장"]
@@ -876,6 +880,101 @@ def test_metadata_target_cas_rejects_changed_title_or_remote_identity(tmp_path):
             "SELECT genre FROM catalog_platform_stats "
             "WHERE title_key = '작품' AND platform = 'series'"
         ).fetchone()[0] is None
+    finally:
+        conn.close()
+
+
+def test_metadata_auth_success_fills_novelpia_tags_without_changing_metrics(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    path = house / "인증 메타데이터 1-10화.txt"
+    path.write_text("fixture", encoding="utf-8")
+    db_path = tmp_path / ".dedup_state" / "auth-metadata.sqlite3"
+    conn = decision_store.initialize_state_db(db_path)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, path, source="house")
+        platform_catalog.sync_catalog_titles(conn)
+        title_key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            title_key,
+            [
+                platform_catalog.PlatformStat(
+                    "series", "ok", remote_id="11", remote_title="인증 메타데이터",
+                    download_count=10, genre="현판",
+                ),
+                platform_catalog.PlatformStat(
+                    "kakao", "ok", remote_id="22", remote_title="인증 메타데이터",
+                    view_count=20, genre="판타지", tags=("성장",),
+                ),
+                platform_catalog.PlatformStat(
+                    "novelpia", "ok", remote_id="33", remote_title="인증 메타데이터",
+                    view_count=30, recommend_count=3,
+                ),
+            ],
+        )
+    finally:
+        conn.close()
+
+    public_calls = []
+    auth_calls = []
+
+    def public_lookup(title, platforms, *, timeout):
+        public_calls.append((title, tuple(platforms), timeout))
+        return [platform_catalog.PlatformStat(
+            "novelpia", "ok", remote_id="33", remote_title="인증 메타데이터",
+            view_count=999, recommend_count=99, genre=None, tags=None,
+        )]
+
+    class ExactAuth:
+        def lookup(self, *_args, **_kwargs):
+            raise AssertionError("metadata backfill must prefer stored-ID lookup")
+
+        def lookup_metadata_batch(
+            self, items, *, timeout, delay_seconds, sleep
+        ):
+            auth_calls.append((list(items), timeout, delay_seconds))
+            return [platform_catalog.PlatformStat(
+                "novelpia", "ok", remote_id="33", remote_title="인증 메타데이터",
+                genre="판타지", tags=("판타지", "성인", "집착"),
+                metadata_lookup_mode="authenticated",
+            )]
+
+    authenticated = ExactAuth()
+
+    result = platform_catalog.refresh_missing_metadata(
+        str(db_path),
+        limit=None,
+        delay_seconds=0,
+        timeout=1,
+        lookup=public_lookup,
+        authenticated_novelpia_lookup=authenticated.lookup,
+    )
+
+    assert public_calls == [("인증 메타데이터", ("novelpia",), 1)]
+    assert auth_calls == [([("인증 메타데이터", "33", "인증 메타데이터")], 1, 0)]
+    assert result["authenticated_novelpia_attempts"] == 1
+    assert result["outcome_counts"]["updated"] == 1
+
+    conn = decision_store.connect_state_db_readonly(db_path)
+    try:
+        row = conn.execute(
+            "SELECT remote_id, view_count, recommend_count, genre, "
+            "genre_collected_at, tags_collected_at "
+            "FROM catalog_platform_stats WHERE title_key = ? AND platform = 'novelpia'",
+            (title_key,),
+        ).fetchone()
+        assert tuple(row[:4]) == ("33", 30, 3, "판타지")
+        assert row["genre_collected_at"] is not None
+        assert row["tags_collected_at"] is not None
+        assert [
+            item[0] for item in conn.execute(
+                "SELECT tag FROM catalog_platform_tags "
+                "WHERE title_key = ? AND platform = 'novelpia' ORDER BY position",
+                (title_key,),
+            )
+        ] == ["판타지", "성인", "집착"]
     finally:
         conn.close()
 

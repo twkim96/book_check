@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import decision_store
+from genre_flattening import resolve_canonical_genre
 
 
 PLATFORMS = ("series", "kakao", "novelpia")
@@ -210,6 +211,15 @@ def catalog_listing(
         for row in rows:
             key = row["title_key"]
             relation = relations_by_key[key]
+            genre_resolution = resolve_canonical_genre(
+                (
+                    platform,
+                    stats_by_key[key][platform].get("genre"),
+                    stats_by_key[key][platform].get("tags"),
+                )
+                for platform in PLATFORMS
+                if stats_by_key[key].get(platform, {}).get("status") == "ok"
+            )
             items.append({
                 "title_key": key,
                 "display_title": row["display_title"],
@@ -224,6 +234,10 @@ def catalog_listing(
                 "variant_ids": sorted(relation["variant_ids"]),
                 "folders": sorted(relation["folders"], key=str.casefold),
                 "representative_file_ids": relation["representative_file_ids"],
+                "canonical_genre": genre_resolution.canonical_genre,
+                "genre_candidates": list(genre_resolution.candidates),
+                "genre_review_required": genre_resolution.review_required,
+                "genre_resolution_state": genre_resolution.state,
                 "platforms": {
                     platform: stats_by_key[key].get(platform, {
                         "platform": platform,

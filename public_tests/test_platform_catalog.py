@@ -779,6 +779,49 @@ def test_authenticated_novelpia_not_found_verifies_once_per_twenty(monkeypatch):
     assert checks == ["check", "check", "check"]
 
 
+def test_authenticated_novelpia_metadata_batch_reads_stored_ids_without_search(
+    monkeypatch,
+):
+    client = platform_catalog.AuthenticatedNovelpiaClient(
+        "reader@example.com", "secret-password"
+    )
+    client._logged_in = True
+    urls = []
+    checks = []
+
+    def fetch_text(url, timeout):
+        urls.append((url, timeout))
+        return """
+        <p class="writer-tag">
+          <span class="tag">#현대판타지</span>
+          <span class="tag">#범죄</span>
+        </p>
+        """
+
+    monkeypatch.setattr(client, "fetch_text", fetch_text)
+    monkeypatch.setattr(client, "verify_session", lambda: checks.append("check"))
+    monkeypatch.setattr(
+        client,
+        "_lookup_once",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("title search must not be used for stored-ID metadata")
+        ),
+    )
+
+    [result] = client.lookup_metadata_batch([
+        ("암흑가 보스요？ 제가요？", "384111", "암흑가 보스요? 제가요?"),
+    ], timeout=3)
+
+    assert urls == [("https://novelpia.com/novel/384111", 3)]
+    assert checks == ["check"]
+    assert result.status == "ok"
+    assert result.remote_id == "384111"
+    assert result.remote_title == "암흑가 보스요? 제가요?"
+    assert result.genre == "현대판타지"
+    assert result.tags == ("현대판타지", "범죄")
+    assert result.metadata_lookup_mode == "authenticated"
+
+
 def test_authenticated_novelpia_expired_chunk_relogs_and_retries(monkeypatch):
     environ = {
         platform_catalog.NOVELPIA_EMAIL_ENV: "reader@example.com",

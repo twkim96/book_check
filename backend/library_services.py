@@ -233,7 +233,7 @@ class LibraryServiceRegistry:
                 "refresh-existing", ("--all",), progress
             ),
             "platform-metadata": lambda payload, progress: self._run_platform(
-                "refresh-metadata", ("--all",), progress
+                "refresh-metadata", ("--all", "--require-novelpia-auth"), progress
             ),
             "platform-identity": lambda payload, progress: self._run_platform(
                 "revalidate-metadata-consistency", ("--all",), progress
@@ -564,11 +564,11 @@ class LibraryServiceRegistry:
                         raise RuntimeError(str(context["platform_error"]))
                     cached = context.get("platform_previews", {}).get(service_id)
                     target_count, preview = cached or self._platform_preview(service_id)
-                    if service_id == "novelpia-auth-retry":
+                    if service_id in {"platform-metadata", "novelpia-auth-retry"}:
                         from platform_catalog import AuthenticatedNovelpiaClient
 
                         configured = AuthenticatedNovelpiaClient.environment_configured()
-                        if preview.get("already_completed"):
+                        if service_id == "novelpia-auth-retry" and preview.get("already_completed"):
                             ready = False
                             blocked_code = "already_completed"
                             blocked_reason = "인증 누락 1회 재검사가 이미 완료되었습니다."

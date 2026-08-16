@@ -571,6 +571,72 @@ def test_platform_update_preview_includes_durable_metadata_completion_pairs(tmp_
     assert preview["pending_metadata_completion_pairs"] == 1
 
 
+def test_platform_metadata_descriptor_fails_closed_without_credentials(
+    tmp_path, monkeypatch
+):
+    import platform_catalog
+
+    app, _ = _server_fixture(tmp_path)
+    registry = app.extensions["library_service_registry"]
+    monkeypatch.setattr(registry, "_production_layout", lambda: True)
+    monkeypatch.setattr(
+        platform_catalog.AuthenticatedNovelpiaClient,
+        "environment_configured",
+        staticmethod(lambda: False),
+    )
+    descriptor = registry.descriptor(
+        "platform-metadata",
+        context={
+            "jobs": [],
+            "active": None,
+            "doctor_ok": True,
+            "doctor_issue_count": 0,
+            "supported_house_files": 1,
+            "platform_previews": {
+                "platform-metadata": (1, {
+                    "dry_run": True,
+                    "selected_titles": 1,
+                    "selected_platforms": 1,
+                }),
+            },
+            "platform_error": None,
+        },
+    )
+
+    assert descriptor["configured"] is False
+    assert descriptor["ready"] is False
+    assert descriptor["blocked_code"] == "credentials_missing"
+
+
+def test_platform_metadata_service_requires_novelpia_auth_flag(
+    tmp_path, monkeypatch
+):
+    import run_platform_catalog
+
+    app, _ = _server_fixture(tmp_path)
+    registry = app.extensions["library_service_registry"]
+    captured = []
+
+    def fake_run(args, *, progress):
+        captured.append(args)
+        return {
+            "selected_titles": 0,
+            "selected_platforms": 0,
+            "outcome_counts": {},
+        }
+
+    def progress(_current, _total, _message, *, stage="running", event=None):
+        return None
+
+    monkeypatch.setattr(run_platform_catalog, "run", fake_run)
+    registry.handlers["platform-metadata"]({}, progress)
+
+    [args] = captured
+    assert args.command == "refresh-metadata"
+    assert args.all is True
+    assert args.require_novelpia_auth is True
+
+
 def test_metadata_consistency_service_requires_review_for_unresolved_results(
     tmp_path, monkeypatch
 ):

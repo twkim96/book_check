@@ -323,6 +323,10 @@ export interface CatalogItem {
   variant_ids: number[];
   folders: string[];
   representative_file_ids: string[];
+  canonical_genre: string | null;
+  genre_candidates: string[];
+  genre_review_required: boolean;
+  genre_resolution_state: "resolved" | "review" | "missing";
   platforms: Record<"series" | "kakao" | "novelpia", CatalogPlatform>;
 }
 

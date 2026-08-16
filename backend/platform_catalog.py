@@ -255,6 +255,95 @@ class AuthenticatedNovelpiaClient:
         except Exception as exc:
             return _error("novelpia", exc)
 
+    def _lookup_metadata_once(
+        self,
+        title: str,
+        remote_id: str,
+        remote_title: Optional[str] = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> PlatformStat:
+        """Read metadata from one already-proven NovelPia remote object."""
+        remote_id_text = str(remote_id or "").strip()
+        if not remote_id_text:
+            return _error("novelpia", RuntimeError("stored remote ID is missing"))
+        try:
+            tags = _parse_novelpia_tags(
+                self.fetch_text(
+                    f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout
+                )
+            )
+        except NovelpiaAuthenticationError:
+            raise
+        except Exception as exc:
+            return _error("novelpia", exc)
+        return PlatformStat(
+            platform="novelpia",
+            status="ok",
+            remote_id=remote_id_text,
+            remote_title=str(remote_title or title).strip(),
+            remote_url=f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}",
+            genre=tags[0] if tags else "",
+            tags=tags,
+            metadata_lookup_mode="authenticated",
+        )
+
+    def lookup_metadata_batch(
+        self,
+        items: Sequence[Tuple[str, str, Optional[str]]],
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        delay_seconds: float = 0,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> List[PlatformStat]:
+        """Read stored-ID metadata in session-verified chunks without title search."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if delay_seconds < 0:
+            raise ValueError("delay_seconds must be non-negative")
+        self.login()
+        results: List[PlatformStat] = []
+        for start in range(0, len(items), NOVELPIA_AUTH_BATCH_SIZE):
+            chunk = list(items[start:start + NOVELPIA_AUTH_BATCH_SIZE])
+
+            def read_chunk() -> List[PlatformStat]:
+                attempted = []
+                for index, (title, remote_id, remote_title) in enumerate(chunk):
+                    attempted.append(self._lookup_metadata_once(
+                        title,
+                        remote_id,
+                        remote_title,
+                        timeout=timeout,
+                    ))
+                    if index + 1 < len(chunk) and delay_seconds:
+                        sleep(delay_seconds)
+                return attempted
+
+            attempted = read_chunk()
+            try:
+                self.verify_session()
+            except NovelpiaSessionExpiredError:
+                self._logged_in = False
+                self.relogin_count += 1
+                self.login()
+                attempted = read_chunk()
+                self.verify_session()
+            results.extend(attempted)
+            self._lookup_count += len(chunk)
+        return results
+
+    def lookup_metadata(
+        self,
+        title: str,
+        remote_id: str,
+        remote_title: Optional[str] = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> PlatformStat:
+        return self.lookup_metadata_batch(
+            [(title, remote_id, remote_title)], timeout=timeout
+        )[0]
+
     def lookup_batch(
         self,
         titles: Sequence[str],
@@ -2933,6 +3022,53 @@ def _authenticated_lookup_batch(
     return results
 
 
+def _authenticated_metadata_lookup_batch(
+    lookup: Callable[..., PlatformStat],
+    targets: Sequence[RefreshTarget],
+    *,
+    timeout: float,
+    delay_seconds: float,
+    sleep: Callable[[float], None],
+) -> List[PlatformStat]:
+    """Prefer stored-ID metadata reads when the authenticated client supports them."""
+    owner = getattr(lookup, "__self__", None)
+    batch_lookup = getattr(owner, "lookup_metadata_batch", None)
+    if callable(batch_lookup):
+        items = []
+        for target in targets:
+            hint = next(
+                (
+                    (remote_id, remote_title)
+                    for platform, remote_id, remote_title in target.remote_hints
+                    if platform == "novelpia"
+                ),
+                (None, None),
+            )
+            remote_id, remote_title = hint
+            if remote_id is None or not str(remote_id).strip():
+                raise RuntimeError(
+                    "authenticated NovelPia metadata target has no stored remote ID"
+                )
+            items.append((
+                target.title.query_title,
+                str(remote_id),
+                remote_title,
+            ))
+        return batch_lookup(
+            items,
+            timeout=timeout,
+            delay_seconds=delay_seconds,
+            sleep=sleep,
+        )
+    return _authenticated_lookup_batch(
+        lookup,
+        [target.title.query_title for target in targets],
+        timeout=timeout,
+        delay_seconds=delay_seconds,
+        sleep=sleep,
+    )
+
+
 def select_authenticated_novelpia_targets(
     conn: sqlite3.Connection,
     *,
@@ -3336,9 +3472,9 @@ def refresh_missing_metadata(
             nonlocal authenticated_novelpia_attempts
             if not pending_authenticated:
                 return
-            authenticated_results = _authenticated_lookup_batch(
+            authenticated_results = _authenticated_metadata_lookup_batch(
                 authenticated_novelpia_lookup,
-                [target.title.query_title for target in pending_authenticated],
+                pending_authenticated,
                 timeout=timeout,
                 delay_seconds=delay_seconds,
                 sleep=sleep,

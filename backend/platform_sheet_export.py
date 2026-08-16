@@ -14,6 +14,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import decision_store
+from genre_flattening import resolve_canonical_genre
 from requests.exceptions import Timeout as RequestTimeout
 
 
@@ -38,6 +39,8 @@ WORK_HEADERS = (
     "원본 도서명",
     "보유 범위",
     "작가",
+    "통합 장르",
+    "장르 후보",
     "작품명",
     "장르",
     "다운로드 수",
@@ -58,7 +61,7 @@ WORK_HEADERS = (
 )
 
 WORK_GROUP_HEADERS = (
-    "메타데이터", None, None,
+    "메타데이터", None, None, None, None,
     "시리즈", None, None, None, None,
     "카카오", None, None, None, None, None,
     "노벨피아", None, None, None, None, None,
@@ -336,10 +339,24 @@ def build_sheet_snapshot(
             else:
                 range_text = ""
 
+            genre_resolution = resolve_canonical_genre(
+                (
+                    platform,
+                    by_platform[platform]["genre"],
+                    tags.get((title_key, platform)),
+                )
+                for platform in ("series", "kakao", "novelpia")
+                if by_platform.get(platform) is not None
+                and by_platform[platform]["status"] == "ok"
+            )
+
             works_rows.append((
                 display_title,
                 range_text,
                 ", ".join(sorted(group["authors"])),
+                _empty(genre_resolution.canonical_genre),
+                " · ".join(genre_resolution.candidates)
+                if genre_resolution.review_required else "",
                 platform_field(series, "remote_title"),
                 platform_field(series, "genre"),
                 platform_field(series, "download_count"),
@@ -753,8 +770,10 @@ def _format_requests(
 
         for index, header in enumerate(headers):
             pixel_size = 250 if header in {"원본 도서명", "작품명"} else None
-            if header in {"보유 범위", "작가", "장르", "평점", "링크"}:
+            if header in {"보유 범위", "작가", "장르", "통합 장르", "평점", "링크"}:
                 pixel_size = 80
+            if header == "장르 후보":
+                pixel_size = 160
             if header in {"다운로드 수", "조회 수"}:
                 pixel_size = 90
             if pixel_size is not None:
