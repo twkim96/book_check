@@ -762,6 +762,37 @@ view `839,048`, rating `9.4174`, rating_count `3,431`이었으며 현재 해당 
 배포/UI/platform catalog는 `1.4.21`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive
 호환성 계약은 1.4.20과 동일하다.
 
+### 1.4.22 cumulative production-safety review hardening
+
+1.4.22는 `a332a67^..93166e3` 누적 production-safety 리뷰에서 확인된 generic platform writer,
+crash convergence, identity ambiguity, Folderling pathname race를 닫는다. schema는 계속 `v16`이다.
+
+- 신규/재시도 platform target은 `query_title + catalog_titles.updated_at + expected row
+  status/remote_id/last_attempt_at` snapshot을 갖고 write transaction에서 CAS한다. 신규 row는 expected-absence가
+  유지될 때만 insert하고, 다른 writer가 먼저 row를 만들거나 title revision이 바뀌면 `stale_target`이다.
+- 기존 `ok`는 search-first UPSERT로 덮지 않는다. Series/Kakao의 보존된 ID는 stored-ID direct 조회만 허용하고,
+  다른 ID는 `identity_conflict`, transient failure는 기존 `ok`/identity/metric을 보존한다. growth count는 monotonic이다.
+  `--force`/`--refresh-after-days`의 기존 성공 row도 stored-ID `refresh-existing` path로 라우팅한다.
+- verified wrong identity invalidation은 schema 변경 없이 `settings` tombstone을 함께 기록한다. 일반 update와
+  failed/not-found retry selector 및 writer가 tombstoned pair를 자동 재설치하지 않는다. 1.4.21에서 이미 정리한
+  `어게인1997` legacy reason도 동일한 tombstone으로 취급한다.
+- persistent `status=ok`에는 `remote_id`와 `remote_title`이 필수다. URL은 platform+ID에서 canonical하게 복원할 수
+  있지만 ID/title evidence가 없는 metric response를 성공 row로 저장하지 않는다.
+- platform title matcher는 whitespace/콜론/괄호 같은 presentation punctuation만 정규화하고 `+`, `&`, `#`,
+  apostrophe 같은 identity-bearing symbol은 보존한다. exact normalized title candidate가 복수면 자동 선택하지 않고,
+  search response가 author evidence를 제공할 때 로컬 author와 불일치하면 fail-closed한다.
+- 일반 `platform-update`는 network write 전에 exact metadata completion pair를 `settings` durable queue로 남긴다.
+  primary writer와 queue state를 같은 transaction에서 갱신하고, 다음 update는 새 cycle보다 먼저 interrupted queue를
+  reconcile/resume한다. pending/review pair는 service readiness와 `needs_review` 결과에 반영된다.
+- Folderling activation manifest는 생성한 원래 `O_RDWR|O_EXCL|O_NOFOLLOW` FD를 active DB commit과 post-commit
+  pathname check까지 유지한다. 같은 FD에서 fsync/hash/JSON payload 검증을 하고, pathname이 그 inode를 계속
+  가리키는지 commit 전후 검사한다. manifest directory는 현재 UID + mode `0700`을 강제한다.
+- interrupted Folderling job은 job JSON/preflight/start event의 모든 explicit run ID가 하나로 합의될 때만 bind한다.
+  서로 다른 ID가 있으면 `ambiguous_job_evidence`로 자동 reconciliation을 중단한다.
+
+배포/UI/platform catalog는 `1.4.22`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive
+호환성 계약은 1.4.21과 동일하다.
+
 ## 구조
 
 ```text

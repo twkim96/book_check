@@ -63,13 +63,13 @@ def _sheet_db(tmp_path):
             key,
             [
                 platform_catalog.PlatformStat(
-                    "series", "ok", remote_title="합성 작품",
+                    "series", "ok", remote_id="1", remote_title="합성 작품",
                     remote_url="https://series.example/1",
                     download_count=1234, rating=9.2, genre="현판"
                 ),
                 platform_catalog.PlatformStat("kakao", "not_found"),
                 platform_catalog.PlatformStat(
-                    "novelpia", "ok", remote_title="합성 작품",
+                    "novelpia", "ok", remote_id="1", remote_title="합성 작품",
                     remote_url="https://novelpia.example/1",
                     view_count=4567, recommend_count=88, genre="판타지",
                     tags=("판타지", "먼치킨"),

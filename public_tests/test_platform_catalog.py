@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import threading
@@ -23,6 +24,20 @@ def _make_db(tmp_path, *names):
     finally:
         conn.close()
     return state_db
+
+
+def _identified_stat(platform, **values):
+    remote_ids = {"series": "11", "kakao": "22", "novelpia": "33"}
+    remote_id = str(values.pop("remote_id", remote_ids[platform]))
+    remote_title = values.pop("remote_title", "합성작품")
+    return platform_catalog.PlatformStat(
+        platform,
+        "ok",
+        remote_id=remote_id,
+        remote_title=remote_title,
+        remote_url=platform_catalog._canonical_remote_url(platform, remote_id),
+        **values,
+    )
 
 
 def _stat(platform):
@@ -106,8 +121,9 @@ def test_file_metadata_rekey_preserves_success_and_drops_failed_lookup(tmp_path)
             conn,
             old_key,
             [
-                platform_catalog.PlatformStat(
-                    "series", "ok", download_count=125_000, rating=9.8
+                _identified_stat(
+                    "series", remote_title="최강 헌터의 자화상 1",
+                    download_count=125_000, rating=9.8,
                 ),
                 platform_catalog.PlatformStat("kakao", "not_found"),
             ],
@@ -385,12 +401,8 @@ def test_existing_metric_refresh_selects_only_successful_platforms_with_counts(t
             conn,
             key,
             [
-                platform_catalog.PlatformStat(
-                    "series", "ok", remote_id="11", rating=9.0
-                ),
-                platform_catalog.PlatformStat(
-                    "kakao", "ok", remote_id="22", view_count=456, rating=8.2
-                ),
+                _identified_stat("series", rating=9.0),
+                _identified_stat("kakao", view_count=456, rating=8.2),
                 platform_catalog.PlatformStat(
                     "novelpia", "not_found"
                 ),
@@ -413,13 +425,11 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
             conn,
             key,
             [
-                platform_catalog.PlatformStat(
-                    "series", "ok", remote_id="11", download_count=100,
-                    rating=9.0, rating_count=20,
+                _identified_stat(
+                    "series", download_count=100, rating=9.0, rating_count=20,
                 ),
-                platform_catalog.PlatformStat(
-                    "novelpia", "ok", remote_id="33",
-                    view_count=1000, recommend_count=100,
+                _identified_stat(
+                    "novelpia", view_count=1000, recommend_count=100,
                 ),
             ],
         )
@@ -427,13 +437,11 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
             conn,
             key,
             [
-                platform_catalog.PlatformStat(
-                    "series", "ok", remote_id="11", download_count=120,
-                    rating=8.7, rating_count=18,
+                _identified_stat(
+                    "series", download_count=120, rating=8.7, rating_count=18,
                 ),
-                platform_catalog.PlatformStat(
-                    "novelpia", "ok", remote_id="33",
-                    view_count=1100, recommend_count=95,
+                _identified_stat(
+                    "novelpia", view_count=1100, recommend_count=95,
                 ),
             ],
         )
@@ -452,9 +460,7 @@ def test_existing_metric_update_is_monotonic_and_rating_follows_growth(tmp_path)
             conn,
             key,
             [
-                platform_catalog.PlatformStat(
-                    "series", "ok", remote_id="11", download_count=119, rating=9.9
-                ),
+                _identified_stat("series", download_count=119, rating=9.9),
                 platform_catalog.PlatformStat(
                     "novelpia", "error", message="temporary"
                 ),
@@ -481,9 +487,7 @@ def test_existing_metric_update_serializes_concurrent_writers(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             key,
-            [platform_catalog.PlatformStat(
-                "series", "ok", remote_id="11", download_count=100
-            )],
+            [_identified_stat("series", download_count=100)],
         )
     finally:
         conn.close()
@@ -498,9 +502,7 @@ def test_existing_metric_update_serializes_concurrent_writers(tmp_path):
             platform_catalog.record_increased_platform_stats(
                 worker,
                 key,
-                [platform_catalog.PlatformStat(
-                    "series", "ok", remote_id="11", download_count=value
-                )],
+                [_identified_stat("series", download_count=value)],
             )
         except Exception as exc:
             errors.append(exc)
@@ -540,13 +542,8 @@ def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallbac
             conn,
             key,
             [
-                platform_catalog.PlatformStat(
-                    "kakao", "ok", remote_id="22", view_count=100, rating=8.0
-                ),
-                platform_catalog.PlatformStat(
-                    "novelpia", "ok", remote_id="33",
-                    view_count=200, recommend_count=20
-                ),
+                _identified_stat("kakao", view_count=100, rating=8.0),
+                _identified_stat("novelpia", view_count=200, recommend_count=20),
             ],
         )
     finally:
@@ -558,16 +555,17 @@ def test_existing_metric_refresh_queries_only_present_platforms_and_auth_fallbac
     def lookup(_title, platforms, *, timeout):
         calls.append(tuple(platforms))
         return [
-            platform_catalog.PlatformStat(
-                "kakao", "ok", remote_id="22", view_count=150, rating=8.3
+            _identified_stat(
+                "kakao", remote_title="성인 합성작품", view_count=150, rating=8.3
             ),
             platform_catalog.PlatformStat("novelpia", "not_found"),
         ]
 
     def authenticated(title, *, timeout):
         auth_calls.append(title)
-        return platform_catalog.PlatformStat(
-            "novelpia", "ok", remote_id="33", view_count=250, recommend_count=25
+        return _identified_stat(
+            "novelpia", remote_title="성인 합성작품",
+            view_count=250, recommend_count=25,
         )
 
     result = platform_catalog.refresh_existing_metrics(
@@ -993,7 +991,10 @@ def test_changed_catalog_query_retries_not_found_but_preserves_success(tmp_path)
             conn,
             key,
             [
-                platform_catalog.PlatformStat("series", "ok", rating=9.0),
+                _identified_stat(
+                    "series", remote_title="합성 메인 제목: 충분히 긴 부제목",
+                    rating=9.0,
+                ),
                 platform_catalog.PlatformStat("kakao", "not_found"),
                 platform_catalog.PlatformStat("novelpia", "not_found"),
             ],
@@ -1387,7 +1388,7 @@ def test_v8_download_values_are_preserved_by_v9_migration(tmp_path):
         platform_catalog.sync_catalog_titles(conn)
         key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
         platform_catalog.record_platform_stats(
-            conn, key, [platform_catalog.PlatformStat("series", "ok", download_count=321)]
+            conn, key, [_identified_stat("series", download_count=321)]
         )
         conn.execute("UPDATE catalog_platform_stats SET interest_count = download_count")
         conn.execute("DROP VIEW catalog_title_metrics")
@@ -1424,12 +1425,12 @@ def test_catalog_top_sorts_by_requested_platform_column(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             keys[0],
-            [platform_catalog.PlatformStat("series", "ok", download_count=10)],
+            [_identified_stat("series", download_count=10)],
         )
         platform_catalog.record_platform_stats(
             conn,
             keys[1],
-            [platform_catalog.PlatformStat("series", "ok", download_count=20)],
+            [_identified_stat("series", download_count=20)],
         )
     finally:
         conn.close()
@@ -1451,14 +1452,14 @@ def test_catalog_top_sorts_by_requested_platform_column(tmp_path):
     assert [row["series_download_count"] for row in active_only] == [10]
 
 
-def test_catalog_top_excludes_last_good_metric_when_current_lookup_failed(tmp_path):
+def test_catalog_top_keeps_last_good_metric_when_current_lookup_failed(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.initialize_state_db(state_db)
     try:
         platform_catalog.sync_catalog_titles(conn)
         key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
         platform_catalog.record_platform_stats(
-            conn, key, [platform_catalog.PlatformStat("series", "ok", rating=9.8)]
+            conn, key, [_identified_stat("series", rating=9.8)]
         )
         platform_catalog.record_platform_stats(
             conn, key, [platform_catalog.PlatformStat("series", "not_found")]
@@ -1466,9 +1467,10 @@ def test_catalog_top_excludes_last_good_metric_when_current_lookup_failed(tmp_pa
     finally:
         conn.close()
 
-    assert platform_catalog.top_catalog_metrics(
+    rows = platform_catalog.top_catalog_metrics(
         str(state_db), order_by="series-rating", limit=10
-    ) == []
+    )
+    assert [row["series_rating"] for row in rows] == [9.8]
 
 
 def test_catalog_status_is_read_only_and_uses_current_active_titles(tmp_path):
@@ -1502,7 +1504,7 @@ def test_not_found_preserves_last_known_metrics(tmp_path):
         platform_catalog.sync_catalog_titles(conn)
         key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
         platform_catalog.record_platform_stats(
-            conn, key, [platform_catalog.PlatformStat("series", "ok", download_count=123, rating=9.8)]
+            conn, key, [_identified_stat("series", download_count=123, rating=9.8)]
         )
         platform_catalog.record_platform_stats(
             conn, key, [platform_catalog.PlatformStat("series", "not_found")]
@@ -1512,7 +1514,7 @@ def test_not_found_preserves_last_known_metrics(tmp_path):
             "WHERE title_key = ? AND platform = 'series'",
             (key,),
         ).fetchone()
-        assert tuple(row) == ("not_found", 123, 9.8)
+        assert tuple(row) == ("ok", 123, 9.8)
     finally:
         conn.close()
 
@@ -1729,3 +1731,402 @@ def test_changed_response_shapes_become_retryable_errors():
         timeout=1,
     )[0]
     assert [series.status, kakao.status, novelpia.status] == ["error", "error", "error"]
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("C++ 개발자", "C 개발자"),
+        ("1+1", "11"),
+        ("D&D", "DD"),
+        ("C# 마스터", "C 마스터"),
+    ],
+)
+def test_platform_title_match_preserves_identity_bearing_symbols(left, right):
+    assert not platform_catalog.titles_match(left, right)
+
+
+def test_series_duplicate_exact_title_candidates_fail_closed():
+    search_page = (
+        '<a href="/novel/detail.series?productNo=11">동일 제목</a>'
+        '<a href="/novel/detail.series?productNo=22">동일 제목</a>'
+    )
+    stat = platform_catalog.lookup_series(
+        "동일 제목",
+        fetch_text=lambda url, _timeout: search_page
+        if "search/search.series" in url else (_ for _ in ()).throw(AssertionError(url)),
+        timeout=1,
+    )
+    assert stat.status == "error"
+    assert "ambiguous" in stat.message
+
+
+def test_kakao_author_evidence_mismatch_fails_closed_before_detail_lookup():
+    def fetch_json(url, _timeout):
+        if "/v2/search/series" in url:
+            return {"result": {"list": [{
+                "series_id": "22",
+                "title": "동일 제목",
+                "authors": [{"name": "작가 B"}],
+                "service_property": {"view_count": 100},
+            }]}}
+        raise AssertionError(f"detail lookup must not run: {url}")
+
+    stat = platform_catalog.lookup_kakao(
+        "동일 제목", fetch_json=fetch_json, author="작가 A", timeout=1
+    )
+    assert stat.status == "not_found"
+    assert stat.message == "remote author mismatch"
+
+
+def test_ok_platform_stat_requires_remote_identity():
+    with pytest.raises(ValueError, match="remote_id"):
+        platform_catalog._validate_stat(
+            platform_catalog.PlatformStat("series", "ok", download_count=1)
+        )
+    with pytest.raises(ValueError, match="remote_title"):
+        platform_catalog._validate_stat(
+            platform_catalog.PlatformStat(
+                "series", "ok", remote_id="11", download_count=1
+            )
+        )
+
+
+def test_primary_writer_rejects_changed_title_revision(tmp_path):
+    state_db = _make_db(tmp_path, "CAS 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        target = platform_catalog.select_refresh_targets(conn, limit=1)[0]
+        conn.execute(
+            "UPDATE catalog_titles SET query_title = ?, updated_at = ? WHERE title_key = ?",
+            ("CAS 작품 변경", "2099-01-01 00:00:00", target.title.title_key),
+        )
+        conn.commit()
+        outcomes = platform_catalog.record_platform_stats(
+            conn,
+            target.title.title_key,
+            [_identified_stat("series", remote_title="CAS 작품", download_count=10)],
+            expected_target=target,
+        )
+        assert outcomes == {"series": "stale_target"}
+        assert conn.execute(
+            "SELECT COUNT(*) FROM catalog_platform_stats WHERE title_key = ?",
+            (target.title.title_key,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_primary_writer_rejects_concurrent_expected_absence_violation(tmp_path):
+    state_db = _make_db(tmp_path, "CAS 동시 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        target = platform_catalog.select_refresh_targets(conn, limit=1)[0]
+        worker = decision_store.connect_state_db(state_db)
+        try:
+            platform_catalog.record_platform_stats(
+                worker,
+                target.title.title_key,
+                [_identified_stat("series", remote_id="11", download_count=20)],
+            )
+        finally:
+            worker.close()
+        outcomes = platform_catalog.record_platform_stats(
+            conn,
+            target.title.title_key,
+            [_identified_stat("series", remote_id="22", download_count=99)],
+            expected_target=target,
+        )
+        assert outcomes == {"series": "stale_target"}
+        row = conn.execute(
+            "SELECT remote_id, download_count FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'series'",
+            (target.title.title_key,),
+        ).fetchone()
+        assert tuple(row) == ("11", 20)
+    finally:
+        conn.close()
+
+
+def test_failed_retry_rejects_cross_id_success(tmp_path):
+    state_db = _make_db(tmp_path, "재시도 ID 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [platform_catalog.PlatformStat(
+                "kakao", "error", remote_id="old", remote_title="재시도 ID 작품",
+                view_count=100, message="old failure",
+            )],
+        )
+    finally:
+        conn.close()
+
+    def lookup(_title, platforms, *, timeout):
+        assert platforms == ("kakao",)
+        return [_identified_stat(
+            "kakao", remote_id="new", remote_title="재시도 ID 작품", view_count=200
+        )]
+
+    result = platform_catalog.refresh_catalog(
+        str(state_db), limit=None, delay_seconds=0, failed_retry=True, lookup=lookup
+    )
+    assert result["outcome_counts"]["identity_conflict"] == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        row = conn.execute(
+            "SELECT status, remote_id, view_count FROM catalog_platform_stats "
+            "WHERE title_key = ? AND platform = 'kakao'",
+            (key,),
+        ).fetchone()
+        assert tuple(row) == ("error", "old", 100)
+    finally:
+        conn.close()
+
+
+def test_invalidated_identity_tombstone_blocks_retry_selectors(tmp_path):
+    state_db = _make_db(tmp_path, "무효화 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [_identified_stat(
+                "kakao", remote_id="bad", remote_title="다른 작품", view_count=10
+            )],
+        )
+        platform_catalog.invalidate_platform_identity(
+            conn,
+            key,
+            "kakao",
+            expected_remote_id="bad",
+            expected_remote_title="다른 작품",
+            reason="verified wrong remote object",
+        )
+        failed = platform_catalog.select_refresh_targets(
+            conn, limit=None, failed_retry=True
+        )
+        assert all("kakao" not in target.platforms for target in failed)
+        retry_not_found = platform_catalog.select_refresh_targets(
+            conn, limit=None, retry_not_found=True
+        )
+        assert all("kakao" not in target.platforms for target in retry_not_found)
+    finally:
+        conn.close()
+
+
+def test_existing_metric_age_selector_is_stored_id_bound(tmp_path):
+    state_db = _make_db(tmp_path, "기간 갱신 작품 1-20화.txt")
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        platform_catalog.sync_catalog_titles(conn)
+        key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        recorded = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        platform_catalog.record_platform_stats(
+            conn, key, [_identified_stat("series", download_count=100)], now=recorded
+        )
+        assert platform_catalog.select_existing_metric_targets(
+            conn, refresh_before=datetime(2025, 12, 31, tzinfo=timezone.utc)
+        ) == []
+        [target] = platform_catalog.select_existing_metric_targets(
+            conn, refresh_before=datetime(2026, 1, 2, tzinfo=timezone.utc)
+        )
+        assert target.platforms == ("series",)
+        assert target.remote_hints[0][1] == "11"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("flags", "force_expected", "age_expected"),
+    [
+        (("--force",), True, False),
+        (("--refresh-after-days", "30"), False, True),
+    ],
+)
+def test_refresh_force_and_age_route_existing_rows_to_stored_id_path(
+    tmp_path, monkeypatch, flags, force_expected, age_expected
+):
+    state_db = tmp_path / "state.sqlite3"
+    calls = {}
+    monkeypatch.setattr(
+        platform_catalog.AuthenticatedNovelpiaClient,
+        "from_environment",
+        classmethod(lambda cls, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        run_platform_catalog,
+        "sync_file_metadata",
+        lambda *_args, **_kwargs: (None, {"total": 0}),
+    )
+    monkeypatch.setattr(
+        run_platform_catalog,
+        "_platform_refresh_lock",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+
+    def generic(_path, **kwargs):
+        calls["generic"] = kwargs
+        return {"selected_titles": 0, "selected_platforms": 0}
+
+    def existing(_path, **kwargs):
+        calls["existing"] = kwargs
+        return {
+            "selected_titles": 1,
+            "selected_platforms": 1,
+            "outcome_counts": {"unchanged": 1},
+        }
+
+    monkeypatch.setattr(platform_catalog, "refresh_catalog", generic)
+    monkeypatch.setattr(platform_catalog, "refresh_existing_metrics", existing)
+    args = run_platform_catalog.build_parser().parse_args([
+        "--state-db", str(state_db), "refresh", "--all", *flags,
+    ])
+
+    result = run_platform_catalog.run(args)
+
+    assert calls["generic"]["refresh_after_days"] is None
+    assert calls["generic"]["force"] is force_expected
+    assert "existing_refresh" in result
+    if age_expected:
+        assert isinstance(calls["existing"]["refresh_before"], datetime)
+    else:
+        assert calls["existing"]["refresh_before"] is None
+
+
+def test_metadata_completion_reconciles_pre_primary_crash_before_new_cycle(tmp_path):
+    state_db = _make_db(tmp_path, "사전 재개 작품 1-20화.txt")
+    public_calls = []
+    metadata_calls = []
+
+    def public_lookup(_title, platforms, *, timeout):
+        public_calls.append(tuple(platforms))
+        values = {
+            "series": _identified_stat(
+                "series", remote_title="사전 재개 작품", download_count=10
+            ),
+            "kakao": platform_catalog.PlatformStat("kakao", "not_found"),
+            "novelpia": platform_catalog.PlatformStat("novelpia", "not_found"),
+        }
+        return [values[platform] for platform in platforms]
+
+    def metadata_lookup(_title, platforms, *, timeout):
+        metadata_calls.append(tuple(platforms))
+        return [_identified_stat(
+            "series", remote_title="사전 재개 작품", download_count=10, genre="현판"
+        )]
+
+    with pytest.raises(RuntimeError, match="pre-primary crash"):
+        platform_catalog.refresh_catalog(
+            str(state_db),
+            limit=None,
+            delay_seconds=0,
+            lookup=public_lookup,
+            metadata_lookup=metadata_lookup,
+            _test_failpoint=lambda phase: (
+                (_ for _ in ()).throw(RuntimeError("pre-primary crash"))
+                if phase == "completion_cycle_created" else None
+            ),
+        )
+    assert public_calls == []
+
+    result = platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        lookup=public_lookup,
+        metadata_lookup=metadata_lookup,
+    )
+    assert result["selected_titles"] == 1
+    assert len(public_calls) == 1
+    assert metadata_calls == [("series",)]
+    assert result["metadata_completion"]["review_pairs"] == 0
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM settings WHERE key LIKE ?",
+            (f"{platform_catalog.METADATA_COMPLETION_PREFIX}%",),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_metadata_completion_resumes_exact_pair_after_primary_crash(tmp_path):
+    state_db = _make_db(tmp_path, "재개 작품 1-20화.txt")
+    metadata_calls = []
+
+    def public_lookup(_title, platforms, *, timeout):
+        values = {
+            "series": _identified_stat(
+                "series", remote_title="재개 작품", download_count=10
+            ),
+            "kakao": platform_catalog.PlatformStat("kakao", "not_found"),
+            "novelpia": platform_catalog.PlatformStat("novelpia", "not_found"),
+        }
+        return [values[platform] for platform in platforms]
+
+    def metadata_lookup(_title, platforms, *, timeout):
+        metadata_calls.append(tuple(platforms))
+        assert platforms == ("series",)
+        return [_identified_stat(
+            "series", remote_title="재개 작품", download_count=10, genre="현판"
+        )]
+
+    def failpoint(phase):
+        if phase == "primary_committed":
+            raise RuntimeError("simulated crash after primary commit")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        platform_catalog.refresh_catalog(
+            str(state_db),
+            limit=None,
+            delay_seconds=0,
+            lookup=public_lookup,
+            metadata_lookup=metadata_lookup,
+            _test_failpoint=failpoint,
+        )
+
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM settings WHERE key LIKE ?",
+            (f"{platform_catalog.METADATA_COMPLETION_PREFIX}%",),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT status FROM catalog_platform_stats WHERE platform = 'series'"
+        ).fetchone()[0] == "ok"
+    finally:
+        conn.close()
+
+    resumed = platform_catalog.refresh_catalog(
+        str(state_db),
+        limit=None,
+        delay_seconds=0,
+        lookup=public_lookup,
+        metadata_lookup=metadata_lookup,
+    )
+    assert resumed["selected_titles"] == 0
+    assert metadata_calls == [("series",)]
+    assert resumed["metadata_completion"]["pending_pairs"] == 0
+    assert resumed["metadata_completion"]["review_pairs"] == 0
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        row = conn.execute(
+            "SELECT genre, genre_collected_at FROM catalog_platform_stats "
+            "WHERE platform = 'series'"
+        ).fetchone()
+        assert row["genre"] == "현판"
+        assert row["genre_collected_at"] is not None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM settings WHERE key LIKE ?",
+            (f"{platform_catalog.METADATA_COMPLETION_PREFIX}%",),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()

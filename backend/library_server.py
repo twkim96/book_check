@@ -93,7 +93,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.4.21"
+SERVER_VERSION = "1.4.22"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -176,22 +176,74 @@ class LibraryServerConfig:
 def _interrupted_folderling_run_id(store: JobStore, record) -> str | None:
     if record.get("job_type") != "service_folderling":
         return None
+    events = store.events(str(record["job_id"]), limit=None)
+    explicit_ids = set()
     if record.get("actual_run_id"):
-        return str(record["actual_run_id"])
-    run_ids = [
-        event.get("run_id") or event.get("approved_run_id")
-        for event in store.events(str(record["job_id"]), limit=None)
+        explicit_ids.add(str(record["actual_run_id"]))
+    for event in events:
         if (
             event.get("phase") == "actual_run_started"
             and event.get("status") == "running"
             and event.get("run_id")
-        ) or (
+        ):
+            explicit_ids.add(str(event["run_id"]))
+        if (
             event.get("phase") == "preflight_result"
             and event.get("status") == "succeeded"
             and event.get("approved_run_id")
+        ):
+            explicit_ids.add(str(event["approved_run_id"]))
+    if len(explicit_ids) > 1:
+        if not any(
+            event.get("error_code") == "ambiguous_job_evidence"
+            for event in events
+        ):
+            store.append_event(str(record["job_id"]), {
+                "phase": "interrupted_run_recovery_required",
+                "status": "blocked",
+                "run_ids": sorted(explicit_ids),
+                "error_code": "ambiguous_job_evidence",
+                "error_message": (
+                    "interrupted Folderling job 내부의 explicit actual-run evidence가 "
+                    "서로 달라 자동 reconciliation을 중단했습니다."
+                ),
+            })
+        return None
+    return next(iter(explicit_ids), None)
+
+
+def _recover_interrupted_platform_jobs(
+    store: JobStore, records
+) -> int:
+    """Make interrupted platform work explicitly reviewable instead of silently resumable."""
+    recovered = 0
+    for record in records:
+        if not str(record.get("job_type") or "").startswith("service_platform_"):
+            continue
+        job_id = str(record["job_id"])
+        resumable = record.get("job_type") in {
+            "service_platform_update", "service_platform_retry"
+        }
+        message = (
+            "플랫폼 작업이 프로세스 중단으로 종료되었습니다. "
+            "다음 플랫폼 DB 업데이트가 남은 durable metadata completion pair를 재개합니다."
+            if resumable else
+            "플랫폼 작업이 프로세스 중단으로 종료되어 현재 결과 검토가 필요합니다."
         )
-    ]
-    return str(run_ids[-1]) if run_ids else None
+        store.update(
+            job_id,
+            state="needs_review",
+            stage="needs_review",
+            message=message,
+            recovery_complete=True,
+        )
+        store.append_event(job_id, {
+            "phase": "interrupted_platform_recovery_required",
+            "status": "needs_review",
+            "error_code": "platform_job_interrupted",
+        })
+        recovered += 1
+    return recovered
 
 
 def _recover_interrupted_folderling_jobs(
@@ -696,6 +748,7 @@ def create_app(
         store,
         store.interrupted_records(job_type="service_folderling"),
     )
+    _recover_interrupted_platform_jobs(store, store.interrupted_records())
     readonly_keeper = (
         _open_state_db_readonly_keeper(config.state_db)
         if config.state_db.is_file() else None

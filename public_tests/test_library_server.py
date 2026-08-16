@@ -13,6 +13,7 @@ import pytest
 
 import decision_store
 import library_server
+import platform_catalog
 from dedup_mutations import _ensure_intake_fingerprint, _file_state
 from library_jobs import JobActiveError, JobNeedsReview, JobRunner, JobStore
 from library_server import _interrupted_folderling_run_id, create_app
@@ -295,7 +296,7 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     client = app.test_client()
     health = client.get("/health").get_json()
     assert health["ok"] is True
-    assert health["version"] == "1.4.21"
+    assert health["version"] == "1.4.22"
     providers = client.get("/api/providers").get_json()["data"]
     assert providers == [
         {"id": "title_correction", "label": "제목 교정", "enabled": True},
@@ -535,6 +536,41 @@ def test_platform_service_preview_is_shared_briefly_and_invalidatable(tmp_path, 
     assert calls == ["compute", "compute"]
 
 
+def test_platform_update_preview_includes_durable_metadata_completion_pairs(tmp_path):
+    app, _ = _server_fixture(tmp_path)
+    registry = app.extensions["library_service_registry"]
+    conn = decision_store.connect_state_db(registry.state_db)
+    try:
+        title_key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        payload = {
+            "cycle_id": "fixture-cycle",
+            "state": "active",
+            "pairs": [{
+                "title_key": title_key,
+                "platform": "series",
+                "state": "pending_metadata",
+            }],
+        }
+        with decision_store.transaction(conn):
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?)",
+                (
+                    f"{platform_catalog.METADATA_COMPLETION_PREFIX}fixture-cycle",
+                    json.dumps(payload),
+                ),
+            )
+    finally:
+        conn.close()
+
+    previews = registry._compute_platform_previews()
+    target_count, preview = previews["platform-update"]
+    assert target_count == 1
+    assert preview["selected_titles"] == 1
+    assert preview["selected_platforms"] == 1
+    assert preview["fresh_platform_pairs"] == 0
+    assert preview["pending_metadata_completion_pairs"] == 1
+
+
 def test_metadata_consistency_service_requires_review_for_unresolved_results(
     tmp_path, monkeypatch
 ):
@@ -571,6 +607,51 @@ def test_metadata_consistency_service_requires_review_for_unresolved_results(
     result = registry._run_platform(
         "revalidate-metadata-consistency", ("--all",), progress
     )
+
+    assert result["_job_state"] == "needs_review"
+    assert result["unresolved_count"] == 1
+    assert "잔여 1건" in result["_job_message"]
+    assert events[-1][4]["status"] == "needs_review"
+
+
+def test_platform_update_requires_review_when_metadata_completion_remains(
+    tmp_path, monkeypatch
+):
+    import run_platform_catalog
+
+    app, _ = _server_fixture(tmp_path)
+    registry = app.extensions["library_service_registry"]
+    events = []
+
+    def fake_run(_args, *, progress):
+        progress({
+            "phase": "start",
+            "discovered_titles": 1,
+            "selected_titles": 1,
+            "selected_platforms": 1,
+        })
+        return {
+            "selected_titles": 1,
+            "selected_platforms": 1,
+            "outcome_counts": {"ok": 1},
+            "metadata_completion": {
+                "pending_pairs": 1,
+                "review_pairs": 0,
+                "completed_pairs": 0,
+                "pair_outcomes": [{
+                    "title_key": "작품",
+                    "platform": "series",
+                    "state": "pending_metadata",
+                    "outcome": "unavailable",
+                }],
+            },
+        }
+
+    def progress(current, total, message, *, stage="running", event=None):
+        events.append((current, total, message, stage, dict(event or {})))
+
+    monkeypatch.setattr(run_platform_catalog, "run", fake_run)
+    result = registry._run_platform("refresh", ("--all",), progress)
 
     assert result["_job_state"] == "needs_review"
     assert result["unresolved_count"] == 1
@@ -1663,6 +1744,169 @@ def test_prepare_actual_run_fsyncs_manifest_file_and_parent_directory(
     assert Path(manifest_path).is_file()
     assert "file" in observed
     assert "directory" in observed
+
+
+def test_prepare_actual_run_rejects_manifest_leaf_replacement_after_fsync(tmp_path):
+    state_db, house, temp, _frontend, _runtime, _source, run_id = (
+        _activation_fault_fixture(tmp_path)
+    )
+    replacement = {"path": None, "stolen": None}
+
+    def replace_leaf(phase):
+        if phase != "manifest_fsynced":
+            return
+        conn = decision_store.connect_state_db_readonly(state_db)
+        try:
+            claim_id = conn.execute(
+                "SELECT activation_claim FROM actual_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        manifest_dir = state_db.parent / "manifests"
+        leaf = manifest_dir / f"{run_id}-{claim_id}.json"
+        stolen = manifest_dir / "original-renamed-away.json"
+        leaf.replace(stolen)
+        leaf.write_text(
+            json.dumps({"run_id": run_id, "files": []}), encoding="utf-8"
+        )
+        replacement["path"] = leaf
+        replacement["stolen"] = stolen
+
+    with pytest.raises(RuntimeError, match="pathname was replaced"):
+        decision_store.prepare_actual_run(
+            state_db, house, temp, _test_failpoint=replace_leaf
+        )
+
+    assert replacement["path"] is not None and replacement["path"].is_file()
+    assert replacement["stolen"] is not None and replacement["stolen"].is_file()
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        row = conn.execute(
+            "SELECT state, manifest_sha256 FROM actual_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        assert row["state"] == "failed"
+        assert row["manifest_sha256"] is None
+    finally:
+        conn.close()
+
+
+def test_prepare_actual_run_rejects_real_process_manifest_replacement(tmp_path):
+    state_db, house, temp, _frontend, _runtime, _source, run_id = (
+        _activation_fault_fixture(tmp_path)
+    )
+    attacker_code = r"""
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+state_db = Path(sys.argv[1])
+run_id = sys.argv[2]
+print("READY", flush=True)
+if sys.stdin.readline().strip() != "GO":
+    raise SystemExit(2)
+conn = sqlite3.connect(state_db)
+try:
+    claim_id = conn.execute(
+        "SELECT activation_claim FROM actual_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]
+finally:
+    conn.close()
+manifest_dir = state_db.parent / "manifests"
+leaf = manifest_dir / f"{run_id}-{claim_id}.json"
+stolen = manifest_dir / "attacker-original.json"
+os.rename(leaf, stolen)
+fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(fd, json.dumps({"run_id": run_id, "files": []}).encode("utf-8"))
+    os.fsync(fd)
+finally:
+    os.close(fd)
+print("DONE", flush=True)
+"""
+    attacker = subprocess.Popen(
+        [sys.executable, "-c", attacker_code, str(state_db), run_id],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert attacker.stdout is not None
+        assert attacker.stdin is not None
+        assert attacker.stdout.readline().strip() == "READY"
+
+        def trigger(phase):
+            if phase == "manifest_fsynced":
+                attacker.stdin.write("GO\n")
+                attacker.stdin.flush()
+                assert attacker.stdout.readline().strip() == "DONE"
+
+        with pytest.raises(RuntimeError, match="pathname was replaced"):
+            decision_store.prepare_actual_run(
+                state_db, house, temp, _test_failpoint=trigger
+            )
+        attacker.wait(timeout=5)
+        assert attacker.returncode == 0
+    finally:
+        if attacker.poll() is None:
+            attacker.terminate()
+            attacker.wait(timeout=5)
+
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT state FROM actual_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == "failed"
+    finally:
+        conn.close()
+
+
+def test_prepare_actual_run_tightens_existing_manifest_directory_mode(tmp_path):
+    state_db, house, temp, _frontend, _runtime, _source, _run_id = (
+        _activation_fault_fixture(tmp_path)
+    )
+    manifest_dir = state_db.parent / "manifests"
+    manifest_dir.mkdir(mode=0o755)
+    os.chmod(manifest_dir, 0o755)
+
+    run_id, manifest_path = decision_store.prepare_actual_run(state_db, house, temp)
+
+    assert run_id.startswith("actual-")
+    assert Path(manifest_path).is_file()
+    assert stat.S_IMODE(manifest_dir.stat().st_mode) == 0o700
+
+
+def test_interrupted_folderling_conflicting_explicit_run_evidence_is_ambiguous(tmp_path):
+    store = JobStore(tmp_path / "runtime")
+    job = store.create("service_folderling", {})
+    store.append_event(job["job_id"], {
+        "phase": "preflight_result",
+        "status": "succeeded",
+        "approved_run_id": "actual-11111111-1111-1111-1111-111111111111",
+    })
+    store.append_event(job["job_id"], {
+        "phase": "actual_run_started",
+        "status": "running",
+        "run_id": "actual-22222222-2222-2222-2222-222222222222",
+    })
+    store.update(
+        job["job_id"], state="interrupted", stage="interrupted"
+    )
+
+    assert _interrupted_folderling_run_id(store, store.get(job["job_id"])) is None
+    events = store.events(job["job_id"], limit=None)
+    [blocked] = [
+        event for event in events
+        if event.get("error_code") == "ambiguous_job_evidence"
+    ]
+    assert blocked["run_ids"] == [
+        "actual-11111111-1111-1111-1111-111111111111",
+        "actual-22222222-2222-2222-2222-222222222222",
+    ]
 
 
 def test_server_restart_rejects_noncanonical_activation_claim_without_unlink(

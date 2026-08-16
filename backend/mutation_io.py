@@ -398,6 +398,19 @@ def ensure_directory_nofollow(path, *, mode=0o755):
     os.close(fd)
 
 
+def assert_private_directory_fd(directory_fd: int, *, mode: int = 0o700) -> None:
+    """Require a pinned directory to be owned by this UID with exact private mode."""
+    info = os.fstat(directory_fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("pinned path is not a directory")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise RuntimeError("pinned directory is not owned by the current user")
+    if stat.S_IMODE(info.st_mode) != mode:
+        raise RuntimeError(
+            f"pinned directory mode is not private: {oct(stat.S_IMODE(info.st_mode))}"
+        )
+
+
 @contextmanager
 def opened_directory_nofollow(path):
     """Yield a pinned directory descriptor after rejecting every symlink component."""
@@ -452,6 +465,28 @@ def inspect_regular_file(path) -> FileEvidence:
     finally:
         os.close(fd)
         os.close(parent_fd)
+
+
+def inspect_open_regular_file_fd(fd: int) -> FileEvidence:
+    """Hash and identify one already pinned regular file descriptor."""
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise RuntimeError("pinned source is not a single-link regular file")
+    if hasattr(os, "getuid") and before.st_uid != os.getuid():
+        raise RuntimeError("pinned source is not owned by the current user")
+    sha256 = _hash_fd(fd)
+    after = os.fstat(fd)
+    before_identity = (
+        before.st_dev, before.st_ino, before.st_ctime_ns,
+        before.st_size, before.st_mtime_ns,
+    )
+    after_identity = (
+        after.st_dev, after.st_ino, after.st_ctime_ns,
+        after.st_size, after.st_mtime_ns,
+    )
+    if before_identity != after_identity:
+        raise SourceIdentityChanged("pinned source changed while read")
+    return _identity(after, sha256)
 
 
 def inspect_regular_file_at(directory_fd: int, leaf: str) -> FileEvidence:

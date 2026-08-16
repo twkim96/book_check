@@ -19,6 +19,20 @@ def _catalog_db(tmp_path):
     return db_path, conn
 
 
+def _ok_stat(platform, **values):
+    remote_ids = {"series": "11", "kakao": "22", "novelpia": "33"}
+    remote_id = str(values.pop("remote_id", remote_ids[platform]))
+    remote_title = values.pop("remote_title", "작품")
+    return platform_catalog.PlatformStat(
+        platform,
+        "ok",
+        remote_id=remote_id,
+        remote_title=remote_title,
+        remote_url=platform_catalog._canonical_remote_url(platform, remote_id),
+        **values,
+    )
+
+
 def _tags(conn, platform):
     return [
         row[0]
@@ -60,7 +74,7 @@ def test_v15_migrates_tags_schema_without_changing_existing_stat(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             "작품",
-            [platform_catalog.PlatformStat("kakao", "ok", view_count=123)],
+            [_ok_stat("kakao", view_count=123)],
         )
         conn.execute("DROP TABLE catalog_platform_tags")
         conn.execute("ALTER TABLE catalog_platform_stats DROP COLUMN genre")
@@ -451,9 +465,7 @@ def test_tag_rows_replace_only_after_authoritative_success(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             "작품",
-            [platform_catalog.PlatformStat(
-                "kakao", "ok", view_count=100, tags=("게임", "방송")
-            )],
+            [_ok_stat("kakao", view_count=100, tags=("게임", "방송"))],
             now=first,
         )
         assert _tags(conn, "kakao") == ["게임", "방송"]
@@ -477,16 +489,14 @@ def test_tag_rows_replace_only_after_authoritative_success(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             "작품",
-            [platform_catalog.PlatformStat(
-                "kakao", "ok", view_count=101, tags=("게임", "성장")
-            )],
+            [_ok_stat("kakao", view_count=101, tags=("게임", "성장"))],
         )
         assert _tags(conn, "kakao") == ["게임", "성장"]
 
         platform_catalog.record_platform_stats(
             conn,
             "작품",
-            [platform_catalog.PlatformStat("kakao", "ok", view_count=102, tags=())],
+            [_ok_stat("kakao", view_count=102, tags=())],
         )
         assert _tags(conn, "kakao") == []
         assert conn.execute(
@@ -503,9 +513,7 @@ def test_tag_parent_delete_cascades_child_rows(tmp_path):
         platform_catalog.record_platform_stats(
             conn,
             "작품",
-            [platform_catalog.PlatformStat(
-                "kakao", "ok", view_count=100, tags=("게임", "성장")
-            )],
+            [_ok_stat("kakao", view_count=100, tags=("게임", "성장"))],
         )
         assert _tags(conn, "kakao") == ["게임", "성장"]
         with decision_store.transaction(conn):
@@ -715,8 +723,9 @@ def test_ambiguous_rekey_discards_source_tags_instead_of_blessing_one(tmp_path):
             platform_catalog.record_platform_stats(
                 conn,
                 old_key,
-                [platform_catalog.PlatformStat(
-                    "kakao", "ok", view_count=100, tags=(tag,)
+                [_ok_stat(
+                    "kakao", remote_id=old_key, remote_title=old_key,
+                    view_count=100, tags=(tag,),
                 )],
             )
         with decision_store.transaction(conn):

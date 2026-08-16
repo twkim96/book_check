@@ -14,6 +14,8 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -24,15 +26,14 @@ from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 import decision_store
-from normalizer import (
-    NORMALIZER_VERSION,
-    extract_core_title,
-)
+from normalizer import NORMALIZER_VERSION
 
 
 PLATFORMS = ("series", "kakao", "novelpia")
 TAG_PLATFORMS = ("kakao", "novelpia")
 IDENTITY_AUDIT_PLATFORMS = ("series", "kakao")
+IDENTITY_TOMBSTONE_PREFIX = "platform_identity_tombstone_v1:"
+METADATA_COMPLETION_PREFIX = "platform_metadata_completion_v1:"
 GROWTH_METRICS = {
     "series": ("download_count",),
     "kakao": ("view_count",),
@@ -306,6 +307,7 @@ class CatalogTitle:
     title_key: str
     display_title: str
     query_title: str
+    author: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -314,6 +316,9 @@ class RefreshTarget:
     platforms: Tuple[str, ...]
     title_updated_at: Optional[str] = None
     remote_hints: Tuple[Tuple[str, Optional[str], Optional[str]], ...] = ()
+    row_hints: Tuple[
+        Tuple[str, Optional[str], Optional[str], Optional[str]], ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -357,42 +362,119 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+_PRESENTATION_PUNCTUATION_RE = re.compile(
+    r"[\s:()\[\]{},.\u3002\u2026?!\-\u2010-\u2015_\u00b7\u318d\u30fb"
+    r"\u201c\u201d\u300c\u300d\u300e\u300f]+"
+)
+
+
+def _normalized_platform_title(value: str) -> str:
+    """Normalize only presentation punctuation; preserve identity-bearing symbols."""
+    text = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).strip()
+    text = re.sub(r"\s*:\s*네이버시리즈\s*$", "", text, flags=re.IGNORECASE)
+    previous = None
+    while text != previous:
+        previous = text
+        text = re.sub(
+            r"\s*\(\s*총\s*[\d,]+\s*(?:화|권|편)"
+            r"(?:\s*/\s*[^)]+)?\)\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        text = re.sub(
+            r"\s*\[\s*(?:단행본|독점|미니노블)\s*\]\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+    return _PRESENTATION_PUNCTUATION_RE.sub("", text.casefold())
+
+
 def titles_match(requested_title: str, candidate_title: str) -> bool:
-    """Match normalized full titles without letting dedup-core parsing veto them.
-
-    Platform responses commonly append presentation-only tags such as
-    ``[단행본]``/``[독점]`` and total episode text.  Remove only that narrow
-    whitelist before the full-title comparison.  The resulting alphanumeric
-    full title is already the stronger identity check; ``extract_core_title``
-    is intentionally more aggressive and can split punctuation-only variants
-    such as ``9이닝 야구의 찬가`` vs ``9이닝 : 야구의 찬가``.
-    """
-    def normalized(value: str) -> str:
-        text = html.unescape(str(value or "")).strip()
-        text = re.sub(r"\s*:\s*네이버시리즈\s*$", "", text, flags=re.IGNORECASE)
-        previous = None
-        while text != previous:
-            previous = text
-            text = re.sub(
-                r"\s*[\(（]\s*총\s*[\d,]+\s*(?:화|권|편)"
-                r"(?:\s*/\s*[^\)）]+)?[\)）]\s*$",
-                "",
-                text,
-                flags=re.IGNORECASE,
-            ).strip()
-            text = re.sub(
-                r"\s*[\[［]\s*(?:단행본|독점|미니노블)\s*[\]］]\s*$",
-                "",
-                text,
-                flags=re.IGNORECASE,
-            ).strip()
-        return re.sub(
-            r"[^a-z0-9가-힣\u3400-\u9fff\uf900-\ufaff]", "", text.lower()
-        )
-
-    requested_exact = normalized(requested_title)
-    candidate_exact = normalized(candidate_title)
+    """Compare full titles while preserving symbols such as ``+``, ``&`` and ``#``."""
+    requested_exact = _normalized_platform_title(requested_title)
+    candidate_exact = _normalized_platform_title(candidate_title)
     return bool(requested_exact) and requested_exact == candidate_exact
+
+
+def _normalized_author(value: object) -> str:
+    return re.sub(
+        r"\s+", "", unicodedata.normalize("NFKC", html.unescape(str(value or "")))
+    ).casefold()
+
+
+def _candidate_author(value: object) -> Optional[str]:
+    """Best-effort author extraction from platform search result shapes."""
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        for key in (
+            "name", "author_name", "authorName", "writer_name", "writerName",
+            "writer_nick", "writerNick", "nickname", "nick_name", "nickName",
+        ):
+            if value.get(key) is not None:
+                extracted = _candidate_author(value.get(key))
+                if extracted:
+                    return extracted
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            extracted = _candidate_author(item)
+            if extracted:
+                return extracted
+    return None
+
+
+def _search_candidate_author(record: object) -> Optional[str]:
+    if not isinstance(record, dict):
+        return None
+    for key in (
+        "author", "authors", "writer", "writers", "creator", "creators",
+        "writer_nick", "writerNick", "writer_name", "writerName",
+    ):
+        if key in record:
+            extracted = _candidate_author(record.get(key))
+            if extracted:
+                return extracted
+    return None
+
+
+def _select_unique_title_candidate(
+    platform: str,
+    requested_title: str,
+    candidates: Sequence[Dict[str, object]],
+    *,
+    requested_author: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, object]], Optional[PlatformStat]]:
+    matched = [
+        item for item in candidates
+        if titles_match(requested_title, str(item.get("title") or ""))
+    ]
+    if requested_author:
+        local_author = _normalized_author(requested_author)
+        author_matches = [
+            item for item in matched
+            if item.get("author") and _normalized_author(item.get("author")) == local_author
+        ]
+        author_mismatches = [
+            item for item in matched
+            if item.get("author") and _normalized_author(item.get("author")) != local_author
+        ]
+        if author_matches:
+            matched = author_matches
+        elif author_mismatches and len(author_mismatches) == len(matched):
+            return None, _not_found(platform, "remote author mismatch")
+    distinct = {
+        str(item.get("id") or "") for item in matched if item.get("id") is not None
+    }
+    if len(distinct) > 1 or len(matched) > 1:
+        return None, _error(
+            platform,
+            RuntimeError("ambiguous exact-title search candidates"),
+        )
+    return (matched[0], None) if matched else (None, None)
 
 
 def _safe_message(error: BaseException) -> str:
@@ -545,7 +627,7 @@ def discover_catalog_titles(conn: sqlite3.Connection) -> List[CatalogTitle]:
             f.canonical_path, f.size, f.mtime_ns, f.ctime_ns,
             a.file_id AS analysis_file_id, a.normalizer_version, a.analyzed_name,
             a.analyzed_size, a.analyzed_mtime_ns, a.analyzed_ctime_ns,
-            a.core_title, a.readable_title, a.catalog_query_title
+            a.core_title, a.readable_title, a.catalog_query_title, a.author
         FROM files AS f
         JOIN file_analysis AS a ON a.file_id = f.file_id
         WHERE f.active = 1 AND f.source = 'house'
@@ -558,6 +640,7 @@ def discover_catalog_titles(conn: sqlite3.Connection) -> List[CatalogTitle]:
     if active_count and not rows:
         raise RuntimeError("file metadata sync required before platform collection")
     titles: Dict[str, CatalogTitle] = {}
+    author_conflicts: set[str] = set()
     stale = 0
     for row in rows:
         current_name = Path(row["canonical_path"]).name
@@ -573,14 +656,30 @@ def discover_catalog_titles(conn: sqlite3.Connection) -> List[CatalogTitle]:
             continue
         readable_title = str(row["readable_title"] or "").strip()
         query_title = str(row["catalog_query_title"] or "").strip()
+        author = str(row["author"] or "").strip() or None
         candidate = CatalogTitle(
             title_key=title_key,
             display_title=query_title or readable_title or title_key,
             query_title=query_title or readable_title or title_key,
+            author=author,
         )
         current = titles.get(title_key)
+        if (
+            current is not None
+            and current.author
+            and candidate.author
+            and _normalized_author(current.author) != _normalized_author(candidate.author)
+        ):
+            author_conflicts.add(title_key)
         if current is None or len(candidate.display_title) < len(current.display_title):
-            titles[title_key] = candidate
+            selected = candidate
+        else:
+            selected = current
+            if selected.author is None and candidate.author and title_key not in author_conflicts:
+                selected = replace(selected, author=candidate.author)
+        if title_key in author_conflicts and selected.author is not None:
+            selected = replace(selected, author=None)
+        titles[title_key] = selected
     if stale:
         raise RuntimeError(
             "file metadata sync required before platform collection: "
@@ -659,8 +758,6 @@ def _needed_platforms(
     failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
 ) -> Tuple[str, ...]:
-    if force:
-        return PLATFORMS
     rows = stats_by_title.get(title_key, {})
     if failed_retry:
         failed = {
@@ -704,17 +801,19 @@ def _needed_platforms(
             continue
         status = row["status"]
         if status == "error":
-            # Failure rows are deliberately sticky. They are retried only by the
-            # explicit failed-results action, never by the regular update button.
+            # Failure rows are sticky during the ordinary update. Explicit retry
+            # paths may select them, but existing successful rows never flow
+            # through this search-first selector.
+            if force:
+                needed.append(platform)
             continue
         if status == "not_found":
-            if retry_not_found:
+            if retry_not_found or force:
                 needed.append(platform)
             continue
-        if refresh_before is not None:
-            last_success = _parse_time(row["last_success_at"])
-            if last_success is None or last_success <= refresh_before:
-                needed.append(platform)
+        # Existing successes are refreshed only by the stored-ID monotonic path.
+        # ``refresh_before`` is intentionally ignored here and is routed by the
+        # CLI/service orchestrator to refresh_existing_metrics().
     return tuple(needed)
 
 
@@ -723,6 +822,186 @@ def _stats_by_title(conn: sqlite3.Connection) -> Dict[str, Dict[str, sqlite3.Row
     for row in conn.execute("SELECT * FROM catalog_platform_stats"):
         values.setdefault(row["title_key"], {})[row["platform"]] = row
     return values
+
+
+def _catalog_title_rows(conn: sqlite3.Connection) -> Dict[str, sqlite3.Row]:
+    return {
+        row["title_key"]: row
+        for row in conn.execute(
+            "SELECT title_key, query_title, updated_at FROM catalog_titles"
+        )
+    }
+
+
+def _identity_tombstone_key(title_key: str, platform: str) -> str:
+    return f"{IDENTITY_TOMBSTONE_PREFIX}{platform}:{title_key}"
+
+
+def _load_identity_tombstones(conn: sqlite3.Connection) -> Dict[Tuple[str, str], Dict[str, object]]:
+    tombstones: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for row in conn.execute(
+        "SELECT key, value FROM settings WHERE key LIKE ?",
+        (f"{IDENTITY_TOMBSTONE_PREFIX}%",),
+    ):
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        title_key = str(payload.get("title_key") or "")
+        platform = str(payload.get("platform") or "")
+        if title_key and platform in PLATFORMS:
+            tombstones[(title_key, platform)] = payload
+    # 1.4.21 performed one verified manual invalidation before tombstones were
+    # persisted. Preserve that fail-closed result across upgrades as well.
+    for row in conn.execute(
+        """
+        SELECT s.title_key, s.platform, t.query_title, s.error_message
+        FROM catalog_platform_stats AS s
+        JOIN catalog_titles AS t ON t.title_key = s.title_key
+        WHERE s.status = 'not_found'
+          AND s.error_message LIKE 'verified wrong remote object:%'
+        """
+    ):
+        tombstones.setdefault((row["title_key"], row["platform"]), {
+            "title_key": row["title_key"],
+            "query_title": row["query_title"],
+            "platform": row["platform"],
+            "rejected_remote_ids": [],
+            "reason": row["error_message"],
+            "legacy": True,
+        })
+    return tombstones
+
+
+def _tombstone_applies(
+    tombstones: Dict[Tuple[str, str], Dict[str, object]],
+    title: CatalogTitle,
+    platform: str,
+) -> bool:
+    payload = tombstones.get((title.title_key, platform))
+    if payload is None:
+        return False
+    query_title = str(payload.get("query_title") or "")
+    return not query_title or query_title == title.query_title
+
+
+def _metadata_completion_key(cycle_id: str) -> str:
+    return f"{METADATA_COMPLETION_PREFIX}{cycle_id}"
+
+
+def _load_metadata_completion_cycle(
+    conn: sqlite3.Connection, cycle_id: str
+) -> Dict[str, object]:
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (_metadata_completion_key(cycle_id),),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"metadata completion cycle disappeared: {cycle_id}")
+    try:
+        payload = json.loads(row["value"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("metadata completion cycle is invalid") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("pairs"), list):
+        raise RuntimeError("metadata completion cycle is invalid")
+    return payload
+
+
+def _save_metadata_completion_cycle(
+    conn: sqlite3.Connection, cycle_id: str, payload: Dict[str, object]
+) -> None:
+    conn.execute(
+        "UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?",
+        (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            _metadata_completion_key(cycle_id),
+        ),
+    )
+
+
+def _create_metadata_completion_cycle(
+    conn: sqlite3.Connection,
+    targets: Sequence[RefreshTarget],
+    *,
+    now: datetime,
+) -> Optional[str]:
+    pairs = []
+    for target in targets:
+        row_hints = {
+            platform: (status, remote_id, last_attempt_at)
+            for platform, status, remote_id, last_attempt_at in target.row_hints
+        }
+        for platform in target.platforms:
+            status, remote_id, last_attempt_at = row_hints.get(
+                platform, (None, None, None)
+            )
+            pairs.append({
+                "title_key": target.title.title_key,
+                "platform": platform,
+                "query_title": target.title.query_title,
+                "title_updated_at": target.title_updated_at,
+                "expected_status": status,
+                "expected_remote_id": remote_id,
+                "expected_last_attempt_at": last_attempt_at,
+                "state": "awaiting_primary",
+                "primary_remote_id": None,
+                "last_outcome": None,
+            })
+    if not pairs:
+        return None
+    cycle_id = str(uuid.uuid4())
+    payload = {
+        "cycle_id": cycle_id,
+        "created_at": _utc_text(now),
+        "state": "active",
+        "pairs": pairs,
+    }
+    with decision_store.transaction(conn):
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?)",
+            (
+                _metadata_completion_key(cycle_id),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+    return cycle_id
+
+
+def _mark_metadata_completion_primary(
+    conn: sqlite3.Connection,
+    cycle_id: Optional[str],
+    title_key: str,
+    platform: str,
+    *,
+    outcome: str,
+    stat: PlatformStat,
+) -> None:
+    if cycle_id is None:
+        return
+    payload = _load_metadata_completion_cycle(conn, cycle_id)
+    for pair in payload["pairs"]:
+        if pair.get("title_key") == title_key and pair.get("platform") == platform:
+            pair["last_outcome"] = outcome
+            if outcome in {"ok", "updated", "unchanged"} and stat.status == "ok":
+                pair["state"] = "pending_metadata"
+                pair["primary_remote_id"] = str(stat.remote_id)
+            elif outcome in {
+                "stale_target", "identity_conflict", "tombstoned", "unavailable"
+            }:
+                pair["state"] = "needs_review"
+            else:
+                pair["state"] = "primary_terminal"
+            _save_metadata_completion_cycle(conn, cycle_id, payload)
+            return
+    raise RuntimeError("metadata completion pair disappeared")
+
+
+def _metadata_snapshot_complete(row: sqlite3.Row, platform: str) -> bool:
+    if row["genre_collected_at"] is None:
+        return False
+    return platform not in TAG_PLATFORMS or row["tags_collected_at"] is not None
 
 
 def _refresh_targets(
@@ -736,6 +1015,8 @@ def _refresh_targets(
     force: bool = False,
     failed_retry: bool = False,
     failure_retry_cutoff: Optional[datetime] = None,
+    title_rows: Optional[Dict[str, sqlite3.Row]] = None,
+    tombstones: Optional[Dict[Tuple[str, str], Dict[str, object]]] = None,
 ) -> List[RefreshTarget]:
     if limit == 0:
         return []
@@ -751,8 +1032,36 @@ def _refresh_targets(
             failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
         )
+        if tombstones:
+            platforms = tuple(
+                platform for platform in platforms
+                if not _tombstone_applies(tombstones, title, platform)
+            )
         if platforms:
-            targets.append(RefreshTarget(title=title, platforms=platforms))
+            rows = stats_by_title.get(title.title_key, {})
+            title_row = (title_rows or {}).get(title.title_key)
+            targets.append(RefreshTarget(
+                title=title,
+                platforms=platforms,
+                title_updated_at=(title_row["updated_at"] if title_row is not None else None),
+                remote_hints=tuple(
+                    (
+                        platform,
+                        rows[platform]["remote_id"] if rows.get(platform) is not None else None,
+                        rows[platform]["remote_title"] if rows.get(platform) is not None else None,
+                    )
+                    for platform in platforms
+                ),
+                row_hints=tuple(
+                    (
+                        platform,
+                        rows[platform]["status"] if rows.get(platform) is not None else None,
+                        rows[platform]["remote_id"] if rows.get(platform) is not None else None,
+                        rows[platform]["last_attempt_at"] if rows.get(platform) is not None else None,
+                    )
+                    for platform in platforms
+                ),
+            ))
             if limit is not None and len(targets) >= limit:
                 break
     return targets
@@ -797,6 +1106,8 @@ def preview_catalog_refresh(
             force=force,
             failed_retry=failed_retry,
             failure_retry_cutoff=failure_retry_cutoff,
+            title_rows=_catalog_title_rows(conn),
+            tombstones=_load_identity_tombstones(conn),
         )
         return {
             "dry_run": True,
@@ -830,6 +1141,8 @@ def select_refresh_targets(
         force=force,
         failed_retry=failed_retry,
         failure_retry_cutoff=failure_retry_cutoff,
+        title_rows=_catalog_title_rows(conn),
+        tombstones=_load_identity_tombstones(conn),
     )
 
 
@@ -841,6 +1154,7 @@ def select_existing_metric_targets(
     conn: sqlite3.Connection,
     *,
     limit: Optional[int] = None,
+    refresh_before: Optional[datetime] = None,
 ) -> List[RefreshTarget]:
     """Select active successful metrics together with their remote identity snapshot."""
     if limit is not None and limit < 0:
@@ -864,6 +1178,11 @@ def select_existing_metric_targets(
             and rows[platform]["status"] == "ok"
             and _row_has_growth_metric(platform, rows[platform])
             and rows[platform]["remote_id"] is not None
+            and (
+                refresh_before is None
+                or _parse_time(rows[platform]["last_success_at"]) is None
+                or _parse_time(rows[platform]["last_success_at"]) <= refresh_before
+            )
         )
         if not platforms:
             continue
@@ -1036,11 +1355,14 @@ def preview_existing_metric_refresh(
     state_db_path: str,
     *,
     limit: Optional[int] = None,
+    refresh_before: Optional[datetime] = None,
 ) -> Dict[str, object]:
     conn = decision_store.connect_state_db_readonly(state_db_path)
     try:
         decision_store.validate_schema(conn)
-        targets = select_existing_metric_targets(conn, limit=limit)
+        targets = select_existing_metric_targets(
+            conn, limit=limit, refresh_before=refresh_before
+        )
         return {
             "dry_run": True,
             "selected_titles": len(targets),
@@ -1049,6 +1371,18 @@ def preview_existing_metric_refresh(
         }
     finally:
         conn.close()
+
+
+def _canonical_remote_url(platform: str, remote_id: str) -> str:
+    if platform == "series":
+        return "https://series.naver.com/novel/detail.series?" + urlencode(
+            {"productNo": remote_id}
+        )
+    if platform == "kakao":
+        return f"https://page.kakao.com/content/{remote_id}"
+    if platform == "novelpia":
+        return f"https://novelpia.com/novel/{remote_id}"
+    raise ValueError(f"unknown platform: {platform}")
 
 
 def _validate_stat(
@@ -1078,8 +1412,20 @@ def _validate_stat(
             raise ValueError(
                 f"invalid {stat.platform} rating: {stat.rating!r} exceeds {scale}"
             )
-    if require_metrics and stat.status == "ok" and not _has_metrics(stat):
-        raise ValueError("ok platform stat requires at least one metric")
+    if stat.status == "ok":
+        for label, value in (
+            ("remote_id", stat.remote_id),
+            ("remote_title", stat.remote_title),
+        ):
+            if value is None or not str(value).strip():
+                raise ValueError(f"ok platform stat requires {label}")
+        if stat.remote_url is None or not str(stat.remote_url).strip():
+            stat = replace(
+                stat,
+                remote_url=_canonical_remote_url(stat.platform, str(stat.remote_id)),
+            )
+        if require_metrics and not _has_metrics(stat):
+            raise ValueError("ok platform stat requires at least one metric")
     if stat.genre is not None:
         stat = replace(stat, genre=_normalize_genre(stat.genre))
     if stat.tags is not None:
@@ -1260,8 +1606,16 @@ def record_platform_stats(
     *,
     now: Optional[datetime] = None,
     error_retry_seconds: int = DEFAULT_ERROR_RETRY_SECONDS,
-) -> None:
-    """Upsert one title's results atomically without erasing prior values on errors."""
+    expected_target: Optional[RefreshTarget] = None,
+    completion_cycle_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """Persist search results without crossing an existing remote identity.
+
+    New rows use expected-absence CAS when a refresh target is supplied. Existing
+    success rows never lose ``ok`` status on lookup failure, never switch remote
+    IDs, and never decrease growth counters. Retry rows are written only when the
+    snapshotted status/remote-id/last-attempt tuple is still current.
+    """
     if error_retry_seconds < 0:
         raise ValueError("error_retry_seconds must be non-negative")
     moment = now or utc_now()
@@ -1270,82 +1624,236 @@ def record_platform_stats(
     validated = [_validate_stat(stat) for stat in stats]
     if len({stat.platform for stat in validated}) != len(validated):
         raise ValueError("at most one stat per platform may be recorded per title")
+    expected_rows = {
+        platform: (status, remote_id, last_attempt_at)
+        for platform, status, remote_id, last_attempt_at in (
+            expected_target.row_hints if expected_target is not None else ()
+        )
+    }
+    outcomes: Dict[str, str] = {}
 
     with decision_store.transaction(conn):
-        exists = conn.execute(
-            "SELECT 1 FROM catalog_titles WHERE title_key = ?", (title_key,)
+        title_row = conn.execute(
+            "SELECT query_title, updated_at FROM catalog_titles WHERE title_key = ?",
+            (title_key,),
         ).fetchone()
-        if exists is None:
+        if title_row is None:
             raise KeyError(f"catalog title not found: {title_key}")
-        for stat in validated:
-            success_at = attempted_at if stat.status == "ok" else None
-            next_retry = retry_after if stat.status == "error" else None
-            conn.execute(
-                """
-                INSERT INTO catalog_platform_stats(
-                    title_key, platform, status, remote_id, remote_title, remote_url,
-                    download_count, view_count, recommend_count, rating, rating_count,
-                    last_attempt_at, last_success_at, retry_after, error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(title_key, platform) DO UPDATE SET
-                    status = excluded.status,
-                    remote_id = CASE WHEN excluded.status != 'ok'
-                                     THEN catalog_platform_stats.remote_id ELSE excluded.remote_id END,
-                    remote_title = CASE WHEN excluded.status != 'ok'
-                                        THEN catalog_platform_stats.remote_title ELSE excluded.remote_title END,
-                    remote_url = CASE WHEN excluded.status != 'ok'
-                                      THEN catalog_platform_stats.remote_url ELSE excluded.remote_url END,
-                    download_count = CASE WHEN excluded.status != 'ok'
-                                          THEN catalog_platform_stats.download_count ELSE excluded.download_count END,
-                    view_count = CASE WHEN excluded.status != 'ok'
-                                      THEN catalog_platform_stats.view_count ELSE excluded.view_count END,
-                    recommend_count = CASE WHEN excluded.status != 'ok'
-                                           THEN catalog_platform_stats.recommend_count ELSE excluded.recommend_count END,
-                    rating = CASE WHEN excluded.status != 'ok'
-                                  THEN catalog_platform_stats.rating ELSE excluded.rating END,
-                    rating_count = CASE WHEN excluded.status != 'ok'
-                                        THEN catalog_platform_stats.rating_count ELSE excluded.rating_count END,
-                    last_attempt_at = excluded.last_attempt_at,
-                    last_success_at = CASE WHEN excluded.status = 'ok'
-                                           THEN excluded.last_success_at ELSE catalog_platform_stats.last_success_at END,
-                    retry_after = excluded.retry_after,
-                    error_message = excluded.error_message,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    title_key,
-                    stat.platform,
-                    stat.status,
-                    stat.remote_id,
-                    stat.remote_title,
-                    stat.remote_url,
-                    stat.download_count,
-                    stat.view_count,
-                    stat.recommend_count,
-                    stat.rating,
-                    stat.rating_count,
-                    attempted_at,
-                    success_at,
-                    next_retry,
-                    stat.message or None,
-                ),
+        if expected_target is not None and (
+            title_row["query_title"] != expected_target.title.query_title
+            or (
+                expected_target.title_updated_at is not None
+                and title_row["updated_at"] != expected_target.title_updated_at
             )
-            if stat.status == "ok" and stat.genre is not None:
-                _replace_platform_genre(
-                    conn,
-                    title_key,
-                    stat.platform,
-                    stat.genre,
-                    attempted_at,
+        ):
+            for stat in validated:
+                outcomes[stat.platform] = "stale_target"
+                _mark_metadata_completion_primary(
+                    conn, completion_cycle_id, title_key, stat.platform,
+                    outcome="stale_target", stat=stat,
                 )
-            if stat.status == "ok" and stat.platform in TAG_PLATFORMS and stat.tags is not None:
-                _replace_platform_tags(
-                    conn,
-                    title_key,
-                    stat.platform,
-                    stat.tags,
-                    attempted_at,
+            return outcomes
+
+        tombstones = _load_identity_tombstones(conn)
+        for stat in validated:
+            if expected_target is not None and _tombstone_applies(
+                tombstones, expected_target.title, stat.platform
+            ):
+                outcomes[stat.platform] = "tombstoned"
+                _mark_metadata_completion_primary(
+                    conn, completion_cycle_id, title_key, stat.platform,
+                    outcome="tombstoned", stat=stat,
                 )
+                continue
+
+            row = conn.execute(
+                "SELECT * FROM catalog_platform_stats "
+                "WHERE title_key = ? AND platform = ?",
+                (title_key, stat.platform),
+            ).fetchone()
+            if expected_target is not None and stat.platform in expected_rows:
+                expected_status, expected_id, expected_attempt = expected_rows[stat.platform]
+                if expected_status is None:
+                    if row is not None:
+                        outcomes[stat.platform] = "stale_target"
+                        _mark_metadata_completion_primary(
+                            conn, completion_cycle_id, title_key, stat.platform,
+                            outcome="stale_target", stat=stat,
+                        )
+                        continue
+                elif row is None or (
+                    row["status"] != expected_status
+                    or row["remote_id"] != expected_id
+                    or row["last_attempt_at"] != expected_attempt
+                ):
+                    outcomes[stat.platform] = "stale_target"
+                    _mark_metadata_completion_primary(
+                        conn, completion_cycle_id, title_key, stat.platform,
+                        outcome="stale_target", stat=stat,
+                    )
+                    continue
+
+            if stat.metadata_lookup_mode == "direct_mismatch":
+                outcomes[stat.platform] = "identity_conflict"
+                _mark_metadata_completion_primary(
+                    conn, completion_cycle_id, title_key, stat.platform,
+                    outcome="identity_conflict", stat=stat,
+                )
+                continue
+            if stat.metadata_lookup_mode == "direct_unavailable":
+                outcomes[stat.platform] = "unavailable"
+                _mark_metadata_completion_primary(
+                    conn, completion_cycle_id, title_key, stat.platform,
+                    outcome="unavailable", stat=stat,
+                )
+                continue
+
+            next_retry = retry_after if stat.status == "error" else None
+            if row is None:
+                success_at = attempted_at if stat.status == "ok" else None
+                conn.execute(
+                    """
+                    INSERT INTO catalog_platform_stats(
+                        title_key, platform, status, remote_id, remote_title, remote_url,
+                        download_count, view_count, recommend_count, rating, rating_count,
+                        last_attempt_at, last_success_at, retry_after, error_message
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        title_key, stat.platform, stat.status,
+                        stat.remote_id, stat.remote_title, stat.remote_url,
+                        stat.download_count, stat.view_count, stat.recommend_count,
+                        stat.rating, stat.rating_count, attempted_at, success_at,
+                        next_retry, stat.message or None,
+                    ),
+                )
+                outcomes[stat.platform] = stat.status
+            elif row["status"] == "ok":
+                if stat.status != "ok":
+                    conn.execute(
+                        """
+                        UPDATE catalog_platform_stats
+                        SET last_attempt_at = ?, retry_after = ?, error_message = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE title_key = ? AND platform = ? AND status = 'ok'
+                    """,
+                        (
+                            attempted_at, next_retry, stat.message or None,
+                            title_key, stat.platform,
+                        ),
+                    )
+                    outcomes[stat.platform] = "preserved_success"
+                    _mark_metadata_completion_primary(
+                        conn, completion_cycle_id, title_key, stat.platform,
+                        outcome="preserved_success", stat=stat,
+                    )
+                    continue
+                if str(stat.remote_id) != str(row["remote_id"]):
+                    outcomes[stat.platform] = "identity_conflict"
+                    _mark_metadata_completion_primary(
+                        conn, completion_cycle_id, title_key, stat.platform,
+                        outcome="identity_conflict", stat=stat,
+                    )
+                    continue
+                growth = _growth_metric_increased(row, stat)
+                conn.execute(
+                    """
+                    UPDATE catalog_platform_stats
+                    SET remote_title = COALESCE(?, remote_title),
+                        remote_url = COALESCE(?, remote_url),
+                        download_count = ?, view_count = ?, recommend_count = ?,
+                        rating = ?, rating_count = ?, last_attempt_at = ?,
+                        last_success_at = ?, retry_after = NULL, error_message = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE title_key = ? AND platform = ? AND status = 'ok' AND remote_id = ?
+                    """,
+                    (
+                        stat.remote_title, stat.remote_url,
+                        _monotonic_count(row["download_count"], stat.download_count),
+                        _monotonic_count(row["view_count"], stat.view_count),
+                        _monotonic_count(row["recommend_count"], stat.recommend_count),
+                        stat.rating if growth and stat.rating is not None else row["rating"],
+                        _monotonic_count(row["rating_count"], stat.rating_count),
+                        attempted_at, attempted_at, title_key, stat.platform, row["remote_id"],
+                    ),
+                )
+                outcomes[stat.platform] = "updated" if growth else "unchanged"
+            else:
+                same_identity = (
+                    row["remote_id"] is not None
+                    and stat.status == "ok"
+                    and str(row["remote_id"]) == str(stat.remote_id)
+                )
+                if (
+                    stat.status == "ok"
+                    and row["remote_id"] is not None
+                    and not same_identity
+                ):
+                    outcomes[stat.platform] = "identity_conflict"
+                    _mark_metadata_completion_primary(
+                        conn, completion_cycle_id, title_key, stat.platform,
+                        outcome="identity_conflict", stat=stat,
+                    )
+                    continue
+                if stat.status == "ok":
+                    preserve_metrics = same_identity
+                    growth = _growth_metric_increased(row, stat) if preserve_metrics else True
+                    conn.execute(
+                        """
+                        UPDATE catalog_platform_stats
+                        SET status = 'ok', remote_id = ?, remote_title = ?, remote_url = ?,
+                            download_count = ?, view_count = ?, recommend_count = ?,
+                            rating = ?, rating_count = ?, last_attempt_at = ?,
+                            last_success_at = ?, retry_after = NULL, error_message = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE title_key = ? AND platform = ?
+                        """,
+                        (
+                            stat.remote_id, stat.remote_title, stat.remote_url,
+                            _monotonic_count(row["download_count"], stat.download_count)
+                            if preserve_metrics else stat.download_count,
+                            _monotonic_count(row["view_count"], stat.view_count)
+                            if preserve_metrics else stat.view_count,
+                            _monotonic_count(row["recommend_count"], stat.recommend_count)
+                            if preserve_metrics else stat.recommend_count,
+                            stat.rating if growth and stat.rating is not None else row["rating"],
+                            _monotonic_count(row["rating_count"], stat.rating_count)
+                            if preserve_metrics else stat.rating_count,
+                            attempted_at, attempted_at, title_key, stat.platform,
+                        ),
+                    )
+                    outcomes[stat.platform] = "ok"
+                else:
+                    conn.execute(
+                        """
+                        UPDATE catalog_platform_stats
+                        SET status = ?, last_attempt_at = ?, retry_after = ?,
+                            error_message = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE title_key = ? AND platform = ?
+                        """,
+                        (
+                            stat.status, attempted_at, next_retry, stat.message or None,
+                            title_key, stat.platform,
+                        ),
+                    )
+                    outcomes[stat.platform] = stat.status
+
+            if stat.status == "ok" and outcomes.get(stat.platform) not in {
+                "identity_conflict", "stale_target", "tombstoned",
+            }:
+                if stat.genre is not None:
+                    _replace_platform_genre(
+                        conn, title_key, stat.platform, stat.genre, attempted_at
+                    )
+                if stat.platform in TAG_PLATFORMS and stat.tags is not None:
+                    _replace_platform_tags(
+                        conn, title_key, stat.platform, stat.tags, attempted_at
+                    )
+            _mark_metadata_completion_primary(
+                conn, completion_cycle_id, title_key, stat.platform,
+                outcome=outcomes[stat.platform], stat=stat,
+            )
+    return outcomes
 
 
 def invalidate_platform_identity(
@@ -1370,6 +1878,12 @@ def invalidate_platform_identity(
     attempted_at = _utc_text(now or utc_now())
 
     with decision_store.transaction(conn):
+        title_row = conn.execute(
+            "SELECT query_title FROM catalog_titles WHERE title_key = ?",
+            (title_key,),
+        ).fetchone()
+        if title_row is None:
+            raise KeyError(f"catalog title not found: {title_key}")
         row = conn.execute(
             "SELECT * FROM catalog_platform_stats "
             "WHERE title_key = ? AND platform = ?",
@@ -1427,6 +1941,36 @@ def invalidate_platform_identity(
         ).fetchone()[0]
         if tag_count:
             raise RuntimeError("platform tag rows survived identity invalidation")
+        tombstone_key = _identity_tombstone_key(title_key, platform)
+        existing_tombstone = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (tombstone_key,)
+        ).fetchone()
+        rejected_ids = []
+        if existing_tombstone is not None:
+            try:
+                payload = json.loads(existing_tombstone["value"])
+                rejected_ids = [str(value) for value in payload.get("rejected_remote_ids", [])]
+            except (TypeError, ValueError, AttributeError):
+                rejected_ids = []
+        if expected_id not in rejected_ids:
+            rejected_ids.append(expected_id)
+        tombstone = {
+            "title_key": title_key,
+            "query_title": str(title_row["query_title"] or ""),
+            "platform": platform,
+            "rejected_remote_ids": rejected_ids,
+            "reason": message,
+            "invalidated_at": attempted_at,
+        }
+        conn.execute(
+            """
+            INSERT INTO settings(key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (tombstone_key, json.dumps(tombstone, ensure_ascii=False, sort_keys=True)),
+        )
 
     return {
         "title_key": title_key,
@@ -1727,6 +2271,7 @@ def lookup_series(
     title: str,
     fetch_text: Callable[[str, float], str] = _http_text,
     *,
+    author: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> PlatformStat:
     search_url = "https://series.naver.com/search/search.series?" + urlencode(
@@ -1738,7 +2283,11 @@ def lookup_series(
         raise ValueError("Naver search response did not contain results or no-result marker")
     if candidates and not any(item["title"] for item in candidates):
         raise ValueError("Naver search result items have an unexpected title structure")
-    candidate = next((item for item in candidates if titles_match(title, item["title"])), None)
+    candidate, rejected = _select_unique_title_candidate(
+        "series", title, candidates, requested_author=author
+    )
+    if rejected is not None:
+        return rejected
     if candidate is None:
         return _not_found("series")
     return _lookup_series_remote(
@@ -1770,6 +2319,7 @@ def _kakao_api_candidates(data: object) -> List[Dict[str, object]]:
             candidates.append({
                 "id": str(content_id),
                 "title": str(candidate_title),
+                "author": _search_candidate_author(item),
                 "view_count": _count(_first_value(props, ("view_count", "viewCount"))),
             })
     if items and not candidates:
@@ -1909,6 +2459,7 @@ def lookup_kakao(
     title: str,
     fetch_json: Callable[[str, float], object] = _http_json,
     *,
+    author: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> PlatformStat:
     params = {
@@ -1924,19 +2475,20 @@ def lookup_kakao(
         f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v2/search/series?" + urlencode(params),
         timeout,
     ))
-    matched = [item for item in candidates if titles_match(title, str(item["title"]))]
-    for candidate in matched[:3]:
-        stat = _lookup_kakao_remote(
-            title,
-            str(candidate["id"]),
-            fetch_json,
-            timeout=timeout,
-            fallback_view_count=candidate.get("view_count"),
-        )
-        if stat.status == "not_found":
-            continue
-        return stat
-    return _not_found("kakao")
+    candidate, rejected = _select_unique_title_candidate(
+        "kakao", title, candidates, requested_author=author
+    )
+    if rejected is not None:
+        return rejected
+    if candidate is None:
+        return _not_found("kakao")
+    return _lookup_kakao_remote(
+        title,
+        str(candidate["id"]),
+        fetch_json,
+        timeout=timeout,
+        fallback_view_count=candidate.get("view_count"),
+    )
 
 
 def _novelpia_title(record: object) -> str:
@@ -1993,6 +2545,7 @@ def lookup_novelpia(
     fetch_json: Callable[[str, float], object] = _http_json,
     fetch_text: Optional[Callable[[str, float], str]] = None,
     *,
+    author: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> PlatformStat:
     params = {
@@ -2019,13 +2572,29 @@ def lookup_novelpia(
     if not isinstance(data, dict) or not isinstance(data.get("list"), list):
         raise ValueError("Novelpia search response has no list array")
     items = data["list"]
-    candidates = [item for item in items if isinstance(item, dict) and _novelpia_title(item)]
-    if items and not candidates:
+    raw_candidates = [item for item in items if isinstance(item, dict) and _novelpia_title(item)]
+    if items and not raw_candidates:
         raise ValueError("Novelpia search result items have an unexpected structure")
-    candidate = next((item for item in candidates if titles_match(title, _novelpia_title(item))), None)
-    if candidate is None:
+    candidates = [
+        {
+            "id": _first_value(item, ("novel_no", "novelNo", "novel_id", "novelId", "id")),
+            "title": _novelpia_title(item),
+            "author": _search_candidate_author(item),
+            "record": item,
+        }
+        for item in raw_candidates
+    ]
+    candidate_ref, rejected = _select_unique_title_candidate(
+        "novelpia", title, candidates, requested_author=author
+    )
+    if rejected is not None:
+        return rejected
+    if candidate_ref is None:
         return _not_found("novelpia")
-    remote_id = _first_value(candidate, ("novel_no", "novelNo", "novel_id", "novelId", "id"))
+    candidate = candidate_ref["record"]
+    remote_id = candidate_ref.get("id")
+    if remote_id is None or not str(remote_id).strip():
+        return _error("novelpia", RuntimeError("matched NovelPia result has no remote ID"))
     remote_id_text = str(remote_id) if remote_id is not None else None
     try:
         tags = _novelpia_genre_tags(candidate)
@@ -2064,6 +2633,7 @@ def lookup_platforms(
     title: str,
     platforms: Sequence[str] = PLATFORMS,
     *,
+    author: Optional[str] = None,
     fetch_text: Callable[[str, float], str] = _http_text,
     fetch_json: Callable[[str, float], object] = _http_json,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -2073,12 +2643,17 @@ def lookup_platforms(
     if len(set(platforms)) != len(platforms):
         raise ValueError("platform lookup list must not contain duplicates")
     lookups = {
-        "series": lambda: lookup_series(title, fetch_text, timeout=timeout),
-        "kakao": lambda: lookup_kakao(title, fetch_json, timeout=timeout),
+        "series": lambda: lookup_series(
+            title, fetch_text, author=author, timeout=timeout
+        ),
+        "kakao": lambda: lookup_kakao(
+            title, fetch_json, author=author, timeout=timeout
+        ),
         "novelpia": lambda: lookup_novelpia(
             title,
             fetch_json,
             fetch_text,
+            author=author,
             timeout=timeout,
         ),
     }
@@ -2358,13 +2933,15 @@ def select_authenticated_novelpia_targets(
     *,
     limit: Optional[int] = None,
     attempted_before: Optional[datetime] = None,
-) -> List[CatalogTitle]:
-    """Select active titles whose three public platform searches all missed."""
+) -> List[RefreshTarget]:
+    """Select triple-miss NovelPia retries with a CAS snapshot."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     if limit == 0:
         return []
     stats = _stats_by_title(conn)
+    title_rows = _catalog_title_rows(conn)
+    tombstones = _load_identity_tombstones(conn)
     targets = []
     for title in discover_catalog_titles(conn):
         by_platform = stats.get(title.title_key, {})
@@ -2374,6 +2951,8 @@ def select_authenticated_novelpia_targets(
             for platform in PLATFORMS
         ):
             continue
+        if _tombstone_applies(tombstones, title, "novelpia"):
+            continue
         novelpia_attempt = _parse_time(by_platform["novelpia"]["last_attempt_at"])
         if (
             attempted_before is not None
@@ -2381,7 +2960,22 @@ def select_authenticated_novelpia_targets(
             and novelpia_attempt > attempted_before
         ):
             continue
-        targets.append(title)
+        title_row = title_rows.get(title.title_key)
+        if title_row is None or title_row["query_title"] != title.query_title:
+            continue
+        novelpia_row = by_platform["novelpia"]
+        targets.append(RefreshTarget(
+            title=title,
+            platforms=("novelpia",),
+            title_updated_at=title_row["updated_at"],
+            remote_hints=((
+                "novelpia", novelpia_row["remote_id"], novelpia_row["remote_title"]
+            ),),
+            row_hints=((
+                "novelpia", novelpia_row["status"], novelpia_row["remote_id"],
+                novelpia_row["last_attempt_at"]
+            ),),
+        ))
         if limit is not None and len(targets) >= limit:
             break
     return targets
@@ -2405,7 +2999,7 @@ def preview_authenticated_novelpia_refresh(
             "dry_run": True,
             "selected_titles": len(targets),
             "selected_platforms": len(targets),
-            "titles": [title.query_title for title in targets],
+            "titles": [target.title.query_title for target in targets],
         }
     finally:
         conn.close()
@@ -2450,7 +3044,7 @@ def refresh_authenticated_novelpia(
         for start in range(0, len(targets), NOVELPIA_AUTH_BATCH_SIZE):
             chunk = targets[start:start + NOVELPIA_AUTH_BATCH_SIZE]
             stats = client.lookup_batch(
-                [title.query_title for title in chunk],
+                [target.title.query_title for target in chunk],
                 timeout=timeout,
                 delay_seconds=delay_seconds,
                 sleep=sleep,
@@ -2463,13 +3057,14 @@ def refresh_authenticated_novelpia(
                 )
             # lookup_batch verifies the session after the whole chunk. Only now
             # may these results escape into persistent DB state.
-            for title, stat in zip(chunk, stats):
+            for target, stat in zip(chunk, stats):
                 record_platform_stats(
                     conn,
-                    title.title_key,
+                    target.title.title_key,
                     [stat],
                     now=now(),
                     error_retry_seconds=error_retry_seconds,
+                    expected_target=target,
                 )
                 completed += 1
                 status_counts[stat.status] = status_counts.get(stat.status, 0) + 1
@@ -2680,6 +3275,7 @@ def refresh_missing_metadata(
             "error": 0,
             "skipped": 0,
         }
+        pair_outcomes: Dict[Tuple[str, str], str] = {}
         lookup_mode_counts = {
             "direct": 0,
             "direct_mismatch": 0,
@@ -2709,8 +3305,9 @@ def refresh_missing_metadata(
             for result in results:
                 if result.metadata_lookup_mode in lookup_mode_counts:
                     lookup_mode_counts[result.metadata_lookup_mode] += 1
-            for outcome in outcomes.values():
+            for platform, outcome in outcomes.items():
                 outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+                pair_outcomes[(target.title.title_key, platform)] = outcome
             return outcomes
 
         def report_completed():
@@ -2816,6 +3413,10 @@ def refresh_missing_metadata(
             "selected_platforms": selected_platforms,
             "outcome_counts": outcome_counts,
             "lookup_mode_counts": lookup_mode_counts,
+            "pair_outcomes": [
+                {"title_key": title_key, "platform": platform, "outcome": outcome}
+                for (title_key, platform), outcome in sorted(pair_outcomes.items())
+            ],
             "authenticated_novelpia_attempts": authenticated_novelpia_attempts,
             "authenticated_novelpia_relogins": int(getattr(
                 getattr(authenticated_novelpia_lookup, "__self__", None),
@@ -2827,10 +3428,193 @@ def refresh_missing_metadata(
         conn.close()
 
 
+def resume_metadata_completion_cycles(
+    state_db_path: str,
+    *,
+    delay_seconds: float = DEFAULT_DELAY_SECONDS,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    authenticated_novelpia_lookup: Optional[Callable[..., PlatformStat]] = None,
+    lookup: Callable[..., List[PlatformStat]] = lookup_platforms,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    progress: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> Dict[str, object]:
+    """Resume exact current-run metadata pairs recorded before network writes."""
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        decision_store.validate_schema(conn)
+        rows = conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE ? ORDER BY key",
+            (f"{METADATA_COMPLETION_PREFIX}%",),
+        ).fetchall()
+        if not rows:
+            return {
+                "cycles": 0,
+                "pending_pairs": 0,
+                "review_pairs": 0,
+                "completed_pairs": 0,
+                "pair_outcomes": [],
+            }
+        target_pairs: set[Tuple[str, str]] = set()
+        with decision_store.transaction(conn):
+            for setting in rows:
+                cycle_id = str(setting["key"])[len(METADATA_COMPLETION_PREFIX):]
+                payload = _load_metadata_completion_cycle(conn, cycle_id)
+                for pair in payload["pairs"]:
+                    state = str(pair.get("state") or "")
+                    if state == "awaiting_primary":
+                        title_row = conn.execute(
+                            "SELECT query_title, updated_at FROM catalog_titles WHERE title_key = ?",
+                            (pair["title_key"],),
+                        ).fetchone()
+                        current = conn.execute(
+                            "SELECT status, remote_id, last_attempt_at FROM catalog_platform_stats "
+                            "WHERE title_key = ? AND platform = ?",
+                            (pair["title_key"], pair["platform"]),
+                        ).fetchone()
+                        expected = (
+                            pair.get("expected_status"),
+                            pair.get("expected_remote_id"),
+                            pair.get("expected_last_attempt_at"),
+                        )
+                        current_tuple = (
+                            (current["status"], current["remote_id"], current["last_attempt_at"])
+                            if current is not None else (None, None, None)
+                        )
+                        title_matches = title_row is not None and (
+                            title_row["query_title"] == pair.get("query_title")
+                            and (
+                                pair.get("title_updated_at") is None
+                                or title_row["updated_at"] == pair.get("title_updated_at")
+                            )
+                        )
+                        if title_matches and current_tuple == expected:
+                            pair["state"] = "primary_terminal"
+                            pair["last_outcome"] = "primary_not_committed"
+                        else:
+                            pair["state"] = "needs_review"
+                            pair["last_outcome"] = "primary_state_changed"
+                    if pair.get("state") == "pending_metadata":
+                        title_row = conn.execute(
+                            "SELECT query_title, updated_at FROM catalog_titles WHERE title_key = ?",
+                            (pair["title_key"],),
+                        ).fetchone()
+                        current = conn.execute(
+                            "SELECT * FROM catalog_platform_stats WHERE title_key = ? AND platform = ?",
+                            (pair["title_key"], pair["platform"]),
+                        ).fetchone()
+                        if (
+                            title_row is None
+                            or title_row["query_title"] != pair.get("query_title")
+                            or (
+                                pair.get("title_updated_at") is not None
+                                and title_row["updated_at"] != pair.get("title_updated_at")
+                            )
+                            or current is None
+                            or current["status"] != "ok"
+                            or str(current["remote_id"] or "") != str(pair.get("primary_remote_id") or "")
+                        ):
+                            pair["state"] = "needs_review"
+                            pair["last_outcome"] = "stale_target"
+                        elif _metadata_snapshot_complete(current, str(pair["platform"])):
+                            pair["state"] = "completed"
+                            pair["last_outcome"] = "already_complete"
+                        else:
+                            target_pairs.add((str(pair["title_key"]), str(pair["platform"])))
+                _save_metadata_completion_cycle(conn, cycle_id, payload)
+    finally:
+        conn.close()
+
+    metadata_result = {
+        "pair_outcomes": [],
+        "outcome_counts": {},
+        "selected_titles": 0,
+        "selected_platforms": 0,
+    }
+    if target_pairs:
+        metadata_result = refresh_missing_metadata(
+            state_db_path,
+            limit=None,
+            delay_seconds=delay_seconds,
+            timeout=timeout,
+            authenticated_novelpia_lookup=authenticated_novelpia_lookup,
+            lookup=lookup,
+            target_pairs=target_pairs,
+            sleep=sleep,
+            now=now,
+            progress=progress,
+        )
+    outcomes = {
+        (str(item["title_key"]), str(item["platform"])): str(item["outcome"])
+        for item in metadata_result.get("pair_outcomes", [])
+    }
+
+    conn = decision_store.connect_state_db(state_db_path)
+    try:
+        rows = conn.execute(
+            "SELECT key FROM settings WHERE key LIKE ? ORDER BY key",
+            (f"{METADATA_COMPLETION_PREFIX}%",),
+        ).fetchall()
+        completed_pairs = 0
+        pending_pairs = 0
+        review_pairs = 0
+        final_outcomes = []
+        with decision_store.transaction(conn):
+            for setting in rows:
+                cycle_id = str(setting["key"])[len(METADATA_COMPLETION_PREFIX):]
+                payload = _load_metadata_completion_cycle(conn, cycle_id)
+                for pair in payload["pairs"]:
+                    key = (str(pair["title_key"]), str(pair["platform"]))
+                    if pair.get("state") == "pending_metadata" and key in outcomes:
+                        outcome = outcomes[key]
+                        pair["last_outcome"] = outcome
+                        if outcome in {"updated", "identity_refreshed"}:
+                            pair["state"] = "completed"
+                        elif outcome in {"identity_conflict", "stale_target", "skipped"}:
+                            pair["state"] = "needs_review"
+                    state = str(pair.get("state") or "")
+                    final_outcomes.append({
+                        "cycle_id": cycle_id,
+                        "title_key": pair.get("title_key"),
+                        "platform": pair.get("platform"),
+                        "state": state,
+                        "outcome": pair.get("last_outcome"),
+                    })
+                    if state in {"completed", "primary_terminal"}:
+                        completed_pairs += 1
+                    elif state == "needs_review":
+                        review_pairs += 1
+                    elif state == "pending_metadata":
+                        pending_pairs += 1
+                if all(
+                    pair.get("state") in {"completed", "primary_terminal"}
+                    for pair in payload["pairs"]
+                ):
+                    conn.execute(
+                        "DELETE FROM settings WHERE key = ?",
+                        (_metadata_completion_key(cycle_id),),
+                    )
+                else:
+                    _save_metadata_completion_cycle(conn, cycle_id, payload)
+        return {
+            "cycles": len(rows),
+            "pending_pairs": pending_pairs,
+            "review_pairs": review_pairs,
+            "completed_pairs": completed_pairs,
+            "pair_outcomes": final_outcomes,
+            "outcome_counts": dict(metadata_result.get("outcome_counts") or {}),
+            "selected_titles": int(metadata_result.get("selected_titles") or 0),
+            "selected_platforms": int(metadata_result.get("selected_platforms") or 0),
+        }
+    finally:
+        conn.close()
+
+
 def refresh_existing_metrics(
     state_db_path: str,
     *,
     limit: Optional[int] = None,
+    refresh_before: Optional[datetime] = None,
     delay_seconds: float = DEFAULT_DELAY_SECONDS,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     dry_run: bool = False,
@@ -2848,7 +3632,9 @@ def refresh_existing_metrics(
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     if dry_run:
-        return preview_existing_metric_refresh(state_db_path, limit=limit)
+        return preview_existing_metric_refresh(
+            state_db_path, limit=limit, refresh_before=refresh_before
+        )
 
     conn = decision_store.connect_state_db(state_db_path)
     try:
@@ -2856,7 +3642,9 @@ def refresh_existing_metrics(
         if progress is not None:
             progress({"phase": "sync_start"})
         synced = sync_catalog_titles(conn)
-        targets = select_existing_metric_targets(conn, limit=limit)
+        targets = select_existing_metric_targets(
+            conn, limit=limit, refresh_before=refresh_before
+        )
         selected_platforms = sum(len(target.platforms) for target in targets)
         outcome_counts = {
             "updated": 0,
@@ -3010,6 +3798,7 @@ def refresh_catalog(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = utc_now,
     progress: Optional[Callable[[Dict[str, object]], None]] = None,
+    _test_failpoint: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, object]:
     """Fill only missing/due platform records in bounded, delayed batches."""
     if limit is not None and limit < 0:
@@ -3020,6 +3809,10 @@ def refresh_catalog(
         raise ValueError("timeout must be positive")
     if refresh_after_days is not None and refresh_after_days < 0:
         raise ValueError("refresh_after_days must be non-negative")
+    if refresh_after_days is not None:
+        raise ValueError(
+            "age refresh must use the stored-ID existing-metric refresh path"
+        )
     if dry_run:
         return preview_catalog_refresh(
             state_db_path,
@@ -3043,6 +3836,29 @@ def refresh_catalog(
             if refresh_after_days is not None else None
         )
         synced = sync_catalog_titles(conn)
+        completion_enabled = metadata_lookup is not None or lookup is lookup_platforms
+        resumed_before = (
+            resume_metadata_completion_cycles(
+                state_db_path,
+                delay_seconds=delay_seconds,
+                timeout=timeout,
+                authenticated_novelpia_lookup=authenticated_novelpia_lookup,
+                lookup=metadata_lookup or lookup_platforms,
+                sleep=sleep,
+                now=now,
+                progress=progress,
+            )
+            if completion_enabled else {
+                "cycles": 0,
+                "pending_pairs": 0,
+                "review_pairs": 0,
+                "completed_pairs": 0,
+                "pair_outcomes": [],
+                "outcome_counts": {},
+                "selected_titles": 0,
+                "selected_platforms": 0,
+            }
+        )
         targets = select_refresh_targets(
             conn,
             limit=limit,
@@ -3054,11 +3870,30 @@ def refresh_catalog(
             failure_retry_cutoff=failure_retry_cutoff,
         )
         status_counts: Dict[str, int] = {"ok": 0, "not_found": 0, "error": 0, "skipped": 0}
+        outcome_counts: Dict[str, int] = {
+            "ok": 0,
+            "not_found": 0,
+            "error": 0,
+            "skipped": 0,
+            "preserved_success": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "identity_conflict": 0,
+            "stale_target": 0,
+            "unavailable": 0,
+            "tombstoned": 0,
+        }
         authenticated_counts: Dict[str, int] = {
             "ok": 0, "not_found": 0, "error": 0, "skipped": 0
         }
         authenticated_attempts = 0
         selected_platforms = sum(len(target.platforms) for target in targets)
+        completion_cycle_id = (
+            _create_metadata_completion_cycle(conn, targets, now=now())
+            if completion_enabled and targets else None
+        )
+        if completion_cycle_id is not None and _test_failpoint is not None:
+            _test_failpoint("completion_cycle_created")
         if progress is not None:
             progress({
                 "phase": "start",
@@ -3077,13 +3912,19 @@ def refresh_catalog(
                     result for result in final_results
                     if result.platform != "novelpia"
                 ] + [authenticated]
-            record_platform_stats(
+            outcomes = record_platform_stats(
                 conn,
                 target.title.title_key,
                 final_results,
                 now=now(),
                 error_retry_seconds=error_retry_seconds,
+                expected_target=target,
+                completion_cycle_id=completion_cycle_id,
             )
+            for outcome in outcomes.values():
+                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            if _test_failpoint is not None:
+                _test_failpoint("primary_committed")
             for result in results:
                 status_counts[result.status] = status_counts.get(result.status, 0) + 1
             if authenticated is not None:
@@ -3100,6 +3941,7 @@ def refresh_catalog(
                     "completed_platforms": sum(status_counts.values()),
                     "selected_platforms": selected_platforms,
                     "status_counts": dict(status_counts),
+                    "outcome_counts": dict(outcome_counts),
                     "authenticated_novelpia_attempts": authenticated_attempts,
                     "authenticated_novelpia_status_counts": dict(authenticated_counts),
                 })
@@ -3127,7 +3969,40 @@ def refresh_catalog(
             pending_authenticated.clear()
 
         for index, target in enumerate(targets):
-            results = lookup(target.title.query_title, target.platforms, timeout=timeout)
+            if lookup is lookup_platforms:
+                stored_ids = {
+                    platform: str(remote_id)
+                    for platform, _status, remote_id, _attempt in target.row_hints
+                    if remote_id is not None and platform in IDENTITY_AUDIT_PLATFORMS
+                }
+                direct_platforms = tuple(
+                    platform for platform in target.platforms if platform in stored_ids
+                )
+                search_platforms = tuple(
+                    platform for platform in target.platforms if platform not in stored_ids
+                )
+                gathered: Dict[str, PlatformStat] = {}
+                if direct_platforms:
+                    for result in lookup_existing_platform_metrics(
+                        target.title.query_title,
+                        direct_platforms,
+                        remote_ids=stored_ids,
+                        timeout=timeout,
+                    ):
+                        gathered[result.platform] = result
+                if search_platforms:
+                    for result in lookup_platforms(
+                        target.title.query_title,
+                        search_platforms,
+                        author=target.title.author,
+                        timeout=timeout,
+                    ):
+                        gathered[result.platform] = result
+                results = [gathered[platform] for platform in target.platforms]
+            else:
+                results = lookup(
+                    target.title.query_title, target.platforms, timeout=timeout
+                )
             if {result.platform for result in results} != set(target.platforms):
                 raise RuntimeError("platform lookup did not return exactly the requested platforms")
             if (
@@ -3144,40 +4019,39 @@ def refresh_catalog(
             if index + 1 < len(targets) and delay_seconds:
                 sleep(delay_seconds)
         flush_authenticated()
-        processed_pairs = {
-            (target.title.title_key, platform)
-            for target in targets
-            for platform in target.platforms
-        }
-        should_complete_metadata = bool(processed_pairs) and (
-            metadata_lookup is not None or lookup is lookup_platforms
+        if completion_enabled and _test_failpoint is not None:
+            _test_failpoint("before_metadata_completion")
+        metadata_completion = (
+            resume_metadata_completion_cycles(
+                state_db_path,
+                delay_seconds=delay_seconds,
+                timeout=timeout,
+                authenticated_novelpia_lookup=authenticated_novelpia_lookup,
+                lookup=metadata_lookup or lookup_platforms,
+                sleep=sleep,
+                now=now,
+                progress=progress,
+            )
+            if completion_enabled else {
+                "cycles": 0,
+                "pending_pairs": 0,
+                "review_pairs": 0,
+                "completed_pairs": 0,
+                "pair_outcomes": [],
+                "outcome_counts": {},
+                "selected_titles": 0,
+                "selected_platforms": 0,
+            }
         )
-        metadata_completion = refresh_missing_metadata(
-            state_db_path,
-            limit=None,
-            delay_seconds=delay_seconds,
-            timeout=timeout,
-            authenticated_novelpia_lookup=authenticated_novelpia_lookup,
-            lookup=metadata_lookup or lookup_platforms,
-            target_pairs=processed_pairs,
-            sleep=sleep,
-            now=now,
-            progress=progress,
-        ) if should_complete_metadata else {
-            "dry_run": False,
-            "selected_titles": 0,
-            "selected_platforms": 0,
-            "outcome_counts": {},
-            "lookup_mode_counts": {},
-            "authenticated_novelpia_attempts": 0,
-            "authenticated_novelpia_relogins": 0,
-        }
+        if completion_enabled and _test_failpoint is not None:
+            _test_failpoint("metadata_completion_finished")
         return {
             "dry_run": False,
             **synced,
             "selected_titles": len(targets),
             "selected_platforms": selected_platforms,
             "status_counts": status_counts,
+            "outcome_counts": outcome_counts,
             "authenticated_novelpia_attempts": authenticated_attempts,
             "authenticated_novelpia_status_counts": authenticated_counts,
             "authenticated_novelpia_relogins": int(getattr(
@@ -3186,6 +4060,7 @@ def refresh_catalog(
                 0,
             )),
             "metadata_completion": metadata_completion,
+            "resumed_metadata_completion": resumed_before,
         }
     finally:
         conn.close()
@@ -3205,11 +4080,18 @@ def catalog_status(state_db_path: str) -> Dict[str, object]:
         for title_key in active_keys:
             for row in stats.get(title_key, {}).values():
                 by_status[row["status"]] = by_status.get(row["status"], 0) + 1
+        title_rows = _catalog_title_rows(conn) if "catalog_titles" in tables else {}
+        tombstones = (
+            _load_identity_tombstones(conn)
+            if {"catalog_titles", "catalog_platform_stats"} <= tables else {}
+        )
         pending = _refresh_targets(
             titles,
             stats,
             limit=None,
             now=utc_now(),
+            title_rows=title_rows,
+            tombstones=tombstones,
         )
         return {
             "catalog_schema_ready": "catalog_platform_stats" in tables,

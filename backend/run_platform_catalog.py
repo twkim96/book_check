@@ -10,7 +10,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -825,9 +825,31 @@ def run(args: argparse.Namespace, *, progress=None):
                     args.state_db,
                     limit=limit,
                     retry_not_found=args.retry_not_found,
-                    refresh_after_days=args.refresh_after_days,
+                    refresh_after_days=None,
                     force=args.force,
                 )
+                if args.force or args.refresh_after_days is not None:
+                    refresh_before = (
+                        None if args.force else
+                        platform_catalog.utc_now() - timedelta(days=args.refresh_after_days)
+                    )
+                    existing = platform_catalog.preview_existing_metric_refresh(
+                        args.state_db,
+                        limit=limit,
+                        refresh_before=refresh_before,
+                    )
+                    result = {
+                        **result,
+                        "existing_refresh": existing,
+                        "selected_titles_total": (
+                            int(result.get("selected_titles") or 0)
+                            + int(existing.get("selected_titles") or 0)
+                        ),
+                        "selected_platforms_total": (
+                            int(result.get("selected_platforms") or 0)
+                            + int(existing.get("selected_platforms") or 0)
+                        ),
+                    }
             result = {
                 **result,
                 "authenticated_novelpia_configured": auth_client is not None,
@@ -848,7 +870,7 @@ def run(args: argparse.Namespace, *, progress=None):
                     delay_seconds=args.delay_seconds,
                     timeout=args.timeout,
                     retry_not_found=args.retry_not_found,
-                    refresh_after_days=args.refresh_after_days,
+                    refresh_after_days=None,
                     force=args.force,
                     error_retry_seconds=args.error_retry_seconds,
                     authenticated_novelpia_lookup=(
@@ -856,6 +878,23 @@ def run(args: argparse.Namespace, *, progress=None):
                     ),
                     progress=progress,
                 )
+                if args.force or args.refresh_after_days is not None:
+                    refresh_before = (
+                        None if args.force else
+                        platform_catalog.utc_now() - timedelta(days=args.refresh_after_days)
+                    )
+                    existing = platform_catalog.refresh_existing_metrics(
+                        args.state_db,
+                        limit=limit,
+                        refresh_before=refresh_before,
+                        delay_seconds=args.delay_seconds,
+                        timeout=args.timeout,
+                        authenticated_novelpia_lookup=(
+                            auth_client.lookup if auth_client is not None else None
+                        ),
+                        progress=progress,
+                    )
+                    result = {**result, "existing_refresh": existing}
             result = {"file_metadata": metadata, **result}
             if getattr(args, "sync_sheet", False):
                 result = {**result, "sheet_sync": sync_google_sheet(args.state_db)}

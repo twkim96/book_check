@@ -309,11 +309,11 @@ class LibraryServiceRegistry:
             titles = platform_catalog.discover_catalog_titles(conn)
             stats = platform_catalog._stats_by_title(conn)
             current = platform_catalog.utc_now()
-            update_targets = platform_catalog._refresh_targets(
-                titles, stats, limit=None, now=current
+            update_targets = platform_catalog.select_refresh_targets(
+                conn, limit=None, now=current
             )
-            retry_targets = platform_catalog._refresh_targets(
-                titles, stats, limit=None, now=current, failed_retry=True
+            retry_targets = platform_catalog.select_refresh_targets(
+                conn, limit=None, now=current, failed_retry=True
             )
             existing_targets = []
             for title in sorted(titles, key=lambda item: item.title_key):
@@ -333,6 +333,27 @@ class LibraryServiceRegistry:
             identity_targets = platform_catalog.select_metadata_identity_targets(
                 conn, limit=None
             )
+            completion_pairs = set()
+            completion_review_pairs = set()
+            for row in conn.execute(
+                "SELECT value FROM settings WHERE key LIKE ?",
+                (f"{platform_catalog.METADATA_COMPLETION_PREFIX}%",),
+            ):
+                try:
+                    payload = json.loads(row["value"])
+                except (TypeError, ValueError):
+                    continue
+                for pair in payload.get("pairs", []) if isinstance(payload, dict) else []:
+                    if not isinstance(pair, dict):
+                        continue
+                    key = (str(pair.get("title_key") or ""), str(pair.get("platform") or ""))
+                    if not key[0] or key[1] not in platform_catalog.PLATFORMS:
+                        continue
+                    state_value = str(pair.get("state") or "")
+                    if state_value in {"awaiting_primary", "pending_metadata"}:
+                        completion_pairs.add(key)
+                    elif state_value == "needs_review":
+                        completion_review_pairs.add(key)
 
             state = run_platform_catalog._novelpia_auth_retry_state(
                 str(self.state_db), create=False
@@ -354,14 +375,24 @@ class LibraryServiceRegistry:
         finally:
             conn.close()
 
+        update_pairs = {
+            (target.title.title_key, platform)
+            for target in update_targets
+            for platform in target.platforms
+        }
+        runnable_update_pairs = update_pairs | completion_pairs
+        runnable_update_titles = {title_key for title_key, _platform in runnable_update_pairs}
         return {
             "platform-update": (
-                len(update_targets),
+                len(runnable_update_titles),
                 {
                     "dry_run": True,
                     "discovered_titles": len(titles),
-                    "selected_titles": len(update_targets),
-                    "selected_platforms": sum(len(item.platforms) for item in update_targets),
+                    "selected_titles": len(runnable_update_titles),
+                    "selected_platforms": len(runnable_update_pairs),
+                    "fresh_platform_pairs": len(update_pairs),
+                    "pending_metadata_completion_pairs": len(completion_pairs),
+                    "review_metadata_completion_pairs": len(completion_review_pairs),
                 },
             ),
             "platform-retry": (
@@ -705,6 +736,34 @@ class LibraryServiceRegistry:
                     result = {
                         **result,
                         "unresolved_count": unresolved,
+                        "_job_state": terminal_state,
+                        "_job_message": terminal_message,
+                    }
+            if terminal_state == "succeeded" and command != "sheet-sync":
+                review_count = 0
+                for section in (
+                    result,
+                    result.get("existing_refresh") or {},
+                ):
+                    counts = dict(section.get("outcome_counts") or {})
+                    review_count += sum(
+                        int(counts.get(key, 0) or 0)
+                        for key in (
+                            "identity_conflict", "unavailable", "stale_target",
+                            "tombstoned",
+                        )
+                    )
+                completion = dict(result.get("metadata_completion") or {})
+                review_count += int(completion.get("pending_pairs") or 0)
+                review_count += int(completion.get("review_pairs") or 0)
+                if review_count:
+                    terminal_state = "needs_review"
+                    terminal_message = (
+                        f"플랫폼 작업 완료 · 잔여 {review_count:,}건 검토/재개 필요"
+                    )
+                    result = {
+                        **result,
+                        "unresolved_count": review_count,
                         "_job_state": terminal_state,
                         "_job_message": terminal_message,
                     }
