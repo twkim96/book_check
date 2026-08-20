@@ -376,6 +376,76 @@ def test_queue_exact_cleanup_finds_excluded_warning_pair_from_state_db(tmp_path)
     assert active_queue_count == 1
 
 
+def test_queue_exact_cleanup_accepts_same_run_warning_move_destinations(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        reference = _add(conn, house / "이어지는 작품.txt", "house", b"other")
+        keep = _add(conn, temp / "batch-a" / "작품.txt", "temp")
+        duplicate = _add(conn, temp / "batch-b" / "작품_1.txt", "temp")
+        keep_review = _add_open_review(
+            conn, keep, reference, classification="metadata_only"
+        )
+        duplicate_review = _add_open_review(
+            conn, duplicate, reference, classification="metadata_only"
+        )
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        queue_dir = temp / "trash_bin" / "warning"
+        keep_move = dedup_mutations.queue_candidate(
+            conn,
+            candidate_file_id=keep["file_id"],
+            reference_file_id=reference["file_id"],
+            classification="metadata_only",
+            queue_dir=queue_dir,
+            run_id=run_id,
+            review_id=keep_review,
+            allow_unassigned_reference=True,
+        )
+        duplicate_move = dedup_mutations.queue_candidate(
+            conn,
+            candidate_file_id=duplicate["file_id"],
+            reference_file_id=reference["file_id"],
+            classification="metadata_only",
+            queue_dir=queue_dir,
+            run_id=run_id,
+            review_id=duplicate_review,
+            allow_unassigned_reference=True,
+        )
+    finally:
+        conn.close()
+
+    assert deduplicator.count_actionable_pending_strong_reviews(state_db) == 1
+    records = deduplicator.cleanup_relationship_preserving_queue_exact_duplicates(
+        str(state_db), str(temp), run_id
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        active_queue = conn.execute(
+            "SELECT file_id, canonical_path FROM files "
+            "WHERE active = 1 AND source = 'queue'"
+        ).fetchall()
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    assert {keep_move["action"], duplicate_move["action"]} == {"warning_move"}
+    assert len(records) == 1
+    assert len(active_queue) == 1
+    assert deduplicator.count_actionable_pending_strong_reviews(state_db) == 0
+    assert Path(active_queue[0]["canonical_path"]).is_file()
+    assert Path(records[0]["dest_path"]).is_file()
+
+
 def test_exact_queue_duplicates_stay_report_only_if_external_review_would_be_lost(
     tmp_path,
 ):

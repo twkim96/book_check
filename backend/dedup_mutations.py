@@ -275,8 +275,12 @@ def user_queue_restore(conn, *, file_id, run_id):
         if destination.exists():
             raise RuntimeError(f"user restore destination already exists: {destination}")
         source_evidence = inspect_regular_file(source_path)
-        decision_store.assert_manifest_source(
-            actual_run, source_path, "temp_root", source_evidence
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            source_path,
+            source_evidence,
+            file_id=file_id,
         )
         with decision_store.transaction(conn):
             operation_id = decision_store.create_operation(
@@ -371,8 +375,12 @@ def user_queue_accept_to_house(
             raise RuntimeError(f"user accept destination already exists: {destination}")
 
         source_evidence = inspect_regular_file(source_path)
-        decision_store.assert_manifest_source(
-            actual_run, source_path, "temp_root", source_evidence
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            source_path,
+            source_evidence,
+            file_id=file_id,
         )
         coordinates = decision_store.coordinate_fields_from_name(destination.name)
         with decision_store.transaction(conn):
@@ -1145,14 +1153,27 @@ def _exact_quarantine(
     # also checked so stale/corrupt cache cannot authorize a logical deletion.
     source_evidence = inspect_regular_file(source_path)
     keep_evidence = inspect_regular_file(keep_path)
-    decision_store.assert_manifest_source(
-        actual_run, source_path, source_root, source_evidence
-    )
-    if queue_keep:
-        # Unlike a house keep produced by this same run, a queue keep must have
-        # existed at activation and be bound to the approved manifest.
+    if source["source"] == "queue":
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            source_path,
+            source_evidence,
+            file_id=source_file_id,
+        )
+    else:
         decision_store.assert_manifest_source(
-            actual_run, keep_path, "temp_root", keep_evidence
+            actual_run, source_path, source_root, source_evidence
+        )
+    if queue_keep:
+        # The queue peer may have existed at activation or may be an exact,
+        # durably recorded destination of this same run's review move.
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            keep_path,
+            keep_evidence,
+            file_id=keep_file_id,
         )
     else:
         # A house keep must either be part of the activation snapshot or be an
@@ -1332,9 +1353,18 @@ def user_quarantine(
         replacement_evidence = (
             inspect_regular_file(replacement_path) if replacement_path is not None else None
         )
-        decision_store.assert_manifest_source(
-            actual_run, source_path, source_root, source_evidence
-        )
+        if source["source"] == "queue":
+            decision_store.assert_manifest_or_same_run_queue_source(
+                conn,
+                actual_run,
+                source_path,
+                source_evidence,
+                file_id=source_file_id,
+            )
+        else:
+            decision_store.assert_manifest_source(
+                actual_run, source_path, source_root, source_evidence
+            )
         if keep_path is not None:
             if keep_origin_operation_id is None:
                 decision_store.assert_manifest_source(
@@ -1877,12 +1907,30 @@ def apply_contained_upgrade(
         )
     short_root = "house_root" if shorter["source"] == "house" else "temp_root"
     long_root = "house_root" if longer["source"] == "house" else "temp_root"
-    decision_store.assert_manifest_source(
-        actual_run, short_path, short_root, proof.short_file_evidence
-    )
-    decision_store.assert_manifest_source(
-        actual_run, long_path, long_root, proof.long_file_evidence
-    )
+    if shorter["source"] == "queue":
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            short_path,
+            proof.short_file_evidence,
+            file_id=shorter_file_id,
+        )
+    else:
+        decision_store.assert_manifest_source(
+            actual_run, short_path, short_root, proof.short_file_evidence
+        )
+    if longer["source"] == "queue":
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            long_path,
+            proof.long_file_evidence,
+            file_id=longer_file_id,
+        )
+    else:
+        decision_store.assert_manifest_source(
+            actual_run, long_path, long_root, proof.long_file_evidence
+        )
 
     ingest_result = None
     if longer["source"] in {"temp", "queue"}:
@@ -2012,10 +2060,10 @@ def apply_ordered_body_quarantine(
 ):
     """Finalize a same-core edition after a current 95% body proof.
 
-    ``near_identical`` additionally needs the same proof in reverse, so a
-    shared fragment cannot consume a distinct edition.  House -> house is
-    limited to the dated-distribution contract and requires 99% in both
-    directions.
+    Queue/house ``near_identical`` and ``longer_unresolved`` reviews additionally
+    need the same proof in reverse, so a shared fragment cannot consume a
+    distinct edition.  House -> house is limited to the near-identical dated-
+    distribution contract and requires 99% in both directions.
     """
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     assert_mutation_lock_held(conn, run_id=run_id)
@@ -2050,7 +2098,9 @@ def apply_ordered_body_quarantine(
     if (
         review is None
         or review["classification"] != classification
-        or classification not in {"ordered_body_match", "near_identical"}
+        or classification not in {
+            "ordered_body_match", "near_identical", "longer_unresolved"
+        }
         or review["state"] not in {"pending", "deferred"}
         or {review["candidate_file_id"], review["reference_file_id"]}
         != {discard_file_id, keep_file_id}
@@ -2071,6 +2121,9 @@ def apply_ordered_body_quarantine(
     keep_meta = _contained_metadata(conn, keep_file_id)
     discard_core = _normalized_metadata_token(discard_meta["core_title"])
     keep_core = _normalized_metadata_token(keep_meta["core_title"])
+    bidirectional_review = classification in {
+        "near_identical", "longer_unresolved"
+    }
     loose_upgrade_relation = classify_loose_title_upgrade_relation(
         Path(discard["canonical_path"]).name,
         Path(keep["canonical_path"]).name,
@@ -2086,9 +2139,28 @@ def apply_ordered_body_quarantine(
             None, discard_core, keep_core, autojunk=False
         ).ratio() >= 0.90
     )
+    declared_coordinate_relation = classify_dedup_coordinate_relation(
+        Path(discard["canonical_path"]).name,
+        Path(keep["canonical_path"]).name,
+        left_span_ambiguous=bool(discard["span_ambiguous"]),
+        right_span_ambiguous=bool(keep["span_ambiguous"]),
+    )
+    shorter_core = min((discard_core, keep_core), key=len)
+    longer_core = max((discard_core, keep_core), key=len)
+    queue_near_core = bool(
+        classification == "near_identical"
+        and discard["source"] == "queue"
+        and keep["source"] == "house"
+        and declared_coordinate_relation is not None
+        and declared_coordinate_relation.mode == "same_coordinates"
+        and declared_coordinate_relation.preferred_side is None
+        and len(shorter_core) >= 4
+        and shorter_core in longer_core
+    )
     if not discard_core or (
         discard_core != keep_core
         and not house_near_core
+        and not queue_near_core
         and not (
             classification == "ordered_body_match"
             and loose_upgrade_relation is not None
@@ -2098,7 +2170,7 @@ def apply_ordered_body_quarantine(
     discard_authors = _author_tokens(discard_meta["author"])
     keep_authors = _author_tokens(keep_meta["author"])
     if (
-        classification != "near_identical"
+        not bidirectional_review
         and discard_authors
         and keep_authors
         and not (discard_authors & keep_authors)
@@ -2109,12 +2181,7 @@ def apply_ordered_body_quarantine(
         loose_upgrade_relation
         if classification == "ordered_body_match"
         and discard_core != keep_core
-        else classify_dedup_coordinate_relation(
-            Path(discard["canonical_path"]).name,
-            Path(keep["canonical_path"]).name,
-            left_span_ambiguous=bool(discard["span_ambiguous"]),
-            right_span_ambiguous=bool(keep["span_ambiguous"]),
-        )
+        else declared_coordinate_relation
     )
     if classification == "ordered_body_match":
         if coordinate_relation is None:
@@ -2183,7 +2250,7 @@ def apply_ordered_body_quarantine(
             "ordered body coverage fell below the current 1.4.1 contract"
         )
     reverse_proof = None
-    if classification == "near_identical":
+    if bidirectional_review:
         reverse_proof = inspect_ordered_text(keep_path, discard_path)
         _assert_row_identity(keep, reverse_proof.source_file_evidence, keep_path)
         _assert_row_identity(
@@ -2217,12 +2284,30 @@ def apply_ordered_body_quarantine(
 
     discard_root = "house_root" if discard["source"] == "house" else "temp_root"
     keep_root = "house_root" if keep["source"] == "house" else "temp_root"
-    decision_store.assert_manifest_source(
-        actual_run, discard_path, discard_root, proof.source_file_evidence
-    )
-    decision_store.assert_manifest_source(
-        actual_run, keep_path, keep_root, proof.target_file_evidence
-    )
+    if discard["source"] == "queue":
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            discard_path,
+            proof.source_file_evidence,
+            file_id=discard_file_id,
+        )
+    else:
+        decision_store.assert_manifest_source(
+            actual_run, discard_path, discard_root, proof.source_file_evidence
+        )
+    if keep["source"] == "queue":
+        decision_store.assert_manifest_or_same_run_queue_source(
+            conn,
+            actual_run,
+            keep_path,
+            proof.target_file_evidence,
+            file_id=keep_file_id,
+        )
+    else:
+        decision_store.assert_manifest_source(
+            actual_run, keep_path, keep_root, proof.target_file_evidence
+        )
 
     ingest_result = None
     if keep["source"] in {"temp", "queue"}:
@@ -2315,8 +2400,8 @@ def apply_ordered_body_quarantine(
             "near_identical_house_bidirectional_99_auto_duplicate"
             if classification == "near_identical"
             and discard["source"] == keep["source"] == "house"
-            else "near_identical_bidirectional_95_auto_duplicate"
-            if classification == "near_identical"
+            else "bidirectional_95_auto_duplicate"
+            if bidirectional_review
             else "ordered_body_95_auto_duplicate"
         ),
         keep_origin_operation_id=(

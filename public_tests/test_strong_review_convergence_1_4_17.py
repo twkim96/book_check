@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import decision_store
+import dedup_mutations
 import deduplicator
 from dedup_episode_relation import classify_loose_title_upgrade_relation
 from mutation_io import mutation_lock_for_roots
@@ -559,6 +560,157 @@ def test_near_identical_queue_copy_requires_bidirectional_95_percent(tmp_path):
     assert Path(keep["path"]).is_file()
     assert Path(records[0]["dest_path"]).is_file()
     assert row["state"] == "superseded"
+
+
+def test_same_run_longer_unresolved_queue_copy_converges_at_bidirectional_95(
+    tmp_path,
+):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    house_body = "".join(
+        f"{index:05d} 분류명과 무관한 양방향 강한 본문입니다.\n"
+        for index in range(5_000)
+    )
+    queue_body = "".join(
+        (
+            f"{index:05d} 교정된 양방향 강한 본문입니다.\n"
+            if index % 250 == 0
+            else f"{index:05d} 분류명과 무관한 양방향 강한 본문입니다.\n"
+        )
+        for index in range(5_000)
+    )
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add_text(
+            conn,
+            house / "ㄹ" / "분류명 무관 작품.txt",
+            "house",
+            house_body,
+        )
+        discard = _add_text(
+            conn,
+            temp / "batch" / "분류명 무관 작품 1-200 완 [2026.03.11].txt",
+            "temp",
+            queue_body,
+        )
+        review_id = _add_review(conn, discard, keep, "longer_unresolved")
+    finally:
+        conn.close()
+
+    with mutation_lock_for_roots(house, temp, "test-longer-bidirectional"):
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            run_id = _approve(conn, state_db, house, temp)
+            queued = dedup_mutations.queue_candidate(
+                conn,
+                candidate_file_id=discard["file_id"],
+                reference_file_id=keep["file_id"],
+                classification="longer_unresolved",
+                queue_dir=temp / "trash_bin" / "warning",
+                run_id=run_id,
+                review_id=review_id,
+                allow_unassigned_reference=True,
+            )
+        finally:
+            conn.close()
+        assert deduplicator.count_actionable_pending_strong_reviews(state_db) == 1
+        records = deduplicator.cleanup_pending_queue_strong_reviews(
+            str(state_db), str(house), str(temp), run_id
+        )
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            review = conn.execute(
+                "SELECT state FROM review_items WHERE review_id = ?", (review_id,)
+            ).fetchone()
+            decision_store.finish_actual_run(conn, run_id, success=True)
+            assert decision_store.doctor_issues(conn) == []
+        finally:
+            conn.close()
+
+    assert queued["action"] == "warning_move"
+    assert len(records) == 1
+    assert records[0]["classification"] == "longer_unresolved"
+    assert records[0]["coverage_ppm"] >= 950_000
+    assert records[0]["reverse_coverage_ppm"] >= 950_000
+    assert review["state"] == "superseded"
+    assert Path(records[0]["dest_path"]).is_file()
+    assert Path(keep["path"]).is_file()
+
+
+def test_near_identical_same_coordinates_allow_contained_title_annotation(
+    tmp_path,
+):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    house_body = "".join(
+        f"{index:05d} 제목 병기와 무관한 양방향 강한 본문입니다.\n"
+        for index in range(5_000)
+    )
+    queue_body = "".join(
+        (
+            f"{index:05d} 교정된 제목 병기 양방향 본문입니다.\n"
+            if index % 250 == 0
+            else f"{index:05d} 제목 병기와 무관한 양방향 강한 본문입니다.\n"
+        )
+        for index in range(5_000)
+    )
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        keep = _add_text(
+            conn,
+            house / "ㄷ" / "대라선 조염 1-226 완.txt",
+            "house",
+            house_body,
+        )
+        discard = _add_text(
+            conn,
+            temp / "batch" / "대라선 조염大羅仙 趙炎 1-226 완.txt",
+            "temp",
+            queue_body,
+        )
+        review_id = _add_review(conn, discard, keep, "near_identical")
+    finally:
+        conn.close()
+
+    with mutation_lock_for_roots(house, temp, "test-near-annotated-core"):
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            run_id = _approve(conn, state_db, house, temp)
+            dedup_mutations.queue_candidate(
+                conn,
+                candidate_file_id=discard["file_id"],
+                reference_file_id=keep["file_id"],
+                classification="near_identical",
+                queue_dir=temp / "trash_bin" / "warning",
+                run_id=run_id,
+                review_id=review_id,
+                allow_unassigned_reference=True,
+            )
+        finally:
+            conn.close()
+        assert deduplicator.count_actionable_pending_strong_reviews(state_db) == 1
+        records = deduplicator.cleanup_pending_queue_strong_reviews(
+            str(state_db), str(house), str(temp), run_id
+        )
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            decision_store.finish_actual_run(conn, run_id, success=True)
+            assert decision_store.doctor_issues(conn) == []
+        finally:
+            conn.close()
+
+    assert len(records) == 1
+    assert records[0]["classification"] == "near_identical"
+    assert records[0]["coverage_ppm"] >= 950_000
+    assert records[0]["reverse_coverage_ppm"] >= 950_000
+    assert Path(records[0]["dest_path"]).is_file()
+    assert Path(keep["path"]).is_file()
 
 
 def test_near_identical_current_subthreshold_evidence_is_not_actionable(tmp_path):

@@ -146,14 +146,24 @@ def run(
                 claimed_actions = review_actions.claim_external_action_moves(
                     conn, src_dir
                 )
+                current_file_ids = tuple(
+                    item["file_id"] for item in claimed_actions
+                )
+                ctime_refresh = (
+                    decision_store.refresh_verified_managed_ctime_identities(
+                        conn,
+                        backup_path=run_backup,
+                        house_dir=dst_dir,
+                        temp_dir=src_dir,
+                        current_file_ids=current_file_ids,
+                    )
+                )
                 device_rebind = decision_store.rebind_mount_device_identities(
                     conn,
                     backup_path=run_backup,
                     house_dir=dst_dir,
                     temp_dir=src_dir,
-                    current_file_ids=tuple(
-                        item["file_id"] for item in claimed_actions
-                    ),
+                    current_file_ids=current_file_ids,
                 )
                 run_id, preflight_receipt = (
                     decision_store.issue_prevalidated_actual_run_token(
@@ -170,6 +180,11 @@ def run(
             print(f"🔐 schema/doctor 준비 완료, migration 백업: {schema_message}")
             if claimed_actions:
                 print(f"📥 검토 처리함 입력 {len(claimed_actions)}개 확인")
+            if ctime_refresh["applied"]:
+                print(
+                    "🔁 SHA 검증된 metadata ctime 자동 재결합: "
+                    f"파일 {ctime_refresh['file_count']}개"
+                )
             if device_rebind["applied"]:
                 print(
                     "🔁 재마운트 device identity 자동 재결합: "
@@ -187,6 +202,7 @@ def run(
                 run_backup=str(run_backup),
                 doctor_issue_count=0,
                 claimed_review_actions=len(claimed_actions),
+                verified_ctime_refresh=ctime_refresh,
                 device_identity_rebind=device_rebind,
                 approved_run_id=run_id,
                 preflight_seconds=round(preflight_seconds, 6),

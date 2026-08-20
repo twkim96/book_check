@@ -476,6 +476,274 @@ def issue_prevalidated_actual_run_token(
     return run_id, receipt
 
 
+def refresh_verified_managed_ctime_identities(
+    conn: sqlite3.Connection,
+    *,
+    backup_path: os.PathLike | str,
+    house_dir: os.PathLike | str,
+    temp_dir: os.PathLike | str,
+    current_file_ids: tuple[str, ...] = (),
+) -> dict:
+    """Repair metadata-only ctime drift after proving the bytes are unchanged.
+
+    chmod, xattr, quarantine-attribute removal, and similar macOS metadata
+    operations can change ctime without changing a file's inode, size, mtime,
+    or content.  Managed files remain strict in Doctor because a same-inode
+    content rewrite with a restored mtime must not be trusted blindly.  This
+    preflight maintenance path is the narrow exception: it hashes each exact
+    ctime-only Doctor failure through a no-follow descriptor and requires the
+    current raw SHA-256 to equal the immutable current fingerprint.
+
+    Only the active file and filename-analysis ctime projection is refreshed.
+    The fingerprint row remains immutable; the auditor will create/reuse a
+    current-identity fingerprint during the authorized run.
+    """
+    from mutation_io import (
+        assert_mutation_lock_for_roots_held,
+        canonical_absolute_path,
+        inspect_open_regular_file_fd,
+        opened_directory_nofollow,
+        opened_regular_file_nofollow,
+    )
+
+    assert_mutation_lock_for_roots_held(house_dir, temp_dir)
+    roots = tuple(
+        canonical_absolute_path(Path(value).expanduser())
+        for value in (house_dir, temp_dir)
+    )
+    root_devices = {}
+    for root in roots:
+        with opened_directory_nofollow(root) as root_fd:
+            info = os.fstat(root_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                f"verified ctime refresh root is not a directory: {root}"
+            )
+        root_devices[root] = info.st_dev
+
+    def owning_root(path: Path) -> Path:
+        matches = []
+        for root in roots:
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            matches.append(root)
+        if not matches:
+            raise RuntimeError(
+                f"verified ctime refresh path is outside configured roots: {path}"
+            )
+        return max(matches, key=lambda value: len(value.parts))
+
+    backup_sha256 = _verify_backup_evidence(str(backup_path))
+    pending_actual = conn.execute(
+        """
+        SELECT run_id, state FROM actual_runs
+        WHERE state IN ('approved', 'active')
+        ORDER BY approved_at LIMIT 1
+        """
+    ).fetchone()
+    if pending_actual is not None:
+        raise RuntimeError(
+            "verified ctime refresh requires no approved or active actual run: "
+            f"{pending_actual['run_id']} ({pending_actual['state']})"
+        )
+    gate = conn.execute(
+        "SELECT value FROM settings WHERE key = 'actual_mutation_enabled'"
+    ).fetchone()
+    approved_setting = conn.execute(
+        "SELECT value FROM settings WHERE key = 'approved_run_id'"
+    ).fetchone()
+    if (gate is not None and gate["value"] != "0") or approved_setting is not None:
+        raise RuntimeError(
+            "verified ctime refresh requires the actual mutation gate to be disabled"
+        )
+
+    issues = doctor_issues(conn)
+    allowed_issue_kinds = {
+        "stale_identity",
+        "managed_folder_identity_stale",
+    }
+    unexpected = [
+        issue for issue in issues if issue["kind"] not in allowed_issue_kinds
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "verified ctime refresh blocked by another Doctor issue: "
+            f"{unexpected[0]['kind']}"
+        )
+    stale_file_ids = {
+        issue["file_id"] for issue in issues if issue["kind"] == "stale_identity"
+    }
+    if not stale_file_ids:
+        return {
+            "applied": False,
+            "file_count": 0,
+            "backup_sha256": backup_sha256,
+        }
+
+    rows = conn.execute(
+        """
+        SELECT
+            f.file_id, f.canonical_path, f.dev, f.ino, f.ctime_ns,
+            f.size, f.mtime_ns, f.assignment_state, f.current_fingerprint_id,
+            fp.file_id AS fingerprint_file_id,
+            fp.canonical_path AS fingerprint_path,
+            fp.dev AS fingerprint_dev, fp.ino AS fingerprint_ino,
+            fp.ctime_ns AS fingerprint_ctime_ns,
+            fp.size AS fingerprint_size, fp.mtime_ns AS fingerprint_mtime_ns,
+            fp.raw_sha256 AS fingerprint_raw_sha256
+        FROM files AS f
+        LEFT JOIN fingerprints AS fp
+          ON fp.fingerprint_id = f.current_fingerprint_id
+        WHERE f.active = 1
+        ORDER BY f.canonical_path
+        """
+    ).fetchall()
+    rows_by_id = {row["file_id"]: row for row in rows}
+    claimed = frozenset(current_file_ids)
+    candidates = []
+
+    for file_id in sorted(stale_file_ids):
+        row = rows_by_id.get(file_id)
+        if row is None:
+            raise RuntimeError(
+                f"verified ctime refresh cannot find active file: {file_id}"
+            )
+        path = Path(row["canonical_path"])
+        root = owning_root(path)
+        with opened_regular_file_nofollow(path) as file_fd:
+            evidence = inspect_open_regular_file_fd(file_fd)
+        if evidence.dev != root_devices[root]:
+            raise RuntimeError(
+                f"verified ctime refresh file is not on its configured root: {path}"
+            )
+
+        # A device-number change is handled by the mount-wide guarded rebind
+        # that immediately follows this step.  Any same-device inode change is
+        # a real identity replacement and must remain fail-closed.
+        if row["dev"] != evidence.dev:
+            continue
+        if row["ino"] != evidence.ino:
+            raise RuntimeError(
+                f"verified ctime refresh found an inode replacement: {path}"
+            )
+        if row["size"] != evidence.size or row["mtime_ns"] != evidence.mtime_ns:
+            raise RuntimeError(
+                f"verified ctime refresh found changed size or mtime: {path}"
+            )
+        if row["ctime_ns"] == evidence.ctime_ns:
+            raise RuntimeError(
+                f"verified ctime refresh Doctor evidence is no longer current: {path}"
+            )
+        if row["assignment_state"] != "managed":
+            raise RuntimeError(
+                f"verified ctime refresh requires a managed file: {path}"
+            )
+        if file_id in claimed:
+            raise RuntimeError(
+                f"verified ctime refresh refuses a claimed review action: {path}"
+            )
+        fingerprint_matches_stored_identity = bool(
+            row["current_fingerprint_id"] is not None
+            and row["fingerprint_file_id"] == file_id
+            and row["fingerprint_path"] == row["canonical_path"]
+            and row["fingerprint_dev"] == row["dev"]
+            and row["fingerprint_ino"] == row["ino"]
+            and row["fingerprint_ctime_ns"] == row["ctime_ns"]
+            and row["fingerprint_size"] == row["size"]
+            and row["fingerprint_mtime_ns"] == row["mtime_ns"]
+            and row["fingerprint_raw_sha256"]
+        )
+        if not fingerprint_matches_stored_identity:
+            raise RuntimeError(
+                f"verified ctime refresh lacks a current raw fingerprint: {path}"
+            )
+        if evidence.sha256 != row["fingerprint_raw_sha256"]:
+            raise RuntimeError(
+                f"verified ctime refresh raw SHA-256 mismatch: {path}"
+            )
+        candidates.append((row, evidence))
+
+    if not candidates:
+        return {
+            "applied": False,
+            "file_count": 0,
+            "backup_sha256": backup_sha256,
+        }
+
+    with transaction(conn):
+        _verify_backup_evidence(str(backup_path), backup_sha256)
+        if doctor_issues(conn) != issues:
+            raise RuntimeError(
+                "Doctor evidence changed during verified ctime refresh"
+            )
+        for row, evidence in candidates:
+            path = Path(row["canonical_path"])
+            with opened_regular_file_nofollow(path) as file_fd:
+                current = inspect_open_regular_file_fd(file_fd)
+            if current != evidence:
+                raise RuntimeError(
+                    f"managed file changed during verified ctime refresh: {path}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE files SET ctime_ns = ?, last_seen_at = CURRENT_TIMESTAMP
+                WHERE file_id = ? AND active = 1
+                  AND dev = ? AND ino = ? AND ctime_ns = ?
+                  AND size = ? AND mtime_ns = ?
+                  AND assignment_state = 'managed'
+                  AND current_fingerprint_id = ?
+                """,
+                (
+                    evidence.ctime_ns,
+                    row["file_id"],
+                    row["dev"],
+                    row["ino"],
+                    row["ctime_ns"],
+                    row["size"],
+                    row["mtime_ns"],
+                    row["current_fingerprint_id"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"managed file row changed during verified ctime refresh: {path}"
+                )
+            conn.execute(
+                """
+                UPDATE file_analysis
+                SET analyzed_ctime_ns = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE file_id = ? AND analyzed_size = ? AND analyzed_mtime_ns = ?
+                  AND (analyzed_ctime_ns IS NULL OR analyzed_ctime_ns = ?)
+                """,
+                (
+                    evidence.ctime_ns,
+                    row["file_id"],
+                    row["size"],
+                    row["mtime_ns"],
+                    row["ctime_ns"],
+                ),
+            )
+
+        remaining = doctor_issues(conn)
+        repaired_ids = {row["file_id"] for row, _ in candidates}
+        if any(
+            issue["kind"] == "stale_identity"
+            and issue["file_id"] in repaired_ids
+            for issue in remaining
+        ):
+            raise RuntimeError(
+                "Doctor still reports a refreshed managed ctime identity"
+            )
+
+    return {
+        "applied": True,
+        "file_count": len(candidates),
+        "backup_sha256": backup_sha256,
+    }
+
+
 def rebind_mount_device_identities(
     conn: sqlite3.Connection,
     *,
@@ -1339,6 +1607,47 @@ def assert_manifest_or_same_run_house_source(
             ORDER BY operation_id DESC
             """,
             (run["run_id"], candidate),
+        ).fetchall()
+        from mutation_io import evidence_matches
+
+        for row in rows:
+            expected = _operation_evidence(row, "destination")
+            if expected is not None and evidence_matches(evidence, expected):
+                return
+        raise manifest_error
+
+
+def assert_manifest_or_same_run_queue_source(
+    conn: sqlite3.Connection, run, path, evidence, *, file_id: str
+) -> None:
+    """Authorize an original temp file or its exact same-run queue result.
+
+    The activation manifest is captured before Folderling moves review items
+    into ``trash_bin``.  A later exact-queue cleanup may therefore see a path
+    that was not present at activation.  Only a committed queue-producing
+    operation for this exact run, file row, destination path, and durable
+    destination identity/SHA is accepted as the fallback.  Stale manifest
+    identities and unrelated operation destinations remain fail-closed.
+    """
+
+    try:
+        assert_manifest_source(run, path, "temp_root", evidence)
+        return
+    except RuntimeError as manifest_error:
+        if not str(manifest_error).startswith(
+            "actual run manifest does not authorize source:"
+        ):
+            raise
+        candidate = str(Path(canonicalize_path(path)))
+        rows = conn.execute(
+            """
+            SELECT * FROM operations
+            WHERE run_id = ? AND state = 'committed' AND file_id = ?
+              AND dest_path = ?
+              AND action IN ('suspected_move', 'warning_move', 'house_review_move')
+            ORDER BY operation_id DESC
+            """,
+            (run["run_id"], file_id, candidate),
         ).fetchall()
         from mutation_io import evidence_matches
 

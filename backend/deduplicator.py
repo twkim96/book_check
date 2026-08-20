@@ -131,7 +131,7 @@ def _current_review_evidence_precludes_action(classification, evidence_json):
     """Return true when current persisted evidence already disproves a rule."""
     if _current_strong_proof_not_sufficient(evidence_json):
         return True
-    if classification != "near_identical":
+    if classification not in {"near_identical", "longer_unresolved"}:
         return False
     try:
         evidence = json.loads(evidence_json or "{}")
@@ -1733,6 +1733,64 @@ def cleanup_post_intake_exact_duplicates(
     return records
 
 
+def _relationship_preserving_queue_exact_pairs(conn):
+    """Return exact two-file queue pairs whose review edges are redundant."""
+
+    from dedup_mutations import queue_exact_review_relationships_preserved
+
+    pairs = []
+    groups = conn.execute(
+        """
+        SELECT fp.raw_sha256, fp.size
+        FROM files AS f
+        JOIN fingerprints AS fp
+          ON fp.fingerprint_id = f.current_fingerprint_id
+        WHERE f.active = 1 AND f.source = 'queue'
+          AND fp.raw_sha256 IS NOT NULL
+        GROUP BY fp.raw_sha256, fp.size
+        HAVING COUNT(*) = 2
+        ORDER BY fp.raw_sha256, fp.size
+        """
+    ).fetchall()
+    for group in groups:
+        members = conn.execute(
+            """
+            SELECT f.file_id, f.canonical_path
+            FROM files AS f
+            JOIN fingerprints AS fp
+              ON fp.fingerprint_id = f.current_fingerprint_id
+            WHERE f.active = 1 AND f.source = 'queue'
+              AND fp.raw_sha256 = ? AND fp.size = ?
+            ORDER BY f.canonical_path, f.file_id
+            """,
+            (group["raw_sha256"], group["size"]),
+        ).fetchall()
+        if len(members) != 2 or any(
+            not os.path.isfile(member["canonical_path"]) for member in members
+        ):
+            continue
+        directions = (
+            (members[1], members[0]),
+            (members[0], members[1]),
+        )
+        selected = next((
+            (source, keep)
+            for source, keep in directions
+            if queue_exact_review_relationships_preserved(
+                conn, source["file_id"], keep["file_id"]
+            )
+        ), None)
+        if selected is None:
+            continue
+        source, keep = selected
+        pairs.append({
+            "source": source,
+            "keep": keep,
+            "raw_sha256": group["raw_sha256"],
+        })
+    return pairs
+
+
 def cleanup_relationship_preserving_queue_exact_duplicates(
     state_db_path, temp_dir, actual_run_id
 ):
@@ -1746,57 +1804,14 @@ def cleanup_relationship_preserving_queue_exact_duplicates(
     """
 
     import decision_store
-    from dedup_mutations import (
-        exact_quarantine,
-        queue_exact_review_relationships_preserved,
-    )
+    from dedup_mutations import exact_quarantine
 
     conn = decision_store.connect_state_db(state_db_path)
     records = []
     quarantine_dir = os.path.join(temp_dir, "trash_bin", "exact_quarantine")
     try:
-        groups = conn.execute(
-            """
-            SELECT fp.raw_sha256, fp.size
-            FROM files AS f
-            JOIN fingerprints AS fp
-              ON fp.fingerprint_id = f.current_fingerprint_id
-            WHERE f.active = 1 AND f.source = 'queue'
-              AND fp.raw_sha256 IS NOT NULL
-            GROUP BY fp.raw_sha256, fp.size
-            HAVING COUNT(*) = 2
-            ORDER BY fp.raw_sha256, fp.size
-            """
-        ).fetchall()
-        for group in groups:
-            members = conn.execute(
-                """
-                SELECT f.file_id, f.canonical_path
-                FROM files AS f
-                JOIN fingerprints AS fp
-                  ON fp.fingerprint_id = f.current_fingerprint_id
-                WHERE f.active = 1 AND f.source = 'queue'
-                  AND fp.raw_sha256 = ? AND fp.size = ?
-                ORDER BY f.canonical_path, f.file_id
-                """,
-                (group["raw_sha256"], group["size"]),
-            ).fetchall()
-            if len(members) != 2:
-                continue
-            directions = (
-                (members[1], members[0]),
-                (members[0], members[1]),
-            )
-            selected = next((
-                (source, keep)
-                for source, keep in directions
-                if queue_exact_review_relationships_preserved(
-                    conn, source["file_id"], keep["file_id"]
-                )
-            ), None)
-            if selected is None:
-                continue
-            source, keep = selected
+        for pair in _relationship_preserving_queue_exact_pairs(conn):
+            source, keep = pair["source"], pair["keep"]
             result = exact_quarantine(
                 conn,
                 source_file_id=source["file_id"],
@@ -1808,7 +1823,7 @@ def cleanup_relationship_preserving_queue_exact_duplicates(
                 **result,
                 "source_path": source["canonical_path"],
                 "keep_path": keep["canonical_path"],
-                "raw_sha256": group["raw_sha256"],
+                "raw_sha256": pair["raw_sha256"],
             })
     finally:
         conn.close()
@@ -1945,7 +1960,7 @@ def cleanup_pending_queue_strong_reviews(
         WHERE r.state IN ('pending', 'deferred')
           AND r.classification IN (
             'contained_exact', 'contained_version', 'ordered_body_match',
-            'near_identical'
+            'near_identical', 'longer_unresolved'
           )
           AND c.active = 1 AND k.active = 1
           AND c.source IN ('house', 'queue')
@@ -2324,7 +2339,8 @@ def _bidirectional_near_direction(relation):
     markers or managed relationships.  The mutation boundary independently
     replays both directions and raises the house/house threshold to 99%.
     """
-    if relation.get("classification") != "near_identical":
+    classification = relation.get("classification")
+    if classification not in {"near_identical", "longer_unresolved"}:
         return None
     left, right = relation["left"], relation["right"]
     if any(
@@ -2350,9 +2366,11 @@ def _bidirectional_near_direction(relation):
         keep = right if discard is left else left
         discard_core = normalize_nfc(discard.get("core_title") or "").casefold()
         keep_core = normalize_nfc(keep.get("core_title") or "").casefold()
-        if not discard_core or discard_core != keep_core:
+        if not discard_core or not keep_core:
             return None
     elif left.get("source") == right.get("source") == "house":
+        if classification != "near_identical":
+            return None
         left_name = left.get("name", "")
         right_name = right.get("name", "")
         left_distribution = bool(_DISTRIBUTION_SUFFIX_RE.search(left_name))
@@ -2410,6 +2428,17 @@ def _bidirectional_near_direction(relation):
         if sources == {"house"}:
             return None
         mode = "one_sided_unknown_coordinates"
+    if sources == {"house", "queue"} and discard_core != keep_core:
+        shorter_core = min((discard_core, keep_core), key=len)
+        longer_core = max((discard_core, keep_core), key=len)
+        if not (
+            classification == "near_identical"
+            and coordinate is not None
+            and coordinate.mode == "same_coordinates"
+            and len(shorter_core) >= 4
+            and shorter_core in longer_core
+        ):
+            return None
     return discard, keep, mode
 
 
@@ -2421,14 +2450,20 @@ def count_actionable_pending_strong_reviews(state_db_path):
     House/house reviews can likewise remain after a rule upgrade even when
     ``txt_temp`` is empty.  Reuse the same direction guards as the mutation
     phase, require current fingerprints and on-disk endpoints, and honor an
-    active human distinct-edition decision.  This is a read-only readiness
-    probe; the mutation phase revalidates all content and snapshots again.
+    active human distinct-edition decision.  Exact two-file queue groups whose
+    review edges are redundant are included as the strongest possible cleanup
+    evidence, allowing a failed run to converge even when temp input is empty.
+    This is a read-only readiness probe; the mutation phase revalidates all
+    content and snapshots again.
     """
 
     import decision_store
 
     conn = decision_store.connect_state_db_readonly(state_db_path)
     try:
+        queue_exact_count = len(
+            _relationship_preserving_queue_exact_pairs(conn)
+        )
         rows = conn.execute(
             """
             SELECT r.classification,
@@ -2480,7 +2515,7 @@ def count_actionable_pending_strong_reviews(state_db_path):
             WHERE r.state IN ('pending', 'deferred')
               AND r.classification IN (
                 'contained_exact', 'contained_version', 'ordered_body_match',
-                'near_identical'
+                'near_identical', 'longer_unresolved'
               )
               AND c.active = 1 AND k.active = 1
               AND c.source IN ('house', 'queue')
@@ -2569,7 +2604,7 @@ def count_actionable_pending_strong_reviews(state_db_path):
             )
             if direction is not None:
                 count += 1
-        return count
+        return count + queue_exact_count
     finally:
         conn.close()
 
