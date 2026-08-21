@@ -37,10 +37,10 @@ COMMA_NUMBER_HEADERS = frozenset({"다운로드 수", "조회 수", "좋아요 �
 
 WORK_HEADERS = (
     "원본 도서명",
-    "보유 범위",
     "작가",
-    "통합 장르",
-    "장르 후보",
+    "장르",
+    "보유 범위",
+    "조회 수",
     "작품명",
     "장르",
     "다운로드 수",
@@ -350,13 +350,24 @@ def build_sheet_snapshot(
                 and by_platform[platform]["status"] == "ok"
             )
 
+            view_counts = [
+                row[field]
+                for row, field in (
+                    (series, "download_count"),
+                    (kakao, "view_count"),
+                    (novelpia, "view_count"),
+                )
+                if row is not None
+                and row["status"] == "ok"
+                and row[field] is not None
+            ]
+
             works_rows.append((
                 display_title,
-                range_text,
                 ", ".join(sorted(group["authors"])),
                 _empty(genre_resolution.canonical_genre),
-                " · ".join(genre_resolution.candidates)
-                if genre_resolution.review_required else "",
+                range_text,
+                sum(view_counts) if view_counts else "",
                 platform_field(series, "remote_title"),
                 platform_field(series, "genre"),
                 platform_field(series, "download_count"),
@@ -597,7 +608,7 @@ def _format_requests(
     errors: bool,
 ):
     header_row_count = 2 if group_headers is not None else 1
-    frozen_column_count = 1 if errors else min(3, column_count)
+    frozen_column_count = 1 if errors else min(5, column_count)
     requests = [
         {
             "updateSheetProperties": {
@@ -770,10 +781,8 @@ def _format_requests(
 
         for index, header in enumerate(headers):
             pixel_size = 250 if header in {"원본 도서명", "작품명"} else None
-            if header in {"보유 범위", "작가", "장르", "통합 장르", "평점", "링크"}:
+            if header in {"보유 범위", "작가", "장르", "평점", "링크"}:
                 pixel_size = 80
-            if header == "장르 후보":
-                pixel_size = 160
             if header in {"다운로드 수", "조회 수"}:
                 pixel_size = 90
             if pixel_size is not None:

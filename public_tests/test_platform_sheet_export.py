@@ -93,7 +93,7 @@ def test_sheet_projection_is_read_only_groups_titles_and_blanks_not_found(tmp_pa
     assert before == after
     assert snapshot.works.title == "도서 목록"
     assert snapshot.works.headers == (
-        "원본 도서명", "보유 범위", "작가", "통합 장르", "장르 후보",
+        "원본 도서명", "작가", "장르", "보유 범위", "조회 수",
         "작품명", "장르", "다운로드 수", "평점", "링크",
         "작품명", "장르", "조회 수", "평점", "태그", "링크",
         "작품명", "장르", "조회 수", "좋아요 수", "태그", "링크",
@@ -107,9 +107,10 @@ def test_sheet_projection_is_read_only_groups_titles_and_blanks_not_found(tmp_pa
     assert len(snapshot.works.rows) == 1
     work = snapshot.works.rows[0]
     assert work[0] == "합성 작품"
-    assert work[1] == "30화"
-    assert work[3] == "현대판타지"
-    assert work[4] == ""
+    assert work[1] == ""
+    assert work[2] == "현대판타지"
+    assert work[3] == "30화"
+    assert work[4] == 5801
     assert work[5] == "합성 작품"
     assert work[6] == "현판"
     assert work[7] == 1234
@@ -124,6 +125,48 @@ def test_sheet_projection_is_read_only_groups_titles_and_blanks_not_found(tmp_pa
     assert work[20] == "#판타지 #먼치킨"
     assert work[21] == "https://novelpia.example/1"
     assert snapshot.errors.rows == ()
+
+
+def test_sheet_integrated_view_count_sums_all_platforms_and_blanks_unknown(tmp_path):
+    state_db = _sheet_db(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        key = conn.execute(
+            "SELECT core_title FROM file_analysis ORDER BY core_title LIMIT 1"
+        ).fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            key,
+            [
+                platform_catalog.PlatformStat(
+                    "kakao",
+                    "ok",
+                    remote_id="2",
+                    remote_title="합성 작품",
+                    remote_url="https://kakao.example/2",
+                    view_count=99,
+                )
+            ],
+            now=datetime(2026, 7, 17, 2, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    assert platform_sheet_export.build_sheet_snapshot(state_db).works.rows[0][4] == 5900
+
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            conn.execute(
+                """
+                UPDATE catalog_platform_stats
+                SET status = 'not_found', download_count = NULL, view_count = NULL
+                """
+            )
+    finally:
+        conn.close()
+
+    assert platform_sheet_export.build_sheet_snapshot(state_db).works.rows[0][4] == ""
 
 
 def test_sheet_error_tab_contains_only_real_errors(tmp_path):
@@ -456,7 +499,7 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
         and request["updateSheetProperties"]["properties"]["sheetId"] == 100
         and "gridProperties" in request["updateSheetProperties"].get("fields", "")
     )
-    assert frozen == {"frozenRowCount": 2, "frozenColumnCount": 3}
+    assert frozen == {"frozenRowCount": 2, "frozenColumnCount": 5}
 
     work_filter = next(
         request["setBasicFilter"]["filter"]["range"]
@@ -476,7 +519,7 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
         if "mergeCells" in request
     ]
     assert merged_columns == [
-        (0, 3), (3, 5), (5, 10), (10, 16), (16, 22),
+        (0, 5), (5, 10), (10, 16), (16, 22),
     ]
 
     widths = {
@@ -486,7 +529,7 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
         if "updateDimensionProperties" in request
     }
     assert widths == {
-        0: 250, 1: 80, 2: 80, 3: 80, 4: 160,
+        0: 250, 1: 80, 2: 80, 3: 80, 4: 90,
         5: 250, 6: 80, 7: 90, 8: 80, 9: 80,
         10: 250, 11: 80, 12: 90, 13: 80, 15: 80,
         16: 250, 17: 80, 18: 90, 21: 80,
@@ -501,7 +544,7 @@ def test_grouped_work_headers_are_merged_frozen_filtered_and_sized():
     ]
     assert [
         request["range"]["startColumnIndex"] for request in comma_formats
-    ] == [7, 12, 18, 19]
+    ] == [4, 7, 12, 18, 19]
     assert all(request["range"]["startRowIndex"] == 2 for request in comma_formats)
     assert all(
         request["cell"]["userEnteredFormat"]["numberFormat"]

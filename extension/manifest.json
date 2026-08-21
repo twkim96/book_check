@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "중복 다운로드 방지 도우미",
-  "version": "2.10",
-  "description": "EnterJoy, Tcafe21, Pastebin에서 로컬 파일 리스트와 다운로드 기록을 통합 검색합니다.",
+  "version": "2.11",
+  "description": "EnterJoy, Tcafe21, Pastebin, Chating Wiki에서 로컬 파일 목록과 다운로드 기록을 통합 검색합니다.",
   "permissions": ["downloads", "storage", "unlimitedStorage", "declarativeNetRequest", "contextMenus"],
   "host_permissions": ["<all_urls>"],
   "declarative_net_request": {
@@ -33,7 +33,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "include_globs": ["*://*enterjoy*/*", "*://*tcafe21*/*", "*://*pastebin.com/*"],
+      "include_globs": ["*://*enterjoy*/*", "*://*tcafe21*/*", "*://*pastebin.com/*", "*://*chating.wiki/*"],
       "js": ["content.js"],
       "css": ["style.css"]
     }

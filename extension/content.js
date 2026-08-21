@@ -2,12 +2,15 @@
 // [수정됨] 여러 사이트 지원을 위한 셀렉터 목록
 // EnterJoy: .item-subject, 게시글 상세 제목
 // Tcafe21: .td_subject a, .list-subject a 등
+// Chating Wiki: 자료함 카드와 게시판 행의 제목 strong
 const SELECTORS = [
   ".item-subject",
   "#at-main > div.view-wrap > section > article > h1",
   ".td_subject a",
   ".list-subject a",
-  ".wr-subject a"
+  ".wr-subject a",
+  ".group-material-copy > strong",
+  ".cw-board-item__title > strong"
 ];
 const TARGET_SELECTOR = SELECTORS.join(", ");
 const CONTEXT_TARGET_SELECTORS = [
@@ -56,10 +59,22 @@ function getCleanTitle(titleEl) {
   });
 
   // 3. 텍스트만 추출하고 불필요한 공백/줄바꿈 정리
-  return clone.textContent
+  return normalizeSiteTitleText(titleEl, clone.textContent)
     .replace(/\n/g, " ") // 줄바꿈을 공백으로
     .replace(/\s+/g, " ") // 연속된 공백을 하나로
     .trim();
+}
+
+function normalizeSiteTitleText(titleEl, value) {
+  const text = String(value || "");
+  if (
+    titleEl &&
+    typeof titleEl.matches === "function" &&
+    titleEl.matches(".group-material-copy > strong")
+  ) {
+    return text.replace(/\+/g, " ");
+  }
+  return text;
 }
 
 function escapeHtml(value) {
@@ -90,15 +105,41 @@ function getSharedTooltip() {
   if (!sharedTooltip) {
     sharedTooltip = document.createElement("div");
     sharedTooltip.className = "dl-check-tooltip";
-    document.body.appendChild(sharedTooltip);
+    if (typeof sharedTooltip.showPopover === "function") {
+      sharedTooltip.setAttribute("popover", "manual");
+    }
+    document.documentElement.appendChild(sharedTooltip);
   }
   return sharedTooltip;
 }
 
 function positionTooltip(btn, tooltip) {
   const rect = btn.getBoundingClientRect();
-  tooltip.style.left = rect.left + window.scrollX + "px";
-  tooltip.style.top = rect.bottom + window.scrollY + 5 + "px";
+  tooltip.style.left = rect.left + "px";
+  tooltip.style.top = rect.bottom + 5 + "px";
+}
+
+function showSharedTooltip(btn, tooltip) {
+  positionTooltip(btn, tooltip);
+  tooltip.style.display = "block";
+  if (typeof tooltip.showPopover !== "function") return;
+  try {
+    if (!tooltip.matches(":popover-open")) tooltip.showPopover();
+  } catch (_error) {
+    tooltip.removeAttribute("popover");
+  }
+}
+
+function hideSharedTooltip(tooltip) {
+  if (!tooltip) return;
+  if (typeof tooltip.hidePopover === "function") {
+    try {
+      if (tooltip.matches(":popover-open")) tooltip.hidePopover();
+    } catch (_error) {
+      // The fixed max-z-index fallback is still hidden below.
+    }
+  }
+  tooltip.style.display = "none";
 }
 
 function getSearchCacheKey(query) {
@@ -252,13 +293,19 @@ function renderTooltip(tooltip, response) {
 
 function closeSelectionSearchModal() {
   if (!selectionSearchModal) return;
+  if (
+    selectionSearchModal.root.open &&
+    typeof selectionSearchModal.root.close === "function"
+  ) {
+    selectionSearchModal.root.close();
+  }
   selectionSearchModal.root.style.display = "none";
 }
 
 function getSelectionSearchModal() {
   if (selectionSearchModal) return selectionSearchModal;
 
-  const root = document.createElement("div");
+  const root = document.createElement("dialog");
   root.className = "dl-selection-search-modal";
   root.setAttribute("role", "dialog");
   root.setAttribute("aria-modal", "true");
@@ -270,6 +317,9 @@ function getSelectionSearchModal() {
         <button type="button" class="dl-selection-search-close" aria-label="닫기">×</button>
       </div>
       <div class="dl-selection-search-query"></div>
+      <div class="dl-selection-web-stats">
+        <div class="dl-check-tooltip"></div>
+      </div>
       <div class="dl-selection-search-results">
         <div class="dl-check-tooltip"></div>
       </div>
@@ -279,11 +329,17 @@ function getSelectionSearchModal() {
   const panel = root.querySelector(".dl-selection-search-panel");
   const closeBtn = root.querySelector(".dl-selection-search-close");
   const queryEl = root.querySelector(".dl-selection-search-query");
-  const resultsEl = root.querySelector(".dl-check-tooltip");
+  const webStatsWrap = root.querySelector(".dl-selection-web-stats");
+  const webStatsEl = webStatsWrap.querySelector(".dl-check-tooltip");
+  const resultsEl = root.querySelector(".dl-selection-search-results .dl-check-tooltip");
 
   closeBtn.addEventListener("click", closeSelectionSearchModal);
   root.addEventListener("click", (event) => {
     if (event.target === root) closeSelectionSearchModal();
+  });
+  root.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeSelectionSearchModal();
   });
   panel.addEventListener("click", (event) => event.stopPropagation());
   document.addEventListener("keydown", (event) => {
@@ -293,18 +349,36 @@ function getSelectionSearchModal() {
   });
 
   document.body.appendChild(root);
-  selectionSearchModal = { root, closeBtn, queryEl, resultsEl };
+  selectionSearchModal = {
+    root,
+    closeBtn,
+    queryEl,
+    webStatsWrap,
+    webStatsEl,
+    resultsEl,
+  };
   return selectionSearchModal;
 }
 
-function showSelectionSearch(query) {
+function showSelectionSearch(query, { includeWebStats = false } = {}) {
   const cleanQuery = String(query || "").replace(/\s+/g, " ").trim();
   if (!cleanQuery) return;
 
   const modal = getSelectionSearchModal();
   modal.queryEl.textContent = cleanQuery;
   modal.resultsEl.innerHTML = "<div class='loading'>파일 찾는 중...</div>";
+  modal.webStatsWrap.style.display = includeWebStats ? "block" : "none";
+  modal.webStatsEl.innerHTML = includeWebStats
+    ? "<div class='loading'>조회수·추천 찾는 중...</div>"
+    : "";
   modal.root.style.display = "flex";
+  if (!modal.root.open && typeof modal.root.showModal === "function") {
+    try {
+      modal.root.showModal();
+    } catch (_error) {
+      // Older/embedded pages can reject top-layer promotion; fixed max z-index remains.
+    }
+  }
   modal.closeBtn.focus();
 
   requestSearch(cleanQuery).then((response) => {
@@ -312,6 +386,18 @@ function showSelectionSearch(query) {
       renderTooltip(modal.resultsEl, response);
     }
   });
+
+  if (includeWebStats) {
+    requestWebStats(cleanQuery).then((response) => {
+      if (
+        modal.root.style.display !== "none" &&
+        modal.webStatsWrap.style.display !== "none" &&
+        modal.queryEl.textContent === cleanQuery
+      ) {
+        renderWebStatsTooltip(modal.webStatsEl, response);
+      }
+    });
+  }
 }
 
 function getSelectedPageText() {
@@ -342,7 +428,7 @@ document.addEventListener("contextmenu", (event) => {
 
   event.preventDefault();
   event.stopPropagation();
-  showSelectionSearch(lastContextSearchQuery);
+  showSelectionSearch(lastContextSearchQuery, { includeWebStats: true });
 }, true);
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -545,8 +631,7 @@ function addCheckButtons() {
       const tooltip = getSharedTooltip();
       activeTooltipOwner = googleBtn;
       webStatsVisible = true;
-      positionTooltip(googleBtn, tooltip);
-      tooltip.style.display = "block";
+      showSharedTooltip(googleBtn, tooltip);
       tooltip.innerHTML = "<div class='loading'>웹 정보 찾는 중...</div>";
 
       const currentQuery = getCleanTitle(titleEl);
@@ -560,7 +645,7 @@ function addCheckButtons() {
     googleBtn.addEventListener("mouseleave", () => {
       webStatsVisible = false;
       if (activeTooltipOwner === googleBtn && sharedTooltip) {
-        sharedTooltip.style.display = "none";
+        hideSharedTooltip(sharedTooltip);
         activeTooltipOwner = null;
       }
     });
@@ -570,8 +655,7 @@ function addCheckButtons() {
       const tooltip = getSharedTooltip();
       activeTooltipOwner = btn;
       tooltipVisible = true;
-      positionTooltip(btn, tooltip);
-      tooltip.style.display = "block";
+      showSharedTooltip(btn, tooltip);
 
       const currentQuery = getCleanTitle(titleEl);
       if (latestResponse && latestQuery === currentQuery && latestVersion === searchCacheVersion) {
@@ -591,7 +675,7 @@ function addCheckButtons() {
     btn.addEventListener("mouseleave", () => {
       tooltipVisible = false;
       if (activeTooltipOwner === btn && sharedTooltip) {
-        sharedTooltip.style.display = "none";
+        hideSharedTooltip(sharedTooltip);
         activeTooltipOwner = null;
       }
     });
