@@ -149,6 +149,7 @@ def test_file_metadata_rekey_preserves_success_and_drops_failed_lookup(tmp_path)
             [
                 _identified_stat(
                     "series", remote_title="최강 헌터의 자화상 1",
+                    cover_url="https://images.example/rekey-cover.jpg",
                     download_count=125_000, rating=9.8,
                 ),
                 platform_catalog.PlatformStat("kakao", "not_found"),
@@ -177,11 +178,14 @@ def test_file_metadata_rekey_preserves_success_and_drops_failed_lookup(tmp_path)
             "SELECT COUNT(*) FROM catalog_titles WHERE title_key = ?", (old_key,)
         ).fetchone()[0] == 0
         series = conn.execute(
-            "SELECT status, download_count, rating FROM catalog_platform_stats "
+            "SELECT status, download_count, rating, cover_url "
+            "FROM catalog_platform_stats "
             "WHERE title_key = ? AND platform = 'series'",
             (new_key,),
         ).fetchone()
-        assert tuple(series) == ("ok", 125_000, 9.8)
+        assert tuple(series) == (
+            "ok", 125_000, 9.8, "https://images.example/rekey-cover.jpg"
+        )
         assert conn.execute(
             "SELECT COUNT(*) FROM catalog_platform_stats "
             "WHERE title_key = ? AND platform = 'kakao'",

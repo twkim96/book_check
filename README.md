@@ -826,6 +826,24 @@ approved·active run 및 unfinished operation/group 0, platform-update target 0�
 서버/UI 버전은 `1.4.23`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive 계약은
 1.4.22와 동일하다.
 
+### 1.4.24 플랫폼별 표지 URL 메타데이터
+
+1.4.24는 `catalog_platform_stats`에 nullable `cover_url`을 추가한다. schema는 `v17`이며 기존 v16
+DB는 backup-owning 플랫폼 카탈로그 진입점에서 마이그레이션한 뒤 사용한다. 저장값은 `https://`
+직접 이미지 URL만 허용하고, 확실한 대표 표지가 없으면 `NULL`을 유지한다. 이미지 바이너리는
+다운로드하거나 SQLite에 저장하지 않는다.
+
+- 네이버 시리즈는 기존 작품 상세 HTML의 `og:image`를 사용한다.
+- 카카오페이지는 기존 overview JSON의 작품 `thumbnail` 키를 카카오 이미지 CDN의 원본 `o1`
+  직접 URL로 만든다.
+- 노벨피아는 작품 상세 HTML의 `og:image`를 우선하고, 상세 표지를 읽지 못했을 때만 검색 응답의
+  명시적 표지 필드를 보조값으로 사용한다.
+- 최초 수집, 기존 성공 행 지표 갱신, 장르·태그 메타데이터 갱신 모두 같은 remote identity의
+  `cover_url`을 함께 교체한다. 실패 응답은 기존 성공 행을 보존하며 플랫폼 간 표지는 합치지 않는다.
+
+서버/UI 버전은 `1.4.24`, SQLite schema는 `v17`이다. normalizer/fingerprint/pair/auditor/archive
+계약과 Sheet 1.4.23 계약은 그대로 유지한다.
+
 ## 구조
 
 ```text

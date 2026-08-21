@@ -222,7 +222,7 @@ def test_v15_migration_retires_legacy_title_real_path(tmp_path):
         fixture["state_db"], migrate=True
     )
     try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 17
         old = migrated.execute(
             "SELECT canonical_path, active FROM files WHERE file_id = ?",
             (fixture["old_file_id"],),

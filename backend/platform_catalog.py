@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 import decision_store
@@ -268,11 +268,11 @@ class AuthenticatedNovelpiaClient:
         if not remote_id_text:
             return _error("novelpia", RuntimeError("stored remote ID is missing"))
         try:
-            tags = _parse_novelpia_tags(
-                self.fetch_text(
-                    f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout
-                )
+            detail_page = self.fetch_text(
+                f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout
             )
+            tags = _parse_novelpia_tags(detail_page)
+            cover_url = _parse_open_graph_cover(detail_page)
         except NovelpiaAuthenticationError:
             raise
         except Exception as exc:
@@ -283,6 +283,7 @@ class AuthenticatedNovelpiaClient:
             remote_id=remote_id_text,
             remote_title=str(remote_title or title).strip(),
             remote_url=f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}",
+            cover_url=cover_url,
             genre=tags[0] if tags else "",
             tags=tags,
             metadata_lookup_mode="authenticated",
@@ -417,6 +418,7 @@ class PlatformStat:
     remote_id: Optional[str] = None
     remote_title: Optional[str] = None
     remote_url: Optional[str] = None
+    cover_url: Optional[str] = None
     download_count: Optional[int] = None
     view_count: Optional[int] = None
     recommend_count: Optional[int] = None
@@ -653,6 +655,46 @@ def _normalize_tags(values: Iterable[str]) -> Tuple[str, ...]:
         seen.add(tag)
         tags.append(tag)
     return tuple(tags)
+
+
+def _normalize_cover_url(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    url = html.unescape(str(value)).strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        return None
+    return url
+
+
+def _parse_open_graph_cover(page: str) -> Optional[str]:
+    for pattern in (
+        r"<meta\b[^>]*(?:property|name)=[\"'](?:og:image|og:image:secure_url)"
+        r"[\"'][^>]*content=[\"']([^\"']+)[\"']",
+        r"<meta\b[^>]*content=[\"']([^\"']+)[\"'][^>]*"
+        r"(?:property|name)=[\"'](?:og:image|og:image:secure_url)[\"']",
+    ):
+        match = re.search(pattern, page, flags=re.IGNORECASE)
+        if match:
+            cover_url = _normalize_cover_url(match.group(1))
+            if cover_url is not None:
+                return cover_url
+    return None
+
+
+def _kakao_cover_url(value: object) -> Optional[str]:
+    direct = _normalize_cover_url(value)
+    if direct is not None:
+        return direct
+    image_key = str(value or "").strip()
+    if not image_key or "://" in image_key:
+        return None
+    return "https://dn-img-page.kakao.com/download/resource?" + urlencode({
+        "kid": image_key,
+        "filename": "o1",
+    })
 
 
 def _has_metrics(stat: PlatformStat) -> bool:
@@ -1520,6 +1562,11 @@ def _validate_stat(
             )
         if require_metrics and not _has_metrics(stat):
             raise ValueError("ok platform stat requires at least one metric")
+    if stat.cover_url is not None:
+        cover_url = _normalize_cover_url(stat.cover_url)
+        if cover_url is None:
+            raise ValueError("cover_url must be a direct https URL")
+        stat = replace(stat, cover_url=cover_url)
     if stat.genre is not None:
         stat = replace(stat, genre=_normalize_genre(stat.genre))
     if stat.tags is not None:
@@ -1613,7 +1660,7 @@ def record_platform_metadata_results(
                 return {stat.platform: "stale_target" for stat in validated}
         for stat in validated:
             row = conn.execute(
-                "SELECT status, remote_id, remote_title, remote_url "
+                "SELECT status, remote_id, remote_title, remote_url, cover_url "
                 "FROM catalog_platform_stats WHERE title_key = ? AND platform = ?",
                 (title_key, stat.platform),
             ).fetchone()
@@ -1665,7 +1712,18 @@ def record_platform_metadata_results(
                     ),
                 )
 
-            updated = False
+            cover_changed = stat.cover_url != row["cover_url"]
+            if cover_changed:
+                conn.execute(
+                    """
+                    UPDATE catalog_platform_stats
+                    SET cover_url = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE title_key = ? AND platform = ? AND remote_id = ?
+                    """,
+                    (stat.cover_url, title_key, stat.platform, row["remote_id"]),
+                )
+
+            updated = cover_changed
             if stat.genre is not None:
                 _replace_platform_genre(
                     conn,
@@ -1809,13 +1867,15 @@ def record_platform_stats(
                     """
                     INSERT INTO catalog_platform_stats(
                         title_key, platform, status, remote_id, remote_title, remote_url,
+                        cover_url,
                         download_count, view_count, recommend_count, rating, rating_count,
                         last_attempt_at, last_success_at, retry_after, error_message
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         title_key, stat.platform, stat.status,
                         stat.remote_id, stat.remote_title, stat.remote_url,
+                        stat.cover_url,
                         stat.download_count, stat.view_count, stat.recommend_count,
                         stat.rating, stat.rating_count, attempted_at, success_at,
                         next_retry, stat.message or None,
@@ -1855,6 +1915,7 @@ def record_platform_stats(
                     UPDATE catalog_platform_stats
                     SET remote_title = COALESCE(?, remote_title),
                         remote_url = COALESCE(?, remote_url),
+                        cover_url = ?,
                         download_count = ?, view_count = ?, recommend_count = ?,
                         rating = ?, rating_count = ?, last_attempt_at = ?,
                         last_success_at = ?, retry_after = NULL, error_message = NULL,
@@ -1862,7 +1923,7 @@ def record_platform_stats(
                     WHERE title_key = ? AND platform = ? AND status = 'ok' AND remote_id = ?
                     """,
                     (
-                        stat.remote_title, stat.remote_url,
+                        stat.remote_title, stat.remote_url, stat.cover_url,
                         _monotonic_count(row["download_count"], stat.download_count),
                         _monotonic_count(row["view_count"], stat.view_count),
                         _monotonic_count(row["recommend_count"], stat.recommend_count),
@@ -1896,6 +1957,7 @@ def record_platform_stats(
                         """
                         UPDATE catalog_platform_stats
                         SET status = 'ok', remote_id = ?, remote_title = ?, remote_url = ?,
+                            cover_url = ?,
                             download_count = ?, view_count = ?, recommend_count = ?,
                             rating = ?, rating_count = ?, last_attempt_at = ?,
                             last_success_at = ?, retry_after = NULL, error_message = NULL,
@@ -1904,6 +1966,7 @@ def record_platform_stats(
                         """,
                         (
                             stat.remote_id, stat.remote_title, stat.remote_url,
+                            stat.cover_url,
                             _monotonic_count(row["download_count"], stat.download_count)
                             if preserve_metrics else stat.download_count,
                             _monotonic_count(row["view_count"], stat.view_count)
@@ -2002,6 +2065,7 @@ def invalidate_platform_identity(
                 "remote_id",
                 "remote_title",
                 "remote_url",
+                "cover_url",
                 "download_count",
                 "view_count",
                 "recommend_count",
@@ -2162,12 +2226,14 @@ def record_increased_platform_stats(
             increased = (
                 _growth_metric_increased(row, stat) if has_growth_metric else False
             )
-            if increased:
+            cover_changed = stat.cover_url != row["cover_url"]
+            if increased or cover_changed:
                 conn.execute(
                     """
                     UPDATE catalog_platform_stats
                     SET remote_title = COALESCE(?, remote_title),
                         remote_url = COALESCE(?, remote_url),
+                        cover_url = ?,
                         download_count = ?, view_count = ?, recommend_count = ?,
                         rating = ?, rating_count = ?,
                         last_attempt_at = ?, last_success_at = ?, retry_after = NULL,
@@ -2178,6 +2244,7 @@ def record_increased_platform_stats(
                     (
                         stat.remote_title,
                         stat.remote_url,
+                        stat.cover_url,
                         _monotonic_count(row["download_count"], stat.download_count),
                         _monotonic_count(row["view_count"], stat.view_count),
                         _monotonic_count(
@@ -2265,7 +2332,9 @@ def _parse_series_genre(page: str) -> Optional[str]:
     return _normalize_genre(_strip_tags(genre.group(1))) if genre else None
 
 
-def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float], Optional[str]]:
+def _parse_series_detail(
+    page: str,
+) -> Tuple[str, Optional[int], Optional[float], Optional[str], Optional[str]]:
     title_match = (
         re.search(r"<meta[^>]+property=[\"']og:title[\"'][^>]+content=[\"']([^\"']+)[\"']", page, flags=re.IGNORECASE)
         or re.search(r"<meta[^>]+content=[\"']([^\"']+)[\"'][^>]+property=[\"']og:title[\"']", page, flags=re.IGNORECASE)
@@ -2288,6 +2357,7 @@ def _parse_series_detail(page: str) -> Tuple[str, Optional[int], Optional[float]
         _count(_strip_tags(download.group(1))) if download else None,
         _rating(rating.group(1), maximum=RATING_SCALES["series"]) if rating else None,
         _parse_series_genre(page),
+        _parse_open_graph_cover(page),
     )
 
 
@@ -2308,7 +2378,7 @@ def _lookup_series_remote(
     detail_url = "https://series.naver.com/novel/detail.series?" + urlencode(
         {"productNo": remote_id}
     )
-    detail_title, download_count, rating, genre = _parse_series_detail(
+    detail_title, download_count, rating, genre, cover_url = _parse_series_detail(
         fetch_text(detail_url, timeout)
     )
     if _series_detail_is_unavailable(detail_title):
@@ -2324,6 +2394,7 @@ def _lookup_series_remote(
         remote_id=str(remote_id),
         remote_title=matched_title,
         remote_url=detail_url,
+        cover_url=cover_url,
         download_count=download_count,
         rating=rating,
         genre=genre,
@@ -2342,7 +2413,7 @@ def _lookup_series_metadata_remote(
     detail_url = "https://series.naver.com/novel/detail.series?" + urlencode(
         {"productNo": remote_id}
     )
-    detail_title, _download_count, _rating_value, genre = _parse_series_detail(
+    detail_title, _download_count, _rating_value, genre, cover_url = _parse_series_detail(
         fetch_text(detail_url, timeout)
     )
     if not detail_title:
@@ -2357,6 +2428,7 @@ def _lookup_series_metadata_remote(
         remote_id=str(remote_id),
         remote_title=detail_title,
         remote_url=detail_url,
+        cover_url=cover_url,
         genre=genre,
     )
 
@@ -2423,7 +2495,9 @@ def _kakao_api_candidates(data: object) -> List[Dict[str, object]]:
 
 def _parse_kakao_overview(
     data: object,
-) -> Tuple[str, Optional[int], Optional[float], Optional[int], Optional[str]]:
+) -> Tuple[
+    str, Optional[int], Optional[float], Optional[int], Optional[str], Optional[str]
+]:
     result = data.get("result") if isinstance(data, dict) else None
     content = result.get("content") if isinstance(result, dict) else None
     if not isinstance(content, dict):
@@ -2442,6 +2516,7 @@ def _parse_kakao_overview(
         _rating(rating_value, maximum=RATING_SCALES["kakao"]),
         rating_count,
         _normalize_genre(str(genre_value)) if genre_value is not None else None,
+        _kakao_cover_url(_first_value(content, ("thumbnail", "coverImage", "image"))),
     )
 
 
@@ -2479,7 +2554,7 @@ def _lookup_kakao_remote(
         f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/overview?"
         + urlencode({"series_id": content_id})
     )
-    detail_title, views, rating, rating_count, genre = _parse_kakao_overview(
+    detail_title, views, rating, rating_count, genre, cover_url = _parse_kakao_overview(
         fetch_json(overview_url, timeout)
     )
     matched_title = detail_title
@@ -2504,6 +2579,7 @@ def _lookup_kakao_remote(
         remote_id=content_id,
         remote_title=matched_title,
         remote_url=detail_url,
+        cover_url=cover_url,
         view_count=views if views is not None else fallback_view_count,
         rating=rating,
         rating_count=rating_count,
@@ -2526,7 +2602,7 @@ def _lookup_kakao_metadata_remote(
         f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/overview?"
         + urlencode({"series_id": content_id})
     )
-    detail_title, _views, _rating, _rating_count, genre = _parse_kakao_overview(
+    detail_title, _views, _rating, _rating_count, genre, cover_url = _parse_kakao_overview(
         fetch_json(overview_url, timeout)
     )
     if not detail_title:
@@ -2544,6 +2620,7 @@ def _lookup_kakao_metadata_remote(
         remote_id=content_id,
         remote_title=detail_title,
         remote_url=f"https://page.kakao.com/content/{content_id}",
+        cover_url=cover_url,
         genre=genre,
         tags=tags,
     )
@@ -2634,6 +2711,21 @@ def _parse_novelpia_tags(page: str) -> Tuple[str, ...]:
     return _normalize_tags(values)
 
 
+def _novelpia_search_cover(record: object) -> Optional[str]:
+    if not isinstance(record, dict):
+        return None
+    value = _first_value(record, (
+        "cover_url", "coverUrl", "novel_thumb_all", "novelThumbAll",
+        "novel_thumb", "novelThumb",
+    ))
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.startswith("/") and not text.startswith("//"):
+        text = urljoin(_NOVELPIA_ORIGIN + "/", text)
+    return _normalize_cover_url(text)
+
+
 def lookup_novelpia(
     title: str,
     fetch_json: Callable[[str, float], object] = _http_json,
@@ -2694,18 +2786,27 @@ def lookup_novelpia(
         tags = _novelpia_genre_tags(candidate)
     except Exception:
         tags = None
+    cover_url = _novelpia_search_cover(candidate)
     detail_fetch = fetch_text
-    if tags is None:
-        if detail_fetch is None and fetch_json is _http_json:
-            detail_fetch = _http_text
-        if remote_id_text and detail_fetch is not None:
-            try:
-                tags = _parse_novelpia_tags(
-                    detail_fetch(f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout)
-                )
-            except Exception:
-                # Search metrics remain valid even if optional metadata cannot be read.
-                tags = None
+    if detail_fetch is None and fetch_json is _http_json:
+        detail_fetch = _http_text
+    if remote_id_text and detail_fetch is not None:
+        try:
+            detail_page = detail_fetch(
+                f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout
+            )
+        except Exception:
+            # Search metrics and an authoritative search cover remain usable.
+            detail_page = None
+        if detail_page is not None:
+            detail_cover = _parse_open_graph_cover(detail_page)
+            if detail_cover is not None:
+                cover_url = detail_cover
+            if tags is None:
+                try:
+                    tags = _parse_novelpia_tags(detail_page)
+                except Exception:
+                    tags = None
     genre = tags[0] if tags else ("" if tags is not None else None)
     stat = PlatformStat(
         platform="novelpia",
@@ -2713,6 +2814,7 @@ def lookup_novelpia(
         remote_id=remote_id_text,
         remote_title=_novelpia_title(candidate),
         remote_url=(f"https://novelpia.com/novel/{remote_id_text}" if remote_id_text else None),
+        cover_url=cover_url,
         view_count=_count(_first_value(candidate, ("count_view", "view_count", "viewCount", "hit", "hits"))),
         recommend_count=_count(_first_value(candidate, ("count_good", "good_count", "goodCount", "recommend", "recommend_count"))),
         rating=_rating(_first_value(candidate, ("rating", "rating_average", "ratingAverage", "score"))),

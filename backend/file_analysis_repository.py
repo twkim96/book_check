@@ -647,7 +647,7 @@ def migrate_catalog_title_keys(
     ambiguous_success_rows_discarded = 0
 
     stat_columns = (
-        "platform, status, remote_id, remote_title, remote_url, "
+        "platform, status, remote_id, remote_title, remote_url, cover_url, "
         "download_count, interest_count, view_count, recommend_count, "
         "rating, rating_count, genre, genre_collected_at, tags_collected_at, last_attempt_at, "
         "last_success_at, retry_after, error_message, created_at, updated_at"

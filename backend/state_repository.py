@@ -569,6 +569,35 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 16")
         conn.commit()
         version = 16
+    if version == 16:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(catalog_platform_stats)")
+        }
+        if "cover_url" not in columns:
+            conn.execute(
+                "ALTER TABLE catalog_platform_stats ADD COLUMN cover_url TEXT "
+                "CHECK (cover_url IS NULL OR cover_url LIKE 'https://%')"
+            )
+        conn.executescript(CATALOG_SCHEMA_SQL)
+        conn.execute(
+            """
+            UPDATE actual_runs
+            SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                error = 'schema v17 migration invalidated unfinished authorization'
+            WHERE state IN ('approved', 'active')
+            """
+        )
+        conn.execute(
+            "DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')"
+        )
+        conn.execute(
+            "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+            "WHERE key = 'actual_mutation_enabled'"
+        )
+        conn.execute("PRAGMA user_version = 17")
+        conn.commit()
+        version = 17
     schema_validator(conn, check_integrity=check_integrity)
     return conn
 
@@ -626,7 +655,7 @@ def validate_schema(
         },
         "catalog_platform_stats": {
             "title_key", "platform", "status", "genre", "genre_collected_at",
-            "tags_collected_at",
+            "tags_collected_at", "cover_url",
         },
         "catalog_platform_tags": {
             "title_key", "platform", "tag", "position",

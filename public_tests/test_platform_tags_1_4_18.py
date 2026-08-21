@@ -47,10 +47,10 @@ def _tags(conn, platform):
     ]
 
 
-def test_schema_v16_has_normalized_platform_tag_table(tmp_path):
+def test_current_schema_has_normalized_platform_tag_table(tmp_path):
     _db_path, conn = _catalog_db(tmp_path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(catalog_platform_stats)")
         }
@@ -87,7 +87,7 @@ def test_v15_migrates_tags_schema_without_changing_existing_stat(tmp_path):
 
     migrated = decision_store.initialize_state_db(db_path, migrate=True)
     try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 17
         assert migrated.execute(
             "SELECT view_count FROM catalog_platform_stats "
             "WHERE title_key = '작품' AND platform = 'kakao'"

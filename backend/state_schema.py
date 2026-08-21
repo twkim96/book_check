@@ -6,7 +6,7 @@ This module is declarative: importing it must never open or migrate SQLite.
 from __future__ import annotations
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 ASSIGNMENT_STATES = (
     "unassigned",
     "managed",
@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS catalog_platform_stats (
     remote_id TEXT,
     remote_title TEXT,
     remote_url TEXT,
+    cover_url TEXT CHECK (cover_url IS NULL OR cover_url LIKE 'https://%'),
     download_count INTEGER CHECK (download_count IS NULL OR download_count >= 0),
     -- v8 compatibility column. New writes use download_count.
     interest_count INTEGER CHECK (interest_count IS NULL OR interest_count >= 0),
