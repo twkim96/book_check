@@ -85,7 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     refresh_tags = subparsers.add_parser(
         "refresh-metadata",
-        help="기존 성공 행 중 아직 장르/태그 snapshot이 없는 플랫폼 메타데이터만 채웁니다.",
+        help=(
+            "기존 성공 행 중 표지/장르/태그가 누락된 플랫폼 메타데이터만 "
+            "저장 remote ID로 채웁니다."
+        ),
     )
     refresh_tags.add_argument(
         "--limit", type=int, default=platform_catalog.DEFAULT_LIMIT
@@ -101,7 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout", type=float, default=platform_catalog.DEFAULT_TIMEOUT_SECONDS
     )
     refresh_tags.add_argument(
-        "--dry-run", action="store_true", help="DB/네트워크 변경 없이 미수집 장르/태그 대상만 확인"
+        "--dry-run", action="store_true",
+        help="DB/네트워크 변경 없이 미수집 표지/장르/태그 대상만 확인",
     )
     refresh_tags.add_argument(
         "--require-novelpia-auth", action="store_true",
@@ -982,7 +986,7 @@ def run(args: argparse.Namespace, *, progress=None):
             if auth_client is not None:
                 auth_client.login()
             backup, metadata = sync_file_metadata(args.state_db, progress=progress)
-            with _platform_refresh_lock(args.state_db, "platform-tag-backfill"):
+            with _platform_refresh_lock(args.state_db, "platform-metadata-backfill"):
                 result = platform_catalog.refresh_missing_metadata(
                     args.state_db,
                     limit=limit,

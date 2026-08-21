@@ -4,6 +4,7 @@ import pytest
 
 import decision_store
 import platform_catalog
+import run_platform_catalog
 
 
 def _catalog_db(tmp_path):
@@ -177,3 +178,112 @@ def test_existing_refresh_writers_replace_and_clear_cover_url(tmp_path):
         ).fetchone()[0] is None
     finally:
         conn.close()
+
+
+def test_cover_null_success_rows_are_metadata_backfill_targets(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    book = house / "표지 대상 1-10화.txt"
+    book.write_text("fixture", encoding="utf-8")
+    db_path = tmp_path / ".dedup_state" / "backfill.sqlite3"
+    conn = decision_store.initialize_state_db(db_path)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, book, source="house")
+        platform_catalog.sync_catalog_titles(conn)
+        title_key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            title_key,
+            [
+                _stat("series", None, download_count=10, genre="판타지"),
+                _stat(
+                    "kakao", "https://images.example/kakao.jpg",
+                    view_count=20, genre="판타지", tags=(),
+                ),
+                _stat(
+                    "novelpia", None, view_count=30, genre="판타지", tags=(),
+                ),
+            ],
+        )
+        [target] = platform_catalog.select_metadata_backfill_targets(conn)
+        assert target.platforms == ("series", "novelpia")
+    finally:
+        conn.close()
+
+
+def test_novelpia_metadata_backfill_uses_stored_id_without_search():
+    calls = []
+
+    def fetch_text(url, _timeout):
+        calls.append(url)
+        assert url == "https://novelpia.com/novel/33"
+        return (
+            '<meta property="og:image" content="https://images.example/novelpia.jpg">'
+            '<p class="writer-tag"><span class="tag">#판타지</span></p>'
+        )
+
+    [result] = platform_catalog.lookup_platform_metadata(
+        "검색하면 안 되는 제목",
+        ("novelpia",),
+        remote_ids={"novelpia": "33"},
+        remote_titles={"novelpia": "저장된 원격 제목"},
+        fetch_text=fetch_text,
+        fetch_json=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("NovelPia title search must not run")
+        ),
+        timeout=1,
+    )
+
+    assert calls == ["https://novelpia.com/novel/33"]
+    assert result.status == "ok"
+    assert result.remote_id == "33"
+    assert result.remote_title == "저장된 원격 제목"
+    assert result.cover_url == "https://images.example/novelpia.jpg"
+    assert result.metadata_lookup_mode == "direct"
+
+
+def test_metadata_backfill_reports_cover_missing_reason(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    book = house / "표지 없음 1-10화.txt"
+    book.write_text("fixture", encoding="utf-8")
+    db_path = tmp_path / ".dedup_state" / "failure-reason.sqlite3"
+    conn = decision_store.initialize_state_db(db_path)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, book, source="house")
+        platform_catalog.sync_catalog_titles(conn)
+        title_key = conn.execute("SELECT title_key FROM catalog_titles").fetchone()[0]
+        platform_catalog.record_platform_stats(
+            conn,
+            title_key,
+            [_stat("series", None, download_count=10, genre="판타지")],
+        )
+    finally:
+        conn.close()
+
+    result = platform_catalog.refresh_missing_metadata(
+        str(db_path),
+        limit=None,
+        delay_seconds=0,
+        lookup=lambda _title, platforms, **_kwargs: [
+            _stat(platform, None, genre="판타지") for platform in platforms
+        ],
+    )
+
+    assert result["failure_reasons"] == [{
+        "platform": "series",
+        "outcome": "updated",
+        "reason": "no https cover in metadata response",
+        "count": 1,
+    }]
+
+
+def test_refresh_metadata_help_names_cover_genre_tag_backfill(capsys):
+    parser = run_platform_catalog.build_parser()
+    with pytest.raises(SystemExit) as raised:
+        parser.parse_args(["refresh-metadata", "--help"])
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "표지/장르/태그" in help_text

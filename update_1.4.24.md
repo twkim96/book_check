@@ -25,6 +25,8 @@ Kakao, NovelPia 수집기가 기존 작품 상세/overview 응답에서 대표 �
 - 최초 플랫폼 성공 row insert 시 `cover_url` 저장
 - 같은 remote ID의 일반 갱신, 증가형 기존 지표 갱신, 장르·태그 메타데이터 갱신에서
   `cover_url`도 최신 응답값으로 교체
+- `refresh-metadata`는 `status='ok' AND cover_url IS NULL`도 대상으로 포함하고 Series/Kakao/NovelPia
+  모두 저장된 `remote_id` 상세에서 표지/장르/태그만 갱신한다. popularity 수치는 건드리지 않는다.
 - 성공한 동일 identity 응답에서 표지가 사라지면 추측값을 보존하지 않고 `NULL`로 갱신
 - transport/parser/identity 실패는 기존 성공 row와 표지 URL을 보존
 - normalizer rekey가 성공 플랫폼 row를 옮길 때 `cover_url`도 함께 보존
@@ -46,7 +48,7 @@ Kakao, NovelPia 수집기가 기존 작품 상세/overview 응답에서 대표 �
 
 ## 완료 검증
 
-- Python 전체 회귀: **1028 passed**, urllib3/LibreSSL 환경 warning 1건
+- Python 전체 회귀: **1032 passed**, urllib3/LibreSSL 환경 warning 1건
 - frontend 1.4.24 typecheck/build: PASS
 - 변경 backend/new fixture pyflakes, compileall, `git diff --check`: PASS
 - 실제 parser live response: Series/Kakao/NovelPia 모두 `status=ok`, `https://` cover 반환
@@ -65,3 +67,9 @@ Kakao, NovelPia 수집기가 기존 작품 상세/overview 응답에서 대표 �
 
 세 URL 모두 실제 요청 200을 확인했다. 현재 `cover_url IS NOT NULL AND cover_url NOT LIKE
 'https://%'` row는 0건이다.
+
+## 전체 backfill follow-up
+
+- `file-metadata-sync`로 stale/unindexed active file을 먼저 정상 수렴
+- PM2의 기존 NovelPia 자격 증명을 사용하는 Control Server `platform-metadata` 전체 작업으로 실행
+- 완료 후 플랫폼별 `ok / cover 있음 / cover NULL`과 `failure_reasons`를 기록

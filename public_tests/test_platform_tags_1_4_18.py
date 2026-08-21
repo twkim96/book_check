@@ -558,8 +558,16 @@ def test_metadata_backfill_reuses_stored_remote_ids(tmp_path, monkeypatch):
 
     captured = []
 
-    def metadata_lookup(title, platforms, *, remote_ids, timeout):
-        captured.append((title, tuple(platforms), dict(remote_ids or {}), timeout))
+    def metadata_lookup(
+        title, platforms, *, remote_ids, remote_titles, timeout
+    ):
+        captured.append((
+            title,
+            tuple(platforms),
+            dict(remote_ids or {}),
+            dict(remote_titles or {}),
+            timeout,
+        ))
         ids = {"series": "9197875", "kakao": "69475645"}
         return [
             platform_catalog.PlatformStat(
@@ -584,12 +592,16 @@ def test_metadata_backfill_reuses_stored_remote_ids(tmp_path, monkeypatch):
     )
     assert result["selected_titles"] == 1
     assert len(captured) == 1
-    _title, platforms, hints, timeout = captured[0]
+    _title, platforms, hints, remote_titles, timeout = captured[0]
     assert platforms == ("series", "kakao")
     assert timeout == 1
     assert hints == {
         "series": "9197875",
         "kakao": "69475645",
+    }
+    assert remote_titles == {
+        "series": "원격 ID 작품",
+        "kakao": "원격 ID 작품",
     }
 
 
@@ -620,6 +632,7 @@ def test_metadata_backfill_targets_missing_genre_or_tags_and_preserves_metrics(t
                 platform_catalog.PlatformStat(
                     "novelpia", "ok", remote_id="33", remote_title="태그 작품",
                     view_count=200, recommend_count=20,
+                    cover_url="https://images.example/novelpia.jpg",
                     genre="판타지", tags=(),
                 ),
             ],
@@ -637,10 +650,12 @@ def test_metadata_backfill_targets_missing_genre_or_tags_and_preserves_metrics(t
         values = {
             "series": platform_catalog.PlatformStat(
                 "series", "ok", remote_id="11", remote_title="태그 작품",
+                cover_url="https://images.example/series.jpg",
                 download_count=999, rating=9.9, genre="현판"
             ),
             "kakao": platform_catalog.PlatformStat(
                 "kakao", "ok", remote_id="22", remote_title="태그 작품",
+                cover_url="https://images.example/kakao.jpg",
                 view_count=999, rating=9.9,
                 genre="판타지", tags=("게임", "성장", "게임"),
             ),
@@ -902,10 +917,12 @@ def test_metadata_auth_success_fills_novelpia_tags_without_changing_metrics(tmp_
             [
                 platform_catalog.PlatformStat(
                     "series", "ok", remote_id="11", remote_title="인증 메타데이터",
+                    cover_url="https://images.example/series.jpg",
                     download_count=10, genre="현판",
                 ),
                 platform_catalog.PlatformStat(
                     "kakao", "ok", remote_id="22", remote_title="인증 메타데이터",
+                    cover_url="https://images.example/kakao.jpg",
                     view_count=20, genre="판타지", tags=("성장",),
                 ),
                 platform_catalog.PlatformStat(
@@ -937,6 +954,7 @@ def test_metadata_auth_success_fills_novelpia_tags_without_changing_metrics(tmp_
             auth_calls.append((list(items), timeout, delay_seconds))
             return [platform_catalog.PlatformStat(
                 "novelpia", "ok", remote_id="33", remote_title="인증 메타데이터",
+                cover_url="https://images.example/novelpia.jpg",
                 genre="판타지", tags=("판타지", "성인", "집착"),
                 metadata_lookup_mode="authenticated",
             )]

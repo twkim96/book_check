@@ -271,12 +271,20 @@ class AuthenticatedNovelpiaClient:
             detail_page = self.fetch_text(
                 f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}", timeout
             )
-            tags = _parse_novelpia_tags(detail_page)
-            cover_url = _parse_open_graph_cover(detail_page)
         except NovelpiaAuthenticationError:
             raise
         except Exception as exc:
             return _error("novelpia", exc)
+        cover_url = _parse_open_graph_cover(detail_page)
+        try:
+            tags = _parse_novelpia_tags(detail_page)
+        except Exception:
+            tags = None
+        if cover_url is None and tags is None:
+            return _error(
+                "novelpia",
+                RuntimeError("NovelPia detail response has no cover or tag metadata"),
+            )
         return PlatformStat(
             platform="novelpia",
             status="ok",
@@ -284,8 +292,9 @@ class AuthenticatedNovelpiaClient:
             remote_title=str(remote_title or title).strip(),
             remote_url=f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}",
             cover_url=cover_url,
-            genre=tags[0] if tags else "",
+            genre=(tags[0] if tags else "") if tags is not None else None,
             tags=tags,
+            message=("" if cover_url is not None else "no https cover in detail response"),
             metadata_lookup_mode="authenticated",
         )
 
@@ -1348,7 +1357,7 @@ def select_metadata_backfill_targets(
     *,
     limit: Optional[int] = None,
 ) -> List[RefreshTarget]:
-    """Select successful rows missing a genre or supported tag snapshot."""
+    """Select successful rows missing a cover, genre, or supported tag snapshot."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     if limit == 0:
@@ -1369,7 +1378,8 @@ def select_metadata_backfill_targets(
             if rows.get(platform) is not None
             and rows[platform]["status"] == "ok"
             and (
-                rows[platform]["genre_collected_at"] is None
+                rows[platform]["cover_url"] is None
+                or rows[platform]["genre_collected_at"] is None
                 or (
                     platform in TAG_PLATFORMS
                     and rows[platform]["tags_collected_at"] is None
@@ -2430,6 +2440,7 @@ def _lookup_series_metadata_remote(
         remote_url=detail_url,
         cover_url=cover_url,
         genre=genre,
+        message=("" if cover_url is not None else "no https cover in detail response"),
     )
 
 
@@ -2609,11 +2620,16 @@ def _lookup_kakao_metadata_remote(
         raise ValueError("Kakao overview response has no title")
     if not titles_match(title, detail_title):
         return _not_found("kakao", "stored remote title mismatch")
-    about_url = (
-        f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/about?"
-        + urlencode({"series_id": content_id})
-    )
-    tags = _parse_kakao_tags(fetch_json(about_url, timeout))
+    tags = None
+    try:
+        about_url = (
+            f"{_KAKAO_BFF_ORIGIN}/api/gateway/api/v1/content/about?"
+            + urlencode({"series_id": content_id})
+        )
+        tags = _parse_kakao_tags(fetch_json(about_url, timeout))
+    except Exception:
+        # Cover/genre metadata from the authoritative overview remains usable.
+        tags = None
     return PlatformStat(
         platform="kakao",
         status="ok",
@@ -2623,6 +2639,7 @@ def _lookup_kakao_metadata_remote(
         cover_url=cover_url,
         genre=genre,
         tags=tags,
+        message=("" if cover_url is not None else "no https cover in overview response"),
     )
 
 
@@ -2724,6 +2741,38 @@ def _novelpia_search_cover(record: object) -> Optional[str]:
     if text.startswith("/") and not text.startswith("//"):
         text = urljoin(_NOVELPIA_ORIGIN + "/", text)
     return _normalize_cover_url(text)
+
+
+def _lookup_novelpia_metadata_remote(
+    title: str,
+    remote_id: str,
+    fetch_text: Callable[[str, float], str],
+    *,
+    timeout: float,
+    fallback_title: Optional[str] = None,
+) -> PlatformStat:
+    """Read cover/tags from one stored NovelPia detail ID without title search."""
+    remote_id_text = str(remote_id)
+    detail_url = f"{_NOVELPIA_ORIGIN}/novel/{remote_id_text}"
+    detail_page = fetch_text(detail_url, timeout)
+    cover_url = _parse_open_graph_cover(detail_page)
+    try:
+        tags = _parse_novelpia_tags(detail_page)
+    except Exception:
+        tags = None
+    if cover_url is None and tags is None:
+        raise ValueError("NovelPia detail response has no cover or tag metadata")
+    return PlatformStat(
+        platform="novelpia",
+        status="ok",
+        remote_id=remote_id_text,
+        remote_title=str(fallback_title or title).strip(),
+        remote_url=detail_url,
+        cover_url=cover_url,
+        genre=(tags[0] if tags else "") if tags is not None else None,
+        tags=tags,
+        message=("" if cover_url is not None else "no https cover in detail response"),
+    )
 
 
 def lookup_novelpia(
@@ -2878,6 +2927,7 @@ def lookup_platform_metadata(
     platforms: Sequence[str],
     *,
     remote_ids: Optional[Dict[str, str]] = None,
+    remote_titles: Optional[Dict[str, str]] = None,
     fetch_text: Callable[[str, float], str] = _http_text,
     fetch_json: Callable[[str, float], object] = _http_json,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -2892,6 +2942,7 @@ def lookup_platform_metadata(
             raise ValueError(f"unknown platform: {platform}")
 
     ids = remote_ids or {}
+    titles = remote_titles or {}
 
     def direct_result(platform: str, remote_id: str) -> PlatformStat:
         try:
@@ -2904,7 +2955,13 @@ def lookup_platform_metadata(
                     title, remote_id, fetch_json, timeout=timeout
                 )
             else:
-                raise ValueError(f"direct metadata lookup unsupported: {platform}")
+                stat = _lookup_novelpia_metadata_remote(
+                    title,
+                    remote_id,
+                    fetch_text,
+                    timeout=timeout,
+                    fallback_title=titles.get(platform),
+                )
         except Exception as exc:
             return replace(_error(platform, exc), metadata_lookup_mode="direct_unavailable")
         if stat.status == "not_found":
@@ -2913,7 +2970,7 @@ def lookup_platform_metadata(
 
     def lookup_one(platform: str) -> PlatformStat:
         remote_id = ids.get(platform)
-        if platform in {"series", "kakao"} and remote_id:
+        if remote_id:
             # A transport/parser failure is not evidence that the stored ID is
             # wrong. Likewise a positive title mismatch is reported for review;
             # neither condition may silently search and switch identities.
@@ -2929,8 +2986,8 @@ def lookup_platform_metadata(
                 metadata_lookup_mode="search",
             )
         return replace(
-            lookup_novelpia(title, fetch_json, fetch_text, timeout=timeout),
-            metadata_lookup_mode="search",
+            _error(platform, RuntimeError("stored remote ID is missing")),
+            metadata_lookup_mode="direct_unavailable",
         )
 
     with ThreadPoolExecutor(
@@ -3466,7 +3523,7 @@ def refresh_missing_metadata(
     now: Callable[[], datetime] = utc_now,
     progress: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Dict[str, object]:
-    """Fill missing genre/tag snapshots without changing stored popularity metrics."""
+    """Fill missing cover/genre/tag metadata without changing popularity metrics."""
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
     if delay_seconds < 0:
@@ -3519,6 +3576,7 @@ def refresh_missing_metadata(
             "skipped": 0,
         }
         pair_outcomes: Dict[Tuple[str, str], str] = {}
+        failure_reason_counts: Dict[Tuple[str, str, str], int] = {}
         lookup_mode_counts = {
             "direct": 0,
             "direct_mismatch": 0,
@@ -3551,6 +3609,15 @@ def refresh_missing_metadata(
             for platform, outcome in outcomes.items():
                 outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
                 pair_outcomes[(target.title.title_key, platform)] = outcome
+                result = next(item for item in results if item.platform == platform)
+                reason = None
+                if outcome not in {"updated", "identity_refreshed"}:
+                    reason = result.message or outcome
+                elif result.cover_url is None:
+                    reason = result.message or "no https cover in metadata response"
+                if reason:
+                    key = (platform, outcome, str(reason)[:240])
+                    failure_reason_counts[key] = failure_reason_counts.get(key, 0) + 1
             return outcomes
 
         def report_completed():
@@ -3608,6 +3675,11 @@ def refresh_missing_metadata(
                         for platform, remote_id, _remote_title in target.remote_hints
                         if remote_id is not None
                     },
+                    remote_titles={
+                        platform: str(remote_title)
+                        for platform, _remote_id, remote_title in target.remote_hints
+                        if remote_title is not None
+                    },
                     timeout=timeout,
                 )
             else:
@@ -3659,6 +3731,16 @@ def refresh_missing_metadata(
             "pair_outcomes": [
                 {"title_key": title_key, "platform": platform, "outcome": outcome}
                 for (title_key, platform), outcome in sorted(pair_outcomes.items())
+            ],
+            "failure_reasons": [
+                {
+                    "platform": platform,
+                    "outcome": outcome,
+                    "reason": reason,
+                    "count": count,
+                }
+                for (platform, outcome, reason), count
+                in sorted(failure_reason_counts.items())
             ],
             "authenticated_novelpia_attempts": authenticated_novelpia_attempts,
             "authenticated_novelpia_relogins": int(getattr(

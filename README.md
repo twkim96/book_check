@@ -683,8 +683,8 @@ version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, archive `1.
   `result.theme_keyword_list[*].title`을 태그로 사용한다.
 - 노벨피아는 검색 JSON의 `novel_genre_arr` 첫 항목을 대표 장르로 쓰고 배열 전체를 태그로 보존한다.
   배열이 없는 예외 응답에서만 상세 페이지 `p.writer-tag > span.tag` parser를 fallback으로 사용한다.
-- 선택 메타데이터가 일시 실패해도 기존 조회 수·추천 수·평점과 과거 성공 장르/태그를 지우지 않는다.
-- 신규/미수집 작품은 일반 `플랫폼 DB 업데이트`가 popularity와 장르/태그를 함께 저장하고, 같은 실행에서
+- 선택 메타데이터가 일시 실패해도 기존 조회 수·추천 수·평점과 과거 성공 표지/장르/태그를 지우지 않는다.
+- 신규/미수집 작품은 일반 `플랫폼 DB 업데이트`가 popularity와 표지/장르/태그를 함께 저장하고, 같은 실행에서
   성공했지만 metadata가 비어 있는 row만 한 번 추가 보완한다. 과거 성공 행의 `refresh-metadata`는 일반
   서비스 목록에서 숨긴 수동 유지보수 명령으로만 남긴다.
 - 1.4.18 metadata backfill은 Series/Kakao의 저장된 `remote_id` direct 조회를 도입해 검색 요청을 줄였다.
@@ -840,6 +840,8 @@ DB는 backup-owning 플랫폼 카탈로그 진입점에서 마이그레이션한
   명시적 표지 필드를 보조값으로 사용한다.
 - 최초 수집, 기존 성공 행 지표 갱신, 장르·태그 메타데이터 갱신 모두 같은 remote identity의
   `cover_url`을 함께 교체한다. 실패 응답은 기존 성공 행을 보존하며 플랫폼 간 표지는 합치지 않는다.
+- `refresh-metadata`는 `status='ok'`이면서 `cover_url IS NULL`이거나 장르/태그 snapshot이 누락된
+  행을 선택한다. 세 플랫폼 모두 저장된 `remote_id` 상세만 읽으며 popularity 수치는 변경하지 않는다.
 
 서버/UI 버전은 `1.4.24`, SQLite schema는 `v17`이다. normalizer/fingerprint/pair/auditor/archive
 계약과 Sheet 1.4.23 계약은 그대로 유지한다.
