@@ -70,6 +70,49 @@ Kakao, NovelPia 수집기가 기존 작품 상세/overview 응답에서 대표 �
 
 ## 전체 backfill follow-up
 
-- `file-metadata-sync`로 stale/unindexed active file을 먼저 정상 수렴
+- `file-metadata-sync`: 전체 18,019건 중 358건 변경, 17,661건 유지
+- 후속 dry-run에서 `stale=0`, `missing_files=0`, `index_missing_db=0`으로 플랫폼 갱신 차단 상태 수렴
+- 남은 `unindexed_active=4`는 지원 대상 file index에 없는 과거 active row(EPUB 내부 `cover.jpg` 3건,
+  `.hwp` 1건)라 정상 동기화 범위 밖이며 플랫폼 갱신을 차단하지 않음
 - PM2의 기존 NovelPia 자격 증명을 사용하는 Control Server `platform-metadata` 전체 작업으로 실행
-- 완료 후 플랫폼별 `ok / cover 있음 / cover NULL`과 `failure_reasons`를 기록
+  - job: `0ca138d1-c2d0-4157-8118-8597e1ce4daf`
+  - 2026-08-21 21:16:45 ~ 2026-08-22 02:55:54 KST, 12,102개 작품 / 21,287개 플랫폼 행
+  - `updated=21,260`, `identity_conflict=20`, `unavailable=7`, `error=0`
+  - 저장된 remote ID 직접 조회 21,257건, NovelPia 인증 조회 3건, 검색 fallback 0건
+  - 작업 자체의 file metadata sync는 18,019건 중 356건 변경, 17,663건 유지
+- 27건을 추측값으로 교체하지 않고 보존했으므로 최종 job 상태는 `needs_review`
+
+### 운영 DB 최종 cover 집계
+
+| platform | `status='ok'` | cover 있음 | cover NULL |
+| --- | ---: | ---: | ---: |
+| Kakao | 9,806 | 9,777 | 29 |
+| NovelPia | 1,204 | 1,203 | 1 |
+| Series | 10,305 | 10,283 | 22 |
+| 합계 | 21,315 | 21,263 | 52 |
+
+- 활성 카탈로그의 cover NULL은 아래 미해결 27건이다.
+- 나머지 cover NULL 25건(Kakao 13, NovelPia 1, Series 11)은 활성 house 파일이 없는 보존용 과거
+  플랫폼 행이라 활성 카탈로그 backfill 대상이 아니다.
+- 완료 후 `refresh-metadata --dry-run --all`은 25개 작품 / 29개 플랫폼 행을 반환한다. 이 중
+  27행은 cover 미해결분이며, 나머지 NovelPia 2행은 cover가 있고 장르/태그 snapshot만 누락됐다.
+
+### 미해결 원인
+
+- Kakao 15건: 저장된 remote ID 상세의 작품명 불일치
+- Series 5건: 저장된 remote ID 상세의 작품명 불일치
+- Kakao 1건, Series 1건: DNS 이름 해석 실패
+- Series 5건: 저장된 상품 상세가 현재 이용 불가
+
+identity 불일치나 상세 이용 불가를 검색 결과로 추측해 교체하지 않았고, 기존 성공 row와 인기 지표를
+보존했다.
+
+### 완료 후 운영 검증
+
+- SQLite `PRAGMA user_version=17`, schema validator PASS
+- `PRAGMA integrity_check=ok`, foreign key issue 0
+- `cover_url IS NOT NULL AND cover_url NOT LIKE 'https://%'` 0건
+- `file-metadata-sync --dry-run`: current 18,019, stale 0, missing 0, index missing 0
+- Control Server `platform-metadata`: configured/ready, active job 없음
+- PM2 `server-control--book_check`: online
+- `/health`: version 1.4.24, database ok
