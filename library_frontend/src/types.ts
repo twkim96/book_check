@@ -64,6 +64,10 @@ export interface TitlePreview {
   structure_hint_tokens: string[];
   target_exists: boolean;
   target_has_ok: boolean;
+  target_ok_platforms: Array<"series" | "kakao" | "novelpia">;
+  core_changed: boolean;
+  metadata_strategy: "preserve_same_core" | "fresh_platform_lookup" | "reuse_existing_target";
+  before_core_other_active_files: number;
   blocked_reasons: string[];
   runnable: boolean;
 }
@@ -567,6 +571,8 @@ export interface ExplorerFileDetail {
   readonly: true;
 }
 
+export type ExplorerFileActions = ExplorerFileDetail["actions"];
+
 export interface FileRelocatePlan {
   version: "1.3.7";
   kind: "file_relocate";
@@ -702,6 +708,11 @@ export interface ExplorerComparison {
   latest_review: ExplorerHistoryItem | null;
   latest_decision: ExplorerHistoryItem | null;
   latest_pair_cache: (ExplorerHistoryItem & { classification?: string }) | null;
+  actions: {
+    left: ExplorerFileActions;
+    right: ExplorerFileActions;
+    pair_available: boolean;
+  };
   relationship_preview: { available_verdicts: string[]; apply_available: false; future_version: string };
   readonly: true;
 }

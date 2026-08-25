@@ -60,6 +60,9 @@ function queuedJobNotice(job: JobRecord, action?: string): string {
   if (job.state === "queued") {
     return `${label} 작업을 대기열 ${job.queue_position ?? "?"}번째에 등록했습니다.`;
   }
+  if (job.state === "succeeded" || job.state === "needs_review") {
+    return `${label} 작업이 완료되었습니다.`;
+  }
   return `${label} 작업을 시작했습니다.`;
 }
 
@@ -248,18 +251,37 @@ function FileInspector({ fileId, close, compareWith, quarantine, organize, corre
   </Modal>;
 }
 
-function CompareModal({ leftId, rightId, close, manage, quarantine }: { leftId: string; rightId: string; close: () => void; manage: (decisionId?: number | null) => void; quarantine: (sourceId: string, keepId: string) => void }) {
+function CompareModal({ leftId, rightId, close, manage, quarantine, correctTitle }: { leftId: string; rightId: string; close: () => void; manage: (decisionId?: number | null) => void; quarantine: (sourceId: string, keepId: string) => void; correctTitle: (fileId: string) => void }) {
   const [result, setResult] = useState<ExplorerComparison>();
   const [error, setError] = useState("");
-  useEffect(() => { api<ExplorerComparison>(`/api/explorer/compare?left=${encodeURIComponent(leftId)}&right=${encodeURIComponent(rightId)}`).then(setResult).catch((reason) => setError(reason.message)); }, [leftId, rightId]);
+  const [refreshing, setRefreshing] = useState(false);
+  const load = () => {
+    setRefreshing(true);
+    api<ExplorerComparison>(`/api/explorer/compare?left=${encodeURIComponent(leftId)}&right=${encodeURIComponent(rightId)}`)
+      .then((value) => { setResult(value); setError(""); })
+      .catch((reason) => setError(reason.message))
+      .finally(() => setRefreshing(false));
+  };
+  useEffect(() => {
+    void load();
+    const refreshOnFocus = () => { void load(); };
+    const refreshWhenVisible = () => { if (document.visibilityState === "visible") void load(); };
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [leftId, rightId]);
   const bool = (value: boolean) => <span className={value ? "explorer-match" : "explorer-different"}>{value ? "일치" : "다름"}</span>;
-  return <Modal close={close} wide><div className="explorer-modal-top"><div><span className="eyebrow">PAIR COMPARE</span><h2>두 파일 관계 비교</h2></div><button className="button secondary" onClick={close}>닫기</button></div>
+  return <Modal close={close} wide><div className="explorer-modal-top"><div><span className="eyebrow">PAIR COMPARE</span><h2>두 파일 관계 비교</h2></div><button className="button secondary" disabled={refreshing} onClick={load}>{refreshing ? "갱신 중…" : "상태 갱신"}</button><button className="button secondary" onClick={close}>닫기</button></div>
     {error && <div className="inline-error">{error}</div>}
     {!result ? !error && <div className="loading"><span />비교 근거를 불러오고 있습니다.</div> : <>
-      <div className="explorer-compare-files">{([result.left, result.right] as const).map((item, index) => <article key={item.file_id}><span>{index === 0 ? "LEFT" : "RIGHT"}</span><strong>{item.name}</strong><small>{item.core_title ?? "core 없음"} · {coordinate(item)}</small><code>{item.canonical_path}</code></article>)}</div>
+      <div className="explorer-compare-files">{([result.left, result.right] as const).map((item, index) => <article key={item.file_id}><span>{index === 0 ? "LEFT" : "RIGHT"}</span><strong>{item.name}</strong><small>{item.core_title ?? "core 없음"} · {coordinate(item)}</small><small>{item.active && item.source === "house" ? "활성 house · 작업 가능" : item.retired_virtual_path ? "퇴역 이력 · 작업 불가" : `${item.active ? "활성" : "비활성"} ${item.source} · 작업 불가`}</small><code>{item.canonical_path}</code></article>)}</div>
+      {!result.actions.pair_available && <div className="explorer-warning">한쪽 파일이 제목 교정 등으로 퇴역했거나 활성 house 밖에 있습니다. 이 ID는 이력 비교만 가능하며, 격리·관계 판정은 할 수 없습니다. temp 재입고 후 새 ID로 다시 비교하세요.</div>}
       <div className="explorer-compare-grid"><span>core title {bool(result.comparison.same_core_title)}</span><span>좌표 {bool(result.comparison.same_coordinate)}</span><span>작가 {bool(result.comparison.same_author)}</span><span>원본 SHA {bool(result.comparison.same_raw_sha256)}</span><span>정규화 SHA {bool(result.comparison.same_normalized_sha256)}</span><span>크기 차이 <b>{formatBytes(Math.abs(result.comparison.size_delta))}</b></span></div>
       <div className="explorer-history-grid"><History label="최근 검토" items={result.latest_review ? [result.latest_review] : []} /><History label="최근 사람 결정" items={result.latest_decision ? [result.latest_decision] : []} /><History label="본문 비교 캐시" items={result.latest_pair_cache ? [result.latest_pair_cache] : []} /></div>
-      <section className="explorer-future-verdict"><strong>사람 판단과 처분</strong><button className="button secondary" onClick={() => quarantine(leftId, rightId)}>왼쪽 격리</button><button className="button secondary" onClick={() => quarantine(rightId, leftId)}>오른쪽 격리</button><button className="button primary" onClick={() => manage((result.latest_decision as { decision_id?: number; active?: number } | null)?.active ? (result.latest_decision as { decision_id?: number }).decision_id : null)}>관계 판정</button></section>
+      <section className="explorer-future-verdict"><strong>사람 판단과 처분</strong><button className="button secondary" disabled={!result.actions.left.title_correction} onClick={() => correctTitle(leftId)}>왼쪽 제목 교정</button><button className="button secondary" disabled={!result.actions.right.title_correction} onClick={() => correctTitle(rightId)}>오른쪽 제목 교정</button><button className="button secondary" disabled={!result.actions.pair_available || !result.actions.left.quarantine} onClick={() => quarantine(leftId, rightId)}>왼쪽 격리</button><button className="button secondary" disabled={!result.actions.pair_available || !result.actions.right.quarantine} onClick={() => quarantine(rightId, leftId)}>오른쪽 격리</button><button className="button primary" disabled={!result.actions.pair_available} onClick={() => manage((result.latest_decision as { decision_id?: number; active?: number } | null)?.active ? (result.latest_decision as { decision_id?: number }).decision_id : null)}>관계 판정</button></section>
     </>}
   </Modal>;
 }
@@ -277,11 +299,49 @@ function FileCatalog() {
   const [organizeFile, setOrganizeFile] = useState<ExplorerFile>();
   const [quickTitleId, setQuickTitleId] = useState<string>();
   const [jobNotice, setJobNotice] = useState<JobRecord>();
+  const [pendingJobId, setPendingJobId] = useState<string>();
   const search = params.get("search") ?? "", source = params.get("source") ?? "active", extension = params.get("extension") ?? "all", sort = params.get("sort") ?? "name", direction = params.get("direction") ?? "asc", cursor = params.get("cursor") ?? "";
   const load = () => { const query = new URLSearchParams({ search, source, extension, sort, direction, limit: "50" }); if (cursor) query.set("cursor", cursor); api<ExplorerFileListing>(`/api/explorer/files?${query}`).then((value) => { setListing(value); setError(""); }).catch((reason) => setError(reason.message)); };
   useEffect(load, [search, source, extension, sort, direction, cursor]);
+  useEffect(() => {
+    if (!pendingJobId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const record = await api<JobRecord>(`/api/jobs/${pendingJobId}`);
+        if (cancelled) return;
+        if (["succeeded", "failed", "needs_review", "interrupted", "cancelled"].includes(record.state)) {
+          setPendingJobId(undefined);
+          const reconfirm = record.error?.code === "reconfirmation_required";
+          if (record.state === "succeeded" || (record.state === "needs_review" && !reconfirm)) {
+            setJobNotice(record);
+            setSelected([]);
+            setDetailId(undefined);
+            setCompare(undefined);
+            load();
+          } else {
+            setJobNotice(undefined);
+            setError(record.error?.message ?? "변경 작업이 완료되지 않았습니다. 작업 이력을 확인하세요.");
+          }
+          return;
+        }
+        timer = window.setTimeout(poll, 1000);
+      } catch (reason) {
+        if (cancelled) return;
+        setPendingJobId(undefined);
+        setError(reason instanceof Error ? reason.message : "변경 작업 상태를 확인하지 못했습니다.");
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [pendingJobId, search, source, extension, sort, direction, cursor]);
   const update = (values: Record<string, string>) => { const next = new URLSearchParams(params); next.set("tab", "files"); Object.entries(values).forEach(([key, value]) => value ? next.set(key, value) : next.delete(key)); if (!("cursor" in values)) next.delete("cursor"); setParams(next); };
   const toggle = (id: string) => setSelected((current) => current.includes(id) ? current.filter((value) => value !== id) : current.length < 2 ? [...current, id] : [current[1], id]);
+  const handleJobStarted = (job: JobRecord) => { setJobNotice(job); setPendingJobId(job.job_id); };
   return <><Header title="파일 탐색기" description="파일 근거를 확인하고 두 파일 관계를 확정하거나 선택한 판본을 안전하게 격리합니다."/><CatalogTabs active="files"/>
     {error && <div className="inline-error">{error}</div>}
     {jobNotice && <div className="inline-notice"><span>{queuedJobNotice(jobNotice)} 현재 화면에서 계속 작업할 수 있습니다.</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
@@ -295,7 +355,7 @@ function FileCatalog() {
     <section className="table-panel"><div className="table-summary"><span>현재 조건 <strong>{formatNumber(listing?.total ?? 0)}</strong>파일 · 비교 선택 {selected.length}/2</span><span>변경 작업은 계획 확인 후에만 실행</span></div>
       {!listing ? <div className="loading"><span/>파일 목록을 확인하고 있습니다.</div> : listing.items.length ? <div className="catalog-table-wrap"><table className="explorer-file-table"><thead><tr><th>선택</th><th>파일·경로</th><th>core·좌표</th><th>관계</th><th>검토 상대</th><th>크기·지문</th><th>상세</th></tr></thead><tbody>{listing.items.map((item) => <FileCatalogRow key={item.file_id} item={item} selected={selected.includes(item.file_id)} toggle={() => toggle(item.file_id)} inspect={() => setDetailId(item.file_id)}/>)}</tbody></table></div> : <div className="empty">조건에 맞는 파일이 없습니다.</div>}
       {listing && <Pager cursor={cursor} next={listing.next_cursor} limit={listing.limit} setCursor={(value) => update({ cursor: value === "0" ? "" : value })}/>}</section>
-    {detailId && <FileInspector fileId={detailId} close={() => setDetailId(undefined)} compareWith={(other) => { setDetailId(undefined); setCompare([detailId, other]); }} quarantine={() => { setQuarantinePair({ source: detailId }); setDetailId(undefined); }} organize={(file) => { setOrganizeFile(file); setDetailId(undefined); }} correctTitle={() => { setQuickTitleId(detailId); setDetailId(undefined); }}/>} {compare?.length === 2 && <CompareModal leftId={compare[0]} rightId={compare[1]} close={() => setCompare(undefined)} manage={(decisionId) => { setRelationship({ left: compare[0], right: compare[1], decisionId }); setCompare(undefined); }} quarantine={(sourceId, keepId) => { setQuarantinePair({ source: sourceId, keep: keepId }); setCompare(undefined); }}/>} {relationship && <RelationshipManager leftId={relationship.left} rightId={relationship.right} currentDecisionId={relationship.decisionId} close={() => setRelationship(undefined)} started={setJobNotice}/>} {quarantinePair && <QuarantineManager sourceId={quarantinePair.source} keepId={quarantinePair.keep} close={() => setQuarantinePair(undefined)} started={setJobNotice}/>} {organizeFile && <FileRelocateManager fileId={organizeFile.file_id} currentName={organizeFile.name} currentParent={organizeFile.parent} close={() => setOrganizeFile(undefined)} started={setJobNotice}/>} {quickTitleId && <QuickTitleCorrectionManager fileId={quickTitleId} close={() => setQuickTitleId(undefined)} started={setJobNotice}/>}</>;
+    {detailId && <FileInspector fileId={detailId} close={() => setDetailId(undefined)} compareWith={(other) => { setDetailId(undefined); setCompare([detailId, other]); }} quarantine={() => { setQuarantinePair({ source: detailId }); setDetailId(undefined); }} organize={(file) => { setOrganizeFile(file); setDetailId(undefined); }} correctTitle={() => { setQuickTitleId(detailId); setDetailId(undefined); }}/>} {compare?.length === 2 && <CompareModal leftId={compare[0]} rightId={compare[1]} close={() => setCompare(undefined)} manage={(decisionId) => { setRelationship({ left: compare[0], right: compare[1], decisionId }); setCompare(undefined); }} quarantine={(sourceId, keepId) => { setQuarantinePair({ source: sourceId, keep: keepId }); setCompare(undefined); }} correctTitle={(fileId) => { setQuickTitleId(fileId); setCompare(undefined); }}/>} {relationship && <RelationshipManager leftId={relationship.left} rightId={relationship.right} currentDecisionId={relationship.decisionId} close={() => setRelationship(undefined)} started={handleJobStarted}/>} {quarantinePair && <QuarantineManager sourceId={quarantinePair.source} keepId={quarantinePair.keep} close={() => setQuarantinePair(undefined)} started={handleJobStarted}/>} {organizeFile && <FileRelocateManager fileId={organizeFile.file_id} currentName={organizeFile.name} currentParent={organizeFile.parent} close={() => setOrganizeFile(undefined)} started={handleJobStarted}/>} {quickTitleId && <QuickTitleCorrectionManager fileId={quickTitleId} close={() => setQuickTitleId(undefined)} started={handleJobStarted}/>}</>;
 }
 
 function FolderInspector({ folder, close, createManaged, adopt, relocate, started }: { folder: ExplorerFolder; close: () => void; createManaged: () => void; adopt: () => void; relocate: () => void; started: (job: JobRecord) => void }) {

@@ -27,6 +27,8 @@ function blockerLabel(value: string): string {
   if (kind === "quarantine_destination_occupied") return "같은 원래 경로의 폴더가 이미 격리 보관함에 있습니다.";
   if (kind === "folder_has_no_registered_books") return "DB에 등록된 도서가 없는 폴더는 이 화면에서 전체 격리할 수 없습니다.";
   if (kind === "inventory_blocked") return `폴더 파일 상태를 안전하게 확정하지 못했습니다: ${detail ?? "원인 미상"}`;
+  if (kind === "source_inactive") return "제목 교정 등으로 퇴역한 파일 이력은 격리할 수 없습니다.";
+  if (kind === "source_outside_active_house") return "활성 house 파일만 이 화면에서 격리할 수 있습니다.";
   return value;
 }
 
@@ -165,18 +167,20 @@ export function QuickTitleCorrectionManager({ fileId, close, started }: { fileId
   const [plan, setPlan] = useState<TitlePlan>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [metadataAcknowledged, setMetadataAcknowledged] = useState(false);
   useEffect(() => {
     api<TitleCase>(`/api/review/titles/${encodeURIComponent(fileId)}`)
       .then((result) => { setItem(result); setValue(result.current_body); })
       .catch((reason) => setError(reason instanceof Error ? reason.message : "제목 정보를 불러오지 못했습니다."));
   }, [fileId]);
-  const changed = (next: string) => { setValue(next); setPreview(undefined); setPlan(undefined); };
+  const changed = (next: string) => { setValue(next); setPreview(undefined); setPlan(undefined); setMetadataAcknowledged(false); };
   const check = async () => {
     if (!item) return;
     setBusy(true); setError("");
     try {
       const nextPreview = await postJson<TitlePreview>("/api/review/titles/preview", { file_id: fileId, source_revision: item.source_revision, new_body: value });
       setPreview(nextPreview);
+      setMetadataAcknowledged(!nextPreview.core_changed);
       if (nextPreview.runnable) {
         setPlan(await postJson<TitlePlan>("/api/review/titles/plan", { changes: [{ file_id: fileId, source_revision: item.source_revision, new_body: value }] }));
       } else setPlan(undefined);
@@ -200,9 +204,9 @@ export function QuickTitleCorrectionManager({ fileId, close, started }: { fileId
     {!item ? !error && <div className="loading"><span/>제목 정보를 확인하고 있습니다.</div> : <>
       <div className="management-paths"><small>현재 파일: {item.current_name}</small><small>현재 core: {item.core_title}</small></div>
       <div className="management-form"><label className="management-wide">새 파일명 본문<input autoFocus value={value} onChange={(event) => changed(event.target.value)} placeholder="확장자 제외 · 제목 [[19금]] · 구조 {{힌트}}"/></label></div>
-      {preview && <><div className="management-impact"><span>변경 후 파일<strong>{preview.materialized_candidate_name}</strong></span><span>변경 후 core<strong>{preview.after_core_title || "-"}</strong></span><span>검색어<strong>{preview.after_query_title || "-"}</strong></span><span>temp 이동<strong>{preview.runnable ? "가능" : "차단"}</strong></span></div><PlanCheck sha={plan?.plan_sha256 ?? preview.source_revision} blockers={preview.blocked_reasons}/></>}
+      {preview && <><div className="management-impact"><span>변경 후 파일<strong>{preview.materialized_candidate_name}</strong></span><span>변경 후 core<strong>{preview.after_core_title || "-"}</strong></span><span>검색어<strong>{preview.after_query_title || "-"}</strong></span><span>메타데이터<strong>{preview.metadata_strategy === "preserve_same_core" ? "기존 유지" : preview.metadata_strategy === "fresh_platform_lookup" ? "신규 수집" : "새 core 기존값 확인"}</strong></span></div><PlanCheck sha={plan?.plan_sha256 ?? preview.source_revision} blockers={preview.blocked_reasons}/>{preview.core_changed && <label className="title-metadata-confirm"><input type="checkbox" checked={metadataAcknowledged} onChange={(event) => setMetadataAcknowledged(event.target.checked)}/><span><strong>core_title 변경과 메타데이터 분리를 확인했습니다</strong><small>옛 메타데이터는 새 core로 승계되지 않습니다. Folderling 후 플랫폼 DB 업데이트를 실행하세요.{preview.target_has_ok ? ` 새 core에는 ${preview.target_ok_platforms.join(", ")} 메타데이터가 이미 있으니 같은 작품인지 확인해야 합니다.` : ""}</small></span></label>}</>}
     </>}
-    <footer><button className="button secondary" disabled={busy || !item || !value.trim()} onClick={check}>{busy ? "확인 중…" : "교정 계획 확인"}</button><button className="button danger" disabled={busy || !plan?.runnable} onClick={apply}>확인하고 실행</button></footer>
+    <footer><button className="button secondary" disabled={busy || !item || !value.trim()} onClick={check}>{busy ? "확인 중…" : "교정 계획 확인"}</button><button className="button danger" disabled={busy || !plan?.runnable || !metadataAcknowledged} onClick={apply}>확인하고 실행</button></footer>
   </Modal>;
 }
 

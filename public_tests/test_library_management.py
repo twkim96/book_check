@@ -113,6 +113,32 @@ def test_relationship_cancel_fails_closed_when_doctor_is_not_clean(tmp_path):
     finally:
         conn.close()
 
+
+def test_quarantine_preview_returns_blocked_plan_for_retired_file(tmp_path):
+    state_db, house, temp, _, paths, ids = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        retired_path = decision_store.retired_canonical_path(conn, ids[0], paths[0])
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET canonical_path = ?, active = 0 WHERE file_id = ?",
+                (retired_path, ids[0]),
+            )
+    finally:
+        conn.close()
+
+    plan = quarantine_preview(
+        state_db,
+        temp_dir=temp,
+        source_file_id=ids[0],
+        keep_file_id=ids[1],
+    )
+
+    assert plan["source"]["active"] is False
+    assert plan["blocked_reasons"] == ["source_inactive"]
+    assert plan["apply_available"] is False
+    assert plan["fingerprint_preparation_count"] == 0
+
 def test_user_quarantine_retires_representative_and_restore_records_distinct_decision(tmp_path):
     state_db, house, temp, index, paths, ids = _fixture(tmp_path)
     _apply_relationship(state_db, house, temp, ids)

@@ -550,8 +550,14 @@ def file_detail(state_db: os.PathLike | str, file_id: str) -> dict:
 def compare_files(state_db: os.PathLike | str, left_file_id: str, right_file_id: str) -> dict:
     if not left_file_id or not right_file_id or left_file_id == right_file_id:
         raise ValueError("two distinct file IDs are required")
-    left = file_detail(state_db, left_file_id)["file"]
-    right = file_detail(state_db, right_file_id)["file"]
+    left_detail = file_detail(state_db, left_file_id)
+    right_detail = file_detail(state_db, right_file_id)
+    left = left_detail["file"]
+    right = right_detail["file"]
+    pair_actions_available = all(
+        bool(item["active"]) and item["source"] == "house"
+        for item in (left, right)
+    )
     ordered = sorted((left_file_id, right_file_id))
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
@@ -600,6 +606,11 @@ def compare_files(state_db: os.PathLike | str, left_file_id: str, right_file_id:
             "latest_review": ({**dict(review), "evidence": _json(review["evidence_json"])} if review else None),
             "latest_decision": ({**dict(decision), "evidence": _json(decision["evidence_json"])} if decision else None),
             "latest_pair_cache": ({**dict(pair), "evidence": _json(pair["evidence_json"])} if pair else None),
+            "actions": {
+                "left": left_detail["actions"],
+                "right": right_detail["actions"],
+                "pair_available": pair_actions_available,
+            },
             "relationship_preview": {
                 "available_verdicts": ["same_content", "same_work_distinct_variant", "distinct_work"],
                 "apply_available": False,

@@ -273,12 +273,17 @@ def quarantine_preview(
 ) -> dict:
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
-        source = _file_row(conn, source_file_id, active=True)
+        source = _file_row(conn, source_file_id)
         blockers = []
-        try:
-            _require_current_file(source, require_fingerprint=False)
-        except RuntimeError as exc:
-            blockers.append(str(exc))
+        if not source["active"]:
+            blockers.append("source_inactive")
+        elif source["source"] != "house":
+            blockers.append("source_outside_active_house")
+        else:
+            try:
+                _require_current_file(source, require_fingerprint=False)
+            except RuntimeError as exc:
+                blockers.append(str(exc))
         keep = None
         if keep_file_id:
             if keep_file_id == source_file_id:
@@ -337,7 +342,12 @@ def quarantine_preview(
         }
         preparation_ids = {
             row["file_id"] for row in (source, keep, replacement)
-            if row is not None and row["current_fingerprint_id"] is None
+            if (
+                row is not None
+                and row["active"]
+                and row["source"] == "house"
+                and row["current_fingerprint_id"] is None
+            )
         }
         return {
             "version": "1.3.2", "kind": "user_quarantine", "item_count": 1,

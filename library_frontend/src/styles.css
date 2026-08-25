@@ -608,6 +608,10 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
 .volume-tree > span { color: var(--neutral-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; word-break: break-all; }
 .volume-confirm { display: flex; align-items: center; gap: 9px; margin-top: 13px; padding: 11px 12px; border: 1px solid var(--warning-border); border-radius: 9px; background: var(--warning-surface); color: var(--warning-text); font-size: 13px; }
 .volume-confirm input { min-height: 0; }
+.title-metadata-confirm { display: flex; align-items: flex-start; gap: 9px; margin-top: 13px; padding: 11px 12px; border: 1px solid var(--warning-border); border-radius: 9px; background: var(--warning-surface); color: var(--warning-text); font-size: 13px; }
+.title-metadata-confirm input { min-height: 0; margin-top: 2px; }
+.title-metadata-confirm span, .title-metadata-confirm strong, .title-metadata-confirm small { display: block; }
+.title-metadata-confirm small { margin-top: 4px; line-height: 1.5; }
 @media (max-width: 760px) {
   .volume-modal-topbar { align-items: flex-start; flex-direction: column; }
   .volume-modal-actions { width: 100%; justify-content: stretch; }

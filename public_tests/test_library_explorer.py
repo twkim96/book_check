@@ -183,6 +183,32 @@ def test_review_filter_excludes_open_edges_to_inactive_files(tmp_path):
     assert listing["total"] == 0
 
 
+def test_compare_disables_actions_for_retired_title_history(tmp_path):
+    state_db, house, _, ids, *_ = _fixture(tmp_path)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        retired_path = decision_store.retired_canonical_path(
+            conn,
+            ids[1],
+            house / "ㄱ" / "검사 작품" / "검사 작품 1권 extra.txt",
+        )
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE files SET canonical_path = ?, active = 0 WHERE file_id = ?",
+                (retired_path, ids[1]),
+            )
+    finally:
+        conn.close()
+
+    comparison = compare_files(state_db, ids[0], ids[1])
+
+    assert comparison["right"]["retired_virtual_path"] is True
+    assert comparison["actions"]["left"]["quarantine"] is True
+    assert comparison["actions"]["right"]["quarantine"] is False
+    assert comparison["actions"]["right"]["title_correction"] is False
+    assert comparison["actions"]["pair_available"] is False
+
+
 def test_folder_explorer_distinguishes_registered_and_auxiliary_files(tmp_path):
     state_db, house, temp, _, folder, *_ = _fixture(tmp_path)
     before = _snapshot(state_db, house, temp)

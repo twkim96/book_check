@@ -4,6 +4,7 @@ import { NavLink, Navigate, Route, Routes, useParams, useSearchParams } from "re
 import { ApiError, api, postJson } from "./api";
 import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
 import { groupFolderlingTimelineEvents } from "./folderlingTimeline";
+import { QuickTitleCorrectionManager } from "./ManagementModals";
 import { SettingsPage } from "./Settings";
 import { WorkManagementModal } from "./WorkManagementModal";
 import { APP_VERSION } from "./version";
@@ -43,6 +44,7 @@ type PendingTitleJob = {
 
 type PendingVolumeJob = {
   job_id: string;
+  kind: "volume" | "title";
 };
 
 const platformLabels = { series: "시리즈", kakao: "카카오", novelpia: "노벨피아" };
@@ -493,8 +495,10 @@ function TitleReview() {
   const [planning, setPlanning] = useState(false);
   const [pendingJob, setPendingJob] = useState<PendingTitleJob>();
   const [jobNotice, setJobNotice] = useState<{ job_id: string; message: string }>();
+  const listingRequestVersion = useRef(0);
 
   const load = (preservePosition = false) => {
+    const requestVersion = ++listingRequestVersion.current;
     const params = new URLSearchParams({
       search: submittedSearch,
       status,
@@ -505,7 +509,13 @@ function TitleReview() {
     if (cursor) params.set("cursor", cursor);
     setError("");
     if (!preservePosition) setListing(undefined);
-    api<TitleListing>(`/api/review/titles?${params}`).then(setListing).catch((reason) => setError(reason.message));
+    api<TitleListing>(`/api/review/titles?${params}`)
+      .then((value) => {
+        if (requestVersion === listingRequestVersion.current) setListing(value);
+      })
+      .catch((reason) => {
+        if (requestVersion === listingRequestVersion.current) setError(reason.message);
+      });
   };
   useEffect(() => { load(); }, [submittedSearch, status, sort, direction, cursor]);
 
@@ -610,7 +620,7 @@ function TitleReview() {
       <PageHeader
         eyebrow="TITLE CORRECTION"
         title="실제 파일명 교정"
-        description="플랫폼에서 확인되지 않은 활성 파일을 표시합니다. 같은 작품의 여러 파일도 따로 보이며, 입력한 파일만 txt_temp에 재입고됩니다."
+        description="기본값은 플랫폼에서 확인되지 않은 활성 파일입니다. 필터에서 메타데이터 있음 포함을 선택하면 분권 후보 여부와 무관하게 모든 활성 house 파일을 검색·교정할 수 있습니다."
         action={
           <button className="button primary" disabled={!selectedChanges.length || planning || Boolean(pendingJob)} onClick={createPlan}>
             선택 {selectedChanges.length}개 계획 확인
@@ -625,6 +635,7 @@ function TitleReview() {
         </form>
         <select value={status} onChange={(event) => { setStatus(event.target.value); resetPage(); }}>
           <option value="all">모든 미확인 상태</option>
+          <option value="all_house">메타데이터 있음 포함 · 활성 house 전체</option>
           <option value="all_not_found">세 플랫폼 모두 없음</option>
           <option value="error">오류 포함</option>
           <option value="missing">미수집 포함</option>
@@ -642,7 +653,7 @@ function TitleReview() {
       {!listing ? <Loading /> : (
         <section className="table-panel">
           <div className="table-summary">
-            <span>검토 파일 <strong>{formatNumber(listing.total)}</strong>개</span>
+            <span>{status === "all_house" ? "활성 house 파일" : "검토 파일"} <strong>{formatNumber(listing.total)}</strong>개</span>
             <span>현재 페이지에서 입력한 항목만 변경됩니다.</span>
           </div>
           <div className="table-scroll">
@@ -766,6 +777,9 @@ function TitleRow({ item, draft, pending, onChange }: { item: TitleCase; draft?:
           {draft.preview.title_literal_tokens.length > 0 && <small className="safe-note">제목 보호: {draft.preview.title_literal_tokens.join(", ")} · 최종 파일명에서는 [[ ]] 제거</small>}
           {draft.preview.structure_hint_tokens.length > 0 && <small className="safe-note">구조 힌트: {draft.preview.structure_hint_tokens.join(", ")} · 최종 파일명에서는 {'{{ }}'} 제거</small>}
           {draft.preview.target_exists && <small className="collision">기존 core 존재{draft.preview.target_has_ok ? " · 플랫폼 정보 있음" : ""}</small>}
+          {draft.preview.metadata_strategy === "preserve_same_core" && <small className="safe-note">core 유지 · 기존 플랫폼 메타데이터 유지</small>}
+          {draft.preview.metadata_strategy === "fresh_platform_lookup" && <small className="collision">core 변경 · 기존 메타데이터 미승계 · Folderling 후 플랫폼 DB 업데이트 필요</small>}
+          {draft.preview.metadata_strategy === "reuse_existing_target" && <small className="collision">core 변경 · 새 core의 기존 메타데이터 사용 예정 ({draft.preview.target_ok_platforms.join(", ")})</small>}
         </> : <span className="muted">입력 대기</span>}
       </td>
     </tr>
@@ -773,6 +787,9 @@ function TitleRow({ item, draft, pending, onChange }: { item: TitleCase; draft?:
 }
 
 function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: boolean; onClose: () => void; onApply: () => void }) {
+  const coreChanged = plan.items.filter((item) => item.core_changed);
+  const existingTarget = coreChanged.filter((item) => item.metadata_strategy === "reuse_existing_target");
+  const [metadataAcknowledged, setMetadataAcknowledged] = useState(coreChanged.length === 0);
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal" role="dialog" aria-modal="true" aria-labelledby="plan-title">
@@ -787,9 +804,13 @@ function PlanDialog({ plan, busy, onClose, onApply }: { plan: TitlePlan; busy: b
         <div className="plan-list">
           {plan.items.map((item) => <div key={item.file_id}><span>{item.current_name}</span><b>→</b><strong>{item.materialized_candidate_name}</strong></div>)}
         </div>
+        {coreChanged.length > 0 && <label className="title-metadata-confirm">
+          <input type="checkbox" checked={metadataAcknowledged} onChange={(event) => setMetadataAcknowledged(event.target.checked)} />
+          <span><strong>core_title 변경 {coreChanged.length}건의 메타데이터 처리를 확인했습니다</strong><small>옛 core의 공용 메타데이터는 삭제하지 않지만 새 core로 승계하지 않습니다. Folderling 재입고 뒤 플랫폼 DB 업데이트가 필요합니다.{existingTarget.length ? ` 이 중 ${existingTarget.length}건은 새 core에 기존 플랫폼 메타데이터가 있어 같은 작품인지 반드시 확인해야 합니다.` : ""}</small></span>
+        </label>}
         <footer>
           <button className="button secondary" disabled={busy} onClick={onClose}>취소</button>
-          <button className="button danger" disabled={busy || !plan.runnable} onClick={onApply}>{busy ? "등록 중…" : "확인하고 실행"}</button>
+          <button className="button danger" disabled={busy || !plan.runnable || !metadataAcknowledged} onClick={onApply}>{busy ? "등록 중…" : "확인하고 실행"}</button>
         </footer>
       </section>
     </div>
@@ -822,7 +843,7 @@ const volumeBlockerLabels: Record<string, string> = {
   source_missing_or_not_regular: "원본 파일 누락 또는 링크",
   source_identity_stale: "원본 파일 상태 변경",
   source_folder_contains_unselected_files: "기존 폴더에 선택하지 않은 파일 또는 부속 파일 존재",
-  side_story_requires_two_main_coordinates: "외전 자동 묶기에는 서로 다른 본편 좌표가 두 개 이상 필요",
+  side_story_requires_two_main_coordinates: "외전끼리 자동 묶기에는 본편 좌표가 하나 이상 필요",
   no_files_to_move: "이미 결과 폴더에 정리됨"
 };
 
@@ -883,12 +904,13 @@ function VolumeReview() {
         if (["succeeded", "failed", "needs_review", "interrupted", "cancelled"].includes(record.state)) {
           setPendingJob(undefined);
           const reconfirm = record.error?.code === "reconfirmation_required";
+          const actionLabel = pendingJob.kind === "title" ? "제목 교정" : "분권 묶기";
           if (record.state === "succeeded" || (record.state === "needs_review" && !reconfirm)) {
-            setJobNotice({ job_id: record.job_id, message: "분권 묶기가 완료되었습니다. 현재 위치에서 계속 작업할 수 있습니다." });
+            setJobNotice({ job_id: record.job_id, message: `${pendingJob.kind === "title" ? "제목 교정이" : "분권 묶기가"} 완료되었습니다. 현재 위치에서 계속 작업할 수 있습니다.` });
             load(true);
           } else {
             setJobNotice(undefined);
-            setError(record.error?.message ?? (record.state === "cancelled" ? "대기 중인 분권 묶기 작업을 취소했습니다." : "분권 묶기 작업이 완료되지 않았습니다. 작업 이력을 확인하세요."));
+            setError(record.error?.message ?? (record.state === "cancelled" ? `대기 중인 ${actionLabel} 작업을 취소했습니다.` : `${actionLabel} 작업이 완료되지 않았습니다. 작업 이력을 확인하세요.`));
           }
           return;
         }
@@ -896,7 +918,7 @@ function VolumeReview() {
       } catch (reason) {
         if (cancelled) return;
         setPendingJob(undefined);
-        setError(reason instanceof Error ? reason.message : "분권 묶기 작업 상태를 확인하지 못했습니다.");
+        setError(reason instanceof Error ? reason.message : `${pendingJob.kind === "title" ? "제목 교정" : "분권 묶기"} 작업 상태를 확인하지 못했습니다.`);
       }
     };
     void poll();
@@ -909,7 +931,13 @@ function VolumeReview() {
   const handleJobStarted = (job: JobRecord) => {
     setActiveCase(undefined);
     setJobNotice({ job_id: job.job_id, message: `${acceptedJobMessage(job, "분권 묶기")} 완료되면 이 목록만 갱신합니다.` });
-    setPendingJob({ job_id: job.job_id });
+    setPendingJob({ job_id: job.job_id, kind: "volume" });
+  };
+
+  const handleTitleJobStarted = (job: JobRecord) => {
+    setActiveCase(undefined);
+    setJobNotice({ job_id: job.job_id, message: `${acceptedJobMessage(job, "제목 교정")} 완료되면 분권 목록만 갱신합니다.` });
+    setPendingJob({ job_id: job.job_id, kind: "title" });
   };
 
   return (
@@ -917,7 +945,7 @@ function VolumeReview() {
       <PageHeader
         eyebrow="SERIES GROUPING · 1.4.3"
         title="분권·다권본 묶기"
-        description="권·부·회차 분할본과 기존 폴더를 분석합니다. Folderling은 안전한 전체 후보를 자동 적용하고, 단일 본편+외전·외전끼리 관계만 승인 대기로 남깁니다."
+        description="권·부·회차 분할본과 기존 폴더를 분석합니다. Folderling은 본편 좌표가 하나 이상인 외전 관계까지 자동 적용하고, 외전끼리만 있는 관계는 승인 대기로 남깁니다."
         action={<span className="readonly-pill">STAGING + JOURNAL</span>}
       />
       {jobNotice && <div className="inline-notice"><span>{jobNotice.message}</span><NavLink to={`/jobs/${jobNotice.job_id}`}>작업 이력 열기</NavLink></div>}
@@ -998,12 +1026,12 @@ function VolumeReview() {
           </div>
         </section>
       </>}
-      {activeCase && <VolumePreviewDialog value={activeCase} onClose={() => setActiveCase(undefined)} onStarted={handleJobStarted} />}
+      {activeCase && <VolumePreviewDialog value={activeCase} onClose={() => setActiveCase(undefined)} onStarted={handleJobStarted} onTitleStarted={handleTitleJobStarted} />}
     </>
   );
 }
 
-function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase; onClose: () => void; onStarted: (job: JobRecord) => void }) {
+function VolumePreviewDialog({ value, onClose, onStarted, onTitleStarted }: { value: VolumeCase; onClose: () => void; onStarted: (job: JobRecord) => void; onTitleStarted: (job: JobRecord) => void }) {
   const [selected, setSelected] = useState(() => new Set(value.items.map((item) => item.file_id)));
   const [folderName, setFolderName] = useState(value.target_folder_name);
   const [allowDuplicateCoordinates, setAllowDuplicateCoordinates] = useState(false);
@@ -1012,14 +1040,15 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
   const [busy, setBusy] = useState(false);
   const [confirmed, setConfirmed] = useState(false);
   const [error, setError] = useState("");
+  const [correctionFileId, setCorrectionFileId] = useState<string>();
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) onClose();
+      if (event.key === "Escape" && !busy && !correctionFileId) onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [busy, onClose]);
+  }, [busy, correctionFileId, onClose]);
 
   const refresh = async () => {
     setBusy(true);
@@ -1106,7 +1135,7 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
             <td><div className="volume-file-title">
               <strong title={item.canonical_path}>{item.name}</strong>
               <small>{item.parent}</small>
-              <NavLink className="button secondary volume-correction-button" to={`/review/titles?search=${encodeURIComponent(item.name)}`} onClick={onClose}>제목 교정</NavLink>
+              <button type="button" className="button secondary volume-correction-button" onClick={() => setCorrectionFileId(item.file_id)}>제목 교정</button>
             </div></td>
             <td><b>{item.coordinate}</b><small>{volumeCoordinateLabels[item.coordinate_kind] ?? item.coordinate_kind}{item.complete ? " · 완결" : ""}</small></td>
             <td>{item.author ?? <span className="muted-value">미상</span>}</td>
@@ -1131,7 +1160,7 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
           setPreview(undefined);
           setConfirmed(false);
         }} />
-        <span><strong>단일 본편+외전 또는 외전끼리 관계를 직접 승인</strong><small>자동 규칙이 의도적으로 보류한 예외입니다. 실제로 한 작품임을 확인한 경우에만 같은 폴더로 묶습니다.</small></span>
+        <span><strong>외전끼리만 있는 관계를 직접 승인</strong><small>본편 좌표가 없는 예외입니다. 실제로 한 작품임을 확인한 경우에만 같은 폴더로 묶습니다.</small></span>
       </label>}
       {error && <div className="inline-error">{error}</div>}
       {preview && <div className="volume-tree">
@@ -1149,6 +1178,7 @@ function VolumePreviewDialog({ value, onClose, onStarted }: { value: VolumeCase;
         파일 {preview.item_count}개와 결과 폴더를 확인했습니다
       </label>}
     </section>
+    {correctionFileId && <QuickTitleCorrectionManager fileId={correctionFileId} close={() => setCorrectionFileId(undefined)} started={onTitleStarted} />}
   </div>;
 }
 
