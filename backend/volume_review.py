@@ -410,7 +410,7 @@ def _case_from_rows(core_title: str, rows: Sequence[Mapping[str, object]], house
     side_story_requires_review = (
         not already_grouped
         and has_side_story
-        and len(main_coordinate_keys) < 2
+        and len(main_coordinate_keys) < 1
     )
 
     # A user may deliberately keep two different EPUB variants at the same
@@ -648,19 +648,22 @@ def _select_distinct_series_rows(
 
 
 def _select_series_rows(rows: Sequence[Mapping[str, object]]) -> list[Mapping[str, object]]:
-    """Select a real multi-position cohort, or only a risky side-story case."""
+    """Select a real multi-position cohort or a side-story relationship."""
 
     selected = _select_distinct_series_rows(rows)
     if selected:
         return selected
 
-    # 단권+외전 또는 외전끼리는 기존 계약대로 사람 검토 대상으로 남긴다.
-    # 외전이 없는 동일 시작점/동일 권의 병행 판본은 분권 화면에서 제외한다.
+    # 본편 좌표가 하나라도 있으면 외전과 같은 작품으로 자동 묶을 수 있다.
+    # 외전끼리만 있으면 사람 검토 대상으로 남기고, 외전이 없는 동일
+    # 시작점/동일 권의 병행 판본은 분권 화면에서 제외한다.
     side_rows = [
         row for row in rows
         if row["coordinate_kind"] == "symbol"
         and row.get("coordinate_symbol") == "side_story"
     ]
+    if len(side_rows) == len(rows) and _is_parallel_coordinate_formats(rows):
+        return []
     if side_rows and len(rows) >= 2:
         return list(rows)
     return []
@@ -675,7 +678,7 @@ def _analyze_volume_cases_uncached(state_db: Path, *, house_dir: Path) -> list[d
         # A compilation or parallel TXT/EPUB edition can share a core title
         # without being a separate series part.  At least two distinct main
         # positions are required; episode ranges specifically need different
-        # starts.  Risky side-story relationships remain reviewable.
+        # starts. Side-story-only relationships remain reviewable.
         selected = _select_series_rows(rows)
         if len(selected) >= 2:
             cases.append(_case_from_rows(core_title, selected, Path(house_dir)))
@@ -1090,9 +1093,8 @@ def apply_auto_ready_volume_groups(
 
     This intentionally has no affected-title filter.  A run repairs the complete
     historical ``auto_ready`` backlog as well as groups made eligible by files
-    ingested earlier in that same run.  Risky side-story-only and single-main
-    plus side-story relationships stay in ``review_required`` and are never
-    overridden here.
+    ingested earlier in that same run. Side-story-only relationships stay in
+    ``review_required`` and are never overridden here.
     """
 
     state_db = Path(state_db).expanduser().resolve()

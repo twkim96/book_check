@@ -3,7 +3,8 @@
 The ordinary filename normalizer deliberately treats a lone trailing number as
 ambiguous.  This module promotes that number to a volume coordinate only when
 the surrounding inventory proves a series: another distinct bare coordinate,
-an explicit volume with the same title, or an already managed work.
+an explicit volume with the same title, an already managed work, or a same-core
+side story next to a single EPUB/PDF volume.
 
 The module is pure.  It does not read SQLite or mutate files, which lets the
 Scanner, duplicate auditor, and Folderling use exactly the same inference.
@@ -29,7 +30,7 @@ from normalizer import (
 )
 
 
-CONTEXT_POLICY_VERSION = "1.4.12"
+CONTEXT_POLICY_VERSION = "1.4.24"
 
 _TRAILING_BRACKET_RE = re.compile(
     r"\s*(?:\[[^\[\]]+\]|\([^()]+\)|【[^【】]+】|\{[^{}]+\})\s*$"
@@ -171,6 +172,18 @@ def _match_bare_volume(stem: str):
     )
 
 
+def _is_unqualified_half_volume(name: str, raw_number: str) -> bool:
+    """Allow conventional ``N.5`` ebook volumes without opening date/version noise."""
+
+    if Path(name).suffix.lower() not in {".epub", ".pdf"}:
+        return False
+    try:
+        value = Decimal(raw_number)
+    except (InvalidOperation, ValueError):
+        return False
+    return value % 1 == Decimal("0.5")
+
+
 def has_bare_volume_shape(name: str) -> bool:
     """Cheap syntax prefilter for an already transport-normalized name.
 
@@ -189,7 +202,11 @@ def has_bare_volume_shape(name: str) -> bool:
     match = _match_bare_volume(structural_stem)
     if match is None:
         return False
-    if "." in match.group("number") and not _DECIMAL_VOLUME_QUALIFIER_RE.search(stem):
+    if (
+        "." in match.group("number")
+        and not _DECIMAL_VOLUME_QUALIFIER_RE.search(stem)
+        and not _is_unqualified_half_volume(name, match.group("number"))
+    ):
         return False
     number = _canonical_bare_number(match.group("number"))
     if number is None:
@@ -268,6 +285,7 @@ def infer_bare_volume_overrides(
     candidates_by_core: dict[str, list[tuple[Mapping[str, object], BareVolumeCandidate]]] = {}
     explicit_authors: dict[str, set[str]] = {}
     explicit_volume_cores: set[str] = set()
+    side_story_cores: set[str] = set()
     managed_cores: set[str] = set()
 
     for record in records:
@@ -279,6 +297,12 @@ def infer_bare_volume_overrides(
             explicit_authors.setdefault(core_title, set()).add(author)
         if core_title and coordinates.get("coordinate_kind") in {"volume", "part"}:
             explicit_volume_cores.add(core_title)
+        if (
+            core_title
+            and coordinates.get("coordinate_kind") == "symbol"
+            and coordinates.get("coordinate_symbol") == "side_story"
+        ):
+            side_story_cores.add(core_title)
         current_core = str(record.get("current_core_title") or "").strip()
         if record.get("assignment_state") == "managed" and current_core:
             managed_cores.add(current_core)
@@ -304,13 +328,16 @@ def infer_bare_volume_overrides(
         if len(authors) > 1:
             continue
         distinct_numbers = {candidate.volume_number for _record, candidate in grouped}
-        proven = (
+        generally_proven = (
             len(distinct_numbers) >= 2
             or core_title in explicit_volume_cores
             or core_title in managed_cores
         )
-        if not proven:
-            continue
         for record, candidate in grouped:
-            overrides[record["key"]] = candidate
+            side_story_proven_ebook = (
+                core_title in side_story_cores
+                and Path(candidate.clean_name).suffix.lower() in {".epub", ".pdf"}
+            )
+            if generally_proven or side_story_proven_ebook:
+                overrides[record["key"]] = candidate
     return overrides

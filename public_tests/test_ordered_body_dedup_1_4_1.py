@@ -268,6 +268,40 @@ def test_side_story_aggregate_96_percent_is_auto_deduplicated(tmp_path):
     assert record["coordinate_mode"] == "side_aggregate_equivalent"
 
 
+def test_same_format_same_start_compilations_use_95_percent_body_proof(tmp_path):
+    shorter = _lines()
+    longer = _lines(count=7_500, changed=range(0, 5_000, 25))
+    house, temp, state_db, index, old = _prepare_managed_reference(
+        tmp_path, "판타지소설 1-100.txt", shorter
+    )
+    incoming = temp / "판타지소설 1-130.txt"
+    incoming.write_text(longer, encoding="utf-8")
+
+    summary = _run(house, temp, state_db, index)
+
+    record = _assert_ordered_quarantine(summary, temp)
+    assert not old.exists() and (house / incoming.name).exists()
+    assert record["coordinate_mode"] == "contained_coordinates"
+    assert record["ordered_body_evidence"]["coverage_ppm"] >= 950_000
+
+
+def test_main_plus_side_story_aggregate_replaces_contained_base(tmp_path):
+    shorter = _lines()
+    aggregate = _lines(count=6_500, changed=range(0, 5_000, 25))
+    house, temp, state_db, index, old = _prepare_managed_reference(
+        tmp_path, "판타지소설 1-100.txt", shorter
+    )
+    incoming = temp / "판타지소설 1-100 외전 1-30.txt"
+    incoming.write_text(aggregate, encoding="utf-8")
+
+    summary = _run(house, temp, state_db, index)
+
+    record = _assert_ordered_quarantine(summary, temp)
+    assert not old.exists() and (house / incoming.name).exists()
+    assert record["coordinate_mode"] == "contained_coordinates"
+    assert record["ordered_body_evidence"]["coverage_ppm"] >= 950_000
+
+
 def test_nested_96_percent_body_keeps_wider_declared_coverage(tmp_path):
     shorter = _lines()
     longer = _lines(count=7_500, changed=range(0, 5_000, 25))

@@ -1268,7 +1268,7 @@ def test_volume_review_api_builds_confirmation_bound_plan(tmp_path):
     assert "ㅂ/별빛 도서/별빛 도서 1권.txt" in indexed
 
 
-def test_volume_review_api_requires_explicit_side_story_override(tmp_path):
+def test_volume_review_api_auto_readies_single_main_plus_side_story(tmp_path):
     app, _ = _server_fixture(tmp_path)
     config = app.config["library_server_config"]
     conn = decision_store.connect_state_db(config.state_db)
@@ -1284,28 +1284,18 @@ def test_volume_review_api_requires_explicit_side_story_override(tmp_path):
 
     client = app.test_client()
     listing = client.get(
-        "/api/review/volumes?classification=review_required"
+        "/api/review/volumes?classification=auto_ready"
     ).get_json()["data"]
     [case] = listing["items"]
     payload = {
         "case_id": case["case_id"],
         "source_revision": case["source_revision"],
     }
-    blocked = client.post(
+    preview = client.post(
         "/api/review/volumes/preview", json=payload
     ).get_json()["data"]
-    assert blocked["apply_available"] is False
-    assert "side_story_requires_two_main_coordinates" in blocked["blocked_reasons"]
-
-    approved = client.post(
-        "/api/review/volumes/preview",
-        json={
-            **payload,
-            "allow_side_story_without_two_main_coordinates": True,
-        },
-    ).get_json()["data"]
-    assert approved["apply_available"] is True
-    assert approved["allow_side_story_without_two_main_coordinates"] is True
+    assert preview["apply_available"] is True
+    assert preview["blocked_reasons"] == []
 
 
 def test_job_store_marks_running_records_interrupted_after_restart(tmp_path):

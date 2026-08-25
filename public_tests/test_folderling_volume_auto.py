@@ -183,6 +183,86 @@ def test_episode_split_backlog_is_auto_grouped_but_side_only_is_not(tmp_path):
     assert result["remaining_summary"]["review_required"] == 1
 
 
+def test_user_series_examples_group_side_stories_and_keep_cross_format_editions(
+    tmp_path,
+):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        names = (
+            "텍스트판타지 1-100.txt",
+            "텍스트판타지 외전 1-30.txt",
+            "교차판타지 1-100.txt",
+            "교차판타지 외전 1-30.epub",
+            "병렬길이 1-100.txt",
+            "병렬길이 1-130.epub",
+            "병렬동일 1-100.txt",
+            "병렬동일 1-100.epub",
+            "반권작품 1.pdf",
+            "반권작품 2.epub",
+            "반권작품 2.5.epub",
+            "반권작품 외전.txt",
+            "단권판타지 1.pdf",
+            "단권판타지 외전.txt",
+        )
+        for name in names:
+            _add(conn, house / "ㅍ" / name, "house")
+        with decision_store.transaction(conn):
+            context = decision_store.sync_contextual_bare_volume_metadata(
+                conn,
+                target_sources=("house",),
+                evidence_sources=("house",),
+            )
+    finally:
+        conn.close()
+
+    assert context["promoted_count"] == 4
+    run_id = _approve(state_db, house, temp)
+    result = apply_auto_ready_volume_groups(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        run_id=run_id,
+    )
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+    grouped = {
+        path.name: {child.name for child in path.iterdir()}
+        for path in house.rglob("*")
+        if path.is_dir() and path.name in {
+            "텍스트판타지", "교차판타지", "반권작품", "단권판타지"
+        }
+    }
+    assert grouped == {
+        "텍스트판타지": {
+            "텍스트판타지 1-100.txt", "텍스트판타지 외전 1-30.txt"
+        },
+        "교차판타지": {
+            "교차판타지 1-100.txt", "교차판타지 외전 1-30.epub"
+        },
+        "반권작품": {
+            "반권작품 1.pdf", "반권작품 2.epub", "반권작품 2.5.epub",
+            "반권작품 외전.txt",
+        },
+        "단권판타지": {"단권판타지 1.pdf", "단권판타지 외전.txt"},
+    }
+    assert (house / "ㅍ" / "병렬길이 1-100.txt").is_file()
+    assert (house / "ㅍ" / "병렬길이 1-130.epub").is_file()
+    assert (house / "ㅍ" / "병렬동일 1-100.txt").is_file()
+    assert (house / "ㅍ" / "병렬동일 1-100.epub").is_file()
+    assert result["applied_count"] == 4
+    assert result["moved_count"] == 10
+
+
 def test_auto_volume_pass_with_no_candidates_keeps_warm_analysis(
     tmp_path, monkeypatch,
 ):

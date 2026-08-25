@@ -108,6 +108,7 @@ def test_decimal_special_edition_and_author_copy_suffix_are_closed_shapes():
     assert collision is not None
     assert collision.volume_number == 1
     assert parse_bare_volume_candidate("86 에이티식스 Alter.2.epub").volume_number == 2
+    assert parse_bare_volume_candidate("판타지소설 2.5.epub").volume_number == "2.5"
     assert parse_bare_volume_candidate("정상 제목 3.11 (작가).epub") is None
 
 
@@ -284,6 +285,48 @@ def test_side_story_is_not_used_as_bare_main_volume_evidence(tmp_path):
 
     assert result["promoted_count"] == 0
     assert projected["coordinate_kind"] != "volume"
+
+
+def test_ebook_volumes_and_side_story_cover_singleton_and_half_volume_examples(
+    tmp_path,
+):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for name in (
+            "연속판타지 1.pdf",
+            "연속판타지 2.epub",
+            "연속판타지 2.5.epub",
+            "연속판타지 외전.txt",
+            "단권판타지 1.pdf",
+            "단권판타지 외전.txt",
+        ):
+            _add(conn, house / "ㅍ" / name, "house")
+        with decision_store.transaction(conn):
+            result = decision_store.sync_contextual_bare_volume_metadata(
+                conn,
+                target_sources=("house",),
+                evidence_sources=("house",),
+            )
+    finally:
+        conn.close()
+
+    assert result["candidate_count"] == 4
+    assert result["promoted_count"] == 4
+    cases = {
+        case["core_title"]: case
+        for case in list_volume_cases(state_db, house_dir=house, limit=20)["items"]
+    }
+    assert set(cases) == {"연속판타지", "단권판타지"}
+    assert all(case["classification"] == "auto_ready" for case in cases.values())
+    assert {item["coordinate"] for item in cases["연속판타지"]["items"]} == {
+        "1권", "2권", "2.5권", "side_story",
+    }
+    assert {item["coordinate"] for item in cases["단권판타지"]["items"]} == {
+        "1권", "side_story",
+    }
 
 
 def test_warm_context_projection_does_not_restat_unchanged_house(tmp_path, monkeypatch):

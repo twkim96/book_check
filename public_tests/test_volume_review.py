@@ -58,12 +58,12 @@ def test_volume_inventory_classifies_without_mutating_files(tmp_path):
     cases = _by_title(listing)
 
     assert listing["readonly"] is False
-    assert listing["total"] == 5
+    assert listing["total"] == 4
     assert listing["summary"] == {
         "already_grouped": 1,
         "auto_ready": 2,
         "excluded": 1,
-        "review_required": 1,
+        "review_required": 0,
     }
     assert cases["우주도서"]["classification"] == "auto_ready"
     assert cases["도시이야기"]["classification"] == "already_grouped"
@@ -71,12 +71,7 @@ def test_volume_inventory_classifies_without_mutating_files(tmp_path):
     assert cases["누락작품"]["missing_coordinates"] == ["2권"]
     assert cases["누락작품"]["blocked_reasons"] == []
     assert cases["누락작품"]["plan_ready"] is True
-    assert cases["형식작품"]["classification"] == "review_required"
-    assert cases["형식작품"]["duplicate_coordinates"] == []
-    assert cases["형식작품"]["parallel_format_coordinates"] == ["side_story"]
-    assert cases["형식작품"]["blocked_reasons"] == [
-        "side_story_requires_two_main_coordinates"
-    ]
+    assert "형식작품" not in cases
     assert cases["24"]["classification"] == "excluded"
 
     after = sorted(str(path.relative_to(house)) for path in house.rglob("*") if path.is_file())
@@ -104,7 +99,7 @@ def test_current_file_analysis_does_not_reparse_every_listing_row(
 
     listing = list_volume_cases(state_db, house_dir=house, limit=50)
 
-    assert listing["total"] == 5
+    assert listing["total"] == 4
 
 
 def test_stale_manual_title_override_remains_one_volume_work(tmp_path):
@@ -199,6 +194,30 @@ def test_parallel_complete_editions_are_not_series_cases(tmp_path):
     assert all(value == 0 for value in listing["summary"].values())
 
 
+def test_live_parallel_side_story_editions_are_not_series_cases(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for name in (
+            "공략 대상은 S급 헌터 0-313 외전 완 [다나안].txt",
+            "공략 대상은 S급 헌터 0-313 외전 완 [다나안].epub",
+            "공작님의 아이만 필요합니다 1-182 외전 완 [백단].txt",
+            "공작님의 아이만 필요합니다 1-182 외전 완 [백단].epub",
+            "회귀했더니 무공 천재 1-705 외전 후일담 완 [윤도진].txt",
+            "회귀했더니 무공 천재 1-705 외전 후일담 완 [윤도진].epub",
+        ):
+            _add_file(conn, house / name[0] / name)
+    finally:
+        conn.close()
+
+    listing = list_volume_cases(state_db, house_dir=house, limit=20)
+
+    assert listing["total"] == 0
+    assert listing["items"] == []
+
+
 def test_episode_zero_and_one_are_the_same_series_start():
     zero = {"coordinate_kind": "episode", "episode_start": 0}
     one = {"coordinate_kind": "episode", "episode_start": 1}
@@ -231,7 +250,7 @@ def test_parallel_edition_can_join_a_real_split_series(tmp_path):
     assert case["parallel_format_coordinates"] == ["1~100화"]
 
 
-def test_same_start_editions_with_side_story_require_review(tmp_path):
+def test_same_start_editions_with_side_story_are_one_series(tmp_path):
     house = tmp_path / "house"
     house.mkdir()
     state_db = tmp_path / ".dedup_state" / "dedup_decisions.sqlite3"
@@ -250,11 +269,9 @@ def test_same_start_editions_with_side_story_require_review(tmp_path):
 
     assert listing["total"] == 1
     [case] = listing["items"]
-    assert case["classification"] == "review_required"
+    assert case["classification"] == "auto_ready"
     assert case["main_coordinate_count"] == 1
-    assert case["blocked_reasons"] == [
-        "side_story_requires_two_main_coordinates"
-    ]
+    assert case["blocked_reasons"] == []
 
 
 def test_identical_concurrent_volume_listings_share_one_analysis(
@@ -284,7 +301,7 @@ def test_identical_concurrent_volume_listings_share_one_analysis(
         )
 
     assert len(calls) == 1
-    assert {result["total"] for result in results} == {5}
+    assert {result["total"] for result in results} == {4}
 
 
 def test_volume_listing_cache_refreshes_only_after_database_revision(
@@ -301,8 +318,8 @@ def test_volume_listing_cache_refreshes_only_after_database_revision(
 
     monkeypatch.setattr(volume_review, "_load_volume_rows", counted_load)
 
-    assert list_volume_cases(state_db, house_dir=house, limit=1)["total"] == 5
-    assert list_volume_cases(state_db, house_dir=house, limit=1)["total"] == 5
+    assert list_volume_cases(state_db, house_dir=house, limit=1)["total"] == 4
+    assert list_volume_cases(state_db, house_dir=house, limit=1)["total"] == 4
     assert len(calls) == 1
 
     conn = decision_store.connect_state_db(state_db)
@@ -315,7 +332,7 @@ def test_volume_listing_cache_refreshes_only_after_database_revision(
     finally:
         conn.close()
 
-    assert list_volume_cases(state_db, house_dir=house, limit=1)["total"] == 5
+    assert list_volume_cases(state_db, house_dir=house, limit=1)["total"] == 4
     assert len(calls) == 2
 
 
@@ -489,7 +506,7 @@ def test_numbered_side_stories_are_distinct_coordinates(tmp_path):
     assert {item["coordinate"] for item in case["items"]} == {"외전 1", "외전 2"}
 
 
-def test_single_main_plus_side_story_requires_explicit_override(tmp_path):
+def test_single_main_plus_side_story_is_auto_ready(tmp_path):
     house = tmp_path / "house"
     house.mkdir()
     state_db = tmp_path / ".state" / "dedup.sqlite3"
@@ -503,28 +520,49 @@ def test_single_main_plus_side_story_requires_explicit_override(tmp_path):
     [case] = list_volume_cases(
         state_db, house_dir=house, search="다정한 작품", limit=10
     )["items"]
-    assert case["classification"] == "review_required"
+    assert case["classification"] == "auto_ready"
     assert case["main_coordinate_count"] == 1
     assert case["has_side_story"] is True
 
-    blocked = preview_volume_group(
+    preview = preview_volume_group(
         state_db,
         house_dir=house,
         case_id=case["case_id"],
         source_revision=case["source_revision"],
     )
-    assert blocked["apply_available"] is False
-    assert "side_story_requires_two_main_coordinates" in blocked["blocked_reasons"]
+    assert preview["apply_available"] is True
+    assert preview["blocked_reasons"] == []
 
-    approved = preview_volume_group(
-        state_db,
-        house_dir=house,
-        case_id=case["case_id"],
-        source_revision=case["source_revision"],
-        allow_side_story_without_two_main_coordinates=True,
-    )
-    assert approved["apply_available"] is True
-    assert approved["allow_side_story_without_two_main_coordinates"] is True
+
+def test_main_plus_side_story_groups_but_parallel_main_editions_stay_loose(tmp_path):
+    house = tmp_path / "house"
+    house.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        for name in (
+            "판타지 소설 1-100.txt",
+            "판타지소설 외전 1-30.txt",
+            "교차 판타지 1-100.txt",
+            "교차판타지 외전 1-30.epub",
+            "병렬 판타지 1-100.txt",
+            "병렬판타지 1-130.epub",
+            "동좌표 판타지 1-100.txt",
+            "동좌표판타지 1-100.epub",
+        ):
+            _add_file(conn, house / "ㅍ" / name)
+    finally:
+        conn.close()
+
+    cases = _by_title(list_volume_cases(state_db, house_dir=house, limit=20))
+
+    assert set(cases) == {"판타지소설", "교차판타지"}
+    assert all(case["classification"] == "auto_ready" for case in cases.values())
+    assert all(case["main_coordinate_count"] == 1 for case in cases.values())
+    assert {item["extension"] for item in cases["판타지소설"]["items"]} == {".txt"}
+    assert {item["extension"] for item in cases["교차판타지"]["items"]} == {
+        ".txt", ".epub"
+    }
 
 
 def test_episode_split_files_are_automatic_even_when_ranges_overlap(tmp_path):
@@ -622,7 +660,7 @@ def test_volume_listing_search_filter_and_cursor(tmp_path):
     result = list_volume_cases(
         state_db,
         house_dir=house,
-        search="작품",
+        search="도",
         classification="all",
         limit=1,
         sort="title",
@@ -633,7 +671,7 @@ def test_volume_listing_search_filter_and_cursor(tmp_path):
     second = list_volume_cases(
         state_db,
         house_dir=house,
-        search="작품",
+        search="도",
         classification="all",
         limit=1,
         sort="title",
