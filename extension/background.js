@@ -28,7 +28,9 @@ function createContextSearchMenu() {
         "*://pastebin.com/*",
         "*://*.pastebin.com/*",
         "*://chating.wiki/*",
-        "*://*.chating.wiki/*"
+        "*://*.chating.wiki/*",
+        "*://lamu.club/*",
+        "*://*.lamu.club/*"
       ],
     }, () => {
       void chrome.runtime.lastError;

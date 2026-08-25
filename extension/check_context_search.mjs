@@ -7,10 +7,12 @@ import vm from "node:vm";
 const manifest = JSON.parse(fs.readFileSync(new URL("./manifest.json", import.meta.url), "utf8"));
 const contentSource = fs.readFileSync(new URL("./content.js", import.meta.url), "utf8");
 const command = manifest.commands["search-selected-text"];
-assert.equal(manifest.version, "2.11");
+assert.equal(manifest.version, "2.12");
 assert.equal(command.suggested_key.mac, "Command+Shift+L");
 assert.equal(command.suggested_key.default, undefined);
-const supportedSites = ["enterjoy", "tcafe21", "pastebin.com", "chating.wiki"];
+const supportedSites = [
+  "enterjoy", "tcafe21", "pastebin.com", "chating.wiki", "lamu.club",
+];
 for (const site of supportedSites) {
   assert.ok(manifest.content_scripts[0].include_globs.some((glob) => glob.includes(site)));
 }
@@ -18,6 +20,7 @@ assert.match(contentSource, /createElement\("dialog"\)/);
 assert.match(contentSource, /\.showModal\(\)/);
 assert.match(contentSource, /\.group-material-copy > strong/);
 assert.match(contentSource, /\.cw-board-item__title > strong/);
+assert.match(contentSource, /\.at-content > \.view-wrap > h1/);
 
 const listeners = { messages: [] };
 class MockElement {
@@ -201,6 +204,8 @@ await import(`./background.js?context-search-check=${Date.now()}`);
 assert.equal(createdMenu.title, "이 제목으로 중복 확인");
 assert.ok(createdMenu.documentUrlPatterns.includes("*://chating.wiki/*"));
 assert.ok(createdMenu.documentUrlPatterns.includes("*://*.chating.wiki/*"));
+assert.ok(createdMenu.documentUrlPatterns.includes("*://lamu.club/*"));
+assert.ok(createdMenu.documentUrlPatterns.includes("*://*.lamu.club/*"));
 assert.equal(typeof commandListener, "function");
 commandListener("search-selected-text", { id: 42 });
 assert.deepEqual(sentMessage, {

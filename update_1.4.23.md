@@ -52,6 +52,9 @@ E열은 현재 `status=ok`인 플랫폼 수치만 대상으로 아래 값을 합
   Popover API를 사용할 수 없으면 기존 최대 z-index fixed 툴팁으로 폴백한다.
 - Chating Wiki 자료함 제목 요소에서만 URL-form 공백 구분자 `+`를 공백으로 바꾼 뒤 검색한다. 공용
   normalizer는 변경하지 않아 `C++`·`1+1` 같은 identity-bearing `+`를 계속 보존한다.
+- 확장 2.12부터 Lamu(`lamu.club` 및 하위 도메인)를 콘텐츠 주입·기존 우클릭 메뉴 대상에 포함한다.
+  로그인된 실제 상세 페이지에서 `.at-content > .view-wrap > h1`가 제목에 정확히 1개 매칭됨을 확인하고,
+  이 selector를 기존 돋보기·웹 정보·Command+우클릭 제목 경로에 추가한다.
 - 모달이 닫혔거나 다른 제목으로 바뀐 뒤 도착한 응답은 렌더링하지 않는다.
 
 ## 변경하지 않는 계약
@@ -67,7 +70,7 @@ E열은 현재 `status=ok`인 플랫폼 수치만 대상으로 아래 값을 합
 - 최종 A:E Sheet projection/format 집중 공개 회귀: **16 passed**
 - Python 전체 회귀: **1024 passed**, urllib3/LibreSSL 환경 warning 1건
 - server health 1.4.23 회귀: 전체 회귀에 포함해 PASS
-- Chrome context-search: PASS (`sites=4`, `Command+Shift+L`)
+- Chrome context-search: PASS (`sites=5`, `Command+Shift+L`)
 - Chrome normalizer parity: PASS (`version=1.3.3`, `cases=37`)
 - frontend 1.4.23 typecheck/build: PASS
 - compileall: PASS

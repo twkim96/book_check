@@ -3,6 +3,7 @@
 // EnterJoy: .item-subject, 게시글 상세 제목
 // Tcafe21: .td_subject a, .list-subject a 등
 // Chating Wiki: 자료함 카드와 게시판 행의 제목 strong
+// Lamu: .at-content > .view-wrap > h1 상세 제목
 const SELECTORS = [
   ".item-subject",
   "#at-main > div.view-wrap > section > article > h1",
@@ -10,12 +11,12 @@ const SELECTORS = [
   ".list-subject a",
   ".wr-subject a",
   ".group-material-copy > strong",
-  ".cw-board-item__title > strong"
+  ".cw-board-item__title > strong",
+  ".at-content > .view-wrap > h1"
 ];
 const TARGET_SELECTOR = SELECTORS.join(", ");
 const CONTEXT_TARGET_SELECTORS = [
   ...SELECTORS,
-  ".at-content > .view-wrap > h1",
   ".highlighted-code .source li > div"
 ];
 const CONTEXT_TARGET_SELECTOR = CONTEXT_TARGET_SELECTORS.join(", ");

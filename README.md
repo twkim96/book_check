@@ -823,6 +823,10 @@ approved·active run 및 unfinished operation/group 0, platform-update target 0�
   `C++`·`1+1` 같은 실제 `+` 제목 보호는 유지한다. 일반 우클릭 메뉴와 `Command+Shift+L` 선택 제목 검색은
   기존 동작을 유지한다.
 
+확장 2.12는 Lamu(`lamu.club` 및 하위 도메인)에도 콘텐츠 스크립트와 기존 우클릭 메뉴를 활성화한다.
+로그인된 실제 상세 페이지에서 확인한 `.at-content > .view-wrap > h1` 제목에 기존 로컬 중복 돋보기와
+웹 정보 아이콘을 붙이며, 선택 제목 Command+우클릭과 `Command+Shift+L`도 동일하게 동작한다.
+
 서버/UI 버전은 `1.4.23`, schema는 계속 `v16`이다. normalizer/fingerprint/pair/auditor/archive 계약은
 1.4.22와 동일하다.
 
