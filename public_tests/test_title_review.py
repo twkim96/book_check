@@ -9,6 +9,7 @@ from scanner import generate_file_list
 from title_review import (
     apply_title_plan,
     build_title_plan,
+    get_title_case,
     list_title_cases,
     preview_title_change,
 )
@@ -82,6 +83,72 @@ def test_list_only_exposes_titles_without_any_ok_metadata(tmp_path):
         "novelpia": "not_found",
     }
     assert item["editable"] is True
+
+
+def test_direct_file_correction_allows_platform_ok_title(tmp_path):
+    state_db, house, temp, _, _ = _fixture(tmp_path)
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        protected_id = conn.execute(
+            "SELECT file_id FROM files WHERE canonical_path LIKE ?",
+            ("%보호 메타데이터 작품 1-100.txt",),
+        ).fetchone()["file_id"]
+    finally:
+        conn.close()
+
+    assert list_title_cases(state_db, search="보호 메타데이터 작품")["total"] == 0
+    all_house = list_title_cases(
+        state_db,
+        search="보호 메타데이터 작품",
+        status_filter="all_house",
+    )
+    assert all_house["total"] == 1
+    assert all_house["items"][0]["file_id"] == protected_id
+    assert all_house["items"][0]["editable"] is True
+    case = get_title_case(state_db, protected_id)
+    assert case["platforms"]["series"] == "ok"
+
+    preview = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=protected_id,
+        new_body="보호 메타데이터 작품 1-101",
+        source_revision=case["source_revision"],
+    )
+    assert preview["runnable"] is True
+    assert preview["candidate_name"] == "보호 메타데이터 작품 1-101.txt"
+    assert preview["core_changed"] is False
+    assert preview["metadata_strategy"] == "preserve_same_core"
+
+
+def test_core_change_does_not_silently_inherit_unrelated_metadata(tmp_path):
+    state_db, house, temp, editable_id, _ = _fixture(tmp_path)
+    [case] = list_title_cases(state_db)["items"]
+
+    fresh = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=editable_id,
+        new_body="완전히 새로운 교정 제목 1-146",
+        source_revision=case["source_revision"],
+    )
+    assert fresh["core_changed"] is True
+    assert fresh["metadata_strategy"] == "fresh_platform_lookup"
+    assert fresh["target_ok_platforms"] == []
+
+    existing = preview_title_change(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        file_id=editable_id,
+        new_body="보호 메타데이터 작품 1-101",
+        source_revision=case["source_revision"],
+    )
+    assert existing["core_changed"] is True
+    assert existing["metadata_strategy"] == "reuse_existing_target"
+    assert existing["target_ok_platforms"] == ["series"]
 
 
 def test_preview_preserves_extension_and_detects_stale_revision(tmp_path):

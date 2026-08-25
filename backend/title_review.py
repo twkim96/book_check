@@ -113,13 +113,20 @@ def _base_select() -> str:
     """
 
 
-def _where_clauses(search: str, status_filter: str) -> tuple[list[str], list[object]]:
-    clauses = [
+def _active_house_clauses() -> list[str]:
+    return [
         "f.active = 1",
         "f.source = 'house'",
-        "NOT EXISTS (SELECT 1 FROM catalog_platform_stats AS ok "
-        "WHERE ok.title_key = fa.core_title AND ok.status = 'ok')",
     ]
+
+
+def _where_clauses(search: str, status_filter: str) -> tuple[list[str], list[object]]:
+    clauses = _active_house_clauses()
+    if status_filter != "all_house":
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM catalog_platform_stats AS ok "
+            "WHERE ok.title_key = fa.core_title AND ok.status = 'ok')"
+        )
     params: list[object] = []
     value = (search or "").strip()
     if value:
@@ -144,7 +151,7 @@ def _where_clauses(search: str, status_filter: str) -> tuple[list[str], list[obj
         clauses.append(
             "(series.status IS NULL OR kakao.status IS NULL OR novelpia.status IS NULL)"
         )
-    elif status_filter != "all":
+    elif status_filter not in {"all", "all_house"}:
         raise ValueError(f"unknown status filter: {status_filter}")
     return clauses, params
 
@@ -247,13 +254,13 @@ def list_title_cases(
 def get_title_case(state_db: Path, file_id: str) -> dict:
     conn = _readonly_connection(state_db)
     try:
-        clauses, params = _where_clauses("", "all")
+        clauses = _active_house_clauses()
         row = conn.execute(
             _base_select()
             + " WHERE "
             + " AND ".join(clauses)
             + " AND f.file_id = ?",
-            tuple(params) + (file_id,),
+            (file_id,),
         ).fetchone()
     finally:
         conn.close()
@@ -298,10 +305,10 @@ def preview_title_change(
     temp_dir = Path(temp_dir).expanduser().resolve()
     conn = _readonly_connection(state_db)
     try:
-        clauses, params = _where_clauses("", "all")
+        clauses = _active_house_clauses()
         row = conn.execute(
             _base_select() + " WHERE " + " AND ".join(clauses) + " AND f.file_id = ?",
-            tuple(params) + (file_id,),
+            (file_id,),
         ).fetchone()
         if row is None:
             raise KeyError(file_id)
@@ -359,10 +366,36 @@ def preview_title_change(
             """,
             (analysis["core_title"],),
         ).fetchone()
+        target_ok_platforms = [
+            str(item["platform"])
+            for item in conn.execute(
+                "SELECT platform FROM catalog_platform_stats "
+                "WHERE title_key = ? AND status = 'ok' ORDER BY platform",
+                (analysis["core_title"],),
+            )
+        ]
+        before_core_active_files = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM files AS active_file
+            JOIN file_analysis AS active_analysis
+              ON active_analysis.file_id = active_file.file_id
+            WHERE active_file.active = 1 AND active_file.source = 'house'
+              AND active_analysis.core_title = ?
+            """,
+            (current["core_title"],),
+        ).fetchone()[0]
     finally:
         conn.close()
 
     blockers = list(dict.fromkeys(blockers))
+    core_changed = current["core_title"] != analysis["core_title"]
+    if not core_changed:
+        metadata_strategy = "preserve_same_core"
+    elif target_ok_platforms:
+        metadata_strategy = "reuse_existing_target"
+    else:
+        metadata_strategy = "fresh_platform_lookup"
     return {
         "file_id": file_id,
         "source_revision": current["source_revision"],
@@ -390,7 +423,11 @@ def preview_title_change(
         "title_literal_tokens": list(extract_title_literal_tokens(candidate_name)),
         "structure_hint_tokens": list(extract_structure_hint_tokens(candidate_name)),
         "target_exists": target is not None,
-        "target_has_ok": bool(target is not None and target["ok_count"]),
+        "target_has_ok": bool(target_ok_platforms),
+        "target_ok_platforms": target_ok_platforms,
+        "core_changed": core_changed,
+        "metadata_strategy": metadata_strategy,
+        "before_core_other_active_files": max(0, int(before_core_active_files) - 1),
         "blocked_reasons": blockers,
         "runnable": not blockers,
     }
@@ -408,6 +445,9 @@ def _plan_sha256(items: Sequence[Mapping[str, object]]) -> str:
             "destination_path": item["destination_path"],
             "before_core_title": item["before_core_title"],
             "after_core_title": item["after_core_title"],
+            "core_changed": item["core_changed"],
+            "metadata_strategy": item["metadata_strategy"],
+            "target_ok_platforms": item["target_ok_platforms"],
             "blocked_reasons": item["blocked_reasons"],
         }
         for item in items
@@ -577,6 +617,11 @@ def apply_title_plan(
             "backup_path": str(backup),
             "planned": plan["item_count"],
             "completed": len(completed),
-            "next_action": "Folderling 실행",
+            "core_changed": sum(bool(item["core_changed"]) for item in plan["items"]),
+            "next_action": (
+                "Folderling 실행 후 플랫폼 DB 업데이트"
+                if any(item["core_changed"] for item in plan["items"])
+                else "Folderling 실행"
+            ),
             "operations": completed,
         }
