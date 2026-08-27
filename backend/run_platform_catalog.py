@@ -250,7 +250,7 @@ def _platform_data_repair_backup_path(state_db: Path) -> Path:
 
 
 def ensure_catalog_schema(state_db_path: str) -> Optional[Path]:
-    """Back up an existing older schema before adding the independent catalog."""
+    """Create a fresh schema or refuse routine migration of an existing DB."""
     state_db = Path(state_db_path)
     with mutation_lock_for_roots(HOUSE_DIR, TEMP_DIR, "platform-catalog-schema"):
         original_version = _schema_version(state_db)
@@ -258,18 +258,15 @@ def ensure_catalog_schema(state_db_path: str) -> Optional[Path]:
             raise RuntimeError(
                 f"state DB schema is newer than this program: {original_version}"
             )
-        backup = None
-        if state_db.is_file() and original_version < decision_store.SCHEMA_VERSION:
-            conn = decision_store.connect_state_db(state_db)
-            try:
-                backup = decision_store.backup_state_db(conn, _backup_path(state_db))
-            finally:
-                conn.close()
-        conn = decision_store.initialize_state_db(
-            state_db, migrate=True, compact_migrations=True
-        )
+        if state_db.is_file() and original_version != decision_store.SCHEMA_VERSION:
+            raise RuntimeError(
+                "platform catalog refuses automatic state DB migration: "
+                f"current={original_version}, expected={decision_store.SCHEMA_VERSION}; "
+                "run migrate_fingerprint_payloads.py --run first"
+            )
+        conn = decision_store.initialize_state_db(state_db)
         conn.close()
-        return backup
+        return None
 
 
 def _duration_text(seconds: float) -> str:

@@ -27,15 +27,19 @@ def _add_text(
     )
     stat_result = path.stat()
     with decision_store.transaction(conn):
+        anchor_state, anchor_hash = decision_store.prepare_fingerprint_anchor_payload(
+            conn, analysis.front_anchor, analysis.tail_anchor
+        )
         fingerprint_id = conn.execute(
             """
             INSERT INTO fingerprints(
                 file_id, canonical_path, size, mtime_ns, normalizer_version,
                 fingerprint_version, dev, ino, ctime_ns,
                 raw_sha256, normalized_sha256, normalized_length,
-                encoding, status, front_anchor, tail_anchor, anchors_json
+                encoding, status, anchors_json,
+                anchor_payload_state, anchor_payload_hash
             ) VALUES (?, ?, ?, ?, 'test-1.4.17', 'test-strong-review',
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')
+                      ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)
             """,
             (
                 row["file_id"], str(path), stat_result.st_size,
@@ -43,9 +47,12 @@ def _add_text(
                 stat_result.st_ino, stat_result.st_ctime_ns,
                 analysis.raw_sha256, analysis.normalized_sha256,
                 analysis.normalized_length, analysis.encoding,
-                analysis.status, analysis.front_anchor, analysis.tail_anchor,
+                analysis.status, anchor_state, anchor_hash,
             ),
         ).lastrowid
+        decision_store.store_fingerprint_anchor_payload(
+            conn, fingerprint_id, analysis.front_anchor, analysis.tail_anchor
+        )
         conn.execute(
             """
             UPDATE files

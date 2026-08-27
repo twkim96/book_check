@@ -123,9 +123,11 @@ def run(
         ensure_directory_nofollow(backup_dir)
         original_schema = _schema_version(state_db)
         pre_migration = None
-        if original_schema < decision_store.SCHEMA_VERSION:
-            pre_migration = _backup_unmigrated_db(
-                state_db, _unique_backup_path(backup_dir, "before_schema")
+        if original_schema != decision_store.SCHEMA_VERSION:
+            raise RuntimeError(
+                "Folderling refuses automatic state DB migration: "
+                f"current={original_schema}, expected={decision_store.SCHEMA_VERSION}; "
+                "run migrate_fingerprint_payloads.py --run first"
             )
         approval_started = False
         try:
@@ -134,9 +136,7 @@ def run(
             # open only needs to prove the current/migrated schema structure.
             conn = decision_store.initialize_state_db(
                 state_db,
-                migrate=True,
                 check_integrity=False,
-                compact_migrations=True,
             )
             try:
                 # A user moves managed queue files into these inboxes outside the

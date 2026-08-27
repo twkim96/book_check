@@ -282,12 +282,14 @@ def claim_external_action_moves(conn, temp_dir):
                         file_id, canonical_path, size, mtime_ns, dev, ino, ctime_ns,
                         normalizer_version, fingerprint_version, analysis_policy_hash,
                         raw_sha256, normalized_sha256, normalized_length, encoding,
-                        status, anchors_json
+                        status, anchors_json, anchor_payload_state,
+                        anchor_payload_hash
                     )
                     SELECT file_id, ?, ?, ?, ?, ?, ?, normalizer_version,
                            fingerprint_version || ?, analysis_policy_hash,
                            raw_sha256, normalized_sha256, normalized_length, encoding,
-                           status, anchors_json
+                           status, anchors_json, anchor_payload_state,
+                           anchor_payload_hash
                     FROM fingerprints WHERE fingerprint_id = ? AND file_id = ?
                     """,
                     (

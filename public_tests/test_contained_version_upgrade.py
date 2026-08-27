@@ -30,22 +30,28 @@ def _prepare_managed_reference(tmp_path, name, body):
         reference, budget=ReadBudget(max_bytes=10_000_000)
     )
     with decision_store.transaction(conn):
+        anchor_state, anchor_hash = decision_store.prepare_fingerprint_anchor_payload(
+            conn, analysis.front_anchor, analysis.tail_anchor
+        )
         fingerprint_id = conn.execute(
             """
             INSERT INTO fingerprints(
                 file_id, canonical_path, size, mtime_ns, normalizer_version,
                 fingerprint_version, raw_sha256, normalized_sha256,
-                normalized_length, encoding, status, front_anchor, tail_anchor,
-                anchors_json
-            ) VALUES (?, ?, ?, ?, 'public-test', '1', ?, ?, ?, ?, ?, ?, ?, '{}')
+                normalized_length, encoding, status, anchors_json,
+                anchor_payload_state, anchor_payload_hash
+            ) VALUES (?, ?, ?, ?, 'public-test', '1', ?, ?, ?, ?, ?, '{}', ?, ?)
             """,
             (
                 row["file_id"], str(reference), analysis.size, analysis.mtime_ns,
                 analysis.raw_sha256, analysis.normalized_sha256,
                 analysis.normalized_length, analysis.encoding, analysis.status,
-                analysis.front_anchor, analysis.tail_anchor,
+                anchor_state, anchor_hash,
             ),
         ).lastrowid
+        decision_store.store_fingerprint_anchor_payload(
+            conn, fingerprint_id, analysis.front_anchor, analysis.tail_anchor
+        )
         work_id = conn.execute(
             "INSERT INTO works(display_title) VALUES ('합성 작품')"
         ).lastrowid

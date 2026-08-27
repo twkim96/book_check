@@ -1554,6 +1554,11 @@ class PersistentAuditCache:
                 fingerprint_version
             )
         with self.store.transaction(self.conn):
+            anchor_payload_state, anchor_payload_hash = (
+                self.store.prepare_fingerprint_anchor_payload(
+                    self.conn, analysis.front_anchor, analysis.tail_anchor
+                )
+            )
             cursor = self.conn.execute(
                 """
                 INSERT INTO fingerprints(
@@ -1561,8 +1566,9 @@ class PersistentAuditCache:
                     fingerprint_version, analysis_policy_hash,
                     dev, ino, ctime_ns,
                     raw_sha256, normalized_sha256,
-                    normalized_length, encoding, status, anchors_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    normalized_length, encoding, status, anchors_json,
+                    anchor_payload_state, anchor_payload_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
                     file_id, canonical_path, size, mtime_ns,
                     normalizer_version, fingerprint_version
@@ -1588,6 +1594,8 @@ class PersistentAuditCache:
                         {"lossy": analysis.lossy, "error": analysis.error},
                         ensure_ascii=False,
                     ),
+                    anchor_payload_state,
+                    anchor_payload_hash,
                 ),
             )
             if cursor.rowcount == 1:

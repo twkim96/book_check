@@ -6,7 +6,7 @@ This module is declarative: importing it must never open or migrate SQLite.
 from __future__ import annotations
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 ASSIGNMENT_STATES = (
     "unassigned",
     "managed",
@@ -110,6 +110,49 @@ CREATE TRIGGER IF NOT EXISTS fingerprint_anchor_refs_no_delete
 BEFORE DELETE ON fingerprint_anchor_refs
 BEGIN
     SELECT RAISE(ABORT, 'fingerprint anchor references are immutable');
+END;
+"""
+
+
+ANCHOR_PAYLOAD_STRICT_SCHEMA_SQL = """
+CREATE TRIGGER IF NOT EXISTS fingerprints_insert_storage_guard
+BEFORE INSERT ON fingerprints
+BEGIN
+    SELECT CASE
+        WHEN file_check_writer_schema_version() != 19
+        THEN RAISE(ABORT, 'fingerprint writer schema mismatch')
+    END;
+    SELECT CASE
+        WHEN COALESCE((
+            SELECT value FROM settings
+            WHERE key = 'fingerprint_payload_migration_gate'
+        ), '') = 'active'
+        THEN RAISE(ABORT, 'fingerprint payload migration is active')
+    END;
+    SELECT CASE
+        WHEN NEW.front_anchor IS NOT NULL OR NEW.tail_anchor IS NOT NULL
+        THEN RAISE(ABORT, 'legacy fingerprint anchor writes are forbidden')
+    END;
+    SELECT CASE
+        WHEN NEW.anchor_payload_state NOT IN ('none', 'present')
+          OR (NEW.anchor_payload_state = 'none' AND NEW.anchor_payload_hash IS NOT NULL)
+          OR (NEW.anchor_payload_state = 'present' AND NEW.anchor_payload_hash IS NULL)
+        THEN RAISE(ABORT, 'invalid fingerprint anchor payload expectation')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS fingerprint_anchor_refs_expected_hash
+BEFORE INSERT ON fingerprint_anchor_refs
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM fingerprints
+            WHERE fingerprint_id = NEW.fingerprint_id
+              AND anchor_payload_state = 'present'
+              AND anchor_payload_hash = NEW.payload_hash
+        )
+        THEN RAISE(ABORT, 'fingerprint anchor reference differs from expected hash')
+    END;
 END;
 """
 
@@ -308,8 +351,23 @@ CREATE TABLE fingerprints (
     status TEXT NOT NULL,
     front_anchor TEXT,
     tail_anchor TEXT,
+    anchor_payload_state TEXT NOT NULL DEFAULT 'none'
+        CHECK (anchor_payload_state IN ('none', 'present')),
+    anchor_payload_hash TEXT
+        REFERENCES anchor_payload_objects(payload_hash) ON DELETE RESTRICT
+        CHECK (
+            anchor_payload_hash IS NULL OR (
+                LENGTH(anchor_payload_hash) = 64
+                AND anchor_payload_hash NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
     anchors_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (anchor_payload_state = 'none' AND anchor_payload_hash IS NULL)
+        OR
+        (anchor_payload_state = 'present' AND anchor_payload_hash IS NOT NULL)
+    ),
     UNIQUE (fingerprint_id, file_id),
     UNIQUE (file_id, canonical_path, size, mtime_ns, normalizer_version, fingerprint_version)
 );
@@ -327,6 +385,7 @@ BEGIN
 END;
 
 {ANCHOR_PAYLOAD_SCHEMA_SQL}
+{ANCHOR_PAYLOAD_STRICT_SCHEMA_SQL}
 
 CREATE TABLE collision_members (
     group_id INTEGER NOT NULL REFERENCES collision_groups(group_id) ON DELETE CASCADE,

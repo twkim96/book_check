@@ -175,6 +175,28 @@ def ensure_anchor_payload_object(
     return payload_hash
 
 
+def prepare_fingerprint_anchor_payload(
+    conn: sqlite3.Connection,
+    front_anchor,
+    tail_anchor,
+) -> tuple[str, str | None]:
+    """Materialize an object before inserting its immutable fingerprint row."""
+    payload_hash = ensure_anchor_payload_object(conn, front_anchor, tail_anchor)
+    if payload_hash is None:
+        return "none", None
+    return "present", payload_hash
+
+
+def _strict_storage_enabled(conn: sqlite3.Connection) -> bool:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < 19:
+        return False
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(fingerprints)")
+    }
+    return {"anchor_payload_state", "anchor_payload_hash"} <= columns
+
+
 def store_fingerprint_anchor_payload(
     conn: sqlite3.Connection,
     fingerprint_id: int,
@@ -182,11 +204,14 @@ def store_fingerprint_anchor_payload(
     tail_anchor,
 ) -> str | None:
     """Attach one immutable content-addressed payload to a fingerprint."""
+    strict = _strict_storage_enabled(conn)
+    expected_columns = (
+        ", anchor_payload_state, anchor_payload_hash" if strict else ""
+    )
     fingerprint = conn.execute(
-        """
-        SELECT fingerprint_id, front_anchor, tail_anchor
-        FROM fingerprints WHERE fingerprint_id = ?
-        """,
+        "SELECT fingerprint_id, front_anchor, tail_anchor"
+        + expected_columns
+        + " FROM fingerprints WHERE fingerprint_id = ?",
         (fingerprint_id,),
     ).fetchone()
     if fingerprint is None:
@@ -207,11 +232,28 @@ def store_fingerprint_anchor_payload(
         _normalize_anchor(fingerprint["front_anchor"], "front_anchor"),
         _normalize_anchor(fingerprint["tail_anchor"], "tail_anchor"),
     )
+    if strict and any(legacy):
+        raise AnchorPayloadCorruptionError(
+            "schema v19 fingerprint contains forbidden legacy anchor evidence"
+        )
     if any(legacy) and legacy != (front, tail):
         raise AnchorPayloadError(
             "fingerprint legacy anchor evidence differs from new payload"
         )
     payload_hash = ensure_anchor_payload_object(conn, front, tail)
+    if strict:
+        expected_state = fingerprint["anchor_payload_state"]
+        expected_hash = fingerprint["anchor_payload_hash"]
+        if payload_hash is None:
+            if expected_state != "none" or expected_hash is not None:
+                raise AnchorPayloadError(
+                    "empty anchor payload differs from fingerprint expectation"
+                )
+            return None
+        if expected_state != "present" or expected_hash != payload_hash:
+            raise AnchorPayloadError(
+                "anchor payload differs from fingerprint expected hash"
+            )
     if payload_hash is None:
         return None
     conn.execute(
@@ -229,9 +271,15 @@ def load_fingerprint_anchor_payload(
     fingerprint_id: int,
 ) -> tuple[str, str]:
     """Load and validate anchors, falling back only for legacy/test rows."""
+    strict = _strict_storage_enabled(conn)
+    expected_columns = (
+        "fp.anchor_payload_state, fp.anchor_payload_hash, " if strict else ""
+    )
     row = conn.execute(
         """
-        SELECT fp.front_anchor, fp.tail_anchor, ref.payload_hash,
+        SELECT fp.front_anchor, fp.tail_anchor, """
+        + expected_columns
+        + """ref.payload_hash,
                obj.codec, obj.front_byte_length, obj.tail_byte_length,
                obj.raw_length, obj.compressed_payload, obj.raw_checksum
         FROM fingerprints AS fp
@@ -249,7 +297,32 @@ def load_fingerprint_anchor_payload(
         _normalize_anchor(row["front_anchor"], "front_anchor"),
         _normalize_anchor(row["tail_anchor"], "tail_anchor"),
     )
-    if row["payload_hash"] is None:
+    if strict:
+        if row["front_anchor"] is not None or row["tail_anchor"] is not None:
+            raise AnchorPayloadCorruptionError(
+                "schema v19 fingerprint contains forbidden legacy anchor evidence"
+            )
+        expected_state = row["anchor_payload_state"]
+        expected_hash = row["anchor_payload_hash"]
+        if expected_state == "none":
+            if expected_hash is not None or row["payload_hash"] is not None:
+                raise AnchorPayloadCorruptionError(
+                    "fingerprint declared no anchors but has payload evidence"
+                )
+            return "", ""
+        if expected_state != "present" or expected_hash is None:
+            raise AnchorPayloadCorruptionError(
+                "fingerprint anchor payload expectation is invalid"
+            )
+        if row["payload_hash"] is None:
+            raise AnchorPayloadCorruptionError(
+                "fingerprint expected anchor payload reference is missing"
+            )
+        if row["payload_hash"] != expected_hash:
+            raise AnchorPayloadCorruptionError(
+                "fingerprint anchor reference differs from expected hash"
+            )
+    elif row["payload_hash"] is None:
         return legacy
     if row["compressed_payload"] is None:
         raise AnchorPayloadCorruptionError(
@@ -287,9 +360,23 @@ def migrate_legacy_anchor_payloads(conn: sqlite3.Connection) -> dict:
         tail = _normalize_anchor(row["tail_anchor"], "tail_anchor")
         if not front and not tail:
             continue
-        store_fingerprint_anchor_payload(
-            conn, row["fingerprint_id"], front, tail
+        payload_hash = ensure_anchor_payload_object(conn, front, tail)
+        conn.execute(
+            """
+            INSERT INTO fingerprint_anchor_refs(fingerprint_id, payload_hash)
+            VALUES (?, ?)
+            ON CONFLICT(fingerprint_id) DO NOTHING
+            """,
+            (row["fingerprint_id"], payload_hash),
         )
+        stored = conn.execute(
+            "SELECT payload_hash FROM fingerprint_anchor_refs WHERE fingerprint_id = ?",
+            (row["fingerprint_id"],),
+        ).fetchone()
+        if stored is None or stored["payload_hash"] != payload_hash:
+            raise AnchorPayloadError(
+                f"legacy anchor reference mismatch: {row['fingerprint_id']}"
+            )
         referenced += 1
     return {
         "fingerprints_scanned": scanned,
@@ -304,6 +391,74 @@ def validate_anchor_payload_storage(
     verify_payloads: bool = True,
 ) -> None:
     """Fail closed on orphaned, mutable, or corrupt payload storage."""
+    strict = _strict_storage_enabled(conn)
+    if strict:
+        legacy = conn.execute(
+            """
+            SELECT fingerprint_id FROM fingerprints
+            WHERE front_anchor IS NOT NULL OR tail_anchor IS NOT NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if legacy is not None:
+            raise AnchorPayloadCorruptionError(
+                f"schema v19 fingerprint has legacy anchors: {legacy[0]}"
+            )
+        invalid_expectation = conn.execute(
+            """
+            SELECT fingerprint_id FROM fingerprints
+            WHERE anchor_payload_state NOT IN ('none', 'present')
+               OR (anchor_payload_state = 'none' AND anchor_payload_hash IS NOT NULL)
+               OR (anchor_payload_state = 'present' AND anchor_payload_hash IS NULL)
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_expectation is not None:
+            raise AnchorPayloadCorruptionError(
+                f"invalid fingerprint anchor expectation: {invalid_expectation[0]}"
+            )
+        missing_ref = conn.execute(
+            """
+            SELECT fp.fingerprint_id FROM fingerprints AS fp
+            LEFT JOIN fingerprint_anchor_refs AS ref
+              ON ref.fingerprint_id = fp.fingerprint_id
+            WHERE fp.anchor_payload_state = 'present'
+              AND ref.fingerprint_id IS NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if missing_ref is not None:
+            raise AnchorPayloadCorruptionError(
+                f"fingerprint expected anchor reference is missing: {missing_ref[0]}"
+            )
+        unexpected_ref = conn.execute(
+            """
+            SELECT fp.fingerprint_id FROM fingerprints AS fp
+            JOIN fingerprint_anchor_refs AS ref
+              ON ref.fingerprint_id = fp.fingerprint_id
+            WHERE fp.anchor_payload_state = 'none'
+            LIMIT 1
+            """
+        ).fetchone()
+        if unexpected_ref is not None:
+            raise AnchorPayloadCorruptionError(
+                f"fingerprint unexpectedly has anchor reference: {unexpected_ref[0]}"
+            )
+        wrong_ref = conn.execute(
+            """
+            SELECT fp.fingerprint_id FROM fingerprints AS fp
+            JOIN fingerprint_anchor_refs AS ref
+              ON ref.fingerprint_id = fp.fingerprint_id
+            WHERE fp.anchor_payload_state = 'present'
+              AND ref.payload_hash != fp.anchor_payload_hash
+            LIMIT 1
+            """
+        ).fetchone()
+        if wrong_ref is not None:
+            raise AnchorPayloadCorruptionError(
+                f"fingerprint anchor reference differs from expected hash: {wrong_ref[0]}"
+            )
+
     orphan_ref = conn.execute(
         """
         SELECT ref.fingerprint_id FROM fingerprint_anchor_refs AS ref
@@ -339,17 +494,18 @@ def validate_anchor_payload_storage(
             """
         ):
             _decode_object(row)
-        for row in conn.execute(
-            """
-            SELECT fingerprint_id FROM fingerprint_anchor_refs
-            WHERE fingerprint_id IN (
-                SELECT fingerprint_id FROM fingerprints
-                WHERE COALESCE(front_anchor, '') != ''
-                   OR COALESCE(tail_anchor, '') != ''
-            )
-            """
-        ):
-            load_fingerprint_anchor_payload(conn, row["fingerprint_id"])
+        if not strict:
+            for row in conn.execute(
+                """
+                SELECT fingerprint_id FROM fingerprint_anchor_refs
+                WHERE fingerprint_id IN (
+                    SELECT fingerprint_id FROM fingerprints
+                    WHERE COALESCE(front_anchor, '') != ''
+                       OR COALESCE(tail_anchor, '') != ''
+                )
+                """
+            ):
+                load_fingerprint_anchor_payload(conn, row["fingerprint_id"])
 
 
 def anchor_payload_storage_stats(conn: sqlite3.Connection) -> dict:

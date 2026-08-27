@@ -219,10 +219,10 @@ def test_v15_migration_retires_legacy_title_real_path(tmp_path):
         conn.close()
 
     migrated = decision_store.initialize_state_db(
-        fixture["state_db"], migrate=True
+        fixture["state_db"], migrate=True, anchor_payload_migration=True
     )
     try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 19
         old = migrated.execute(
             "SELECT canonical_path, active FROM files WHERE file_id = ?",
             (fixture["old_file_id"],),

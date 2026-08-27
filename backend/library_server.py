@@ -9,9 +9,7 @@ import os
 import sqlite3
 import sys
 import threading
-import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Sequence
@@ -20,6 +18,7 @@ from urllib.parse import urlsplit
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import decision_store
+from build_info import resolve_build_info
 from library_catalog import catalog_listing, review_queue_listing
 from library_appearance import (
     create_appearance_preset,
@@ -93,7 +92,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.5.0"
+SERVER_VERSION = "1.5.1"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -488,7 +487,7 @@ def _recover_interrupted_folderling_jobs(
 
 
 def _ensure_server_schema(config: LibraryServerConfig) -> Path | None:
-    """Own a verified backup before migrating the local management server DB."""
+    """Refuse one-time payload migrations from routine server startup."""
     if not config.state_db.is_file():
         return None
     probe = sqlite3.connect(str(config.state_db))
@@ -499,46 +498,11 @@ def _ensure_server_schema(config: LibraryServerConfig) -> Path | None:
         probe.close()
     if version == decision_store.SCHEMA_VERSION:
         return None
-
-    with mutation_lock_for_roots(
-        config.house_dir, config.temp_dir, "library-server-schema-migration"
-    ):
-        conn = decision_store.connect_state_db(config.state_db)
-        try:
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version == decision_store.SCHEMA_VERSION:
-                return None
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
-            }
-            if "actual_runs" in tables and conn.execute(
-                "SELECT 1 FROM actual_runs WHERE state IN ('approved', 'active') LIMIT 1"
-            ).fetchone():
-                raise RuntimeError("schema migration requires no active actual run")
-            if "operations" in tables and conn.execute(
-                "SELECT 1 FROM operations WHERE state IN ('planned', 'fs_done', 'db_done') LIMIT 1"
-            ).fetchone():
-                raise RuntimeError("schema migration requires operation recovery first")
-            if "operation_groups" in tables and conn.execute(
-                "SELECT 1 FROM operation_groups "
-                "WHERE state IN ('planned', 'fs_done', 'db_done') LIMIT 1"
-            ).fetchone():
-                raise RuntimeError("schema migration requires operation-group recovery first")
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            backup = decision_store.backup_state_db(
-                conn,
-                config.state_db.parent / "backups" /
-                f"before_library_server_schema_{stamp}_{uuid.uuid4().hex[:8]}.sqlite3",
-            )
-        finally:
-            conn.close()
-        migrated = decision_store.initialize_state_db(
-            config.state_db, migrate=True, compact_migrations=True
-        )
-        migrated.close()
-        return backup
+    raise RuntimeError(
+        "state DB schema migration required: "
+        f"current={version}, expected={decision_store.SCHEMA_VERSION}; "
+        "stop writers and run migrate_fingerprint_payloads.py --run"
+    )
 
 
 def _open_state_db_readonly_keeper(state_db: Path):
@@ -691,6 +655,7 @@ def dashboard_snapshot(config: LibraryServerConfig, runner: JobRunner) -> dict:
         })
     return {
         "version": SERVER_VERSION,
+        **resolve_build_info(str(config.project_root)),
         "database": {
             "path": str(config.state_db),
             "integrity": integrity,
@@ -742,6 +707,7 @@ def create_app(
         frontend_dist=Path(frontend_dist).expanduser().resolve(),
         project_root=Path(project_root).expanduser().resolve(),
     )
+    build_info = resolve_build_info(str(config.project_root))
     _ensure_server_schema(config)
     store = JobStore(config.runtime_dir)
     store.mark_interrupted_records()
@@ -1125,6 +1091,7 @@ def create_app(
             return jsonify({
                 "ok": False,
                 "version": SERVER_VERSION,
+                **build_info,
                 "state_db": str(config.state_db),
                 "database": "missing",
             }), 503
@@ -1132,12 +1099,16 @@ def create_app(
             conn = decision_store.connect_state_db_readonly(config.state_db)
             try:
                 conn.execute("SELECT 1").fetchone()
+                schema_version = int(
+                    conn.execute("PRAGMA user_version").fetchone()[0]
+                )
             finally:
                 conn.close()
         except sqlite3.Error as exc:
             return jsonify({
                 "ok": False,
                 "version": SERVER_VERSION,
+                **build_info,
                 "state_db": str(config.state_db),
                 "database": "unavailable",
                 "error": str(exc),
@@ -1146,8 +1117,10 @@ def create_app(
             {
                 "ok": True,
                 "version": SERVER_VERSION,
+                **build_info,
                 "state_db": str(config.state_db),
                 "database": "ok",
+                "schema": schema_version,
             }
         )
 

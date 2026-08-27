@@ -864,9 +864,10 @@ DB는 backup-owning 플랫폼 카탈로그 진입점에서 마이그레이션한
 - `fingerprints`의 legacy TEXT 두 컬럼은 이전 fixture와 비상 read fallback을 위해 nullable 호환 컬럼으로
   남기되, v18 migration과 신규 writer는 값을 기록하지 않는다. 평시 상세 비교는 ref를 따라 BLOB을
   제한적으로 압축 해제하고 checksum·길이·UTF-8·framing을 모두 검증한다.
-- full schema validator/Doctor는 SQLite integrity와 FK뿐 아니라 모든 payload object의 bounded
-  decompression과 checksum도 검사한다. 손상·누락·legacy/ref 불일치는 anchor를 추측하거나 파일 본문을
-  몰래 다시 읽지 않고 fail-closed한다.
+- full schema validator/Doctor는 SQLite integrity와 FK뿐 아니라 존재하는 payload object의 bounded
+  decompression과 checksum도 검사한다. 다만 v18에는 fingerprint별 기대 ref를 독립적으로 남기지 않아,
+  공유 object를 다른 fingerprint가 계속 참조하는 상황의 단일 ref 누락은 구분하지 못했다. 이 completeness
+  불변식은 아래 1.5.1/schema v19에서 닫는다.
 - recovery 및 review-action fingerprint 복제는 새 fingerprint ID를 만든 뒤 같은 immutable payload
   evidence를 참조한다. decision/review/pair/operation/actual-run의 기존 FK와 fingerprint ID는 바뀌지 않는다.
 
@@ -898,6 +899,61 @@ anchor 제외 metadata digest는 유지됐으며 integrity/FK/payload validator/
 version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, auditor `1.4.17`, archive
 `1.4.10`, 숫자 권 문맥 policy `1.4.24`는 그대로 유지한다.
 
+### 1.5.1 fingerprint payload production-safety hardening
+
+1.5.1은 1.5.0의 압축 표현과 fingerprint ID를 그대로 유지하면서 schema를 v19로 올려 ref completeness,
+구형 writer 경쟁, 자동 migration 우회와 logical commit 이후 재개 불가능 문제를 닫는다.
+
+- immutable `fingerprints` 행에 `anchor_payload_state=none|present`와 `anchor_payload_hash`를 기록한다.
+  `present`는 같은 hash의 ref가 반드시 있어야 하며, `none`은 ref가 없어야 한다. validator와 lazy load는
+  missing ref, unexpected ref, 다른 정상 object로 바뀐 ref, legacy TEXT가 하나라도 있으면 fail-closed한다.
+- 신규 writer는 payload object를 먼저 생성·검증하고 기대 state/hash를 fingerprint INSERT에 함께 고정한
+  뒤 같은 transaction에서 ref를 붙인다. clone/recovery도 source의 기대 state/hash를 그대로 복제한다.
+- fingerprint INSERT trigger는 connection-local schema-v19 writer 함수를 요구한다. 1.5.0/1.4.x에서 이미
+  열어 둔 SQLite connection에는 이 함수가 없으므로 legacy 컬럼이 남아 있어도 새 fingerprint INSERT가
+  DB에서 거부된다. legacy `front_anchor`/`tail_anchor` INSERT도 별도로 금지한다.
+- 서버 시작, Folderling one-button, platform catalog는 구 schema를 자동 변환하거나 반복 backup하지 않고
+  `migrate_fingerprint_payloads.py --run` 실행을 요구하며 종료한다.
+- 전용 migration은 plan부터 backup과 logical commit까지 하나의 `BEGIN IMMEDIATE` writer epoch를 유지한다.
+  commit 뒤 report 완료 전에는 DB의 migration gate가 신규 fingerprint writer를 막는다.
+- main DB, WAL, rollback journal, `page_count*page_size`를 포함한 보수적 source extent를 기준으로 backup,
+  migration WAL, VACUUM, 256 MiB margin을 각각 preflight한다.
+- fsync된 journal은 `preparing → prepared → logical_committed → compacted → verified → reported`를 기록한다.
+  backup ENOSPC나 commit 직후 종료가 발생해도 같은 migration ID·backup으로 재개하며 새 대형 backup을
+  반복 생성하지 않는다.
+
+이미 schema v18인 DB는 보존된 schema-v17 backup으로 fingerprint ID별 canonical anchor hash를 대조해야
+한다. 계획과 실행에 같은 `--legacy-anchor-backup`을 전달한다.
+
+```bash
+# read-only plan: WAL까지 포함한 공간, blocker, v17 evidence 확인
+PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py \
+  --legacy-anchor-backup .dedup_state/backups/before_fingerprint_payload_v18_<id>.sqlite3
+
+# 유일한 v18 → v19 write entrypoint; 중단 시 같은 명령으로 재개
+PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py \
+  --legacy-anchor-backup .dedup_state/backups/before_fingerprint_payload_v18_<id>.sqlite3 \
+  --run
+```
+
+v19 rollback copy는 `before_fingerprint_payload_v19_<migration-id>.sqlite3`, 결과는
+`fingerprint_payload_migration_1_5_1_<migration-id>.json`, 재개 journal은
+`fingerprint_payload_migration_1_5_1_journal.json`에 남는다. DB settings에도 rollback path/SHA를 남겨
+일반 backup retention에서 보호한다. v19 DB를 계속 사용할 때는 1.5.1 writer를, v18 copy를 복원할 때는
+1.5.0 writer를, 최초 v17 copy를 복원할 때는 1.4.24 writer를 조합한다.
+
+`/health`와 dashboard는 `version` 외에 `build_commit`과 `build_dirty`를 반환한다. 정식 main merge/tag 전에는
+branch 이름만 믿지 말고 이 값과 DB schema를 함께 pin한다. 세부 계약, fault test와 검증 결과는
+[`update_1.5.1.md`](update_1.5.1.md)에 기록한다.
+
+서버/UI 버전은 `1.5.1`, SQLite schema는 `v19`이다. normalizer/fingerprint/pair/auditor/archive와
+숫자 권 문맥 판정 정책은 1.5.0에서 변경하지 않는다.
+
+2026-08-27 운영 적용에서는 84,417개 fingerprint에 `present=65,901`, `none=18,516` 기대 상태를
+고정했다. missing/unexpected/wrong ref와 legacy row는 0, integrity/FK/Doctor는 정상이다. DB 파일은
+300,085,248 bytes에서 306,688,000 bytes로 6,602,752 bytes 증가했고 v18 rollback backup과 최초 v17
+backup을 모두 보존했다. 적용 report와 exact backup SHA는 `update_1.5.1.md`에 기록한다.
+
 ## 구조
 
 ```text
@@ -912,7 +968,7 @@ run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
 run_library_server.py             1.2.8+ 독립 도서 관리 웹 서버
 library_frontend/                 React 기반 도서 관리 화면
 extension/                        Chrome 다중 사이트 제목 검색 확장과 공개 회귀
-backend/migrate_fingerprint_payloads.py  1.5.0 fingerprint payload 계획·변환·검증기
+backend/migrate_fingerprint_payloads.py  1.5.1 fingerprint payload 계획·변환·재개·검증기
 ```
 
 mutable runtime 파일은 계속 프로젝트 루트에 생성됩니다.

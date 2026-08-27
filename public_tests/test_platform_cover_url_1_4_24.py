@@ -43,9 +43,11 @@ def test_schema_v17_adds_nullable_https_cover_url_to_existing_v16_db(tmp_path):
         conn.commit()
     finally:
         conn.close()
-    migrated = decision_store.initialize_state_db(db_path, migrate=True)
+    migrated = decision_store.initialize_state_db(
+        db_path, migrate=True, anchor_payload_migration=True
+    )
     try:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 19
         columns = {
             row[1]
             for row in migrated.execute("PRAGMA table_info(catalog_platform_stats)")

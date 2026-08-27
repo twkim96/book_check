@@ -116,7 +116,7 @@ def test_file_relocate_preview_and_apply_api(tmp_path):
     assert (target / payload["new_name"]).is_file()
 
 
-def test_library_server_migrates_v11_with_owned_backup(tmp_path):
+def test_library_server_refuses_v11_automatic_migration(tmp_path):
     state_db = tmp_path / ".dedup_state" / "dedup.sqlite3"
     conn = decision_store.initialize_state_db(state_db)
     try:
@@ -133,29 +133,29 @@ def test_library_server_migrates_v11_with_owned_backup(tmp_path):
         path.mkdir()
     (frontend / "index.html").write_text("ok", encoding="utf-8")
 
-    app = create_app(
-        state_db=state_db,
-        house_dir=house,
-        temp_dir=temp,
-        index_path=tmp_path / "file_index.json",
-        runtime_dir=runtime,
-        frontend_dist=frontend,
-    )
-    assert app.test_client().get("/health").status_code == 200
+    with pytest.raises(RuntimeError, match="migrate_fingerprint_payloads"):
+        create_app(
+            state_db=state_db,
+            house_dir=house,
+            temp_dir=temp,
+            index_path=tmp_path / "file_index.json",
+            runtime_dir=runtime,
+            frontend_dist=frontend,
+        )
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
         assert (
             conn.execute("PRAGMA user_version").fetchone()[0]
-            == decision_store.SCHEMA_VERSION
+            == 11
         )
         assert conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
             "AND name IN ('operation_groups', 'work_folders')"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 0
     finally:
         conn.close()
     backups = list((state_db.parent / "backups").glob("before_library_server_schema_*.sqlite3"))
-    assert len(backups) == 1
+    assert backups == []
 
 
 def test_managed_folder_create_api_appears_in_folder_catalog(tmp_path):
@@ -296,7 +296,10 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     client = app.test_client()
     health = client.get("/health").get_json()
     assert health["ok"] is True
-    assert health["version"] == "1.5.0"
+    assert health["version"] == "1.5.1"
+    assert health["schema"] == 19
+    assert len(health["build_commit"]) == 40
+    assert isinstance(health["build_dirty"], bool)
     providers = client.get("/api/providers").get_json()["data"]
     assert providers == [
         {"id": "title_correction", "label": "제목 교정", "enabled": True},

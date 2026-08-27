@@ -37,6 +37,7 @@ from fingerprint_payloads import (
     anchor_payload_storage_stats,
     copy_fingerprint_anchor_payload,
     load_fingerprint_anchor_payload,
+    prepare_fingerprint_anchor_payload,
     store_fingerprint_anchor_payload,
     validate_anchor_payload_storage,
 )
@@ -48,6 +49,7 @@ from state_repository import (
     connect_state_db,
     connect_state_db_readonly,
     initialize_state_db as _initialize_state_db,
+    migrate_anchor_payload_schema_connection,
     retire_legacy_title_requeue_path_owners,
     retired_canonical_path,
     transaction,
@@ -80,6 +82,9 @@ def initialize_state_db(
     migrate: bool = False,
     check_integrity: bool = True,
     compact_migrations: bool = False,
+    anchor_payload_migration: bool = False,
+    legacy_anchor_expectations: dict[int, str | None] | None = None,
+    require_legacy_expectations: bool = False,
 ) -> sqlite3.Connection:
     """Compatibility facade preserving decision_store validation hooks."""
     return _initialize_state_db(
@@ -87,6 +92,9 @@ def initialize_state_db(
         migrate=migrate,
         check_integrity=check_integrity,
         compact_migrations=compact_migrations,
+        anchor_payload_migration=anchor_payload_migration,
+        legacy_anchor_expectations=legacy_anchor_expectations,
+        require_legacy_expectations=require_legacy_expectations,
         _validate_schema=validate_schema,
     )
 
@@ -124,6 +132,8 @@ _COMPATIBILITY_FACADE_EXPORTS = (
     sync_active_file_analysis,
     connect_state_db_readonly,
     load_fingerprint_anchor_payload,
+    migrate_anchor_payload_schema_connection,
+    prepare_fingerprint_anchor_payload,
     retire_legacy_title_requeue_path_owners,
     canonical_rational,
     canonical_symbol,
@@ -2157,6 +2167,13 @@ def protected_state_backup_paths(conn: sqlite3.Connection) -> set[str]:
             )
             if row[0]
         )
+    if "settings" in tables:
+        rollback = conn.execute(
+            "SELECT value FROM settings "
+            "WHERE key = 'fingerprint_payload_rollback_backup'"
+        ).fetchone()
+        if rollback is not None and rollback[0]:
+            protected.add(str(Path(rollback[0]).resolve()))
     return protected
 
 
@@ -2522,12 +2539,12 @@ def _clone_fingerprint_for_recovered_file(conn, file_id, canonical_path, evidenc
             file_id, canonical_path, size, mtime_ns, dev, ino, ctime_ns,
             normalizer_version, fingerprint_version, analysis_policy_hash,
             raw_sha256, normalized_sha256, normalized_length, encoding, status,
-            anchors_json
+            anchors_json, anchor_payload_state, anchor_payload_hash
         )
         SELECT file_id, ?, ?, ?, ?, ?, ?, normalizer_version,
                fingerprint_version || ?, analysis_policy_hash, raw_sha256,
                normalized_sha256, normalized_length, encoding, status,
-               anchors_json
+               anchors_json, anchor_payload_state, anchor_payload_hash
         FROM fingerprints WHERE fingerprint_id = ? AND file_id = ?
         """,
         (

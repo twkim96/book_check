@@ -1339,7 +1339,7 @@ def test_plain_initializer_refuses_to_migrate_an_existing_old_schema(tmp_path):
         readonly.close()
 
 
-def test_platform_entry_backs_up_before_explicit_schema_migration(tmp_path):
+def test_platform_entry_refuses_automatic_schema_migration(tmp_path):
     state_db = _make_db(tmp_path, "합성작품 1-20화.txt")
     conn = decision_store.connect_state_db(state_db)
     try:
@@ -1351,25 +1351,19 @@ def test_platform_entry_backs_up_before_explicit_schema_migration(tmp_path):
     finally:
         conn.close()
 
-    backup = run_platform_catalog.ensure_catalog_schema(str(state_db))
-    assert backup is not None and backup.is_file()
-    before = decision_store.connect_state_db_readonly(backup)
+    with pytest.raises(RuntimeError, match="refuses automatic"):
+        run_platform_catalog.ensure_catalog_schema(str(state_db))
+    current = decision_store.connect_state_db_readonly(state_db)
     try:
-        assert before.execute("PRAGMA user_version").fetchone()[0] == 7
-        assert before.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    finally:
-        before.close()
-    current = decision_store.initialize_state_db(state_db)
-    try:
-        assert current.execute("PRAGMA user_version").fetchone()[0] == decision_store.SCHEMA_VERSION
+        assert current.execute("PRAGMA user_version").fetchone()[0] == 7
         assert current.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'file_analysis'"
-        ).fetchone()[0] == 1
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'catalog_titles'"
+        ).fetchone()[0] == 0
     finally:
         current.close()
 
 
-def test_v9_migration_and_file_metadata_sync_backfill_active_house_files(tmp_path):
+def test_file_metadata_sync_refuses_v9_automatic_migration(tmp_path):
     state_db = _make_db(tmp_path, "합성 메인 제목: 부제목 1-20화.txt")
     conn = decision_store.connect_state_db(state_db)
     try:
@@ -1379,23 +1373,14 @@ def test_v9_migration_and_file_metadata_sync_backfill_active_house_files(tmp_pat
     finally:
         conn.close()
 
-    backup, result = run_platform_catalog.sync_file_metadata(str(state_db))
-    assert backup is not None and backup.is_file()
-    assert result == {"total": 1, "changed": 1, "unchanged": 0}
-    before = decision_store.connect_state_db_readonly(backup)
-    try:
-        assert before.execute("PRAGMA user_version").fetchone()[0] == 9
-        assert before.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'file_analysis'"
-        ).fetchone()[0] == 0
-    finally:
-        before.close()
+    with pytest.raises(RuntimeError, match="refuses automatic"):
+        run_platform_catalog.sync_file_metadata(str(state_db))
     current = decision_store.connect_state_db_readonly(state_db)
     try:
-        row = current.execute("SELECT * FROM file_analysis").fetchone()
-        assert row["core_title"] == "부제목"
-        assert row["catalog_query_title"] == "합성 메인 제목: 부제목"
-        assert current.execute("PRAGMA user_version").fetchone()[0] == decision_store.SCHEMA_VERSION
+        assert current.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert current.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'file_analysis'"
+        ).fetchone()[0] == 0
     finally:
         current.close()
 
@@ -1413,7 +1398,9 @@ def test_v10_migration_adds_title_override_column_only_with_explicit_permission(
     with pytest.raises(RuntimeError, match="migration required"):
         decision_store.initialize_state_db(state_db)
 
-    migrated = decision_store.initialize_state_db(state_db, migrate=True)
+    migrated = decision_store.initialize_state_db(
+        state_db, migrate=True, anchor_payload_migration=True
+    )
     try:
         columns = {
             row[1] for row in migrated.execute("PRAGMA table_info(file_analysis)")
@@ -1471,9 +1458,9 @@ def test_v8_download_values_are_preserved_by_v9_migration(tmp_path):
     finally:
         conn.close()
 
-    backup = run_platform_catalog.ensure_catalog_schema(str(state_db))
-    assert backup is not None and backup.is_file()
-    current = decision_store.initialize_state_db(state_db)
+    current = decision_store.initialize_state_db(
+        state_db, migrate=True, anchor_payload_migration=True
+    )
     try:
         row = current.execute("SELECT * FROM catalog_title_metrics").fetchone()
         assert row["series_download_count"] == 321

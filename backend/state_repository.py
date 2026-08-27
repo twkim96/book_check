@@ -8,7 +8,6 @@ journals, recovery decisions, and Doctor policy remain together in
 from __future__ import annotations
 
 import os
-import shutil
 import sqlite3
 import time
 import unicodedata
@@ -16,11 +15,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from fingerprint_payloads import (
+    anchor_payload_storage_stats,
     migrate_legacy_anchor_payloads,
     validate_anchor_payload_storage,
 )
 from state_schema import (
     ANCHOR_PAYLOAD_SCHEMA_SQL,
+    ANCHOR_PAYLOAD_STRICT_SCHEMA_SQL,
     CATALOG_SCHEMA_SQL,
     FILE_ANALYSIS_SCHEMA_SQL,
     REQUIRED_TABLES,
@@ -49,10 +50,205 @@ def connect_state_db(path: os.PathLike | str, *, create: bool = False) -> sqlite
 
     conn = sqlite3.connect(str(db_path), timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
+    # Schema v19 INSERT triggers call this connection-local function.  A writer
+    # from 1.5.0 or older has no such function and therefore fails before it can
+    # append a legacy/misdeclared immutable fingerprint to a current database.
+    conn.create_function(
+        "file_check_writer_schema_version", 0, lambda: SCHEMA_VERSION
+    )
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {DEFAULT_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute DDL without sqlite3.executescript's implicit COMMIT."""
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            pending = ""
+            if statement:
+                conn.execute(statement)
+    if pending.strip():
+        raise RuntimeError("incomplete SQLite schema statement")
+
+
+def migrate_anchor_payload_schema_connection(
+    conn: sqlite3.Connection,
+    source_version: int,
+    *,
+    legacy_anchor_expectations: dict[int, str | None] | None = None,
+    require_legacy_expectations: bool = False,
+    activate_writer_gate: bool = False,
+) -> dict:
+    """Upgrade schema 17/18 to 19 inside the caller's writer transaction.
+
+    The caller must hold ``BEGIN IMMEDIATE`` continuously from its pre-migration
+    snapshot and verified backup through this function's eventual commit.
+    """
+    if source_version not in (17, 18):
+        raise RuntimeError(
+            f"fingerprint payload migration requires schema 17 or 18, got {source_version}"
+        )
+    if not conn.in_transaction:
+        raise RuntimeError("fingerprint payload migration requires an active transaction")
+    conn.execute("DROP TRIGGER IF EXISTS fingerprints_insert_storage_guard")
+    conn.execute("DROP TRIGGER IF EXISTS fingerprint_anchor_refs_expected_hash")
+    if activate_writer_gate:
+        conn.execute(
+            """
+            INSERT INTO settings(key, value, updated_at)
+            VALUES ('fingerprint_payload_migration_gate', 'active', CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value, updated_at = excluded.updated_at
+            """
+        )
+
+    if source_version == 17:
+        _execute_sql_script(conn, ANCHOR_PAYLOAD_SCHEMA_SQL)
+        migration = migrate_legacy_anchor_payloads(conn)
+        validate_anchor_payload_storage(conn, verify_payloads=True)
+    else:
+        legacy_row = conn.execute(
+            """
+            SELECT fingerprint_id FROM fingerprints
+            WHERE front_anchor IS NOT NULL OR tail_anchor IS NOT NULL
+            LIMIT 1
+            """
+        ).fetchone()
+        if legacy_row is not None:
+            raise RuntimeError(
+                f"schema v18 contains forbidden legacy anchors: {legacy_row[0]}"
+            )
+        migration = {
+            "fingerprints_scanned": int(
+                conn.execute("SELECT COUNT(*) FROM fingerprints").fetchone()[0]
+            ),
+            **anchor_payload_storage_stats(conn),
+        }
+        if (
+            require_legacy_expectations
+            and migration["fingerprints_scanned"]
+            and legacy_anchor_expectations is None
+        ):
+            raise RuntimeError(
+                "schema v18 migration requires a verified schema-v17 anchor backup"
+            )
+        if (
+            require_legacy_expectations
+            and legacy_anchor_expectations is not None
+            and len(legacy_anchor_expectations)
+            != migration["fingerprints_scanned"]
+        ):
+            raise RuntimeError(
+                "schema-v17 evidence fingerprint count differs from schema-v18 DB"
+            )
+
+    if legacy_anchor_expectations is not None:
+        for fingerprint_id, expected_hash in legacy_anchor_expectations.items():
+            current = conn.execute(
+                """
+                SELECT fp.fingerprint_id, ref.payload_hash
+                FROM fingerprints AS fp
+                LEFT JOIN fingerprint_anchor_refs AS ref
+                  ON ref.fingerprint_id = fp.fingerprint_id
+                WHERE fp.fingerprint_id = ?
+                """,
+                (fingerprint_id,),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError(
+                    f"legacy fingerprint is missing from current DB: {fingerprint_id}"
+                )
+            if current["payload_hash"] != expected_hash:
+                raise RuntimeError(
+                    "legacy backup/current payload mapping mismatch: "
+                    f"fingerprint_id={fingerprint_id}"
+                )
+
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(fingerprints)")
+    }
+    if "anchor_payload_state" not in columns:
+        conn.execute(
+            "ALTER TABLE fingerprints ADD COLUMN anchor_payload_state TEXT "
+            "NOT NULL DEFAULT 'none' CHECK (anchor_payload_state IN ('none', 'present'))"
+        )
+    if "anchor_payload_hash" not in columns:
+        conn.execute(
+            "ALTER TABLE fingerprints ADD COLUMN anchor_payload_hash TEXT "
+            "REFERENCES anchor_payload_objects(payload_hash) ON DELETE RESTRICT "
+            "CHECK (anchor_payload_hash IS NULL OR (LENGTH(anchor_payload_hash) = 64 "
+            "AND anchor_payload_hash NOT GLOB '*[^0-9a-f]*'))"
+        )
+
+    conn.execute("DROP TRIGGER IF EXISTS fingerprints_no_update")
+    conn.execute("DROP TRIGGER IF EXISTS fingerprints_no_delete")
+    conn.execute(
+        """
+        UPDATE fingerprints
+        SET anchor_payload_state = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM fingerprint_anchor_refs AS ref
+                    WHERE ref.fingerprint_id = fingerprints.fingerprint_id
+                ) THEN 'present' ELSE 'none' END,
+            anchor_payload_hash = (
+                SELECT ref.payload_hash FROM fingerprint_anchor_refs AS ref
+                WHERE ref.fingerprint_id = fingerprints.fingerprint_id
+            ),
+            front_anchor = NULL,
+            tail_anchor = NULL
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER fingerprints_no_update
+        BEFORE UPDATE ON fingerprints
+        BEGIN
+            SELECT RAISE(ABORT, 'fingerprints are immutable');
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER fingerprints_no_delete
+        BEFORE DELETE ON fingerprints
+        BEGIN
+            SELECT RAISE(ABORT, 'fingerprints are immutable');
+        END
+        """
+    )
+    _execute_sql_script(conn, ANCHOR_PAYLOAD_STRICT_SCHEMA_SQL)
+
+    conn.execute(
+        """
+        UPDATE actual_runs
+        SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+            error = 'schema v19 migration invalidated unfinished authorization'
+        WHERE state IN ('approved', 'active')
+        """
+    )
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')"
+    )
+    conn.execute(
+        "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+        "WHERE key = 'actual_mutation_enabled'"
+    )
+    conn.execute(
+        """
+        INSERT INTO settings(key, value, updated_at)
+        VALUES ('anchor_payload_storage', 'content-addressed-zlib-v2', CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value, updated_at = excluded.updated_at
+        """
+    )
+    conn.execute("PRAGMA user_version = 19")
+    validate_anchor_payload_storage(conn, verify_payloads=True)
+    return migration
 
 
 
@@ -93,6 +289,9 @@ def initialize_state_db(
     migrate: bool = False,
     check_integrity: bool = True,
     compact_migrations: bool = False,
+    anchor_payload_migration: bool = False,
+    legacy_anchor_expectations: dict[int, str | None] | None = None,
+    require_legacy_expectations: bool = False,
     _validate_schema=None,
 ) -> sqlite3.Connection:
     """Open/create the state DB; upgrade an existing DB only with explicit consent.
@@ -110,6 +309,17 @@ def initialize_state_db(
             "state DB schema migration required: "
             f"current={version}, expected={SCHEMA_VERSION}; "
             "use a backup-owning migration entry point"
+        )
+    if (
+        version not in (0, SCHEMA_VERSION)
+        and migrate
+        and version <= 18
+        and not anchor_payload_migration
+    ):
+        conn.close()
+        raise RuntimeError(
+            "schema 17/18 fingerprint payload migration is accepted only by "
+            "migrate_fingerprint_payloads.py --run"
         )
     if version == 0:
         conn.executescript(SCHEMA_SQL)
@@ -606,79 +816,20 @@ def initialize_state_db(
         conn.commit()
         version = 17
     migrated_anchor_payloads = False
-    if version == 17:
-        if compact_migrations:
-            db_path = Path(_connection_main_path(conn))
-            database_bytes = db_path.stat().st_size
-            free_bytes = shutil.disk_usage(db_path.parent).free
-            required_free = database_bytes * 2 + 256 * 1024 * 1024
-            if free_bytes < required_free:
-                conn.close()
-                raise RuntimeError(
-                    "schema v18 migration requires free disk for its WAL and "
-                    f"verified compaction: required={required_free}, free={free_bytes}"
-                )
+    if version in (17, 18):
+        if not anchor_payload_migration:
+            conn.close()
+            raise RuntimeError(
+                "schema 17/18 fingerprint payload migration is accepted only by "
+                "migrate_fingerprint_payloads.py --run"
+            )
         try:
-            conn.executescript("BEGIN IMMEDIATE;\n" + ANCHOR_PAYLOAD_SCHEMA_SQL)
-            migration = migrate_legacy_anchor_payloads(conn)
-            validate_anchor_payload_storage(conn, verify_payloads=True)
-            conn.execute("DROP TRIGGER fingerprints_no_update")
-            conn.execute("DROP TRIGGER fingerprints_no_delete")
-            conn.execute(
-                """
-                UPDATE fingerprints SET front_anchor = NULL, tail_anchor = NULL
-                WHERE front_anchor IS NOT NULL OR tail_anchor IS NOT NULL
-                """
-            )
-            conn.execute(
-                """
-                CREATE TRIGGER fingerprints_no_update
-                BEFORE UPDATE ON fingerprints
-                BEGIN
-                    SELECT RAISE(ABORT, 'fingerprints are immutable');
-                END
-                """
-            )
-            conn.execute(
-                """
-                CREATE TRIGGER fingerprints_no_delete
-                BEFORE DELETE ON fingerprints
-                BEGIN
-                    SELECT RAISE(ABORT, 'fingerprints are immutable');
-                END
-                """
-            )
-            if conn.execute(
-                """
-                SELECT 1 FROM fingerprints
-                WHERE front_anchor IS NOT NULL OR tail_anchor IS NOT NULL
-                LIMIT 1
-                """
-            ).fetchone():
-                raise RuntimeError("schema v18 migration left legacy anchor payloads")
-            validate_anchor_payload_storage(conn, verify_payloads=True)
-            conn.execute(
-                """
-                UPDATE actual_runs
-                SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
-                    error = 'schema v18 migration invalidated unfinished authorization'
-                WHERE state IN ('approved', 'active')
-                """
-            )
-            conn.execute(
-                "DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')"
-            )
-            conn.execute(
-                "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
-                "WHERE key = 'actual_mutation_enabled'"
-            )
-            conn.execute(
-                """
-                INSERT INTO settings(key, value, updated_at)
-                VALUES ('anchor_payload_storage', 'content-addressed-zlib-v1', CURRENT_TIMESTAMP)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value, updated_at = excluded.updated_at
-                """
+            conn.execute("BEGIN IMMEDIATE")
+            migration = migrate_anchor_payload_schema_connection(
+                conn,
+                version,
+                legacy_anchor_expectations=legacy_anchor_expectations,
+                require_legacy_expectations=require_legacy_expectations,
             )
             conn.execute(
                 """
@@ -692,9 +843,8 @@ def initialize_state_db(
                     "objects={object_count},raw={raw_bytes},compressed={compressed_bytes}"
                 ).format(**migration),),
             )
-            conn.execute("PRAGMA user_version = 18")
             conn.commit()
-            version = 18
+            version = 19
             migrated_anchor_payloads = True
         except Exception:
             conn.rollback()
@@ -775,6 +925,10 @@ def validate_schema(
         "fingerprint_anchor_refs": {
             "fingerprint_id", "payload_hash", "created_at",
         },
+        "fingerprints": {
+            "fingerprint_id", "front_anchor", "tail_anchor",
+            "anchor_payload_state", "anchor_payload_hash",
+        },
     }
     for table, expected in required_columns.items():
         actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -823,6 +977,8 @@ def validate_schema(
         "anchor_payload_objects_no_delete",
         "fingerprint_anchor_refs_no_update",
         "fingerprint_anchor_refs_no_delete",
+        "fingerprints_insert_storage_guard",
+        "fingerprint_anchor_refs_expected_hash",
     }
     missing_triggers = required_triggers - triggers
     if missing_triggers:
