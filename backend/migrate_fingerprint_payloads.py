@@ -129,9 +129,14 @@ def _git_diff_sha256(project_root: Path) -> str:
 def _source_provenance(*, allow_dirty: bool) -> dict:
     build = resolve_build_info(str(PROJECT_ROOT))
     try:
-        dirty = bool(_git_status_porcelain(PROJECT_ROOT))
+        worktree_dirty = bool(_git_status_porcelain(PROJECT_ROOT))
     except RuntimeError:
         dirty = build.get("build_dirty")
+    else:
+        # The embedded/runtime build marker and the checkout are independent
+        # provenance signals.  Never let a clean checkout erase an explicitly
+        # dirty build marker; either source being dirty must fail closed.
+        dirty = worktree_dirty or build.get("build_dirty") is True
     commit = str(build.get("build_commit") or "unknown")
     if dirty is None and not allow_dirty:
         raise RuntimeError(

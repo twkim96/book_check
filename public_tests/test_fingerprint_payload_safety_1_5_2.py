@@ -338,6 +338,7 @@ def test_dirty_migration_requires_explicit_override_and_records_provenance(
         "resolve_build_info",
         lambda _root: {"build_commit": "a" * 40, "build_dirty": True},
     )
+    monkeypatch.setattr(migration, "_git_status_porcelain", lambda _root: b"")
     monkeypatch.setattr(migration, "_git_diff_sha256", lambda _root: "d" * 64)
 
     blocked = migration.build_plan(state_db)
