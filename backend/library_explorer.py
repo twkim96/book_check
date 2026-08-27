@@ -403,6 +403,12 @@ def file_detail(state_db: os.PathLike | str, file_id: str) -> dict:
         if row is None:
             raise KeyError(file_id)
         item = dict(row)
+        if row["fingerprint_id"] is not None:
+            item["front_anchor"], item["tail_anchor"] = (
+                decision_store.load_fingerprint_anchor_payload(
+                    conn, row["fingerprint_id"]
+                )
+            )
         item["active"] = bool(row["active"])
         item["protected"] = bool(row["protected"])
         item["representative"] = bool(row["representative"])

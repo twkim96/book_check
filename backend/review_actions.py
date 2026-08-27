@@ -282,12 +282,12 @@ def claim_external_action_moves(conn, temp_dir):
                         file_id, canonical_path, size, mtime_ns, dev, ino, ctime_ns,
                         normalizer_version, fingerprint_version, analysis_policy_hash,
                         raw_sha256, normalized_sha256, normalized_length, encoding,
-                        status, front_anchor, tail_anchor, anchors_json
+                        status, anchors_json
                     )
                     SELECT file_id, ?, ?, ?, ?, ?, ?, normalizer_version,
                            fingerprint_version || ?, analysis_policy_hash,
                            raw_sha256, normalized_sha256, normalized_length, encoding,
-                           status, front_anchor, tail_anchor, anchors_json
+                           status, anchors_json
                     FROM fingerprints WHERE fingerprint_id = ? AND file_id = ?
                     """,
                     (
@@ -297,6 +297,9 @@ def claim_external_action_moves(conn, temp_dir):
                         row["current_fingerprint_id"], row["file_id"],
                     ),
                 ).lastrowid
+                decision_store.copy_fingerprint_anchor_payload(
+                    conn, row["current_fingerprint_id"], fingerprint_id
+                )
                 origin_path = row["canonical_path"]
             else:
                 from normalizer import NORMALIZER_VERSION

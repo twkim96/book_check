@@ -28,6 +28,7 @@ from dedup_episode_relation import (
     classify_dedup_coordinate_relation,
     classify_loose_title_upgrade_relation,
 )
+from fingerprint_payloads import load_fingerprint_anchor_payload
 from normalizer import (
     NORMALIZER_VERSION,
     analyze_name,
@@ -1401,8 +1402,8 @@ class PersistentAuditCache:
         file_id = self.file_ids[entry.path]
         current = os.stat(entry.path, follow_symlinks=False)
         row = self.conn.execute(
-            """
-            SELECT * FROM fingerprints
+            f"""
+            SELECT {_CURRENT_FINGERPRINT_COLUMNS} FROM fingerprints AS fp
             WHERE file_id = ? AND canonical_path = ? AND size = ? AND mtime_ns = ?
               AND normalizer_version = ? AND fingerprint_version IN (?, ?)
               AND analysis_policy_hash = ?
@@ -1443,8 +1444,8 @@ class PersistentAuditCache:
                 self.stats["fingerprint_cache_peek_misses"] += 1
             return None
         self.pending_identities.pop(entry.path, None)
-        analysis = self._text_analysis_from_row(entry, row)
-        self.deferred_detail_paths.discard(entry.path)
+        analysis = self._text_analysis_from_row(entry, row, include_details=False)
+        self.deferred_detail_paths.add(entry.path)
         self.fingerprint_ids[entry.path] = row["fingerprint_id"]
         self.stats["fingerprint_cache_hits"] += 1
         return analysis
@@ -1560,9 +1561,8 @@ class PersistentAuditCache:
                     fingerprint_version, analysis_policy_hash,
                     dev, ino, ctime_ns,
                     raw_sha256, normalized_sha256,
-                    normalized_length, encoding, status, front_anchor, tail_anchor,
-                    anchors_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    normalized_length, encoding, status, anchors_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
                     file_id, canonical_path, size, mtime_ns,
                     normalizer_version, fingerprint_version
@@ -1584,8 +1584,6 @@ class PersistentAuditCache:
                     analysis.normalized_length,
                     analysis.encoding,
                     analysis.status,
-                    analysis.front_anchor,
-                    analysis.tail_anchor,
                     json.dumps(
                         {"lossy": analysis.lossy, "error": analysis.error},
                         ensure_ascii=False,
@@ -1594,11 +1592,18 @@ class PersistentAuditCache:
             )
             if cursor.rowcount == 1:
                 fingerprint_id = cursor.lastrowid
+                self.store.store_fingerprint_anchor_payload(
+                    self.conn,
+                    fingerprint_id,
+                    analysis.front_anchor,
+                    analysis.tail_anchor,
+                )
                 self.stats["fingerprint_cache_writes"] += 1
             else:
                 stored = self.conn.execute(
-                    """
-                    SELECT * FROM fingerprints
+                    f"""
+                    SELECT {_CURRENT_FINGERPRINT_COLUMNS}
+                    FROM fingerprints AS fp
                     WHERE file_id = ? AND canonical_path = ?
                       AND size = ? AND mtime_ns = ?
                       AND normalizer_version = ? AND fingerprint_version = ?
@@ -1622,7 +1627,17 @@ class PersistentAuditCache:
                     raise RuntimeError(
                         "fingerprint cache conflict did not converge to a current row"
                     )
-                stored_analysis = self._text_analysis_from_row(entry, stored)
+                stored_analysis = self._text_analysis_from_row(
+                    entry, stored, include_details=False
+                )
+                stored_front, stored_tail = load_fingerprint_anchor_payload(
+                    self.conn, stored["fingerprint_id"]
+                )
+                stored_analysis = replace(
+                    stored_analysis,
+                    front_anchor=stored_front,
+                    tail_anchor=stored_tail,
+                )
                 comparable = lambda value: (
                     value.size,
                     value.mtime_ns,
@@ -1656,17 +1671,12 @@ class PersistentAuditCache:
         if entry.path not in self.deferred_detail_paths:
             return analysis
         fingerprint_id = self.fingerprint_ids.get(entry.path)
-        row = self.conn.execute(
-            """
-            SELECT front_anchor, tail_anchor FROM fingerprints
-            WHERE fingerprint_id = ?
-            """,
-            (fingerprint_id,),
-        ).fetchone()
-        if row is None:
+        try:
+            front_anchor, tail_anchor = load_fingerprint_anchor_payload(
+                self.conn, fingerprint_id
+            )
+        except KeyError:
             raise StaleInputDuringAnalysis(entry.path)
-        front_anchor = row["front_anchor"] or ""
-        tail_anchor = row["tail_anchor"] or ""
         self.deferred_detail_paths.discard(entry.path)
         self.stats["fingerprint_detail_loads"] += 1
         self.stats["fingerprint_detail_chars"] += (
@@ -2189,17 +2199,12 @@ class ReadOnlyAuditCache:
         if entry.path not in self.deferred_detail_paths:
             return analysis
         fingerprint_id = self.fingerprint_ids.get(entry.path)
-        row = self.conn.execute(
-            """
-            SELECT front_anchor, tail_anchor FROM fingerprints
-            WHERE fingerprint_id = ?
-            """,
-            (fingerprint_id,),
-        ).fetchone()
-        if row is None:
+        try:
+            front_anchor, tail_anchor = load_fingerprint_anchor_payload(
+                self.conn, fingerprint_id
+            )
+        except KeyError:
             raise StaleInputDuringAnalysis(entry.path)
-        front_anchor = row["front_anchor"] or ""
-        tail_anchor = row["tail_anchor"] or ""
         self.deferred_detail_paths.discard(entry.path)
         self.stats["fingerprint_detail_loads"] += 1
         self.stats["fingerprint_detail_chars"] += (

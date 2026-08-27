@@ -6,7 +6,7 @@ This module is declarative: importing it must never open or migrate SQLite.
 from __future__ import annotations
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 ASSIGNMENT_STATES = (
     "unassigned",
     "managed",
@@ -40,6 +40,8 @@ REQUIRED_TABLES = frozenset({
     "representatives",
     "decisions",
     "fingerprints",
+    "anchor_payload_objects",
+    "fingerprint_anchor_refs",
     "review_items",
     "pair_cache",
     "actual_runs",
@@ -56,6 +58,60 @@ REQUIRED_TABLES = frozenset({
 REQUIRED_VIEWS = frozenset({
     "catalog_title_metrics",
 })
+
+
+ANCHOR_PAYLOAD_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS anchor_payload_objects (
+    payload_hash TEXT PRIMARY KEY
+        CHECK (LENGTH(payload_hash) = 64)
+        CHECK (payload_hash NOT GLOB '*[^0-9a-f]*'),
+    codec TEXT NOT NULL CHECK (codec = 'zlib-6-v1'),
+    front_byte_length INTEGER NOT NULL CHECK (front_byte_length >= 0),
+    tail_byte_length INTEGER NOT NULL CHECK (tail_byte_length >= 0),
+    raw_length INTEGER NOT NULL CHECK (
+        raw_length >= front_byte_length + tail_byte_length
+    ),
+    compressed_payload BLOB NOT NULL CHECK (LENGTH(compressed_payload) > 0),
+    raw_checksum TEXT NOT NULL
+        CHECK (raw_checksum = payload_hash),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS fingerprint_anchor_refs (
+    fingerprint_id INTEGER PRIMARY KEY
+        REFERENCES fingerprints(fingerprint_id) ON DELETE RESTRICT,
+    payload_hash TEXT NOT NULL
+        REFERENCES anchor_payload_objects(payload_hash) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS fingerprint_anchor_refs_payload_hash
+ON fingerprint_anchor_refs(payload_hash);
+
+CREATE TRIGGER IF NOT EXISTS anchor_payload_objects_no_update
+BEFORE UPDATE ON anchor_payload_objects
+BEGIN
+    SELECT RAISE(ABORT, 'anchor payload objects are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS anchor_payload_objects_no_delete
+BEFORE DELETE ON anchor_payload_objects
+BEGIN
+    SELECT RAISE(ABORT, 'anchor payload objects are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS fingerprint_anchor_refs_no_update
+BEFORE UPDATE ON fingerprint_anchor_refs
+BEGIN
+    SELECT RAISE(ABORT, 'fingerprint anchor references are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS fingerprint_anchor_refs_no_delete
+BEFORE DELETE ON fingerprint_anchor_refs
+BEGIN
+    SELECT RAISE(ABORT, 'fingerprint anchor references are immutable');
+END;
+"""
 
 
 FILE_ANALYSIS_SCHEMA_SQL = """
@@ -269,6 +325,8 @@ BEFORE DELETE ON fingerprints
 BEGIN
     SELECT RAISE(ABORT, 'fingerprints are immutable');
 END;
+
+{ANCHOR_PAYLOAD_SCHEMA_SQL}
 
 CREATE TABLE collision_members (
     group_id INTEGER NOT NULL REFERENCES collision_groups(group_id) ON DELETE CASCADE,

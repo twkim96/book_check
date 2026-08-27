@@ -133,7 +133,10 @@ def run(
             # followed by the preflight full Doctor before authorization. This
             # open only needs to prove the current/migrated schema structure.
             conn = decision_store.initialize_state_db(
-                state_db, migrate=True, check_integrity=False
+                state_db,
+                migrate=True,
+                check_integrity=False,
+                compact_migrations=True,
             )
             try:
                 # A user moves managed queue files into these inboxes outside the

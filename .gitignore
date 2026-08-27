@@ -38,6 +38,8 @@ manual_duplicate_plan_*.json
 
 # private 운영 이력 (공개 저장소에는 정리된 README/docs만 포함)
 update*.md
+# 1.5.0의 공개 schema migration 계약은 README 링크 대상으로 추적한다.
+!update_1.5.0.md
 dedup_detection_gap_*.md
 REAL_DEVICE_TEST_CHECKLIST.md
 DEDUP_REVIEW_GUIDE.md

@@ -850,6 +850,54 @@ DB는 backup-owning 플랫폼 카탈로그 진입점에서 마이그레이션한
 서버/UI 버전은 `1.4.24`, SQLite schema는 `v17`이다. normalizer/fingerprint/pair/auditor/archive
 계약과 Sheet 1.4.23 계약은 그대로 유지한다.
 
+### 1.5.0 content-addressed fingerprint anchor payload
+
+1.5.0은 중복 판정 의미나 immutable fingerprint ID를 바꾸지 않고, `fingerprints.front_anchor`와
+`tail_anchor`에 반복 저장하던 큰 UTF-8 본문 조각만 schema v18의 공유 압축 객체로 옮긴다.
+
+- `anchor_payload_objects`는 front/tail 경계를 길이로 framing한 canonical UTF-8 bytes의 SHA-256을
+  `payload_hash`로 사용하고, `zlib-6-v1` BLOB과 원문 길이·checksum을 함께 보존한다. 단순 문자열 연결은
+  사용하지 않으므로 `(ab, c)`와 `(a, bc)`가 같은 객체가 되지 않는다.
+- `fingerprint_anchor_refs`는 기존 `fingerprint_id`를 payload hash에 연결한다. fingerprint·payload
+  object·reference는 모두 update/delete 금지이며, 같은 anchor를 가진 여러 과거 fingerprint가 객체
+  하나를 공유한다.
+- `fingerprints`의 legacy TEXT 두 컬럼은 이전 fixture와 비상 read fallback을 위해 nullable 호환 컬럼으로
+  남기되, v18 migration과 신규 writer는 값을 기록하지 않는다. 평시 상세 비교는 ref를 따라 BLOB을
+  제한적으로 압축 해제하고 checksum·길이·UTF-8·framing을 모두 검증한다.
+- full schema validator/Doctor는 SQLite integrity와 FK뿐 아니라 모든 payload object의 bounded
+  decompression과 checksum도 검사한다. 손상·누락·legacy/ref 불일치는 anchor를 추측하거나 파일 본문을
+  몰래 다시 읽지 않고 fail-closed한다.
+- recovery 및 review-action fingerprint 복제는 새 fingerprint ID를 만든 뒤 같은 immutable payload
+  evidence를 참조한다. decision/review/pair/operation/actual-run의 기존 FK와 fingerprint ID는 바뀌지 않는다.
+
+v17→v18은 backup-owning 진입점에서만 허용한다. migration은 root lock, active/approved run과 미완료
+operation 차단, free-disk 확인, 검증 SQLite backup을 거친다. legacy anchor를 object/ref로 backfill한 뒤
+압축 해제 결과를 기존 TEXT와 byte-for-byte 대조하고, 전부 일치한 transaction에서만 legacy 값을 비운다.
+마지막 `VACUUM`으로 해제된 overflow page를 실제 파일에서 회수한다.
+
+```bash
+# 읽기 전용 계획과 blocker/공간 확인
+PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py
+
+# backup + schema v18 변환 + 검증 compaction + JSON report
+PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py --run
+```
+
+완료 보고서는 `.dedup_state/reports/fingerprint_payload_migration_1_5_0_*.json`에, v17 원본은
+`.dedup_state/backups/before_fingerprint_payload_v18_*.sqlite3`에 남는다. rollback은 1.5.0 writer를
+중지하고 이 backup을 원래 DB 경로로 검증 복원하는 방식이며, 1.4.x 코드는 schema v18 DB를 열어 쓰지
+못한다. 세부 계약과 검증은 [`update_1.5.0.md`](update_1.5.0.md)에 기록한다.
+
+2026-08-27 운영 적용에서는 84,417개 fingerprint 중 65,901개 anchor ref가 14,908개 압축 object를
+공유했고, DB 파일은 1,031,340,032 bytes에서 300,085,248 bytes로 70.90% 감소했다. fingerprint 수와
+anchor 제외 metadata digest는 유지됐으며 integrity/FK/payload validator/Doctor와 재가동된 1.5.0 health가
+모두 통과했다. v17 rollback backup은 보존하므로 해당 backup이 retention으로 만료되기 전까지
+`.dedup_state` 전체 점유량에는 원본 1.03GB가 별도로 남는다.
+
+서버/UI 버전은 `1.5.0`, SQLite schema는 `v18`이다. `NORMALIZER_VERSION=1.3.3`, fingerprint
+version/policy `5`/`1.4.2`, pair policy `1.4.16-lossless-legacy-v3`, auditor `1.4.17`, archive
+`1.4.10`, 숫자 권 문맥 policy `1.4.24`는 그대로 유지한다.
+
 ## 구조
 
 ```text
@@ -864,6 +912,7 @@ run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
 run_library_server.py             1.2.8+ 독립 도서 관리 웹 서버
 library_frontend/                 React 기반 도서 관리 화면
 extension/                        Chrome 다중 사이트 제목 검색 확장과 공개 회귀
+backend/migrate_fingerprint_payloads.py  1.5.0 fingerprint payload 계획·변환·검증기
 ```
 
 mutable runtime 파일은 계속 프로젝트 루트에 생성됩니다.

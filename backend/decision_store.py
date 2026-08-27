@@ -32,6 +32,14 @@ from file_analysis_repository import (
     sync_contextual_bare_volume_metadata as _sync_contextual_bare_volume_metadata,
     upsert_file_analysis,
 )
+from fingerprint_payloads import (
+    ANCHOR_PAYLOAD_CODEC,
+    anchor_payload_storage_stats,
+    copy_fingerprint_anchor_payload,
+    load_fingerprint_anchor_payload,
+    store_fingerprint_anchor_payload,
+    validate_anchor_payload_storage,
+)
 from state_repository import (
     DEFAULT_BUSY_TIMEOUT_MS,
     _connection_main_path,
@@ -71,12 +79,14 @@ def initialize_state_db(
     *,
     migrate: bool = False,
     check_integrity: bool = True,
+    compact_migrations: bool = False,
 ) -> sqlite3.Connection:
     """Compatibility facade preserving decision_store validation hooks."""
     return _initialize_state_db(
         path,
         migrate=migrate,
         check_integrity=check_integrity,
+        compact_migrations=compact_migrations,
         _validate_schema=validate_schema,
     )
 
@@ -95,6 +105,7 @@ def sync_contextual_bare_volume_metadata(conn, **kwargs):
 # ``__all__``.  Existing callers may import the actual-run, journal, recovery,
 # and Doctor API that intentionally remains implemented in this facade.
 _COMPATIBILITY_FACADE_EXPORTS = (
+    ANCHOR_PAYLOAD_CODEC,
     ASSIGNMENT_STATES,
     CATALOG_SCHEMA_SQL,
     FILE_ANALYSIS_SCHEMA_SQL,
@@ -102,6 +113,7 @@ _COMPATIBILITY_FACADE_EXPORTS = (
     REQUIRED_VIEWS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
+    anchor_payload_storage_stats,
     build_effective_file_analysis,
     file_analysis_snapshot_is_current,
     file_analysis_sync_status,
@@ -111,11 +123,14 @@ _COMPATIBILITY_FACADE_EXPORTS = (
     resolve_current_file_analysis,
     sync_active_file_analysis,
     connect_state_db_readonly,
+    load_fingerprint_anchor_payload,
     retire_legacy_title_requeue_path_owners,
     canonical_rational,
     canonical_symbol,
     coordinate_sort_token,
     coordinates_compatible,
+    store_fingerprint_anchor_payload,
+    validate_anchor_payload_storage,
 )
 
 
@@ -2507,12 +2522,12 @@ def _clone_fingerprint_for_recovered_file(conn, file_id, canonical_path, evidenc
             file_id, canonical_path, size, mtime_ns, dev, ino, ctime_ns,
             normalizer_version, fingerprint_version, analysis_policy_hash,
             raw_sha256, normalized_sha256, normalized_length, encoding, status,
-            front_anchor, tail_anchor, anchors_json
+            anchors_json
         )
         SELECT file_id, ?, ?, ?, ?, ?, ?, normalizer_version,
                fingerprint_version || ?, analysis_policy_hash, raw_sha256,
                normalized_sha256, normalized_length, encoding, status,
-               front_anchor, tail_anchor, anchors_json
+               anchors_json
         FROM fingerprints WHERE fingerprint_id = ? AND file_id = ?
         """,
         (
@@ -2522,6 +2537,10 @@ def _clone_fingerprint_for_recovered_file(conn, file_id, canonical_path, evidenc
             current["current_fingerprint_id"], file_id,
         ),
     ).lastrowid
+    if fingerprint_id:
+        copy_fingerprint_anchor_payload(
+            conn, current["current_fingerprint_id"], fingerprint_id
+        )
     return fingerprint_id or None
 
 

@@ -8,13 +8,19 @@ journals, recovery decisions, and Doctor policy remain together in
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import time
 import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
+from fingerprint_payloads import (
+    migrate_legacy_anchor_payloads,
+    validate_anchor_payload_storage,
+)
 from state_schema import (
+    ANCHOR_PAYLOAD_SCHEMA_SQL,
     CATALOG_SCHEMA_SQL,
     FILE_ANALYSIS_SCHEMA_SQL,
     REQUIRED_TABLES,
@@ -86,6 +92,7 @@ def initialize_state_db(
     *,
     migrate: bool = False,
     check_integrity: bool = True,
+    compact_migrations: bool = False,
     _validate_schema=None,
 ) -> sqlite3.Connection:
     """Open/create the state DB; upgrade an existing DB only with explicit consent.
@@ -598,7 +605,107 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 17")
         conn.commit()
         version = 17
+    migrated_anchor_payloads = False
+    if version == 17:
+        if compact_migrations:
+            db_path = Path(_connection_main_path(conn))
+            database_bytes = db_path.stat().st_size
+            free_bytes = shutil.disk_usage(db_path.parent).free
+            required_free = database_bytes * 2 + 256 * 1024 * 1024
+            if free_bytes < required_free:
+                conn.close()
+                raise RuntimeError(
+                    "schema v18 migration requires free disk for its WAL and "
+                    f"verified compaction: required={required_free}, free={free_bytes}"
+                )
+        try:
+            conn.executescript("BEGIN IMMEDIATE;\n" + ANCHOR_PAYLOAD_SCHEMA_SQL)
+            migration = migrate_legacy_anchor_payloads(conn)
+            validate_anchor_payload_storage(conn, verify_payloads=True)
+            conn.execute("DROP TRIGGER fingerprints_no_update")
+            conn.execute("DROP TRIGGER fingerprints_no_delete")
+            conn.execute(
+                """
+                UPDATE fingerprints SET front_anchor = NULL, tail_anchor = NULL
+                WHERE front_anchor IS NOT NULL OR tail_anchor IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER fingerprints_no_update
+                BEFORE UPDATE ON fingerprints
+                BEGIN
+                    SELECT RAISE(ABORT, 'fingerprints are immutable');
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER fingerprints_no_delete
+                BEFORE DELETE ON fingerprints
+                BEGIN
+                    SELECT RAISE(ABORT, 'fingerprints are immutable');
+                END
+                """
+            )
+            if conn.execute(
+                """
+                SELECT 1 FROM fingerprints
+                WHERE front_anchor IS NOT NULL OR tail_anchor IS NOT NULL
+                LIMIT 1
+                """
+            ).fetchone():
+                raise RuntimeError("schema v18 migration left legacy anchor payloads")
+            validate_anchor_payload_storage(conn, verify_payloads=True)
+            conn.execute(
+                """
+                UPDATE actual_runs
+                SET state = 'failed', finished_at = CURRENT_TIMESTAMP,
+                    error = 'schema v18 migration invalidated unfinished authorization'
+                WHERE state IN ('approved', 'active')
+                """
+            )
+            conn.execute(
+                "DELETE FROM settings WHERE key IN ('approved_run_id', 'approved_backup')"
+            )
+            conn.execute(
+                "UPDATE settings SET value = '0', updated_at = CURRENT_TIMESTAMP "
+                "WHERE key = 'actual_mutation_enabled'"
+            )
+            conn.execute(
+                """
+                INSERT INTO settings(key, value, updated_at)
+                VALUES ('anchor_payload_storage', 'content-addressed-zlib-v1', CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO settings(key, value, updated_at)
+                VALUES ('anchor_payload_migration_counts', ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                ((
+                    "fingerprints={fingerprints_scanned},refs={reference_count},"
+                    "objects={object_count},raw={raw_bytes},compressed={compressed_bytes}"
+                ).format(**migration),),
+            )
+            conn.execute("PRAGMA user_version = 18")
+            conn.commit()
+            version = 18
+            migrated_anchor_payloads = True
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
     schema_validator(conn, check_integrity=check_integrity)
+    if migrated_anchor_payloads and compact_migrations:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        schema_validator(conn, check_integrity=True)
     return conn
 
 
@@ -660,6 +767,14 @@ def validate_schema(
         "catalog_platform_tags": {
             "title_key", "platform", "tag", "position",
         },
+        "anchor_payload_objects": {
+            "payload_hash", "codec", "front_byte_length",
+            "tail_byte_length", "raw_length", "compressed_payload",
+            "raw_checksum", "created_at",
+        },
+        "fingerprint_anchor_refs": {
+            "fingerprint_id", "payload_hash", "created_at",
+        },
     }
     for table, expected in required_columns.items():
         actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -682,6 +797,7 @@ def validate_schema(
         "work_management_events_work",
         "operations_group_state",
         "catalog_platform_tags_tag",
+        "fingerprint_anchor_refs_payload_hash",
     }
     missing_indexes = required_indexes - indexes
     if missing_indexes:
@@ -694,6 +810,23 @@ def validate_schema(
     missing_views = REQUIRED_VIEWS - views
     if missing_views:
         raise RuntimeError(f"schema views missing: {sorted(missing_views)}")
+
+    triggers = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        )
+    }
+    required_triggers = {
+        "fingerprints_no_update",
+        "fingerprints_no_delete",
+        "anchor_payload_objects_no_update",
+        "anchor_payload_objects_no_delete",
+        "fingerprint_anchor_refs_no_update",
+        "fingerprint_anchor_refs_no_delete",
+    }
+    missing_triggers = required_triggers - triggers
+    if missing_triggers:
+        raise RuntimeError(f"schema triggers missing: {sorted(missing_triggers)}")
 
     analysis_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(file_analysis)")
@@ -709,6 +842,10 @@ def validate_schema(
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if integrity != "ok":
             raise RuntimeError(f"integrity_check failed: {integrity}")
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_keys:
+            raise RuntimeError(f"foreign_key_check failed: {foreign_keys[0]}")
+        validate_anchor_payload_storage(conn, verify_payloads=True)
 
 
 
