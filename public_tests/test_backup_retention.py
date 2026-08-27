@@ -78,3 +78,34 @@ def test_backup_creation_automatically_applies_retention(tmp_path):
         assert not (backup_dir / "before_test_01.sqlite3").exists()
     finally:
         conn.close()
+
+
+def test_payload_migration_evidence_is_permanently_retention_protected(tmp_path):
+    state_db = tmp_path / "state" / "decisions.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    backup_dir = state_db.parent / "backups"
+    backup_dir.mkdir()
+    try:
+        legacy = _automatic_backup(backup_dir, 1)
+        legacy_named = legacy.with_name(
+            "before_fingerprint_payload_v18_legacy.sqlite3"
+        )
+        legacy.rename(legacy_named)
+        rollback = _automatic_backup(backup_dir, 2)
+        rollback_named = rollback.with_name(
+            "before_fingerprint_payload_v19_rollback.sqlite3"
+        )
+        rollback.rename(rollback_named)
+        newest = _automatic_backup(backup_dir, 100)
+
+        removed = decision_store.prune_state_backups(
+            conn, backup_dir, keep_latest=1
+        )
+
+        assert legacy_named.is_file()
+        assert rollback_named.is_file()
+        assert newest.is_file()
+        assert legacy_named not in removed
+        assert rollback_named not in removed
+    finally:
+        conn.close()

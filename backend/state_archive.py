@@ -228,6 +228,27 @@ def _referenced_backup_paths(connection) -> set[str]:
     ).fetchone()
     if approved is not None and approved[0]:
         referenced.add(_canonical(approved[0]))
+    referenced.update(
+        _canonical(row[0])
+        for row in connection.execute(
+            "SELECT value FROM settings WHERE key IN ("
+            "'fingerprint_payload_rollback_backup', "
+            "'fingerprint_payload_legacy_evidence_backup'"
+            ")"
+        )
+        if row[0]
+    )
+    main_path = next(
+        row[2]
+        for row in connection.execute("PRAGMA database_list")
+        if row[1] == "main"
+    )
+    backup_dir = Path(main_path).resolve().parent / "backups"
+    for pattern in (
+        "before_fingerprint_payload_v18_*.sqlite3",
+        "before_fingerprint_payload_v19_*.sqlite3",
+    ):
+        referenced.update(_canonical(path) for path in backup_dir.glob(pattern))
     return referenced
 
 

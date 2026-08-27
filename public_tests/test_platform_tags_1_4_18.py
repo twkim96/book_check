@@ -3,7 +3,25 @@ from datetime import datetime, timezone
 import decision_store
 import library_catalog
 import library_services
+import migrate_fingerprint_payloads as payload_migration
 import platform_catalog
+import pytest
+
+
+def _upgrade_legacy_schema(state_db, tmp_path):
+    with pytest.raises(RuntimeError, match="accepted only"):
+        decision_store.initialize_state_db(state_db, migrate=True)
+    house = tmp_path / "migration-house"
+    temp = tmp_path / "migration-temp"
+    house.mkdir(exist_ok=True)
+    temp.mkdir(exist_ok=True)
+    payload_migration.apply_migration(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        allow_dirty=True,
+    )
+    return decision_store.initialize_state_db(state_db)
 
 
 def _catalog_db(tmp_path):
@@ -85,9 +103,7 @@ def test_v15_migrates_tags_schema_without_changing_existing_stat(tmp_path):
     finally:
         conn.close()
 
-    migrated = decision_store.initialize_state_db(
-        db_path, migrate=True, anchor_payload_migration=True
-    )
+    migrated = _upgrade_legacy_schema(db_path, tmp_path)
     try:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == 19
         assert migrated.execute(

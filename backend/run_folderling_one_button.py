@@ -120,14 +120,20 @@ def run(
     )
 
     with mutation_lock_for_roots(dst_dir, src_dir, "folderling-one-button"):
-        ensure_directory_nofollow(backup_dir)
         original_schema = _schema_version(state_db)
         pre_migration = None
         if original_schema != decision_store.SCHEMA_VERSION:
+            if original_schema < 17:
+                guidance = (
+                    "first use a compatible staged upgrader to reach schema 17; "
+                    "the payload migrator accepts only schema 17/18"
+                )
+            else:
+                guidance = "run migrate_fingerprint_payloads.py --run first"
             raise RuntimeError(
                 "Folderling refuses automatic state DB migration: "
                 f"current={original_schema}, expected={decision_store.SCHEMA_VERSION}; "
-                "run migrate_fingerprint_payloads.py --run first"
+                + guidance
             )
         approval_started = False
         try:
@@ -139,6 +145,7 @@ def run(
                 check_integrity=False,
             )
             try:
+                ensure_directory_nofollow(backup_dir)
                 # A user moves managed queue files into these inboxes outside the
                 # program.  Back up first, then bind those renames to the stable
                 # file IDs before doctor judges the old queue paths as missing.

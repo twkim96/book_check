@@ -6,8 +6,25 @@ import threading
 import pytest
 
 import decision_store
+import migrate_fingerprint_payloads as payload_migration
 import platform_catalog
 import run_platform_catalog
+
+
+def _upgrade_legacy_schema(state_db, tmp_path):
+    with pytest.raises(RuntimeError, match="accepted only"):
+        decision_store.initialize_state_db(state_db, migrate=True)
+    house = tmp_path / "house"
+    temp = tmp_path / "migration-temp"
+    house.mkdir(exist_ok=True)
+    temp.mkdir(exist_ok=True)
+    payload_migration.apply_migration(
+        state_db,
+        house_dir=house,
+        temp_dir=temp,
+        allow_dirty=True,
+    )
+    return decision_store.initialize_state_db(state_db)
 
 
 def _make_db(tmp_path, *names):
@@ -1398,9 +1415,7 @@ def test_v10_migration_adds_title_override_column_only_with_explicit_permission(
     with pytest.raises(RuntimeError, match="migration required"):
         decision_store.initialize_state_db(state_db)
 
-    migrated = decision_store.initialize_state_db(
-        state_db, migrate=True, anchor_payload_migration=True
-    )
+    migrated = _upgrade_legacy_schema(state_db, tmp_path)
     try:
         columns = {
             row[1] for row in migrated.execute("PRAGMA table_info(file_analysis)")
@@ -1458,9 +1473,7 @@ def test_v8_download_values_are_preserved_by_v9_migration(tmp_path):
     finally:
         conn.close()
 
-    current = decision_store.initialize_state_db(
-        state_db, migrate=True, anchor_payload_migration=True
-    )
+    current = _upgrade_legacy_schema(state_db, tmp_path)
     try:
         row = current.execute("SELECT * FROM catalog_title_metrics").fetchone()
         assert row["series_download_count"] == 321

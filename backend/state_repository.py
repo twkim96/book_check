@@ -76,12 +76,11 @@ def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
         raise RuntimeError("incomplete SQLite schema statement")
 
 
-def migrate_anchor_payload_schema_connection(
+def _migrate_anchor_payload_schema_connection(
     conn: sqlite3.Connection,
     source_version: int,
     *,
     legacy_anchor_expectations: dict[int, str | None] | None = None,
-    require_legacy_expectations: bool = False,
     activate_writer_gate: bool = False,
 ) -> dict:
     """Upgrade schema 17/18 to 19 inside the caller's writer transaction.
@@ -112,6 +111,10 @@ def migrate_anchor_payload_schema_connection(
         migration = migrate_legacy_anchor_payloads(conn)
         validate_anchor_payload_storage(conn, verify_payloads=True)
     else:
+        if legacy_anchor_expectations is None:
+            raise RuntimeError(
+                "schema v18 migration requires a verified schema-v17 anchor backup"
+            )
         legacy_row = conn.execute(
             """
             SELECT fingerprint_id FROM fingerprints
@@ -129,20 +132,7 @@ def migrate_anchor_payload_schema_connection(
             ),
             **anchor_payload_storage_stats(conn),
         }
-        if (
-            require_legacy_expectations
-            and migration["fingerprints_scanned"]
-            and legacy_anchor_expectations is None
-        ):
-            raise RuntimeError(
-                "schema v18 migration requires a verified schema-v17 anchor backup"
-            )
-        if (
-            require_legacy_expectations
-            and legacy_anchor_expectations is not None
-            and len(legacy_anchor_expectations)
-            != migration["fingerprints_scanned"]
-        ):
+        if len(legacy_anchor_expectations) != migration["fingerprints_scanned"]:
             raise RuntimeError(
                 "schema-v17 evidence fingerprint count differs from schema-v18 DB"
             )
@@ -288,10 +278,6 @@ def initialize_state_db(
     *,
     migrate: bool = False,
     check_integrity: bool = True,
-    compact_migrations: bool = False,
-    anchor_payload_migration: bool = False,
-    legacy_anchor_expectations: dict[int, str | None] | None = None,
-    require_legacy_expectations: bool = False,
     _validate_schema=None,
 ) -> sqlite3.Connection:
     """Open/create the state DB; upgrade an existing DB only with explicit consent.
@@ -309,17 +295,6 @@ def initialize_state_db(
             "state DB schema migration required: "
             f"current={version}, expected={SCHEMA_VERSION}; "
             "use a backup-owning migration entry point"
-        )
-    if (
-        version not in (0, SCHEMA_VERSION)
-        and migrate
-        and version <= 18
-        and not anchor_payload_migration
-    ):
-        conn.close()
-        raise RuntimeError(
-            "schema 17/18 fingerprint payload migration is accepted only by "
-            "migrate_fingerprint_payloads.py --run"
         )
     if version == 0:
         conn.executescript(SCHEMA_SQL)
@@ -815,55 +790,47 @@ def initialize_state_db(
         conn.execute("PRAGMA user_version = 17")
         conn.commit()
         version = 17
-    migrated_anchor_payloads = False
     if version in (17, 18):
-        if not anchor_payload_migration:
-            conn.close()
-            raise RuntimeError(
-                "schema 17/18 fingerprint payload migration is accepted only by "
-                "migrate_fingerprint_payloads.py --run"
-            )
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            migration = migrate_anchor_payload_schema_connection(
-                conn,
-                version,
-                legacy_anchor_expectations=legacy_anchor_expectations,
-                require_legacy_expectations=require_legacy_expectations,
-            )
-            conn.execute(
-                """
-                INSERT INTO settings(key, value, updated_at)
-                VALUES ('anchor_payload_migration_counts', ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value, updated_at = excluded.updated_at
-                """,
-                ((
-                    "fingerprints={fingerprints_scanned},refs={reference_count},"
-                    "objects={object_count},raw={raw_bytes},compressed={compressed_bytes}"
-                ).format(**migration),),
-            )
-            conn.commit()
-            version = 19
-            migrated_anchor_payloads = True
-        except Exception:
-            conn.rollback()
-            conn.close()
-            raise
+        conn.close()
+        raise RuntimeError(
+            "schema 17/18 fingerprint payload migration is accepted only by "
+            "migrate_fingerprint_payloads.py --run"
+        )
     schema_validator(conn, check_integrity=check_integrity)
-    if migrated_anchor_payloads and compact_migrations:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.execute("VACUUM")
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        schema_validator(conn, check_integrity=True)
     return conn
 
+
+
+def fingerprint_payload_migration_state(conn: sqlite3.Connection) -> str | None:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if "settings" not in tables:
+        return None
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = 'fingerprint_payload_migration_gate'"
+    ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def assert_fingerprint_payload_migration_complete(conn: sqlite3.Connection) -> None:
+    state = fingerprint_payload_migration_state(conn)
+    if state is not None:
+        raise RuntimeError(
+            "fingerprint payload migration is incomplete "
+            f"(gate={state!r}); stop routine writers and resume "
+            "migrate_fingerprint_payloads.py --run"
+        )
 
 
 def validate_schema(
     conn: sqlite3.Connection,
     *,
     check_integrity: bool = True,
+    allow_active_migration_gate: bool = False,
 ) -> None:
     """Validate the state DB schema and, by default, its full integrity.
 
@@ -875,6 +842,8 @@ def validate_schema(
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version != SCHEMA_VERSION:
         raise RuntimeError(f"schema version mismatch: expected={SCHEMA_VERSION}, actual={version}")
+    if not allow_active_migration_gate:
+        assert_fingerprint_payload_migration_complete(conn)
 
     rows = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -1011,6 +980,7 @@ def transaction(conn: sqlite3.Connection, *, immediate: bool = True):
         raise RuntimeError("nested decision_store transactions are not supported")
     conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
+        assert_fingerprint_payload_migration_complete(conn)
         yield conn
     except Exception:
         conn.rollback()

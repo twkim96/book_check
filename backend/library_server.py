@@ -92,7 +92,7 @@ from normalizer import should_exclude_dir, should_exclude_file
 from project_paths import FILE_INDEX, HOUSE_DIR, PROJECT_ROOT, STATE_DB, TEMP_DIR
 
 
-SERVER_VERSION = "1.5.1"
+SERVER_VERSION = "1.5.2"
 
 
 def _is_loopback_host(value: str | None) -> bool:
@@ -494,14 +494,34 @@ def _ensure_server_schema(config: LibraryServerConfig) -> Path | None:
     try:
         probe.execute("PRAGMA query_only = ON")
         version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+        migration_state = None
+        if version == decision_store.SCHEMA_VERSION:
+            row = probe.execute(
+                "SELECT value FROM settings "
+                "WHERE key = 'fingerprint_payload_migration_gate'"
+            ).fetchone()
+            migration_state = None if row is None else str(row[0])
     finally:
         probe.close()
     if version == decision_store.SCHEMA_VERSION:
+        if migration_state is not None:
+            raise RuntimeError(
+                "fingerprint payload migration is incomplete "
+                f"(gate={migration_state!r}); resume "
+                "migrate_fingerprint_payloads.py --run before starting the server"
+            )
         return None
+    if version < 17:
+        guidance = (
+            "first use a compatible staged upgrader to reach schema 17; "
+            "migrate_fingerprint_payloads.py accepts only schema 17/18"
+        )
+    else:
+        guidance = "stop writers and run migrate_fingerprint_payloads.py --run"
     raise RuntimeError(
         "state DB schema migration required: "
         f"current={version}, expected={decision_store.SCHEMA_VERSION}; "
-        "stop writers and run migrate_fingerprint_payloads.py --run"
+        + guidance
     )
 
 
@@ -1102,6 +1122,9 @@ def create_app(
                 schema_version = int(
                     conn.execute("PRAGMA user_version").fetchone()[0]
                 )
+                migration_state = (
+                    decision_store.fingerprint_payload_migration_state(conn)
+                )
             finally:
                 conn.close()
         except sqlite3.Error as exc:
@@ -1113,6 +1136,18 @@ def create_app(
                 "database": "unavailable",
                 "error": str(exc),
             }), 503
+        if migration_state is not None:
+            return jsonify(
+                {
+                    "ok": False,
+                    "version": SERVER_VERSION,
+                    **build_info,
+                    "state_db": str(config.state_db),
+                    "database": "maintenance",
+                    "schema": schema_version,
+                    "migration_state": migration_state,
+                }
+            ), 503
         return jsonify(
             {
                 "ok": True,
@@ -1121,6 +1156,7 @@ def create_app(
                 "state_db": str(config.state_db),
                 "database": "ok",
                 "schema": schema_version,
+                "migration_state": "complete",
             }
         )
 

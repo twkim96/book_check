@@ -44,12 +44,13 @@ from fingerprint_payloads import (
 from state_repository import (
     DEFAULT_BUSY_TIMEOUT_MS,
     _connection_main_path,
+    assert_fingerprint_payload_migration_complete,
     canonicalize_path,
     canonicalize_real_path,
     connect_state_db,
     connect_state_db_readonly,
+    fingerprint_payload_migration_state,
     initialize_state_db as _initialize_state_db,
-    migrate_anchor_payload_schema_connection,
     retire_legacy_title_requeue_path_owners,
     retired_canonical_path,
     transaction,
@@ -81,20 +82,12 @@ def initialize_state_db(
     *,
     migrate: bool = False,
     check_integrity: bool = True,
-    compact_migrations: bool = False,
-    anchor_payload_migration: bool = False,
-    legacy_anchor_expectations: dict[int, str | None] | None = None,
-    require_legacy_expectations: bool = False,
 ) -> sqlite3.Connection:
     """Compatibility facade preserving decision_store validation hooks."""
     return _initialize_state_db(
         path,
         migrate=migrate,
         check_integrity=check_integrity,
-        compact_migrations=compact_migrations,
-        anchor_payload_migration=anchor_payload_migration,
-        legacy_anchor_expectations=legacy_anchor_expectations,
-        require_legacy_expectations=require_legacy_expectations,
         _validate_schema=validate_schema,
     )
 
@@ -130,9 +123,10 @@ _COMPATIBILITY_FACADE_EXPORTS = (
     reconcile_file_metadata,
     resolve_current_file_analysis,
     sync_active_file_analysis,
+    assert_fingerprint_payload_migration_complete,
     connect_state_db_readonly,
+    fingerprint_payload_migration_state,
     load_fingerprint_anchor_payload,
-    migrate_anchor_payload_schema_connection,
     prepare_fingerprint_anchor_payload,
     retire_legacy_title_requeue_path_owners,
     canonical_rational,
@@ -2132,7 +2126,7 @@ def _is_state_backup(path: Path) -> bool:
 
 
 def protected_state_backup_paths(conn: sqlite3.Connection) -> set[str]:
-    """Return backups that are still required by an unfinished actual run."""
+    """Return recovery and migration evidence excluded from retention."""
     protected = {
         str(Path(row[0]).resolve())
         for row in conn.execute(
@@ -2168,12 +2162,25 @@ def protected_state_backup_paths(conn: sqlite3.Connection) -> set[str]:
             if row[0]
         )
     if "settings" in tables:
-        rollback = conn.execute(
-            "SELECT value FROM settings "
-            "WHERE key = 'fingerprint_payload_rollback_backup'"
-        ).fetchone()
-        if rollback is not None and rollback[0]:
-            protected.add(str(Path(rollback[0]).resolve()))
+        protected.update(
+            str(Path(row[0]).resolve())
+            for row in conn.execute(
+                "SELECT value FROM settings WHERE key IN ("
+                "'fingerprint_payload_rollback_backup', "
+                "'fingerprint_payload_legacy_evidence_backup'"
+                ")"
+            )
+            if row[0]
+        )
+    # Schema-v17 evidence produced by 1.5.0 predates the explicit artifact
+    # setting.  Keep those narrowly named immutable migration backups protected
+    # so current installations cannot lose their only legacy mapping proof.
+    backup_dir = Path(_connection_main_path(conn)).parent / "backups"
+    for pattern in (
+        "before_fingerprint_payload_v18_*.sqlite3",
+        "before_fingerprint_payload_v19_*.sqlite3",
+    ):
+        protected.update(str(path.resolve()) for path in backup_dir.glob(pattern))
     return protected
 
 
@@ -3236,6 +3243,8 @@ def doctor_issues(
     allowed_active_run_id=None,
     verify_files: bool = True,
     check_integrity: bool = True,
+    _allow_legacy_payload_schema: bool = False,
+    _allow_active_migration_gate: bool = False,
 ):
     """Return operational, schema, and optionally filesystem doctor issues.
 
@@ -3245,7 +3254,31 @@ def doctor_issues(
     """
     issues = []
     try:
-        validate_schema(conn, check_integrity=check_integrity)
+        if _allow_legacy_payload_schema:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version not in (17, 18):
+                raise RuntimeError(
+                    "legacy payload migration Doctor requires schema 17 or 18, "
+                    f"got {version}"
+                )
+            if check_integrity:
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError(f"integrity_check failed: {integrity}")
+                foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if foreign_keys:
+                    raise RuntimeError(
+                        f"foreign_key_check failed: {foreign_keys[0]}"
+                    )
+        else:
+            if _allow_active_migration_gate:
+                validate_schema(
+                    conn,
+                    check_integrity=check_integrity,
+                    allow_active_migration_gate=True,
+                )
+            else:
+                validate_schema(conn, check_integrity=check_integrity)
     except RuntimeError as exc:
         return [{"kind": "schema", "detail": str(exc)}]
     for row in conn.execute(

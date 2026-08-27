@@ -5,17 +5,20 @@ import pytest
 
 import decision_store
 import fingerprint_payloads
+import migrate_fingerprint_payloads as payload_migration
 
 
 def _insert_fingerprint(conn, root, index, front=None, tail=None):
     file_id = str(uuid.uuid4())
     path = root / f"book-{index}.txt"
+    path.write_bytes(b"x" * (index + 1))
+    info = path.stat()
     conn.execute(
         """
         INSERT INTO files(file_id, canonical_path, source, size, mtime_ns)
         VALUES (?, ?, 'house', ?, ?)
         """,
-        (file_id, str(path), index + 1, index + 10),
+        (file_id, str(path), info.st_size, info.st_mtime_ns),
     )
     if conn.execute("PRAGMA user_version").fetchone()[0] >= 19:
         state, payload_hash = decision_store.prepare_fingerprint_anchor_payload(
@@ -30,7 +33,7 @@ def _insert_fingerprint(conn, root, index, front=None, tail=None):
             ) VALUES (?, ?, ?, ?, 'test', ?, 'ok', ?, ?)
             """,
             (
-                file_id, str(path), index + 1, index + 10,
+                file_id, str(path), info.st_size, info.st_mtime_ns,
                 f"test-{index}", state, payload_hash,
             ),
         ).lastrowid
@@ -47,7 +50,7 @@ def _insert_fingerprint(conn, root, index, front=None, tail=None):
             ) VALUES (?, ?, ?, ?, 'test', ?, 'ok', ?, ?)
             """,
             (
-                file_id, str(path), index + 1, index + 10,
+                file_id, str(path), info.st_size, info.st_mtime_ns,
                 f"test-{index}", front, tail,
             ),
         ).lastrowid
@@ -118,12 +121,17 @@ def test_schema_v19_migrates_v17_anchors_without_changing_fingerprint_ids(tmp_pa
     finally:
         conn.close()
 
-    migrated = decision_store.initialize_state_db(
+    house = tmp_path / "migration-house"
+    temp = tmp_path / "migration-temp"
+    house.mkdir()
+    temp.mkdir()
+    payload_migration.apply_migration(
         state_db,
-        migrate=True,
-        compact_migrations=True,
-        anchor_payload_migration=True,
+        house_dir=house,
+        temp_dir=temp,
+        allow_dirty=True,
     )
+    migrated = decision_store.initialize_state_db(state_db)
     try:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == 19
         assert [

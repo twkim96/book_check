@@ -1,7 +1,7 @@
 import os
-from pathlib import Path
 
 import decision_store
+import migrate_fingerprint_payloads as payload_migration
 import pytest
 from dedup_mutations import (
     _ensure_intake_fingerprint,
@@ -10,6 +10,18 @@ from dedup_mutations import (
 )
 from folderling import create_recent_link, ensure_recent_link_slot
 from mutation_io import inspect_regular_file
+
+
+def _upgrade_legacy_schema(state_db, tmp_path):
+    with pytest.raises(RuntimeError, match="accepted only"):
+        decision_store.initialize_state_db(state_db, migrate=True)
+    payload_migration.apply_migration(
+        state_db,
+        house_dir=tmp_path / "house",
+        temp_dir=tmp_path / "temp",
+        allow_dirty=True,
+    )
+    return decision_store.initialize_state_db(state_db)
 
 
 def _legacy_collision_fixture(tmp_path, *, with_requeue_provenance=True):
@@ -218,9 +230,7 @@ def test_v15_migration_retires_legacy_title_real_path(tmp_path):
     finally:
         conn.close()
 
-    migrated = decision_store.initialize_state_db(
-        fixture["state_db"], migrate=True, anchor_payload_migration=True
-    )
+    migrated = _upgrade_legacy_schema(fixture["state_db"], tmp_path)
     try:
         assert migrated.execute("PRAGMA user_version").fetchone()[0] == 19
         old = migrated.execute(

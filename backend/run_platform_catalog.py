@@ -259,10 +259,17 @@ def ensure_catalog_schema(state_db_path: str) -> Optional[Path]:
                 f"state DB schema is newer than this program: {original_version}"
             )
         if state_db.is_file() and original_version != decision_store.SCHEMA_VERSION:
+            if original_version < 17:
+                guidance = (
+                    "first use a compatible staged upgrader to reach schema 17; "
+                    "the payload migrator accepts only schema 17/18"
+                )
+            else:
+                guidance = "run migrate_fingerprint_payloads.py --run first"
             raise RuntimeError(
                 "platform catalog refuses automatic state DB migration: "
                 f"current={original_version}, expected={decision_store.SCHEMA_VERSION}; "
-                "run migrate_fingerprint_payloads.py --run first"
+                + guidance
             )
         conn = decision_store.initialize_state_db(state_db)
         conn.close()

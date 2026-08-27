@@ -88,6 +88,23 @@ def test_macos_stable_var_alias_still_excludes_referenced_backup(tmp_path):
     assert backups[0].is_file()
 
 
+def test_archive_plan_excludes_legacy_payload_migration_evidence(tmp_path):
+    state_db, backups = _state_with_backups(tmp_path, count=2)
+    legacy = backups[0].with_name(
+        "before_fingerprint_payload_v18_legacy-evidence.sqlite3"
+    )
+    backups[0].rename(legacy)
+
+    plan = state_archive.build_backup_archive_plan(
+        state_db, keep_latest_unreferenced=0
+    )
+
+    assert str(legacy.resolve()) in plan["referenced_paths"]
+    assert str(legacy.resolve()) not in {
+        item["source_path"] for item in plan["items"]
+    }
+
+
 def test_verified_archive_excludes_references_and_restores_without_consuming_cold_copy(
     tmp_path,
 ):

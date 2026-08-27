@@ -954,6 +954,48 @@ branch 이름만 믿지 말고 이 값과 DB schema를 함께 pin한다. 세부 
 300,085,248 bytes에서 306,688,000 bytes로 6,602,752 bytes 증가했고 v18 rollback backup과 최초 v17
 backup을 모두 보존했다. 적용 report와 exact backup SHA는 `update_1.5.1.md`에 기록한다.
 
+### 1.5.2 migration/recovery fail-closed hardening
+
+1.5.2는 payload 형식과 schema v19를 바꾸지 않는 안전성 패치다. 정상 v19 writer와 운영 데이터에는
+재변환이 없으며, 1.5.1 추가 리뷰에서 확인된 migration 우회·중단 재개·rollback 경계를 닫는다.
+
+- `initialize_state_db()`의 payload migration 인자와 `decision_store` 공개 migration facade를 제거했다.
+  schema v17/v18은 routine initializer에서 항상 거부되며, 내부 v18 변환도 schema-v17 ID/hash evidence를
+  무조건 요구한다.
+- source writer epoch가 한 번이라도 풀린 pre-commit resume은 과거 partial/final backup을 재사용하지 않는다.
+  새 `BEGIN IMMEDIATE` 아래에서 active run, unfinished operation/group, integrity, FK, full operational Doctor,
+  free space와 build provenance를 다시 검사하고 현재 전체 snapshot으로 rollback backup을 새로 만든다.
+- migration gate는 fingerprint trigger뿐 아니라 `validate_schema()`, 모든 공용 transaction, server startup,
+  Folderling과 platform catalog preflight를 차단한다. 이미 실행 중인 서버의 `/health`는 gate가 있으면
+  `database=maintenance`, `migration_state=active`, HTTP 503을 반환한다.
+- logical commit transaction은 migration ID, source schema/snapshot SHA, rollback·legacy evidence path/SHA,
+  build commit/dirty와 migration/schema source SHA를 DB settings에 기록한다. report를 쓴 뒤 DB marker에
+  report path/SHA와 `reported`를 기록하고 나서 gate를 해제한다.
+- `reported` journal은 현재 DB의 schema·migration marker·report SHA·fingerprint digest와 모두 일치할 때만
+  재사용한다. rollback된 DB에는 `--reapply` 확인이 필요하며 기존 journal은 stale artifact로 보존한다.
+- v17 evidence와 v18 rollback backup은 settings뿐 아니라 기존 1.5.0/1.5.1 filename도 인식해 retention 및
+  cold archive 대상에서 제외한다. WAL checkpoint busy도 즉시 실패한다.
+- journal 파일명은 resolved DB path hash를 포함하므로 같은 디렉터리의 서로 다른 DB가 충돌하지 않는다.
+
+정식 migration은 clean checkout만 허용한다. 긴급 dirty build는 아래처럼 명시해야 하며 report에 전체 git
+diff SHA-256이 남는다.
+
+```bash
+PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py \
+  --state-db .dedup_state/dedup_decisions.sqlite3 \
+  --legacy-anchor-backup .dedup_state/backups/before_fingerprint_payload_v18_<id>.sqlite3 \
+  --run
+
+# rollback을 명시적으로 확인한 뒤 stale journal을 보존하고 재적용할 때만 추가
+# --reapply
+
+# commit할 수 없는 긴급 source를 증거와 함께 사용할 때만 추가
+# --allow-dirty
+```
+
+서버/UI 버전은 `1.5.2`, SQLite schema는 계속 `v19`다. 세부 판정과 fault regression은
+[`update_1.5.2.md`](update_1.5.2.md)에 기록한다.
+
 ## 구조
 
 ```text
@@ -968,7 +1010,7 @@ run_title_cleanup_apply.py       1.2.7 제목 교정 재입고 dry-run/실행기
 run_library_server.py             1.2.8+ 독립 도서 관리 웹 서버
 library_frontend/                 React 기반 도서 관리 화면
 extension/                        Chrome 다중 사이트 제목 검색 확장과 공개 회귀
-backend/migrate_fingerprint_payloads.py  1.5.1 fingerprint payload 계획·변환·재개·검증기
+backend/migrate_fingerprint_payloads.py  1.5.2 fingerprint payload 계획·변환·재개·검증기
 ```
 
 mutable runtime 파일은 계속 프로젝트 루트에 생성됩니다.
