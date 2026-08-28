@@ -70,6 +70,7 @@ function reviewClassLabel(value: string | undefined): string {
   return ({
     text_equivalent: "본문 동일 추정",
     epub_equivalent: "EPUB 내용 동일 추정",
+    epub_package_variant: "EPUB 동일판 패키지 변형",
     metadata_only: "제목·좌표 기반 검토",
     decode_lossy: "본문 디코딩 불확실",
     longer_unresolved: "더 긴 판본 여부 미확정",

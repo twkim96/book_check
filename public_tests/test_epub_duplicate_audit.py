@@ -339,9 +339,9 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
     assert duplicate_auditor.FINGERPRINT_POLICY_VERSION == "1.4.2"
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.4.16-lossless-legacy-v3"
+    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.5.3-review-lifecycle-v1"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.4.17"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.5.3"
 
 
 def _txt_cache_fixture(tmp_path):

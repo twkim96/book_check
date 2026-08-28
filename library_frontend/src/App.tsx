@@ -1391,6 +1391,7 @@ const folderlingStatusLabels: Record<string, string> = {
   warning: "경고 보류",
   author_conflict: "작가 충돌",
   metadata_only: "메타데이터 판정",
+  epub_package_variant: "EPUB 패키지 변형 검토",
   skipped: "제외",
   failed: "실패",
   empty_directory_cleaned: "빈 폴더 정리"

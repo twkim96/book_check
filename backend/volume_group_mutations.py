@@ -308,16 +308,34 @@ def classify_folderling_volume_target(
         if row["coordinate_kind"] == source["coordinate_kind"]
         and _coordinate_key(row) == source_coordinate
     ]
+    alternate_format_matches = []
     if coordinate_matches:
-        return {
-            "status": "coordinate_conflict",
-            "reason": "existing_same_coordinate",
-            "core_title": str(source["core_title"]),
-            "display_title": str(source["readable_title"] or source["core_title"]),
-            **_coordinate_response(source),
-            "conflicting_file_ids": [str(row["file_id"]) for row in coordinate_matches],
-            "conflicting_paths": [str(row["canonical_path"]) for row in coordinate_matches],
+        source_format = Path(str(source["canonical_path"])).suffix.casefold()
+        match_formats = {
+            Path(str(row["canonical_path"])).suffix.casefold()
+            for row in coordinate_matches
         }
+        same_format_match = source_format in match_formats
+        alternate_format_only = bool(
+            len(coordinate_matches) == 1
+            and source_format in {".epub", ".pdf"}
+            and match_formats <= {".epub", ".pdf"}
+            and not same_format_match
+        )
+        if not alternate_format_only:
+            return {
+                "status": "coordinate_conflict",
+                "reason": "existing_same_coordinate",
+                "core_title": str(source["core_title"]),
+                "display_title": str(source["readable_title"] or source["core_title"]),
+                **_coordinate_response(source),
+                "conflicting_file_ids": [str(row["file_id"]) for row in coordinate_matches],
+                "conflicting_paths": [str(row["canonical_path"]) for row in coordinate_matches],
+            }
+        # PDF and EPUB at the same work coordinate are alternate reading
+        # formats, not duplicate files. Continue through every author/work/
+        # parent safety check before admitting the incoming format.
+        alternate_format_matches = coordinate_matches
     managed_existing = [
         row for row in all_existing
         if row["assignment_state"] == "managed"
@@ -376,6 +394,11 @@ def classify_folderling_volume_target(
     if len(parents) != 1:
         return no_target("multiple_existing_parents")
     target = next(iter(parents))
+    if alternate_format_matches and any(
+        Path(str(row["canonical_path"])).resolve().parent != target
+        for row in alternate_format_matches
+    ):
+        return no_target("alternate_format_parent_conflict")
     try:
         relative = target.relative_to(house_root)
     except ValueError:
@@ -388,6 +411,10 @@ def classify_folderling_volume_target(
         "existing_file_ids": [str(row["file_id"]) for row in existing],
         "display_title": str(source["readable_title"] or source["core_title"]),
         "core_title": str(source["core_title"]),
+        "alternate_format": bool(alternate_format_matches),
+        "alternate_format_file_ids": [
+            str(row["file_id"]) for row in alternate_format_matches
+        ],
     }
 
 

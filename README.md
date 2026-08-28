@@ -996,6 +996,25 @@ PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py \
 서버/UI 버전은 `1.5.2`, SQLite schema는 계속 `v19`다. 세부 판정과 fault regression은
 [`update_1.5.2.md`](update_1.5.2.md)에 기록한다.
 
+### 1.5.3 review lifecycle and alternate-format hardening
+
+1.5.3은 2026-08-28 운영 감사에서 확인된 “실제 이동보다 open review가 크게 보이는” 문제를 줄이는
+호환성 패치다. schema v19와 fingerprint/payload 표현은 변경하지 않고 pair cache 정책만 새로 만든다.
+
+- writable auditor는 inactive/stale fingerprint review, 구조적으로 다른 EPUB의 `metadata_only`, 다른 core의
+  `decode_lossy`, 같은 unordered pair의 약한 과거 classification만 자동 `superseded` 처리한다. 방문하지 않은
+  현재 review는 `coverage_limited=true`에서도 닫지 않고, 실제 queue path가 있는 row도 보존한다.
+- 같은 작품·같은 권의 PDF와 EPUB는 중복 충돌이 아니라 alternate format으로 같은 work에 입고한다. 같은
+  확장자나 여러 기존 충돌, 작가/work/parent 모호성은 계속 warning으로 보낸다.
+- EPUB는 spine item 경계를 제외한 연속 visible-text digest를 추가한다. 같은 안정 identifier와 최소 본문을
+  가진 동일 텍스트라도 package 구조가 다르면 `epub_package_variant` 수동검토로 분류하며 자동 격리하거나
+  용량이 큰 파일을 자동 선택하지 않는다. 신규 package는 기존 house 사본을 유지한 채 warning에 보류한다.
+- ordered-body 95%, 최소 본문, 누락 구간, protected/representative 안전선은 그대로 유지한다.
+
+서버/UI/auditor 버전은 `1.5.3`, SQLite schema는 계속 `v19`다. fingerprint version/policy는 `5`/`1.4.2`,
+pair policy는 `1.5.3-review-lifecycle-v1`이다. 상세 근거와 회귀 범위는
+[`update_1.5.3.md`](update_1.5.3.md)에 기록한다.
+
 ## 구조
 
 ```text

@@ -71,7 +71,10 @@ from mutation_io import (
 from review_noise import (
     different_core_titles,
     distinct_terminal_epub_volumes,
+    plan_open_review_reconciliation,
+    reconcile_open_reviews,
     side_story_vs_numbered_epub_volume,
+    structurally_distinct_epub_books,
     supersede_open_pair_reviews,
 )
 
@@ -95,10 +98,10 @@ FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # 1.4.16 suffix admits reversible legacy-byte fingerprints only to exact digest
 # equality; it never enables fuzzy/containment comparison for damaged text.
 # This invalidates pair decisions only; the base fingerprint policy stays 1.4.2.
-PAIR_POLICY_VERSION = "1.4.16-lossless-legacy-v3"
+PAIR_POLICY_VERSION = "1.5.3-review-lifecycle-v1"
 LEGACY_ESCAPE_FINGERPRINT_SUFFIX = ":lossless-legacy-v1"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.4.17"
+AUDITOR_VERSION = "1.5.3"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -129,6 +132,7 @@ _CURRENT_FINGERPRINT_COLUMNS = """
 
 _REVIEWABLE_CLASSIFICATIONS = {
     "text_equivalent", "epub_equivalent", "marker_recheck",
+    "epub_package_variant",
     "near_identical", "contained_exact", "contained_version",
     "ordered_body_match", "ordered_body_review", "longer_unresolved",
     "decode_lossy", "metadata_only", "insufficient_text",
@@ -1814,6 +1818,7 @@ class PersistentAuditCache:
     def store_pair_results(self, candidates, results):
         stable = {
             "text_equivalent", "epub_equivalent", "marker_recheck", "near_identical", "contained_exact",
+            "epub_package_variant",
             "contained_version", "ordered_body_match", "ordered_body_review",
             "longer_unresolved", "boilerplate_only", "different",
             "decode_lossy", "lossless_identity_mismatch",
@@ -2024,6 +2029,22 @@ class PersistentAuditCache:
         ):
             self.stats["cross_core_reviews_suppressed"] += 1
             return
+        if (
+            result.classification == "metadata_only"
+            and structurally_distinct_epub_books(
+                candidate.left.name, candidate.right.name
+            )
+        ):
+            self.stats["structural_reviews_suppressed"] += 1
+            return
+        if (
+            result.classification == "decode_lossy"
+            and different_core_titles(
+                candidate.left.core_title, candidate.right.core_title
+            )
+        ):
+            self.stats["cross_core_decode_reviews_suppressed"] += 1
+            return
         if not (
             _entry_is_current(candidate.left)
             and _entry_is_current(candidate.right)
@@ -2160,6 +2181,25 @@ class PersistentAuditCache:
             ),
         )
         self.stats["review_items_created"] += 1
+
+    def reconcile_review_items(self):
+        """Close only coverage-independent review noise after a clean audit."""
+        plan = plan_open_review_reconciliation(self.conn)
+        if not any(plan.values()):
+            return
+        with self.store.transaction(self.conn):
+            if self.before_non_cache_mutation is not None:
+                self.before_non_cache_mutation(self.conn)
+            result = reconcile_open_reviews(self.conn)
+        self.stats["diagnostic_reviews_superseded"] += result[
+            "noise_superseded"
+        ]
+        self.stats["stale_reviews_superseded"] += result[
+            "stale_superseded"
+        ]
+        self.stats["weaker_reviews_superseded"] += result[
+            "duplicate_superseded"
+        ]
 
 
 class ReadOnlyAuditCache:
@@ -2348,7 +2388,8 @@ def _pair_configuration_hash(config):
         # so a retry/cache correction does not rebuild every base fingerprint.
         "epub_reading_payload_contract": "same-edition+opf-metadata+calibre-bookmark-v3",
         "epub_spine_text_contract": (
-            f"exact-visible-spine+shared-package-id+min-{EPUB_SPINE_TEXT_MIN_CHARS}"
+            "exact-framed-or-continuous-visible-spine+shared-package-id+"
+            f"min-{EPUB_SPINE_TEXT_MIN_CHARS}+package-variant-review-v1"
         ),
     }
     payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
@@ -3237,6 +3278,12 @@ def analyze_candidates(
                     evidence.update({
                         "left_spine_text_sha256": spines[0].text_sha256,
                         "right_spine_text_sha256": spines[1].text_sha256,
+                        "left_spine_continuous_text_sha256": (
+                            spines[0].continuous_text_sha256
+                        ),
+                        "right_spine_continuous_text_sha256": (
+                            spines[1].continuous_text_sha256
+                        ),
                         "left_spine_text_chars": spines[0].text_chars,
                         "right_spine_text_chars": spines[1].text_chars,
                         "left_spine_item_count": spines[0].spine_item_count,
@@ -3263,6 +3310,25 @@ def analyze_candidates(
                     evidence["epub_equivalence_mode"] = "spine_text"
                     results[candidate.pair_id] = _basic_result(
                         candidate, "epub_equivalent", evidence
+                    )
+                    continue
+                same_reading_text_package_variant = bool(
+                    len(spines) == 2
+                    and _epub_reading_payload_candidate(candidate)
+                    and spines[0].text_chars >= EPUB_SPINE_TEXT_MIN_CHARS
+                    and spines[0].text_chars == spines[1].text_chars
+                    and spines[0].continuous_text_sha256
+                    == spines[1].continuous_text_sha256
+                    and spines[0].text_sha256 != spines[1].text_sha256
+                    and set(spines[0].identifiers) & set(spines[1].identifiers)
+                )
+                if same_reading_text_package_variant:
+                    evidence.update({
+                        "epub_equivalence_mode": "continuous_spine_text_review",
+                        "epub_package_variant": True,
+                    })
+                    results[candidate.pair_id] = _basic_result(
+                        candidate, "epub_package_variant", evidence
                     )
                     continue
                 distinct_evidence = (
@@ -3861,6 +3927,12 @@ def run_audit(args):
         )
         if persistent is not None:
             persistent.store_pair_results(safe_candidates, results)
+            # This pass never closes an unseen current actionable pair, so it
+            # remains safe under bounded/coverage-limited candidate discovery.
+            # Skip it only when the audit itself is incomplete or an input
+            # changed while evidence was being collected.
+            if not stop_reasons and not changed:
+                persistent.reconcile_review_items()
         persistent_stats = Counter(readonly_fingerprint_stats)
         if persistent is not None:
             persistent_stats.update(persistent.stats)
@@ -4039,6 +4111,21 @@ def run_audit(args):
         "cross_core_reviews_suppressed": persistent_stats.get(
             "cross_core_reviews_suppressed", 0
         ),
+        "structural_reviews_suppressed": persistent_stats.get(
+            "structural_reviews_suppressed", 0
+        ),
+        "cross_core_decode_reviews_suppressed": persistent_stats.get(
+            "cross_core_decode_reviews_suppressed", 0
+        ),
+        "diagnostic_reviews_superseded": persistent_stats.get(
+            "diagnostic_reviews_superseded", 0
+        ),
+        "stale_reviews_superseded": persistent_stats.get(
+            "stale_reviews_superseded", 0
+        ),
+        "weaker_reviews_superseded": persistent_stats.get(
+            "weaker_reviews_superseded", 0
+        ),
         "stale_open_reviews_superseded": persistent_stats.get(
             "stale_open_reviews_superseded", 0
         ),
@@ -4102,7 +4189,8 @@ def _text_report(report, include_details=True):
         f"메타 후보 {report.stats['candidate_pairs']}쌍 / 결과 {report.stats['result_pairs']}쌍",
     ]
     for key in (
-        "text_equivalent", "epub_equivalent", "near_identical", "contained_exact", "contained_version",
+        "text_equivalent", "epub_equivalent", "epub_package_variant",
+        "near_identical", "contained_exact", "contained_version",
         "ordered_body_match", "ordered_body_review",
         "marker_recheck", "boilerplate_only", "longer_unresolved", "metadata_only",
         "decode_lossy", "lossless_identity_mismatch", "empty_text",

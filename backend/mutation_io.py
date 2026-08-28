@@ -70,6 +70,7 @@ class EpubContentEvidence:
 class EpubSpineTextEvidence:
     file_evidence: FileEvidence
     text_sha256: str
+    continuous_text_sha256: str
     text_chars: int
     spine_item_count: int
     identifiers: tuple[str, ...]
@@ -1527,6 +1528,7 @@ def inspect_epub_spine_text(
                     raise RuntimeError("EPUB spine is empty or malformed")
 
                 digest = hashlib.sha256()
+                continuous_digest = hashlib.sha256()
                 text_chars = 0
                 spine_count = 0
                 for item_id in spine_ids:
@@ -1545,6 +1547,11 @@ def inspect_epub_spine_text(
                     encoded = visible.encode("utf-8")
                     digest.update(struct.pack(">Q", len(encoded)))
                     digest.update(encoded)
+                    # A packaging-only cover/nav/section split changes the
+                    # framed digest above. This second digest deliberately
+                    # ignores item boundaries and is used only for a manual
+                    # package-variant classification, never automatic removal.
+                    continuous_digest.update(encoded)
                     text_chars += len(visible)
                     spine_count += 1
 
@@ -1572,6 +1579,7 @@ def inspect_epub_spine_text(
         return EpubSpineTextEvidence(
             file_evidence=_identity(after, raw_sha),
             text_sha256=digest.hexdigest(),
+            continuous_text_sha256=continuous_digest.hexdigest(),
             text_chars=text_chars,
             spine_item_count=spine_count,
             identifiers=identifiers,

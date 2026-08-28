@@ -7,7 +7,10 @@ from mutation_io import inspect_epub_spine_text
 from normalizer import analyze_name
 
 
-def _write_epub(path, *, title, identifier, publisher, date, body, asset):
+def _write_epub(
+    path, *, title, identifier, publisher, date, body, asset,
+    leading_empty_spine=False,
+):
     container = b"""<?xml version='1.0'?>
 <container xmlns='urn:oasis:names:tc:opendocument:xmlns:container'>
   <rootfiles><rootfile full-path='OEBPS/content.opf'
@@ -20,9 +23,9 @@ def _write_epub(path, *, title, identifier, publisher, date, body, asset):
  <metadata><dc:identifier id='BookId'>{identifier}</dc:identifier>
   <dc:title>{title}</dc:title><dc:creator>테스트 작가</dc:creator>
   <dc:publisher>{publisher}</dc:publisher><dc:date>{date}</dc:date></metadata>
- <manifest><item id='chapter' href='chapter.xhtml' media-type='application/xhtml+xml'/>
+ <manifest>{"<item id='cover' href='cover.xhtml' media-type='application/xhtml+xml'/>" if leading_empty_spine else ""}<item id='chapter' href='chapter.xhtml' media-type='application/xhtml+xml'/>
   <item id='asset' href='asset.bin' media-type='application/octet-stream'/></manifest>
- <spine><itemref idref='chapter'/></spine>
+ <spine>{"<itemref idref='cover'/>" if leading_empty_spine else ""}<itemref idref='chapter'/></spine>
 </package>""".encode("utf-8")
     chapter = (
         "<html><head><style>hidden</style></head><body>"
@@ -31,6 +34,8 @@ def _write_epub(path, *, title, identifier, publisher, date, body, asset):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("META-INF/container.xml", container)
         archive.writestr("OEBPS/content.opf", opf)
+        if leading_empty_spine:
+            archive.writestr("OEBPS/cover.xhtml", b"<html><body></body></html>")
         archive.writestr("OEBPS/chapter.xhtml", chapter)
         archive.writestr("OEBPS/asset.bin", asset)
 
@@ -104,6 +109,50 @@ def test_auditor_uses_spine_text_only_for_same_coordinate_and_identity(tmp_path)
     assert report.completed is True
     assert report.results[0]["classification"] == "epub_equivalent"
     assert report.results[0]["evidence"]["epub_equivalence_mode"] == "spine_text"
+
+
+def test_boundary_only_spine_change_is_manual_package_variant(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["패키지 변형 작품 5권.epub", "패키지 변형 작품 05권.epub"]
+    body = "동일한 연속 본문입니다." * 6_000
+    _write_epub(
+        house / names[0], title="패키지 변형 작품 5",
+        identifier="urn:uuid:package-variant", publisher="출판사",
+        date="2026-01-01", body=body, asset=b"small",
+    )
+    _write_epub(
+        house / names[1], title="패키지 변형 작품 5",
+        identifier="urn:uuid:package-variant", publisher="출판사",
+        date="2026-01-01", body=body, asset=b"richer-images",
+        leading_empty_spine=True,
+    )
+    first = inspect_epub_spine_text(house / names[0])
+    second = inspect_epub_spine_text(house / names[1])
+    assert first.text_sha256 != second.text_sha256
+    assert first.continuous_text_sha256 == second.continuous_text_sha256
+
+    index_path = tmp_path / "file_index.json"
+    state_db = tmp_path / "state.sqlite3"
+    _write_index(index_path, house, names)
+    report = duplicate_auditor.run_audit(
+        _args(index_path, house, temp, state_db)
+    )
+
+    assert report.completed is True
+    assert report.results[0]["classification"] == "epub_package_variant"
+    assert report.results[0]["evidence"]["epub_equivalence_mode"] == \
+        "continuous_spine_text_review"
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        row = conn.execute(
+            "SELECT classification, state FROM review_items"
+        ).fetchone()
+        assert tuple(row) == ("epub_package_variant", "pending")
+    finally:
+        conn.close()
 
 
 def test_disjoint_opf_edition_proof_suppresses_metadata_review(tmp_path):

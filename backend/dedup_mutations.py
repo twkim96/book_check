@@ -43,6 +43,7 @@ WEAK_QUEUE_CLASSES = frozenset({
 })
 REPORT_ONLY_CLASSES = frozenset({
     "longer_unresolved", "decode_lossy", "metadata_only", "insufficient_text",
+    "epub_package_variant",
 })
 HUMAN_REVIEW_CLASSES = (
     NORMALIZED_EQUAL_CLASSES | EPUB_EQUAL_CLASSES | WEAK_QUEUE_CLASSES | REPORT_ONLY_CLASSES

@@ -88,6 +88,7 @@ _EXPLICIT_EDITION_MARKER_RE = re.compile(
 AUDITOR_STRONG_CLASSES = frozenset({"text_equivalent", "epub_equivalent"})
 AUDITOR_RELATION_CLASSES = frozenset({
     "text_equivalent", "epub_equivalent", "marker_recheck",
+    "epub_package_variant",
     "near_identical", "contained_exact", "contained_version", "ordered_body_match",
     "ordered_body_review",
     "longer_unresolved",
@@ -1066,7 +1067,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.4.17"
+        duplicate_auditor.AUDITOR_VERSION == "1.5.3"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -3220,13 +3221,22 @@ def _managed_auditor_queue_records(
                 item for item in relations
                 if item[0]["classification"] in AUDITOR_STRONG_CLASSES
             ]
+            package_variant_relations = [
+                item for item in relations
+                if item[0]["classification"] == "epub_package_variant"
+            ]
             protected_or_managed = [
                 entry for entry in houses
                 if entry.get("protected") or entry.get("representative")
                 or entry.get("assignment_state") != "unassigned"
                 or house_incidence[entry["path"]] > 1
             ]
-            if strong_relations:
+            if package_variant_relations:
+                # Same continuous text and package identifier still do not
+                # choose image/navigation quality. Preserve the established
+                # house copy and hold only the incoming package for a person.
+                keep = choose_keep(houses)
+            elif strong_relations:
                 # Exact normalized TXT/EPUB content is already fully proven;
                 # preserve an established house copy instead of allowing a
                 # cosmetic incoming filename to replace it.

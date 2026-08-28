@@ -840,6 +840,68 @@ def test_bare_and_explicit_same_volume_are_coordinate_conflict(tmp_path):
     assert decision["coordinate_num"] == 5
 
 
+def test_same_coordinate_pdf_and_epub_are_routed_as_alternate_formats(tmp_path):
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    target = house / "ㅈ" / "전생했더니 슬라임이었던 건에 대하여"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        existing = _add(
+            conn,
+            target / "전생했더니 슬라임이었던 건에 대하여 23권.pdf",
+            "house",
+        )
+        incoming = _add(
+            conn,
+            temp / "전생했더니 슬라임이었던 건에 대하여 23권.epub",
+            "temp",
+        )
+        decision = classify_folderling_volume_target(
+            conn,
+            source_file_id=incoming["file_id"],
+            house_root=house,
+        )
+        assert decision["status"] == "target"
+        assert decision["alternate_format"] is True
+        assert decision["alternate_format_file_ids"] == [existing["file_id"]]
+        assert Path(decision["target_folder"]) == target
+    finally:
+        conn.close()
+
+    run_id = _approve(state_db, house, temp)
+    destination = move_to_house(
+        str(temp / "전생했더니 슬라임이었던 건에 대하여 23권.epub"),
+        str(house),
+        str(house / "_최근"),
+        "전생했더니 슬라임이었던 건에 대하여 23권.epub",
+        StringIO(),
+        "",
+        state_db_path=str(state_db),
+        run_id=run_id,
+    )
+
+    assert Path(destination).parent == target
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        decision_store.finish_actual_run(conn, run_id, success=True)
+        rows = conn.execute(
+            """
+            SELECT v.work_bucket_id
+            FROM files AS f JOIN variants AS v ON v.variant_id = f.variant_id
+            WHERE f.file_id IN (?, ?)
+            """,
+            (existing["file_id"], incoming["file_id"]),
+        ).fetchall()
+        assert len(rows) == 2
+        assert len({row["work_bucket_id"] for row in rows}) == 1
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+
 def test_numbered_side_stories_have_distinct_canonical_coordinates():
     first = decision_store.coordinate_fields_from_name("블랙 라벨 외전 1.epub")
     second = decision_store.coordinate_fields_from_name("블랙 라벨 외전 2.epub")

@@ -1284,9 +1284,13 @@ def move_to_house(
                         display_title=auto_volume["display_title"],
                         origin="strong_match",
                     )
+                route_kind = (
+                    " alternate-format"
+                    if auto_volume.get("alternate_format") else ""
+                )
                 source_label += (
                     f"[volume-auto work={relationship['work_bucket_id']} "
-                    f"core={auto_volume['core_title']}] "
+                    f"core={auto_volume['core_title']}{route_kind}] "
                 )
         finally:
             conn.close()
