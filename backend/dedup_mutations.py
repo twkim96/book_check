@@ -1361,14 +1361,18 @@ def user_quarantine(
                 source_evidence,
                 file_id=source_file_id,
             )
+        elif source["source"] == "house":
+            decision_store.assert_manifest_or_same_run_house_source(
+                conn, actual_run, source_path, source_evidence
+            )
         else:
             decision_store.assert_manifest_source(
                 actual_run, source_path, source_root, source_evidence
             )
         if keep_path is not None:
             if keep_origin_operation_id is None:
-                decision_store.assert_manifest_source(
-                    actual_run, keep_path, "house_root", keep_evidence
+                decision_store.assert_manifest_or_same_run_house_source(
+                    conn, actual_run, keep_path, keep_evidence
                 )
             else:
                 keep_origin = conn.execute(
@@ -1407,8 +1411,8 @@ def user_quarantine(
                         "user-discard keep is not owned by the current ingest"
                     )
         if replacement_path is not None and replacement_path != keep_path:
-            decision_store.assert_manifest_source(
-                actual_run, replacement_path, "house_root", replacement_evidence
+            decision_store.assert_manifest_or_same_run_house_source(
+                conn, actual_run, replacement_path, replacement_evidence
             )
         destination = _unique_destination(conn, quarantine_dir, source_path.name)
         with decision_store.transaction(conn):
@@ -1915,6 +1919,10 @@ def apply_contained_upgrade(
             proof.short_file_evidence,
             file_id=shorter_file_id,
         )
+    elif shorter["source"] == "house":
+        decision_store.assert_manifest_or_same_run_house_source(
+            conn, actual_run, short_path, proof.short_file_evidence
+        )
     else:
         decision_store.assert_manifest_source(
             actual_run, short_path, short_root, proof.short_file_evidence
@@ -1926,6 +1934,10 @@ def apply_contained_upgrade(
             long_path,
             proof.long_file_evidence,
             file_id=longer_file_id,
+        )
+    elif longer["source"] == "house":
+        decision_store.assert_manifest_or_same_run_house_source(
+            conn, actual_run, long_path, proof.long_file_evidence
         )
     else:
         decision_store.assert_manifest_source(
@@ -2292,6 +2304,10 @@ def apply_ordered_body_quarantine(
             proof.source_file_evidence,
             file_id=discard_file_id,
         )
+    elif discard["source"] == "house":
+        decision_store.assert_manifest_or_same_run_house_source(
+            conn, actual_run, discard_path, proof.source_file_evidence
+        )
     else:
         decision_store.assert_manifest_source(
             actual_run, discard_path, discard_root, proof.source_file_evidence
@@ -2303,6 +2319,10 @@ def apply_ordered_body_quarantine(
             keep_path,
             proof.target_file_evidence,
             file_id=keep_file_id,
+        )
+    elif keep["source"] == "house":
+        decision_store.assert_manifest_or_same_run_house_source(
+            conn, actual_run, keep_path, proof.target_file_evidence
         )
     else:
         decision_store.assert_manifest_source(

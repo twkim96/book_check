@@ -647,6 +647,96 @@ def test_same_run_longer_unresolved_queue_copy_converges_at_bidirectional_95(
     assert Path(keep["path"]).is_file()
 
 
+def test_same_run_ingested_house_keep_converges_after_house_review_move(
+    tmp_path,
+):
+    """Authorize the exact house destination produced earlier in this run."""
+
+    house = tmp_path / "house"
+    temp = tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    state_db = tmp_path / ".state" / "dedup.sqlite3"
+    incoming_body = "".join(
+        f"{index:05d} 같은 실행에서 입고될 기준 본문입니다.\n"
+        for index in range(5_000)
+    )
+    existing_body = "".join(
+        (
+            f"{index:05d} 일부 교정된 기존 본문입니다.\n"
+            if index % 250 == 0
+            else f"{index:05d} 같은 실행에서 입고될 기준 본문입니다.\n"
+        )
+        for index in range(5_000)
+    )
+    conn = decision_store.initialize_state_db(state_db)
+    try:
+        incoming = _add_text(
+            conn,
+            temp / "batch" / "실행중 입고 작품.txt",
+            "temp",
+            incoming_body,
+        )
+        existing = _add_text(
+            conn,
+            house / "ㅅ" / "실행중 입고 작품 1-200 완 [2026.03.11].txt",
+            "house",
+            existing_body,
+        )
+        review_id = _add_review(
+            conn, incoming, existing, "longer_unresolved"
+        )
+    finally:
+        conn.close()
+
+    destination = house / "ㅅ" / "실행중 입고 작품.txt"
+    with mutation_lock_for_roots(house, temp, "test-same-run-house-keep"):
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            run_id = _approve(conn, state_db, house, temp)
+            queued = dedup_mutations.house_review_move(
+                conn,
+                review_id=review_id,
+                move_file_id=existing["file_id"],
+                keep_file_id=incoming["file_id"],
+                classification="longer_unresolved",
+                queue_dir=temp / "trash_bin" / "warning",
+                run_id=run_id,
+            )
+            ingested = dedup_mutations.ingest_to_house(
+                conn,
+                source_file_id=incoming["file_id"],
+                destination=destination,
+                run_id=run_id,
+            )
+        finally:
+            conn.close()
+
+        records = deduplicator.cleanup_pending_queue_strong_reviews(
+            str(state_db), str(house), str(temp), run_id
+        )
+        conn = decision_store.connect_state_db(state_db)
+        try:
+            review = conn.execute(
+                "SELECT state FROM review_items WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+            decision_store.finish_actual_run(conn, run_id, success=True)
+            assert decision_store.doctor_issues(conn) == []
+        finally:
+            conn.close()
+
+    assert Path(queued["destination"]).is_file() is False
+    assert ingested["dest_path"] == str(destination)
+    assert len(records) == 1
+    assert records[0]["classification"] == "longer_unresolved"
+    assert records[0]["coverage_ppm"] >= 950_000
+    assert records[0]["reverse_coverage_ppm"] >= 950_000
+    assert review["state"] == "superseded"
+    assert destination.is_file()
+    assert Path(records[0]["dest_path"]).is_file()
+
+
 def test_near_identical_same_coordinates_allow_contained_title_annotation(
     tmp_path,
 ):
