@@ -3,6 +3,7 @@ import { NavLink, Navigate, Route, Routes, useParams, useSearchParams } from "re
 
 import { ApiError, api, postJson } from "./api";
 import { CatalogExplorer, CatalogTabs, type CatalogTab } from "./Explorer";
+import { folderlingProgress, folderlingSteps } from "./folderlingProgress";
 import { groupFolderlingTimelineEvents } from "./folderlingTimeline";
 import { QuickTitleCorrectionManager } from "./ManagementModals";
 import { SettingsPage } from "./Settings";
@@ -1665,6 +1666,7 @@ function JobDetail() {
   if (error && !job) return <ErrorPanel message={error} retry={load} />;
   if (!job) return <Loading />;
   const percent = job.progress.total ? Math.round(job.progress.current / job.progress.total * 100) : 0;
+  const overall = job.job_type === "service_folderling" ? folderlingProgress(job, events) : null;
   const visibleLog = filter
     ? log.split("\n").filter((line) => line.toLocaleLowerCase().includes(filter.toLocaleLowerCase())).join("\n")
     : log;
@@ -1692,10 +1694,19 @@ function JobDetail() {
     />
     {error && <div className="inline-error">{error}</div>}
     {job.state === "queued" && <div className="inline-notice"><span>단일 변경 대기열 {job.queue_position ?? "?"}번째 · 앞 작업 {job.jobs_ahead ?? 0}개</span><strong>실행 차례에 계획과 fingerprint를 다시 확인합니다.</strong></div>}
+    {overall && <section className="panel folderling-overall" aria-label="Folderling 전체 작업 진행">
+      <div className="panel-title"><div><span className="eyebrow">OVERALL PROGRESS</span><h2>{overall.heading}</h2></div></div>
+      <ol className="folderling-stepper">{folderlingSteps.map((label, index) => <li key={label} className={index === overall.current && !overall.complete ? (overall.stopped ? "is-current is-stopped" : "is-current") : ["완료", "통과"].includes(overall.states[index]) ? "is-complete" : ""} aria-current={index === overall.current && !overall.complete ? "step" : undefined}>
+        <span className="folderling-step-track" aria-hidden="true" />
+        <span className="folderling-step-label">{label}</span>
+        <small className="folderling-step-state">{index + 1}단계 · {overall.states[index]}</small>
+      </li>)}</ol>
+      <p>{overall.complete ? "최종 검사와 작업 종료가 확인되었습니다." : overall.stopped ? "작업 상태와 오류 내용을 확인해 주세요." : "단계별 작업량과 소요 시간은 다릅니다. 세부 단계가 100%여도 전체 작업은 계속 진행됩니다."}{overall.retrying && " 본문 감사 재검사 중입니다."}</p>
+    </section>}
     <section className="job-detail-summary">
       <article className="panel"><span>상태</span><strong className={`state-text state-text-${job.state}`}>{job.state}</strong><small>{job.message}</small></article>
       <article className="panel"><span>현재 단계</span><strong>{job.stage}</strong><small>{job.updated_at ? new Date(job.updated_at).toLocaleString("ko-KR") : "-"}</small></article>
-      <article className="panel"><span>진행률</span><strong>{job.progress.total ? `${percent}%` : "대기"}</strong><small>{job.progress.current}/{job.progress.total}</small></article>
+      <article className="panel"><span>{overall ? "현재 세부 단계 진행률" : "진행률"}</span><strong>{job.progress.total ? `${percent}%` : overall ? (overall.complete ? "완료" : overall.stopped ? "중단" : overall.waiting ? "대기" : "진행 중") : "대기"}</strong><small>{overall && !job.progress.total ? "이 단계는 수량을 집계하지 않습니다" : `${job.progress.current}/${job.progress.total}`}</small></article>
     </section>
     {job.progress.total > 0 && <div className="progress job-detail-progress"><i style={{ width: `${percent}%` }} /><small>{job.progress.current}/{job.progress.total}</small></div>}
     {job.error && <section className="inline-error"><strong>{job.error.code}</strong><div>{job.error.message}</div></section>}

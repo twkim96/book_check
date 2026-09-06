@@ -65,6 +65,8 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run typecheck
+      - name: Folderling progress regression
+        run: npm run test:progress
       - name: Production build
         run: npm run build
 

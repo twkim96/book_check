@@ -6,6 +6,130 @@ import decision_store
 import duplicate_auditor
 import library_catalog
 import review_noise
+import epub_review_context
+import pytest
+
+
+_EPUB_CONTEXT_CASES = [
+    ("회귀자의 미용실.02권.epub", "회귀자의 미용실.01권.epub"),
+    ("크리쉬나의 검 epub/1.epub", "캔서 epub/1.epub"),
+    ("[혜율] 구멍가게.epub", "[혜율] 구멍가게 외전.epub"),
+    ("사일런트 위치 04권〔P〕.epub", "사일런트 위치 04권 after.epub"),
+    ("사일런트 위치 9권 extra.epub", "사일런트 위치 09권.epub"),
+    ("작품│본편│[-19] [작가].epub", "작품│外│[-19] [작가].epub"),
+    ("[코로나] 아드님 말고 아버님이요 외전2,3.epub",
+     "아드님 말고 아버님이요 외전1〔P〕.epub"),
+    ("두 집 살림을 하는 중입니다만[외전].epub", "두 집 살림을 하는 중입니다만.epub"),
+]
+
+
+@pytest.mark.parametrize("names", _EPUB_CONTEXT_CASES)
+def test_epub_context_suppresses_new_and_historical_metadata_reviews(
+    tmp_path, monkeypatch, names,
+):
+    _house, _temp, state_db, args = _audit_fixture(tmp_path, names=names)
+    # Seed a real historical weak row using the prior context behavior.
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            epub_review_context, "metadata_only_epub_context_reason", lambda *_args: None,
+        )
+        patcher.setattr(
+            duplicate_auditor, "plan_open_review_reconciliation",
+            lambda _conn: {"noise": [], "stale": [], "redundant": []},
+        )
+        initial = duplicate_auditor.run_audit(args)
+    assert any(r["classification"] == "metadata_only" for r in initial.results)
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        [old] = conn.execute("SELECT review_id FROM review_items").fetchall()
+        plan = review_noise.plan_open_review_reconciliation(conn)
+        assert [r["review_id"] for r in plan["noise"]] == [old["review_id"]]
+    finally:
+        conn.close()
+    warm = duplicate_auditor.run_audit(args)
+    assert warm.stats["diagnostic_reviews_superseded"] == 1
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT state FROM review_items WHERE review_id=?", (old["review_id"],)
+        ).fetchone()["state"] == "superseded"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM review_items WHERE state IN ('pending','deferred')"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("left,right", [
+    ("/books/1.epub", "/temp/1.epub"),
+    ("/작품 epub/1.epub", "/작품 epub/2.epub"),
+    ("작품 1.5권.epub", "작품 1.50권.epub"),
+    ("작품 외전2,3.epub", "작품 외전3.epub"),
+    ("작품 외전1-3.epub", "작품 외전2.epub"),
+    ("작품 외전.epub", "작품 외전2.epub"),
+    ("작품 외전포함.epub", "작품 외전.epub"),
+    ("작품 본편 외전.epub", "작품 외전.epub"),
+    ("작품 after.epub", "작품.epub"),
+    ("외전 작가 1권.epub", "작가 1권.epub"),
+    ("작품 외전.txt", "작품.txt"),
+])
+def test_epub_context_keeps_ambiguous_or_overlapping_editions(left, right):
+    assert epub_review_context.metadata_only_epub_context_reason(left, right) is None
+
+
+def test_epub_context_never_suppresses_strong_body_proof(tmp_path):
+    house, _temp, state_db, args = _audit_fixture(
+        tmp_path, names=["동일 작품.epub", "동일 작품 외전.epub"]
+    )
+    (house / "동일 작품 외전.epub").write_bytes((house / "동일 작품.epub").read_bytes())
+    report = duplicate_auditor.run_audit(args)
+    assert report.results[0]["classification"] == "epub_equivalent"
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute(
+            "SELECT classification FROM review_items WHERE state='pending'"
+        ).fetchone()["classification"] == "epub_equivalent"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("names", _EPUB_CONTEXT_CASES)
+def test_distinct_epub_temp_intake_exports_no_warning_relation(tmp_path, names):
+    from deduplicator import (
+        _managed_auditor_queue_records, build_auditor_report_relations,
+    )
+
+    house, temp, state_db, args = _audit_fixture(tmp_path, names=names)
+    incoming = temp / names[1]
+    incoming.parent.mkdir(parents=True, exist_ok=True)
+    (house / names[1]).replace(incoming)
+    index = Path(args.index)
+    payload = json.loads(index.read_text())
+    payload["entries"] = payload["entries"][:1]
+    index.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    args.house_only = False
+    for _ in range(2):
+        report = duplicate_auditor.run_audit(args)
+        assert report.completed is True
+        [result] = report.results
+        assert result["classification"] == "different"
+        assert result["evidence"]["epub_metadata_context_reason"]
+        entries = [
+            {**result[side], "path": str(
+                (house if result[side]["source"] == "house" else temp)
+                / result[side]["rel_path"]
+            )}
+            for side in ("left", "right")
+        ]
+        relations = build_auditor_report_relations(report, entries)
+        assert _managed_auditor_queue_records(
+            [], relations, state_db, str(temp), True, set(), house_dir=str(house),
+        ) == []
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM review_items").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def _write_epub(path: Path, body: bytes):
@@ -20,6 +144,7 @@ def _audit_fixture(tmp_path, names=None):
     temp.mkdir()
     names = names or ["분권 작품 05.epub", "분권 작품 09.epub"]
     for name, body in zip(names, (b"volume-five", b"volume-nine")):
+        (house / name).parent.mkdir(parents=True, exist_ok=True)
         _write_epub(house / name, body)
     index = tmp_path / "file_index.json"
     index.write_text(json.dumps({
@@ -28,7 +153,7 @@ def _audit_fixture(tmp_path, names=None):
         "entries": [
             {
                 "type": "file",
-                "name": name,
+                "name": Path(name).name,
                 "rel_path": name,
                 "size": (house / name).stat().st_size,
             }
@@ -117,8 +242,10 @@ def test_auditor_keeps_side_story_vs_numbered_volume_out_of_human_review(tmp_pat
 
     report = duplicate_auditor.run_audit(args)
 
-    assert report.results[0]["classification"] == "metadata_only"
-    assert report.stats["side_story_volume_reviews_suppressed"] == 1
+    assert report.results[0]["classification"] == "different"
+    assert report.results[0]["evidence"]["epub_metadata_context_reason"] == (
+        "epub_main_vs_supplement"
+    )
     conn = decision_store.connect_state_db_readonly(state_db)
     try:
         assert conn.execute("SELECT COUNT(*) FROM review_items").fetchone()[0] == 0
@@ -130,6 +257,9 @@ def test_cleanup_supersedes_existing_side_story_volume_noise(tmp_path, monkeypat
     house, temp, state_db, args = _audit_fixture(
         tmp_path,
         names=["마녀의 여행 외전.epub", "마녀의 여행 14권.epub"],
+    )
+    monkeypatch.setattr(
+        epub_review_context, "metadata_only_epub_context_reason", lambda *_args: None,
     )
     monkeypatch.setattr(
         duplicate_auditor,
@@ -165,6 +295,9 @@ def test_completed_audit_reconciles_historical_unqueued_diagnostic_row(
         names=["마녀의 여행 외전.epub", "마녀의 여행 14권.epub"],
     )
     with monkeypatch.context() as patcher:
+        patcher.setattr(
+            epub_review_context, "metadata_only_epub_context_reason", lambda *_args: None,
+        )
         patcher.setattr(
             duplicate_auditor,
             "side_story_vs_numbered_epub_volume",

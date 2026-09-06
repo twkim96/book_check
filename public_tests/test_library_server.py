@@ -296,7 +296,7 @@ def test_health_dashboard_and_title_review_api(tmp_path):
     client = app.test_client()
     health = client.get("/health").get_json()
     assert health["ok"] is True
-    assert health["version"] == "1.5.3"
+    assert health["version"] == "1.5.4"
     assert health["migration_state"] == "complete"
     assert health["schema"] == 19
     assert len(health["build_commit"]) == 40

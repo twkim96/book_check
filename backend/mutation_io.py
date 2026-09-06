@@ -28,7 +28,7 @@ from text_preview import (
     NormalizedLineSequence,
     OrderedBodyCoverage,
     lossless_legacy_text_fingerprint_bytes,
-    ordered_body_coverage,
+    ordered_body_coverage_with_refinement,
 )
 
 
@@ -838,7 +838,7 @@ def inspect_ordered_text(source_path, target_path) -> OrderedTextEvidence:
             target_lines = _normalized_line_sequence_from_fd(
                 target_fd, target_encoding, target_path, target_before
             )
-            coverage = ordered_body_coverage(source_lines, target_lines)
+            coverage = ordered_body_coverage_with_refinement(source_lines, target_lines)
 
         source_after = os.fstat(source_fd)
         target_after = os.fstat(target_fd)

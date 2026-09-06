@@ -795,3 +795,22 @@ th:nth-child(2) { width: 24%; } th:nth-child(3) { width: 15%; } th:nth-child(4) 
   .shell { grid-template-columns: 210px 1fr; }
   .settings-layout { grid-template-columns: 1fr; }
 }
+
+.folderling-overall { margin-bottom: 16px; }
+.folderling-stepper { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin: 24px 0 18px; padding: 0; list-style: none; }
+.folderling-stepper li { min-width: 0; text-align: center; color: var(--muted); }
+.folderling-step-track { position: relative; display: block; height: 12px; margin-bottom: 16px; background: var(--neutral-surface); }
+.folderling-stepper li + li .folderling-step-track { border-left: 2px solid var(--panel); }
+.folderling-stepper li:first-child .folderling-step-track { border-radius: 99px 0 0 99px; }
+.folderling-stepper li:last-child .folderling-step-track { border-radius: 0 99px 99px 0; }
+.folderling-stepper .is-complete .folderling-step-track { background: var(--blue-2); }
+.folderling-stepper .is-current .folderling-step-track { background: var(--accent-soft); }
+.folderling-stepper .is-current .folderling-step-track::after { content: ""; position: absolute; top: 50%; left: 50%; width: 12px; height: 12px; border: 3px solid var(--panel); border-radius: 50%; background: var(--blue-2); box-shadow: 0 0 0 2px var(--blue-2); transform: translate(-50%, -50%); }
+.folderling-step-label { display: block; padding: 0 6px; font-size: 13px; line-height: 1.5; word-break: keep-all; }
+.folderling-step-state { display: block; margin-top: 5px; font-size: 12px; line-height: 1.5; }
+.folderling-stepper .is-complete .folderling-step-label { color: var(--text); }
+.folderling-stepper .is-current { color: var(--link); font-weight: 700; }
+.folderling-stepper .is-stopped { color: var(--danger-text); }
+.folderling-stepper .is-stopped .folderling-step-track { background: var(--danger-surface); }
+.folderling-stepper .is-stopped .folderling-step-track::after { background: var(--red); box-shadow: 0 0 0 2px var(--red); }
+.folderling-overall p { margin-bottom: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }

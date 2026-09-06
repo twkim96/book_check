@@ -57,7 +57,7 @@ from text_preview import (
     TextAnalysisCache,
     batch_scan_normalized,
     extract_position_anchors,
-    ordered_body_coverage,
+    ordered_body_coverage_with_refinement,
     ordered_body_coverage_sufficient,
     read_normalized_line_sequence,
 )
@@ -98,10 +98,10 @@ FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # 1.4.16 suffix admits reversible legacy-byte fingerprints only to exact digest
 # equality; it never enables fuzzy/containment comparison for damaged text.
 # This invalidates pair decisions only; the base fingerprint policy stays 1.4.2.
-PAIR_POLICY_VERSION = "1.5.3-review-lifecycle-v1"
+PAIR_POLICY_VERSION = "1.5.4-body-review-v1"
 LEGACY_ESCAPE_FINGERPRINT_SUFFIX = ":lossless-legacy-v1"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.5.3"
+AUDITOR_VERSION = "1.5.4"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -1065,6 +1065,17 @@ def _entry_public(entry):
 
 
 def _basic_result(candidate, classification, evidence=None):
+    if classification == "metadata_only":
+        from epub_review_context import metadata_only_epub_context_reason
+
+        reason = metadata_only_epub_context_reason(
+            candidate.left.path, candidate.right.path
+        )
+        if reason is not None:
+            # Apply on fresh results and cache reconstruction alike. Suppressing
+            # only the database review would still export a warning-move edge.
+            classification = "different"
+            evidence = {**(evidence or {}), "epub_metadata_context_reason": reason}
     return AuditResult(
         pair_id=candidate.pair_id,
         classification=classification,
@@ -3036,7 +3047,7 @@ def _apply_ordered_body_classification(
                 proof = _exact_ordered_coverage(source_analysis, target_analysis)
             else:
                 try:
-                    proof = ordered_body_coverage(
+                    proof = ordered_body_coverage_with_refinement(
                         sequence(source_entry, source_analysis),
                         sequence(target_entry, target_analysis),
                     )
@@ -3056,7 +3067,7 @@ def _apply_ordered_body_classification(
 
         result.evidence.update({
             "ordered_body_checked": True,
-            "ordered_body_version": "1.4.1",
+            "ordered_body_version": "1.5.4",
             "ordered_body_direction": direction,
             "ordered_body_keep_side": keep_side,
             "ordered_body_selection_policy": selection_policy,
@@ -3167,7 +3178,10 @@ def analyze_candidates(
             else:
                 payloads = []
                 payload_error = None
-                if _epub_reading_payload_candidate(candidate):
+                # Full reading payload equality includes package structure and
+                # assets, so a filename's wrong episode range cannot veto it.
+                # Spine-text-only fallbacks retain their stricter edition gate.
+                if _epub_spine_candidate(candidate):
                     for entry in (candidate.left, candidate.right):
                         try:
                             payload = epub_payload_cache.get(entry.path)

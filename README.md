@@ -1015,6 +1015,16 @@ PYTHONPATH=backend python3 backend/migrate_fingerprint_payloads.py \
 pair policy는 `1.5.3-review-lifecycle-v1`이다. 상세 근거와 회귀 범위는
 [`update_1.5.3.md`](update_1.5.3.md)에 기록한다.
 
+### 1.5.4 본문 중복 판정과 전체 진행도
+
+전체 작업의 6단계 진행 막대와 단계별 설명을 추가해 하위 단계의 100%를 전체 완료와 구분한다.
+EPUB는 전체 읽기 payload의 동일성을 회차 표기보다 우선하고, 다른 권·작품·본편/외전의 명확한
+문맥을 공통 처리해 불필요한 리뷰와 경고 이동을 줄인다. TXT는 기존 줄 비교가 실패한 경우에만
+양방향 99.9%와 짧은 불일치 구간을 요구하는 제한된 문자 비교로 보완하며 이동 직전에 재검증한다.
+
+서버/UI/auditor는 `1.5.4`, SQLite schema는 `v19`다. 변경 계약과 실제 재입고 검증은
+[`update_1.5.4.md`](update_1.5.4.md)에 기록한다.
+
 ## 구조
 
 ```text

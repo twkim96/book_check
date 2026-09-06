@@ -9,11 +9,14 @@ from dedup_episode_relation import classify_dedup_coordinate_relation
 from deduplicator import _ordered_body_direction, clean_duplicates
 from scanner import generate_file_list
 from text_preview import (
+    _BoundedSequenceMatcher,
+    _bounded_character_coverage,
     NormalizationDeferred,
     NormalizedLineSequence,
     ReadBudget,
     analyze_text_file,
     ordered_body_coverage,
+    read_normalized_line_sequence,
 )
 from mutation_io import inspect_ordered_text
 
@@ -28,6 +31,77 @@ def _lines(count=5_000, changed=None):
         )
         for number in range(count)
     )
+
+
+def _punctuation_body(changed=False):
+    return "\n".join(
+        f"{number:05d} " + "서로 다른 사건을 기록하는 충분히 긴 합성 본문입니다." * 16
+        + ("▸" if changed and number % 3 == 0 else "?")
+        for number in range(1_000)
+    )
+
+
+def test_punctuation_only_edits_use_same_proof_in_auditor_and_mutation(tmp_path):
+    house, temp, state_db, index, existing = _prepare_managed_reference(
+        tmp_path, "합성문자비교 1-100 完.txt", _punctuation_body()
+    )
+    incoming = temp / "합성문자비교 1-100 完 [배포].txt"
+    incoming.write_text(_punctuation_body(changed=True), encoding="utf-8")
+    proof = inspect_ordered_text(incoming, existing)
+    assert proof.coverage.method == "bounded_character_v1"
+    assert proof.coverage.coverage_ppm >= 999_000
+    assert proof.source_normalized_sha256 != proof.target_normalized_sha256
+
+    summary = _run(house, temp, state_db, index)
+
+    _assert_ordered_quarantine(summary, temp)
+    assert existing.exists() and not incoming.exists()
+    assert (temp / "trash_bin" / "ordered_body_duplicates" / incoming.name).exists()
+
+
+def test_character_fallback_recovers_bounded_line_graph_overflow(tmp_path):
+    lines = []
+    for number in range(900):
+        lines.append(f"고유{number:04d}" + "합성 사건의 구체적인 서술 문장입니다." * 16)
+        lines.extend([f"반복{number:04d}"] * 24)
+    source, target = tmp_path / "a.txt", tmp_path / "b.txt"
+    source.write_text("\n".join(lines), encoding="utf-8")
+    lines[0] += "!"
+    target.write_text("\n".join(lines), encoding="utf-8")
+    proof = inspect_ordered_text(source, target)
+    assert proof.coverage.method == "bounded_character_v1"
+    assert proof.coverage.max_unmatched_chars <= 1
+
+
+def test_character_fallback_does_not_prove_repeated_boilerplate(tmp_path):
+    source, target = tmp_path / "a.txt", tmp_path / "b.txt"
+    source.write_text(("상용 문구만 반복하는 텍스트\n" * 20_000) + "원본 결말", encoding="utf-8")
+    target.write_text(("상용 문구만 반복하는 텍스트\n" * 20_000) + "다른 결말", encoding="utf-8")
+    left = read_normalized_line_sequence(source, "utf-8")
+    right = read_normalized_line_sequence(target, "utf-8")
+    assert _bounded_character_coverage(left, right) is None
+
+
+def test_character_fallback_rejects_missing_passage_even_at_high_coverage(tmp_path):
+    source, target = tmp_path / "a.txt", tmp_path / "b.txt"
+    body = _punctuation_body()
+    source.write_text(body, encoding="utf-8")
+    target.write_text(body.replace("00500 ", "새로운내용" * 60 + "00500 "), encoding="utf-8")
+    left = read_normalized_line_sequence(source, "utf-8")
+    right = read_normalized_line_sequence(target, "utf-8")
+    assert _bounded_character_coverage(left, right) is None
+
+
+def test_character_alignment_stops_recursive_reordering_cost():
+    import pytest
+
+    source = [f"unique-{i}" for i in range(2_000)]
+    target = [source[i ^ 1] for i in range(len(source))]
+    matcher = _BoundedSequenceMatcher(
+        None, source, target, autojunk=True, work_budget=[20_000],
+    )
+    with pytest.raises(NormalizationDeferred, match="search budget exceeded"):
+        matcher.get_opcodes()
 
 
 def _prepare_managed_reference(tmp_path, name, body, *, extra_house_files=None):

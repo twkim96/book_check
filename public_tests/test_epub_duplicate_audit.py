@@ -19,7 +19,9 @@ def _write_epub(path, body, *, compression, timestamp):
         archive.writestr(info, body)
 
 
-def _write_metadata_repacked_epub(path, *, title, bookmark=False, reverse_spine=False):
+def _write_metadata_repacked_epub(
+    path, *, title, bookmark=False, reverse_spine=False, chapter_body=None,
+):
     opf = f"""<?xml version='1.0' encoding='utf-8'?>
 <package version='2.0' unique-identifier='BookId'
  xmlns='http://www.idpf.org/2007/opf'
@@ -32,7 +34,7 @@ def _write_metadata_repacked_epub(path, *, title, bookmark=False, reverse_spine=
 </package>""".encode("utf-8")
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("OEBPS/content.opf", opf)
-        archive.writestr("OEBPS/one.xhtml", b"same first chapter")
+        archive.writestr("OEBPS/one.xhtml", chapter_body or b"same first chapter")
         archive.writestr("OEBPS/two.xhtml", b"same second chapter")
         if bookmark:
             archive.writestr("META-INF/calibre_bookmarks.txt", b"reading position")
@@ -151,6 +153,46 @@ def test_auditor_classifies_metadata_only_epub_repack_as_equivalent(tmp_path):
     assert report.completed is True
     assert report.results[0]["classification"] == "epub_equivalent"
     assert report.results[0]["evidence"]["epub_equivalence_mode"] == "reading_payload"
+
+
+@pytest.mark.parametrize("different_assets", [False, True])
+def test_epub_full_payload_can_override_filename_range_but_spine_alone_cannot(
+    tmp_path, different_assets,
+):
+    house, temp = tmp_path / "house", tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    names = ["표기 오류 작품 1-271 완.epub", "표기 오류 작품 1-252 완.epub"]
+    body = ("<html><body><p>" + "동일한 작품 본문입니다. " * 6000
+            + "</p></body></html>").encode()
+    for index, name in enumerate(names):
+        _write_metadata_repacked_epub(
+            house / name, title=f"표시 제목 {index}",
+            bookmark=bool(index), chapter_body=body,
+        )
+        with zipfile.ZipFile(house / name, "a") as archive:
+            archive.writestr(
+                "OEBPS/cover.jpg",
+                b"other illustration" if different_assets and index else b"illustration",
+            )
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, names)
+    report = duplicate_auditor.run_audit(
+        _general_args(index, house, temp, "--house-only")
+    )
+    assert report.completed is True
+    [result] = report.results
+    if different_assets:
+        assert result["classification"] == "metadata_only"
+        assert result["evidence"]["left_spine_text_sha256"] == (
+            result["evidence"]["right_spine_text_sha256"]
+        )
+        assert result["evidence"]["left_spine_text_chars"] >= (
+            duplicate_auditor.EPUB_SPINE_TEXT_MIN_CHARS
+        )
+    else:
+        assert result["classification"] == "epub_equivalent"
+        assert result["evidence"]["epub_equivalence_mode"] == "reading_payload"
 
 
 def test_open_review_is_refreshed_when_same_fingerprints_gain_stronger_proof(tmp_path):
@@ -339,9 +381,9 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
     assert duplicate_auditor.FINGERPRINT_POLICY_VERSION == "1.4.2"
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.5.3-review-lifecycle-v1"
+    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.5.4-body-review-v1"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.AUDITOR_VERSION == "1.5.3"
+    assert duplicate_auditor.AUDITOR_VERSION == "1.5.4"
 
 
 def _txt_cache_fixture(tmp_path):

@@ -16,7 +16,10 @@ import codecs
 import hashlib
 import stat
 import unicodedata
+from bisect import bisect_left
+from collections import Counter
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -142,6 +145,7 @@ class OrderedBodyCoverage:
     coverage_ppm: int
     max_unmatched_chars: int
     repetitive_source_chars: int
+    method: str = "ordered_lines_v1"
 
 
 def ordered_body_coverage_sufficient(proof: OrderedBodyCoverage) -> bool:
@@ -154,6 +158,145 @@ def ordered_body_coverage_sufficient(proof: OrderedBodyCoverage) -> bool:
         and proof.coverage_ppm >= ORDERED_BODY_MATCH_THRESHOLD_PPM
         and proof.max_unmatched_chars <= max_gap
     )
+
+
+class _BoundedSequenceMatcher(SequenceMatcher):
+    """Charge every recursive range search before difflib visits it."""
+
+    def __init__(self, *args, work_budget, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.work_budget = work_budget
+        self.max_positions = max(map(len, self.b2j.values()), default=0)
+
+    def find_longest_match(self, alo=0, ahi=None, blo=0, bhi=None):
+        ahi = len(self.a) if ahi is None else ahi
+        bhi = len(self.b) if bhi is None else bhi
+        # b2j may include positions outside the current range, so use its full
+        # maximum length. Include both spans for junk/edge extension scans.
+        cost = (ahi - alo) * (self.max_positions + 2) + (bhi - blo)
+        self.work_budget[0] -= cost
+        if self.work_budget[0] < 0:
+            raise NormalizationDeferred("character refinement search budget exceeded")
+        return super().find_longest_match(alo, ahi, blo, bhi)
+
+
+def _bounded_character_coverage(source, target):
+    try:
+        return _character_coverage(source, target)
+    except NormalizationDeferred:
+        return None
+
+
+def _unique_line_opcodes(source, target, left_counts, right_counts):
+    """Patience anchors in O(N log N), without recursive suffix rescanning."""
+    positions = {
+        token: index for index, token in enumerate(target.lines)
+        if right_counts[token] == 1 and left_counts[token] == 1
+    }
+    pairs = [(index, positions[token]) for index, token in enumerate(source.lines)
+             if token in positions]
+    tails, tail_nodes, previous = [], [], []
+    for node, (_, target_index) in enumerate(pairs):
+        slot = bisect_left(tails, target_index)
+        previous.append(tail_nodes[slot - 1] if slot else -1)
+        if slot == len(tails):
+            tails.append(target_index)
+            tail_nodes.append(node)
+        else:
+            tails[slot], tail_nodes[slot] = target_index, node
+    anchors = []
+    node = tail_nodes[-1] if tail_nodes else -1
+    while node >= 0:
+        anchors.append(pairs[node])
+        node = previous[node]
+    anchors.reverse()
+    opcodes = []
+    i = j = anchor_chars = 0
+    for a, b in anchors:
+        if a != i or b != j:
+            opcodes.append(("replace", i, a, j, b))
+        if opcodes and opcodes[-1][0] == "equal" and a == i and b == j:
+            _, start, _, target_start, _ = opcodes[-1]
+            opcodes[-1] = ("equal", start, a + 1, target_start, b + 1)
+        else:
+            opcodes.append(("equal", a, a + 1, b, b + 1))
+        anchor_chars += source.weights[a]
+        i, j = a + 1, b + 1
+    if i != len(source.lines) or j != len(target.lines):
+        opcodes.append(("replace", i, len(source.lines), j, len(target.lines)))
+    return opcodes, anchor_chars
+
+
+def _character_coverage(source, target):
+    """Prove only near-complete bidirectional equality between anchored texts.
+
+    This fallback retains punctuation and every decoded character. Popular
+    lines cannot establish identity: at least half the body and 100k characters
+    must first match through non-repetitive complete lines. Unresolved or costly
+    gaps fail closed, rather than inferring equality from sampled anchors.
+    """
+    sizes = source.total_chars, target.total_chars
+    if min(sizes) < ORDERED_BODY_MIN_SOURCE_CHARS or (
+        max(sizes) - min(sizes) > max(sizes) // 1000
+    ) or max(len(source.lines), len(target.lines)) > 500_000:
+        return None
+    left_counts, right_counts = Counter(source.lines), Counter(target.lines)
+    opcodes, anchor_chars = _unique_line_opcodes(
+        source, target, left_counts, right_counts,
+    )
+    if anchor_chars < max(ORDERED_BODY_MIN_SOURCE_CHARS, max(sizes) // 2):
+        return None
+    matched = matched_lines = work = 0
+    gaps = [0, 0]
+    character_budget = [100_000_000]
+    for tag, i, j, k, l in opcodes:
+        if tag == "equal":
+            matched += sum(source.weights[i:j])
+            matched_lines += j - i
+            continue
+        left, right = "".join(source.lines[i:j]), "".join(target.lines[k:l])
+        if left == right:
+            matched += len(left)
+            matched_lines += j - i
+            continue
+        work += len(left) * len(right)
+        if max(len(left), len(right)) > 10_000 or min(len(left), len(right)) > 2_000 or work > 100_000_000:
+            return None
+        for subtag, a, b, c, d in _BoundedSequenceMatcher(
+            None, left, right, autojunk=False, work_budget=character_budget,
+        ).get_opcodes():
+            if subtag == "equal":
+                matched += b - a
+            else:
+                gaps[0] = max(gaps[0], b - a)
+                gaps[1] = max(gaps[1], d - c)
+    if any(matched * 1_000_000 // size < 999_000 for size in sizes) or max(gaps) > 256:
+        return None
+    return OrderedBodyCoverage(
+        source.total_chars, target.total_chars, len(source.lines), len(target.lines),
+        matched, matched_lines, matched * 1_000_000 // source.total_chars,
+        gaps[0], sum(len(token) * count for token, count in left_counts.items()
+                     if max(count, right_counts[token]) > ORDERED_BODY_MAX_LINE_OCCURRENCES),
+        "bounded_character_v1",
+    )
+
+
+def ordered_body_coverage_with_refinement(source, target):
+    """Keep the existing ordered proof; use stricter character proof on failure."""
+    deferred = None
+    try:
+        proof = ordered_body_coverage(source, target)
+        if ordered_body_coverage_sufficient(proof):
+            return proof
+    except NormalizationDeferred as exc:
+        deferred = exc
+        proof = None
+    refined = _bounded_character_coverage(source, target)
+    if refined is not None:
+        return refined
+    if deferred is not None:
+        raise deferred
+    return proof
 
 
 _EDGE_CACHE = {}

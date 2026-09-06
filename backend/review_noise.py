@@ -14,6 +14,7 @@ import decision_store
 from mutation_io import mutation_lock_for_roots
 from normalizer import extract_volume_number, is_side_story
 from project_paths import HOUSE_DIR, STATE_DB, TEMP_DIR
+from epub_review_context import metadata_only_epub_context_reason
 
 
 SUPPRESSION_REASON = "distinct_terminal_epub_volume"
@@ -25,7 +26,7 @@ STALE_EVIDENCE_SUPPRESSION_REASON = "stale_open_review_evidence"
 INACTIVE_ENDPOINT_SUPPRESSION_REASON = "inactive_review_endpoint"
 DUPLICATE_SUPPRESSION_REASON = "stale_duplicate_open_review"
 WEAKER_RELATION_SUPPRESSION_REASON = "weaker_open_review_relation"
-SUPPRESSION_VERSION = "1.5.3"
+SUPPRESSION_VERSION = "1.5.4"
 
 
 # Current evidence always wins before this ordering is considered.  The rank
@@ -125,6 +126,8 @@ def diagnostic_only_review_reason(
     right_name: str,
     left_core: str,
     right_core: str,
+    left_path: str | None = None,
+    right_path: str | None = None,
 ) -> str | None:
     """Classify only evidence that cannot justify an actionable review row."""
     if classification == "decode_lossy" and different_core_titles(
@@ -141,7 +144,9 @@ def diagnostic_only_review_reason(
         return CORE_SUPPRESSION_REASON
     if structurally_distinct_epub_books(left_name, right_name):
         return STRUCTURAL_SUPPRESSION_REASON
-    return None
+    return metadata_only_epub_context_reason(
+        left_path or left_name, right_path or right_name
+    )
 
 
 def find_open_review_noise(conn) -> list[dict]:
@@ -177,6 +182,8 @@ def find_open_review_noise(conn) -> list[dict]:
             right_name=Path(row["reference_path"]).name,
             left_core=row["candidate_core_title"],
             right_core=row["reference_core_title"],
+            left_path=row["candidate_path"],
+            right_path=row["reference_path"],
         )
         if reason is None:
             continue
@@ -464,7 +471,7 @@ def cleanup_review_noise(
             "duplicate_items": redundant,
         }
 
-    with mutation_lock_for_roots(house_dir, temp_dir, "review-noise-cleanup-1.5.3"):
+    with mutation_lock_for_roots(house_dir, temp_dir, "review-noise-cleanup-1.5.4"):
         conn = decision_store.connect_state_db(state_db)
         try:
             issues = decision_store.doctor_issues(conn)

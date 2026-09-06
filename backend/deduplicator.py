@@ -74,7 +74,7 @@ FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE = 128
 FOLDERLING_REBASELINE_STOP_REASONS = frozenset({
     "body_budget_exhausted", "deep_check_deferred",
 })
-STRONG_PROOF_POLICY_VERSION = "1.4.16-pinned-v1"
+STRONG_PROOF_POLICY_VERSION = "1.5.4-refined-pinned-v1"
 HOUSE_NEAR_DUPLICATE_MIN_COVERAGE_PPM = 990_000
 _DISTRIBUTION_SUFFIX_RE = re.compile(
     r"(?:^|[-_\s])(?:현|로)?판\d{6}(?=(?:[^0-9]|$))", re.IGNORECASE
@@ -1067,7 +1067,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.5.3"
+        duplicate_auditor.AUDITOR_VERSION == "1.5.4"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
