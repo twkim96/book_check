@@ -11,23 +11,26 @@ import pytest
 
 
 _EPUB_CONTEXT_CASES = [
-    ("회귀자의 미용실.02권.epub", "회귀자의 미용실.01권.epub"),
-    ("크리쉬나의 검 epub/1.epub", "캔서 epub/1.epub"),
-    ("[혜율] 구멍가게.epub", "[혜율] 구멍가게 외전.epub"),
-    ("사일런트 위치 04권〔P〕.epub", "사일런트 위치 04권 after.epub"),
-    ("사일런트 위치 9권 extra.epub", "사일런트 위치 09권.epub"),
-    ("작품│본편│[-19] [작가].epub", "작품│外│[-19] [작가].epub"),
-    ("[코로나] 아드님 말고 아버님이요 외전2,3.epub",
-     "아드님 말고 아버님이요 외전1〔P〕.epub"),
-    ("두 집 살림을 하는 중입니다만[외전].epub", "두 집 살림을 하는 중입니다만.epub"),
+    (("회귀자의 미용실.02권.epub", "회귀자의 미용실.01권.epub"), None),
+    (("크리쉬나의 검 epub/1.epub", "캔서 epub/1.epub"),
+     ("크리쉬나의 검 1", "캔서 1")),
+    (("[혜율] 구멍가게.epub", "[혜율] 구멍가게 외전.epub"), None),
+    (("사일런트 위치 04권〔P〕.epub", "사일런트 위치 04권 after.epub"), None),
+    (("사일런트 위치 9권 extra.epub", "사일런트 위치 09권.epub"), None),
+    (("작품│본편│[-19] [작가].epub", "작품│外│[-19] [작가].epub"), None),
+    (("[코로나] 아드님 말고 아버님이요 외전2,3.epub",
+      "아드님 말고 아버님이요 외전1〔P〕.epub"), None),
+    (("두 집 살림을 하는 중입니다만[외전].epub", "두 집 살림을 하는 중입니다만.epub"), None),
 ]
 
 
-@pytest.mark.parametrize("names", _EPUB_CONTEXT_CASES)
+@pytest.mark.parametrize("names,metadata_titles", _EPUB_CONTEXT_CASES)
 def test_epub_context_suppresses_new_and_historical_metadata_reviews(
-    tmp_path, monkeypatch, names,
+    tmp_path, monkeypatch, names, metadata_titles,
 ):
-    _house, _temp, state_db, args = _audit_fixture(tmp_path, names=names)
+    _house, _temp, state_db, args = _audit_fixture(
+        tmp_path, names=names, metadata_titles=metadata_titles,
+    )
     # Seed a real historical weak row using the prior context behavior.
     with monkeypatch.context() as patcher:
         patcher.setattr(
@@ -62,7 +65,13 @@ def test_epub_context_suppresses_new_and_historical_metadata_reviews(
 
 @pytest.mark.parametrize("left,right", [
     ("/books/1.epub", "/temp/1.epub"),
+    ("/완결/1.epub", "/보관/1.epub"),
+    ("/읽는 중/1.epub", "/다 읽음/1.epub"),
+    ("/크리쉬나의 검 epub/1.epub", "/캔서 epub/1.epub"),
     ("/작품 epub/1.epub", "/작품 epub/2.epub"),
+    ("작품 1부 2권.epub", "작품 2권.epub"),
+    ("작품 1부.epub", "작품 1부 2권.epub"),
+    ("작품 1부 1-3권.epub", "작품 1부 2권.epub"),
     ("작품 1.5권.epub", "작품 1.50권.epub"),
     ("작품 외전2,3.epub", "작품 외전3.epub"),
     ("작품 외전1-3.epub", "작품 외전2.epub"),
@@ -75,6 +84,138 @@ def test_epub_context_suppresses_new_and_historical_metadata_reviews(
 ])
 def test_epub_context_keeps_ambiguous_or_overlapping_editions(left, right):
     assert epub_review_context.metadata_only_epub_context_reason(left, right) is None
+
+
+@pytest.mark.parametrize("left,right", [
+    ("작품 1부 2권.epub", "작품 2부 2권.epub"),
+    ("작품 1부 2권.epub", "작품 1부 3권.epub"),
+    ("작품 1권.epub", "작품 2권.epub"),
+])
+def test_known_epub_coordinate_conflicts_still_suppress_noise(left, right):
+    assert epub_review_context.metadata_only_epub_context_reason(left, right) == (
+        "explicit_epub_volume_context"
+    )
+
+
+@pytest.mark.parametrize("titles", [
+    {},
+    {"/작품 하나/1.epub": ["작품 하나 1"]},
+    {"/작품 하나/1.epub": ["작품 하나 1"], "/작품 둘/1.epub": ["작품 하나 1"]},
+    {"/작품 하나/1.epub": ["작품 하나 2"], "/작품 둘/1.epub": ["작품 둘 1"]},
+    {"/작품 하나/1.epub": ["작품 하나 1", "다른 제목 1"],
+     "/작품 둘/1.epub": ["작품 둘 1"]},
+])
+def test_numeric_parent_requires_consistent_path_bound_opf_titles(titles):
+    assert epub_review_context.metadata_only_epub_context_reason(
+        "/작품 하나/1.epub", "/작품 둘/1.epub", titles,
+    ) is None
+
+
+@pytest.mark.parametrize("names", [
+    ("작품 1부 2권.epub", "작품 2권.epub"),
+    ("완결/1.epub", "보관/1.epub"),
+])
+def test_new_policy_reopens_weak_pairs_hidden_by_old_context_cache(
+    tmp_path, monkeypatch, names,
+):
+    _house, _temp, state_db, args = _audit_fixture(
+        tmp_path, names=names, metadata_titles=("작품 2권", "작품 2권"),
+    )
+    with monkeypatch.context() as old_policy:
+        old_policy.setattr(duplicate_auditor, "PAIR_POLICY_VERSION", "1.5.4-body-review-v1")
+        old_policy.setattr(
+            epub_review_context, "metadata_only_epub_context_reason",
+            lambda *_args: "old_unverified_context",
+        )
+        initial = duplicate_auditor.run_audit(args)
+        assert initial.results[0]["classification"] == "different"
+    for _ in range(2):
+        report = duplicate_auditor.run_audit(args)
+        assert report.completed
+        assert report.results[0]["classification"] == "metadata_only"
+        conn = decision_store.connect_state_db_readonly(state_db)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM review_items WHERE state='pending'"
+            ).fetchone()[0] == 1
+            assert review_noise.find_open_review_noise(conn) == []
+        finally:
+            conn.close()
+
+
+def test_historical_numeric_context_requires_current_fingerprint_evidence(
+    tmp_path, monkeypatch,
+):
+    _house, _temp, state_db, args = _audit_fixture(
+        tmp_path, names=("작품 하나/1.epub", "작품 둘/1.epub"),
+        metadata_titles=("작품 하나 1", "작품 둘 1"),
+    )
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            epub_review_context, "metadata_only_epub_context_reason", lambda *_args: None,
+        )
+        patcher.setattr(
+            duplicate_auditor, "plan_open_review_reconciliation",
+            lambda _conn: {"noise": [], "stale": [], "redundant": []},
+        )
+        duplicate_auditor.run_audit(args)
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        assert len(review_noise.find_open_review_noise(conn)) == 1
+        with decision_store.transaction(conn):
+            conn.execute("""UPDATE files SET current_fingerprint_id=NULL
+                WHERE file_id=(SELECT candidate_file_id FROM review_items LIMIT 1)""")
+        assert review_noise.find_open_review_noise(conn) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_current_opf_proof_resolves_legacy_numeric_review_only_without_queue(
+    tmp_path, monkeypatch, queued,
+):
+    _house, temp, state_db, args = _audit_fixture(
+        tmp_path, names=("작품 하나/1.epub", "작품 둘/1.epub"),
+        metadata_titles=("작품 하나 1", "작품 둘 1"),
+    )
+    with monkeypatch.context() as old_policy:
+        old_policy.setattr(duplicate_auditor, "PAIR_POLICY_VERSION", "1.5.4-body-review-v1")
+        old_policy.setattr(
+            epub_review_context, "metadata_only_epub_context_reason", lambda *_args: None,
+        )
+        old_policy.setattr(
+            duplicate_auditor, "plan_open_review_reconciliation",
+            lambda _conn: {"noise": [], "stale": [], "redundant": []},
+        )
+        duplicate_auditor.run_audit(args)
+    conn = decision_store.connect_state_db(state_db)
+    queued_path = temp / "trash_bin" / "warning" / "보류.epub"
+    try:
+        [row] = conn.execute("SELECT review_id,evidence_json FROM review_items").fetchall()
+        evidence = json.loads(row["evidence_json"])
+        evidence.pop("epub_metadata_titles")  # Old releases did not retain OPF titles.
+        if queued:
+            queued_path.parent.mkdir(parents=True)
+            queued_path.write_bytes(b"recoverable queued file")
+        with decision_store.transaction(conn):
+            conn.execute(
+                "UPDATE review_items SET evidence_json=?,queue_path=? WHERE review_id=?",
+                (json.dumps(evidence), str(queued_path) if queued else None, row["review_id"]),
+            )
+        assert review_noise.find_open_review_noise(conn) == []
+    finally:
+        conn.close()
+    report = duplicate_auditor.run_audit(args)
+    assert report.results[0]["classification"] == "different"
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        assert conn.execute("SELECT state FROM review_items").fetchone()[0] == (
+            "pending" if queued else "superseded"
+        )
+        if queued:
+            assert queued_path.read_bytes() == b"recoverable queued file"
+    finally:
+        conn.close()
 
 
 def test_epub_context_never_suppresses_strong_body_proof(tmp_path):
@@ -93,13 +234,17 @@ def test_epub_context_never_suppresses_strong_body_proof(tmp_path):
         conn.close()
 
 
-@pytest.mark.parametrize("names", _EPUB_CONTEXT_CASES)
-def test_distinct_epub_temp_intake_exports_no_warning_relation(tmp_path, names):
+@pytest.mark.parametrize("names,metadata_titles", _EPUB_CONTEXT_CASES)
+def test_distinct_epub_temp_intake_exports_no_warning_relation(
+    tmp_path, names, metadata_titles,
+):
     from deduplicator import (
         _managed_auditor_queue_records, build_auditor_report_relations,
     )
 
-    house, temp, state_db, args = _audit_fixture(tmp_path, names=names)
+    house, temp, state_db, args = _audit_fixture(
+        tmp_path, names=names, metadata_titles=metadata_titles,
+    )
     incoming = temp / names[1]
     incoming.parent.mkdir(parents=True, exist_ok=True)
     (house / names[1]).replace(incoming)
@@ -132,20 +277,33 @@ def test_distinct_epub_temp_intake_exports_no_warning_relation(tmp_path, names):
         conn.close()
 
 
-def _write_epub(path: Path, body: bytes):
+def _write_epub(path: Path, body: bytes, title=None):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("OEBPS/chapter.xhtml", body)
+        if title is not None:
+            from xml.sax.saxutils import escape
+
+            archive.writestr("OEBPS/content.opf", f"""
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0"
+ xmlns:dc="http://purl.org/dc/elements/1.1/">
+ <metadata><dc:title>{escape(title)}</dc:title></metadata>
+ <manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+ <spine><itemref idref="chapter"/></spine>
+</package>""")
 
 
-def _audit_fixture(tmp_path, names=None):
+def _audit_fixture(tmp_path, names=None, metadata_titles=None):
     house = tmp_path / "house"
     temp = tmp_path / "temp"
     house.mkdir()
     temp.mkdir()
     names = names or ["분권 작품 05.epub", "분권 작품 09.epub"]
-    for name, body in zip(names, (b"volume-five", b"volume-nine")):
+    for index, (name, body) in enumerate(zip(names, (b"volume-five", b"volume-nine"))):
         (house / name).parent.mkdir(parents=True, exist_ok=True)
-        _write_epub(house / name, body)
+        _write_epub(
+            house / name, body,
+            title=metadata_titles[index] if metadata_titles is not None else None,
+        )
     index = tmp_path / "file_index.json"
     index.write_text(json.dumps({
         "version": 2,

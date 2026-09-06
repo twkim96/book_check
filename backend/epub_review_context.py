@@ -10,6 +10,7 @@ import re
 import unicodedata
 from pathlib import Path
 
+from bare_volume_context import parse_bare_volume_candidate
 from normalizer import analyze_name, extract_volume_number
 
 
@@ -29,7 +30,15 @@ def _core(name: str) -> str:
     return str(analyze_name(name).get("core_title") or "").casefold().strip()
 
 
-def _numeric_parent(path: Path) -> str | None:
+def explicit_volume_conflict(left, right) -> bool:
+    """Only coordinates explicitly known on both sides can conflict."""
+    return bool(left and right and any(
+        a is not None and b is not None and a != b
+        for a, b in zip(left, right)
+    ))
+
+
+def _numeric_parent(path: Path, metadata_titles) -> str | None:
     if not re.fullmatch(r"0*\d{1,3}", path.stem):
         return None
     parent = unicodedata.normalize("NFC", path.parent.name).strip()
@@ -39,6 +48,24 @@ def _numeric_parent(path: Path) -> str | None:
     value = _core(parent + ".epub")
     if not value or value.isdecimal():
         return None
+    # A directory may describe download state rather than a work. Require
+    # current, path-bound OPF titles to independently support its identity.
+    titles = metadata_titles.get(str(path), ())
+    if not isinstance(titles, (list, tuple)) or not titles:
+        return None
+    for title in titles:
+        if not isinstance(title, str) or not title.strip():
+            return None
+        name = title.strip() + ".epub"
+        bare = parse_bare_volume_candidate(name)
+        if bare is not None:
+            core, volume = bare.core_title.casefold(), bare.volume_number
+        else:
+            core = _core(name)
+            coordinate = extract_volume_number(name)
+            volume = coordinate[1] if coordinate is not None else None
+        if core != value or (volume is not None and volume != int(path.stem)):
+            return None
     return value
 
 
@@ -69,18 +96,22 @@ def _context(path: Path) -> dict:
     }
 
 
-def metadata_only_epub_context_reason(left_path: str, right_path: str) -> str | None:
+def metadata_only_epub_context_reason(
+    left_path: str, right_path: str, metadata_titles=None,
+) -> str | None:
     """Explain an explicit distinction; missing/ambiguous context stays manual."""
     left, right = Path(left_path), Path(right_path)
     if left.suffix.casefold() != ".epub" or right.suffix.casefold() != ".epub":
         return None
-    left_parent, right_parent = _numeric_parent(left), _numeric_parent(right)
+    metadata_titles = metadata_titles if isinstance(metadata_titles, dict) else {}
+    left_parent = _numeric_parent(left, metadata_titles)
+    right_parent = _numeric_parent(right, metadata_titles)
     if left_parent and right_parent and left_parent != right_parent:
         return "numeric_epub_different_parent_work"
     a, b = _context(left), _context(right)
     if not a["core"] or a["core"] != b["core"] or a["ambiguous"] or b["ambiguous"]:
         return None
-    if a["volume"] and b["volume"] and a["volume"] != b["volume"]:
+    if explicit_volume_conflict(a["volume"], b["volume"]):
         return "explicit_epub_volume_context"
     if a["side"] != b["side"]:
         # after/extra are standalone supplements only beside an explicit volume.

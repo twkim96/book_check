@@ -26,7 +26,7 @@ STALE_EVIDENCE_SUPPRESSION_REASON = "stale_open_review_evidence"
 INACTIVE_ENDPOINT_SUPPRESSION_REASON = "inactive_review_endpoint"
 DUPLICATE_SUPPRESSION_REASON = "stale_duplicate_open_review"
 WEAKER_RELATION_SUPPRESSION_REASON = "weaker_open_review_relation"
-SUPPRESSION_VERSION = "1.5.4"
+SUPPRESSION_VERSION = "1.5.4-context-v2"
 
 
 # Current evidence always wins before this ordering is considered.  The rank
@@ -128,6 +128,7 @@ def diagnostic_only_review_reason(
     right_core: str,
     left_path: str | None = None,
     right_path: str | None = None,
+    metadata_titles=None,
 ) -> str | None:
     """Classify only evidence that cannot justify an actionable review row."""
     if classification == "decode_lossy" and different_core_titles(
@@ -145,7 +146,7 @@ def diagnostic_only_review_reason(
     if structurally_distinct_epub_books(left_name, right_name):
         return STRUCTURAL_SUPPRESSION_REASON
     return metadata_only_epub_context_reason(
-        left_path or left_name, right_path or right_name
+        left_path or left_name, right_path or right_name, metadata_titles,
     )
 
 
@@ -159,7 +160,12 @@ def find_open_review_noise(conn) -> list[dict]:
                reference.file_id AS reference_file_id,
                reference.canonical_path AS reference_path,
                candidate_analysis.core_title AS candidate_core_title,
-               reference_analysis.core_title AS reference_core_title
+               reference_analysis.core_title AS reference_core_title,
+               CASE
+                 WHEN r.left_fingerprint_id = candidate.current_fingerprint_id
+                  AND r.right_fingerprint_id = reference.current_fingerprint_id
+                 THEN 1 ELSE 0
+               END AS current_evidence
         FROM review_items AS r
         JOIN files AS candidate ON candidate.file_id = r.candidate_file_id
         JOIN files AS reference ON reference.file_id = r.reference_file_id
@@ -176,6 +182,10 @@ def find_open_review_noise(conn) -> list[dict]:
     ).fetchall()
     result = []
     for row in rows:
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
         reason = diagnostic_only_review_reason(
             row["classification"],
             left_name=Path(row["candidate_path"]).name,
@@ -184,6 +194,10 @@ def find_open_review_noise(conn) -> list[dict]:
             right_core=row["reference_core_title"],
             left_path=row["candidate_path"],
             right_path=row["reference_path"],
+            metadata_titles=(
+                evidence.get("epub_metadata_titles")
+                if row["current_evidence"] and isinstance(evidence, dict) else None
+            ),
         )
         if reason is None:
             continue
@@ -392,6 +406,7 @@ def supersede_open_pair_reviews(
     candidate_file_id: str,
     reference_file_id: str,
     classification: str,
+    unqueued_only: bool = False,
 ) -> int:
     """Close stale open rows immediately before persisting fresher evidence."""
     rows = conn.execute(
@@ -400,11 +415,13 @@ def supersede_open_pair_reviews(
         WHERE state IN ('pending', 'deferred') AND classification = ?
           AND ((candidate_file_id = ? AND reference_file_id = ?)
             OR (candidate_file_id = ? AND reference_file_id = ?))
+          AND (? = 0 OR queue_path IS NULL OR queue_path = '')
         """,
         (
             classification,
             candidate_file_id, reference_file_id,
             reference_file_id, candidate_file_id,
+            int(unqueued_only),
         ),
     ).fetchall()
     for row in rows:

@@ -98,7 +98,7 @@ FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # 1.4.16 suffix admits reversible legacy-byte fingerprints only to exact digest
 # equality; it never enables fuzzy/containment comparison for damaged text.
 # This invalidates pair decisions only; the base fingerprint policy stays 1.4.2.
-PAIR_POLICY_VERSION = "1.5.4-body-review-v1"
+PAIR_POLICY_VERSION = "1.5.4-epub-context-v2"
 LEGACY_ESCAPE_FINGERPRINT_SUFFIX = ":lossless-legacy-v1"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
 AUDITOR_VERSION = "1.5.4"
@@ -679,6 +679,12 @@ def _explicit_single_volume(entry):
 def _different_explicit_volumes(left, right):
     a = _explicit_single_volume(left)
     b = _explicit_single_volume(right)
+    if left.ext == right.ext == ".epub":
+        from epub_review_context import explicit_volume_conflict
+
+        # Do not discard the pair before the context/review stage can retain
+        # an omitted part number as unknown.
+        return explicit_volume_conflict(a, b)
     return bool(a and b and a != b)
 
 
@@ -1069,7 +1075,8 @@ def _basic_result(candidate, classification, evidence=None):
         from epub_review_context import metadata_only_epub_context_reason
 
         reason = metadata_only_epub_context_reason(
-            candidate.left.path, candidate.right.path
+            candidate.left.path, candidate.right.path,
+            (evidence or {}).get("epub_metadata_titles"),
         )
         if reason is not None:
             # Apply on fresh results and cache reconstruction alike. Suppressing
@@ -1982,7 +1989,10 @@ class PersistentAuditCache:
                     )
                 if (
                     review_result.classification == "different"
-                    and review_result.evidence.get("epub_distinct_edition") is True
+                    and (
+                        review_result.evidence.get("epub_distinct_edition") is True
+                        or review_result.evidence.get("epub_metadata_context_reason")
+                    )
                 ):
                     if self.before_non_cache_mutation is not None:
                         self.before_non_cache_mutation(self.conn)
@@ -1992,6 +2002,7 @@ class PersistentAuditCache:
                             candidate_file_id=self.file_ids[candidate.left.path],
                             reference_file_id=self.file_ids[candidate.right.path],
                             classification="metadata_only",
+                            unqueued_only=True,
                         )
                     )
                 self._store_review_item(candidate, review_result)
@@ -3216,7 +3227,9 @@ def analyze_candidates(
                             stop_reasons.append("stale_input")
                             payload_error = "stale_input"
                             break
-                        except (RuntimeError, zipfile.BadZipFile) as exc:
+                        except (
+                            ElementTree.ParseError, RuntimeError, zipfile.BadZipFile,
+                        ) as exc:
                             payload_error = str(exc)
                             break
                 if len(payloads) == 2:
@@ -3303,6 +3316,10 @@ def analyze_candidates(
                         "left_spine_item_count": spines[0].spine_item_count,
                         "right_spine_item_count": spines[1].spine_item_count,
                         "epub_identifier_overlap": identifier_overlap,
+                        "epub_metadata_titles": {
+                            candidate.left.path: list(spines[0].titles),
+                            candidate.right.path: list(spines[1].titles),
+                        },
                     })
                 elif spine_error:
                     evidence["epub_spine_text_error"] = spine_error

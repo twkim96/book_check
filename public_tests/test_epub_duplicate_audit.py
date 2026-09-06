@@ -195,6 +195,54 @@ def test_epub_full_payload_can_override_filename_range_but_spine_alone_cannot(
         assert result["evidence"]["epub_equivalence_mode"] == "reading_payload"
 
 
+@pytest.mark.parametrize("malformed_indices", [(0,), (1,), (0, 1)])
+def test_malformed_opf_is_metadata_only_without_aborting_other_pairs_or_warm_cache(
+    tmp_path, malformed_indices,
+):
+    house, temp = tmp_path / "house", tmp_path / "temp"
+    house.mkdir()
+    temp.mkdir()
+    malformed_names = ["손상 자료 1-271 완.epub", "손상 자료 1-252 완.epub"]
+    valid_names = ["정상 소설 1-271 완.epub", "정상 소설 1-252 완.epub"]
+    for number, name in enumerate(malformed_names):
+        # An unescaped ampersand breaks OPF XML while leaving the ZIP valid.
+        title = f"손상 & 제목 {number}" if number in malformed_indices else "정상 제목"
+        _write_metadata_repacked_epub(house / name, title=title)
+    for number, name in enumerate(valid_names):
+        _write_metadata_repacked_epub(
+            house / name, title=f"정상 제목 {number}", bookmark=bool(number),
+        )
+    index = tmp_path / "file_index.json"
+    _write_index(index, house, malformed_names + valid_names)
+    state_db = tmp_path / "state.sqlite3"
+
+    def audit():
+        return duplicate_auditor.run_audit(_general_args(
+            index, house, temp, "--house-only", "--state-db", str(state_db),
+        ))
+
+    cold = audit()
+    warm = audit()
+
+    for report in (cold, warm):
+        assert report.completed is True
+        assert report.stop_reasons == []
+        assert len(report.results) == 2
+        pairs = {
+            frozenset((result["left"]["name"], result["right"]["name"])): result
+            for result in report.results
+        }
+        malformed = pairs[frozenset(malformed_names)]
+        assert malformed["classification"] == "metadata_only"
+        assert "invalid token" in malformed["evidence"]["epub_reading_payload_error"]
+        assert "epub_equivalence_mode" not in malformed["evidence"]
+        valid = pairs[frozenset(valid_names)]
+        assert valid["classification"] == "epub_equivalent"
+        assert valid["evidence"]["epub_equivalence_mode"] == "reading_payload"
+    assert warm.stats["pair_cache_hits"] == 2
+    assert warm.stats["actual_read_bytes"] == 0
+
+
 def test_open_review_is_refreshed_when_same_fingerprints_gain_stronger_proof(tmp_path):
     house = tmp_path / "house"
     temp = tmp_path / "temp"
@@ -381,7 +429,7 @@ def test_epub_limit_semantics_use_new_cache_generation():
     assert duplicate_auditor.FINGERPRINT_VERSION == "5"
     assert duplicate_auditor.FINGERPRINT_POLICY_VERSION == "1.4.2"
     assert duplicate_auditor.FINGERPRINT_NORMALIZER_COMPAT_VERSION == "1.3.0"
-    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.5.4-body-review-v1"
+    assert duplicate_auditor.PAIR_POLICY_VERSION == "1.5.4-epub-context-v2"
     assert duplicate_auditor.PAIR_NORMALIZER_COMPAT_VERSION == "1.3.0"
     assert duplicate_auditor.AUDITOR_VERSION == "1.5.4"
 
