@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,54 @@ def test_relationship_preview_apply_and_cancel_preserve_history(tmp_path):
         conn.close()
 
 
+def test_scanner_preserves_human_variant_after_verified_ctime_only_change(tmp_path):
+    from scanner import generate_file_list
+
+    state_db, house, temp, index, paths, ids = _fixture(tmp_path)
+    _apply_relationship(state_db, house, temp, ids)
+    conn = decision_store.connect_state_db_readonly(state_db)
+    before = dict(conn.execute("SELECT * FROM files WHERE file_id = ?", (ids[0],)).fetchone())
+    original_fp = dict(conn.execute("SELECT * FROM fingerprints WHERE fingerprint_id = ?",
+                                   (before["current_fingerprint_id"],)).fetchone())
+    conn.close()
+    paths[0].chmod(paths[0].stat().st_mode ^ 0o100)
+    assert paths[0].stat().st_ctime_ns != before["ctime_ns"]
+    assert generate_file_list([str(house)], str(index.with_name("file_list.json")),
+                              str(index), state_db_path=str(state_db), temp_root=str(temp))
+    conn = decision_store.connect_state_db_readonly(state_db)
+    try:
+        after = conn.execute("SELECT * FROM files WHERE file_id = ?", (ids[0],)).fetchone()
+        assert after["assignment_state"] == "managed"
+        assert after["variant_id"] == before["variant_id"]
+        assert after["current_fingerprint_id"] == before["current_fingerprint_id"]
+        assert dict(conn.execute("SELECT * FROM fingerprints WHERE fingerprint_id = ?",
+                                 (before["current_fingerprint_id"],)).fetchone()) == original_fp
+        assert decision_store.doctor_issues(conn) == []
+    finally:
+        conn.close()
+
+
+def test_reconcile_does_not_preserve_human_assignment_for_same_size_rewrite(tmp_path):
+    import os
+
+    state_db, house, temp, _, paths, ids = _fixture(tmp_path)
+    _apply_relationship(state_db, house, temp, ids)
+    before = paths[0].stat()
+    original = paths[0].read_bytes()
+    paths[0].write_bytes(b"x" * len(original))
+    os.utime(paths[0], ns=(before.st_atime_ns, before.st_mtime_ns))
+    conn = decision_store.connect_state_db(state_db)
+    try:
+        with decision_store.transaction(conn):
+            decision_store.reconcile_file_metadata(conn, paths[0], source="house")
+        after = conn.execute("SELECT * FROM files WHERE file_id = ?", (ids[0],)).fetchone()
+        assert after["assignment_state"] == "decision_required"
+        assert after["current_fingerprint_id"] is None
+    finally:
+        conn.close()
+
+
+
 def test_relationship_cancel_fails_closed_when_doctor_is_not_clean(tmp_path):
     state_db, house, temp, _, paths, ids = _fixture(tmp_path)
     result = _apply_relationship(state_db, house, temp, ids)
@@ -183,6 +232,122 @@ def test_user_quarantine_retires_representative_and_restore_records_distinct_dec
         ).fetchone()[0] == "same_work_distinct_variant"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("device_rebound", [False, True])
+def test_explicit_restore_verifies_metadata_drift_without_rewriting_origin(tmp_path, device_rebound):
+    state_db, house, temp, index, paths, ids = _fixture(tmp_path)
+    plan = quarantine_preview(state_db, temp_dir=temp, source_file_id=ids[0], keep_file_id=ids[1])
+    quarantine = apply_quarantine(
+        state_db, house_dir=house, temp_dir=temp, index_path=index,
+        source_file_id=ids[0], keep_file_id=ids[1], confirm_count=1,
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    source = Path(quarantine["dest_path"])
+    source.chmod(0o700)
+    source.chmod(0o600)
+    conn = decision_store.connect_state_db(state_db)
+    if device_rebound:
+        with decision_store.transaction(conn):
+            conn.execute("UPDATE operations SET destination_dev = destination_dev + 1 WHERE operation_id = ?", (quarantine["operation_id"],))
+    origin = dict(conn.execute("SELECT * FROM operations WHERE operation_id = ?", (quarantine["operation_id"],)).fetchone())
+    conn.close()
+    restore = restore_preview(
+        state_db, house_dir=house, operation_id=quarantine["operation_id"],
+        reference_file_id=ids[1], verdict="same_work_distinct_variant",
+    )
+    assert restore["apply_available"] and restore["source_identity_refreshed"]
+    result = apply_restore(
+        state_db, house_dir=house, temp_dir=temp, index_path=index,
+        operation_id=quarantine["operation_id"], reference_file_id=ids[1],
+        verdict="same_work_distinct_variant", note="", confirm_count=1,
+        confirm_plan_sha256=restore["plan_sha256"],
+    )
+    assert Path(result["dest_path"]).read_text() == "첫 번째 판본 본문"
+    assert not source.exists()
+    conn = decision_store.connect_state_db(state_db)
+    assert dict(conn.execute("SELECT * FROM operations WHERE operation_id = ?", (quarantine["operation_id"],)).fetchone()) == origin
+    assert not decision_store.doctor_issues(conn)
+    conn.close()
+
+    # A restored edition is immediately usable as a keep reference, including
+    # metadata-only drift after publication. Preview must not rewrite evidence.
+    restored_path = Path(result["dest_path"])
+    restored_path.chmod(0o700)
+    restored_path.chmod(0o600)
+    conn = decision_store.connect_state_db_readonly(state_db)
+    before = dict(conn.execute("SELECT * FROM files WHERE file_id = ?", (ids[0],)).fetchone())
+    conn.close()
+    followup = quarantine_preview(state_db, temp_dir=temp, source_file_id=ids[1], keep_file_id=ids[0])
+    assert followup["apply_available"], followup["blocked_reasons"]
+    conn = decision_store.connect_state_db_readonly(state_db)
+    assert dict(conn.execute("SELECT * FROM files WHERE file_id = ?", (ids[0],)).fetchone()) == before
+    conn.close()
+    quarantined_other = apply_quarantine(
+        state_db, house_dir=house, temp_dir=temp, index_path=index,
+        source_file_id=ids[1], keep_file_id=ids[0], confirm_count=1,
+        confirm_plan_sha256=followup["plan_sha256"],
+    )
+    assert Path(quarantined_other["dest_path"]).read_text() == "서로 다른 extra 본문"
+    assert restored_path.read_text() == "첫 번째 판본 본문"
+
+
+@pytest.mark.parametrize("change", ["content", "replacement", "hardlink", "symlink"])
+def test_quarantine_preview_rejects_unsafe_keep_metadata_drift(tmp_path, change):
+    state_db, _, temp, _, paths, ids = _fixture(tmp_path)
+    keep = paths[0]
+    info = keep.stat()
+    raw = keep.read_bytes()
+    if change == "content":
+        keep.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        os.utime(keep, ns=(info.st_atime_ns, info.st_mtime_ns))
+    elif change == "replacement":
+        other = keep.with_suffix(".replacement")
+        other.write_bytes(raw)
+        os.utime(other, ns=(info.st_atime_ns, info.st_mtime_ns))
+        other.replace(keep)
+    elif change == "hardlink":
+        os.link(keep, keep.with_suffix(".linked"))
+    else:
+        keep.unlink()
+        keep.symlink_to(paths[1])
+    plan = quarantine_preview(state_db, temp_dir=temp, source_file_id=ids[1], keep_file_id=ids[0])
+    assert not plan["apply_available"]
+    assert any(reason.startswith("invalid_keep:") for reason in plan["blocked_reasons"])
+    assert paths[1].read_text() == "서로 다른 extra 본문"
+
+
+@pytest.mark.parametrize("change", ["content", "replacement", "hardlink", "symlink"])
+def test_restore_metadata_exception_rejects_changed_bytes_or_inode(tmp_path, change):
+    state_db, house, temp, index, paths, ids = _fixture(tmp_path)
+    plan = quarantine_preview(state_db, temp_dir=temp, source_file_id=ids[0], keep_file_id=ids[1])
+    quarantine = apply_quarantine(
+        state_db, house_dir=house, temp_dir=temp, index_path=index,
+        source_file_id=ids[0], keep_file_id=ids[1], confirm_count=1,
+        confirm_plan_sha256=plan["plan_sha256"],
+    )
+    source = Path(quarantine["dest_path"])
+    info = source.stat()
+    if change == "content":
+        raw = source.read_bytes()
+        source.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
+    elif change == "replacement":
+        other = source.with_suffix(".replacement")
+        other.write_bytes(source.read_bytes())
+        os.utime(other, ns=(info.st_atime_ns, info.st_mtime_ns))
+        other.replace(source)
+    elif change == "hardlink":
+        os.link(source, source.with_suffix(".linked"))
+    else:
+        source.unlink()
+        source.symlink_to(paths[1])
+    restore = restore_preview(
+        state_db, house_dir=house, operation_id=quarantine["operation_id"],
+        reference_file_id=ids[1], verdict="same_work_distinct_variant",
+    )
+    assert not restore["apply_available"]
+    assert not paths[0].exists()
 
 
 def test_user_quarantine_prepares_missing_fingerprint_after_backup(tmp_path):

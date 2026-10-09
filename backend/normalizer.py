@@ -549,10 +549,16 @@ _UNIT_NUMBER_RE = re.compile(
 )
 _COMPLETION_NUMBER_RE = re.compile(r"(?<!\d)(\d+)\s*(?:완결|完結|완|完|終)(?![가-힣A-Za-z])")
 _HYPHEN_TAIL_RE = re.compile(r"[~\-]\s*(\d+)\s*(?=(?:완결|完結|완|完|終|종|$))")
-_SIDE_WORD = r"(?:외전|번외|특외|부외|후일담|에필로그|에필|(?<![가-힣A-Za-z])외(?![가-힣A-Za-z])|外傳|外伝|(?<![가-힣A-Za-z])外(?![가-힣A-Za-z]))"
+_SIDE_WORD = r"(?:외전|번외|특외|부외|후일담|에필로그|에필(?!로그)|(?<![가-힣A-Za-z])외(?![가-힣A-Za-z])|外傳|外伝|(?<![가-힣A-Za-z])外(?![가-힣A-Za-z]))"
 _SIDE_PREFIX_RE = re.compile(_SIDE_WORD + r"[^0-9]{0,8}$")
 _SIDE_SUFFIX_RE = re.compile(
     r"^\s*[\(\[【{]?\s*" + _SIDE_WORD + r"(?!\s*(?:포함|\d))"
+)
+_SIDE_AGGREGATE_RE = re.compile(
+    r"[+＋]\s*(?P<marker>외전|번외|특외|부외|후일담|에필로그|에필)\s*"
+    r"(?P<count>\d{1,4})\s*(?P<unit>화|회|권|장|편)?"
+    r"(?=\s|完|완|본|@|\.|$)",
+    re.IGNORECASE,
 )
 _META_NUMBER_PREFIX_RE = re.compile(
     r"(?:시즌|누락|중복|수정|추가|부족|완결|完結|완|完)\s*$", re.IGNORECASE
@@ -643,6 +649,8 @@ def _span_role(base, start_at, end_at, raw_unit, start, end):
         return "date"
     prefix = base[max(0, start_at - 12):start_at]
     suffix = base[end_at:end_at + 20]
+    # A numbered side-story range remains its own coordinate because
+    # ``_SIDE_SUFFIX_RE`` excludes a digit immediately after the marker.
     if _SIDE_PREFIX_RE.search(prefix) or _SIDE_SUFFIX_RE.search(suffix):
         return "side"
     if _META_NUMBER_PREFIX_RE.search(prefix) or _META_NUMBER_SUFFIX_RE.search(suffix):
@@ -691,6 +699,19 @@ def extract_episode_spans(filename):
         if end < start:
             continue
         add(match, start, end, raw_unit, True)
+
+    # Explicit aggregate notation such as ``1-450화 + 외전5`` has a main
+    # range and a side-story count without a second range.  The plus sign is
+    # required so a numbered ``외전 5`` remains its own side-story coordinate.
+    for match in _SIDE_AGGREGATE_RE.finditer(base):
+        if _overlaps((match.start(), match.end()), occupied):
+            continue
+        count = int(match.group("count"))
+        if count < 1 or count >= _NUMBER_MAX:
+            continue
+        add(
+            match, 1, count, match.group("unit"), False, role="side"
+        )
 
     # 공백 구분 범위는 명시 단위가 있고 끝값이 충분히 크며 제목 뒤 메타 영역에 있을 때만.
     for match in _SPACE_RANGE_RE.finditer(base):

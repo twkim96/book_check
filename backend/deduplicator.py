@@ -8,6 +8,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from normalizer import (
     SUPPORTED_EXTENSIONS,
@@ -65,6 +66,36 @@ def _sync_extension_index(index_path):
         return False
 
 
+def _quarantine_inventory(temp_dir):
+    """Return a small physical inventory for run-level quarantine accounting."""
+    root = Path(temp_dir).expanduser().resolve() / "trash_bin"
+    files = 0
+    total_bytes = 0
+    by_category = {}
+    if not root.is_dir():
+        return {"files": 0, "bytes": 0, "by_category": {}}
+    for current_root, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [name for name in dirnames if not os.path.islink(
+            os.path.join(current_root, name)
+        )]
+        for name in filenames:
+            path = os.path.join(current_root, name)
+            if os.path.islink(path):
+                continue
+            try:
+                size = os.stat(path, follow_symlinks=False).st_size
+            except OSError:
+                continue
+            relative = Path(path).relative_to(root)
+            category = relative.parts[0] if relative.parts else "(root)"
+            files += 1
+            total_bytes += size
+            bucket = by_category.setdefault(category, {"files": 0, "bytes": 0})
+            bucket["files"] += 1
+            bucket["bytes"] += size
+    return {"files": files, "bytes": total_bytes, "by_category": by_category}
+
+
 DEFAULT_HOUSE_DIR = str(HOUSE_DIR)
 DEFAULT_TEMP_DIR = str(TEMP_DIR)
 DEFAULT_STATE_DB = str(STATE_DB)
@@ -74,7 +105,7 @@ FOLDERLING_REBASELINE_DEEP_PAIRS_PER_FILE = 128
 FOLDERLING_REBASELINE_STOP_REASONS = frozenset({
     "body_budget_exhausted", "deep_check_deferred",
 })
-STRONG_PROOF_POLICY_VERSION = "1.5.4-refined-pinned-v1"
+STRONG_PROOF_POLICY_VERSION = "1.5.5-declared-coverage-v1"
 HOUSE_NEAR_DUPLICATE_MIN_COVERAGE_PPM = 990_000
 _DISTRIBUTION_SUFFIX_RE = re.compile(
     r"(?:^|[-_\s])(?:현|로)?판\d{6}(?=(?:[^0-9]|$))", re.IGNORECASE
@@ -1067,7 +1098,7 @@ def run_auditor_queue_report(
     import duplicate_auditor
 
     required = (
-        duplicate_auditor.AUDITOR_VERSION == "1.5.4"
+        duplicate_auditor.AUDITOR_VERSION == "1.5.5"
         and duplicate_auditor.MANAGED_REPRESENTATIVE_MODE == "normalized_sha_join"
         and duplicate_auditor.SUPPORTS_READ_ONLY_CACHE is True
     )
@@ -2145,8 +2176,19 @@ def _review_id_for_unordered_pair(conn, left_file_id, right_file_id, classificat
     return row[0] if row else None
 
 
-def _auditor_relation_queue_eligible(classification, left, right):
+def _auditor_relation_queue_eligible(classification, left, right, evidence=None):
     """본문을 읽지 못한 서로 다른 제목을 유사도만으로 격리하지 않는다."""
+    # The auditor keeps this classification as evidence for a human/reporting
+    # surface, but it has not established comparable declared coverage.  It
+    # must stay at its original path; sending it through the generic warning
+    # queue would still be an automatic quarantine.
+    if classification == "ordered_body_review":
+        evidence = evidence if isinstance(evidence, dict) else {}
+        coordinate = evidence.get("ordered_body_coordinate") or {}
+        return bool(
+            coordinate.get("mode") == "same_coordinates"
+            or coordinate.get("preferred_side") in {"left", "right"}
+        )
     if classification != "decode_lossy":
         return True
     left_core = normalize_nfc(left.get("core_title") or "")
@@ -2289,12 +2331,38 @@ def _ordered_body_direction(relation):
     )
     if coordinate_relation is None:
         return None
+    # Equal declared ranges are intentionally eligible: the shorter body is
+    # the discard side.  Directed wider-range relations are also eligible.
+    # Redistribution of side stories and episode/volume pairs are not
+    # comparable enough for an automatic move.
+    if (
+        coordinate_relation.mode != "same_coordinates"
+        and coordinate_relation.preferred_side not in {"left", "right"}
+    ):
+        return None
     if coordinate_relation.preferred_side == "left":
         keep, discard = left, right
     elif coordinate_relation.preferred_side == "right":
         keep, discard = right, left
     else:
-        keep = choose_keep([left, right])
+        evidence = relation.get("evidence") or {}
+        left_length = evidence.get("left_normalized_length")
+        right_length = evidence.get("right_normalized_length")
+        if _legacy_marker_discard_allowed(left, right):
+            keep = right
+        elif _legacy_marker_discard_allowed(right, left):
+            keep = left
+        elif (
+            coordinate_relation.mode == "same_coordinates"
+            and isinstance(left_length, int)
+            and isinstance(right_length, int)
+            and left_length > 0
+            and right_length > 0
+            and left_length != right_length
+        ):
+            keep = left if left_length > right_length else right
+        else:
+            keep = choose_keep([left, right])
         discard = right if keep is left else left
 
     def automatic_endpoint(entry):
@@ -2737,10 +2805,14 @@ def _managed_auditor_queue_records(
     queued_paths = set(excluded_paths)
     conn = decision_store.connect_state_db(state_db_path)
 
-    def queue_temp(entry, reference, classification, destination, status):
+    def queue_temp(
+        entry, reference, classification, destination, status, evidence=None
+    ):
         if classification not in HUMAN_REVIEW_CLASSES:
             return
-        if not _auditor_relation_queue_eligible(classification, entry, reference):
+        if not _auditor_relation_queue_eligible(
+            classification, entry, reference, evidence
+        ):
             return
         if classification not in AUDITOR_STRONG_CLASSES and not decision_store.coordinates_compatible(
             decision_store.coordinate_fields_from_name(entry["name"]),
@@ -2795,10 +2867,14 @@ def _managed_auditor_queue_records(
         records.append(record)
         queued_paths.add(entry["path"])
 
-    def queue_house(entry, reference, classification, destination, status):
+    def queue_house(
+        entry, reference, classification, destination, status, evidence=None
+    ):
         if classification not in HUMAN_REVIEW_CLASSES:
             return
-        if not _auditor_relation_queue_eligible(classification, entry, reference):
+        if not _auditor_relation_queue_eligible(
+            classification, entry, reference, evidence
+        ):
             return
         if classification not in AUDITOR_STRONG_CLASSES and not decision_store.coordinates_compatible(
             decision_store.coordinate_fields_from_name(entry["name"]),
@@ -3187,7 +3263,9 @@ def _managed_auditor_queue_records(
             left, right = relation["left"], relation["right"]
             if {left.get("source"), right.get("source")} != {"house", "temp"}:
                 continue
-            if not _auditor_relation_queue_eligible(classification, left, right):
+            if not _auditor_relation_queue_eligible(
+                classification, left, right, relation.get("evidence")
+            ):
                 continue
             temp_entry = left if left.get("source") == "temp" else right
             house_entry = right if temp_entry is left else left
@@ -3256,6 +3334,7 @@ def _managed_auditor_queue_records(
                         relation["classification"],
                         warning_dir,
                         "warning",
+                        relation.get("evidence"),
                     )
             else:
                 selected = next(
@@ -3269,6 +3348,7 @@ def _managed_auditor_queue_records(
                     selected["classification"],
                     suspected_dir if is_strong else warning_dir,
                     "moved" if is_strong else "warning",
+                    selected.get("evidence"),
                 )
     finally:
         conn.close()
@@ -3514,6 +3594,7 @@ def _clean_duplicates_impl(
     auditor_initial_stop_reasons = []
     script_dir = str(PROJECT_ROOT)
     index_path = index_path or os.path.join(script_dir, "file_index.json")
+    quarantine_before = _quarantine_inventory(temp_dir)
 
     scan_label = "house + temp" if include_temp else "house만"
     print(f"🧹 중복/검토 큐 정리 시작 (모드: {'미리보기/Dry-run' if dry_run else '실제 실행'}, 스캔: {scan_label})")
@@ -3844,6 +3925,23 @@ def _clean_duplicates_impl(
         r for r in suspect_move_records
         if r.get("status") == "metadata_only"
     ]
+    quarantine_plan_records = []
+    quarantine_root = Path(temp_dir).expanduser().resolve() / "trash_bin"
+    for record in [*exact_records, *suspect_move_records]:
+        destination = record.get("dest_path") or record.get("quarantine_path")
+        if not destination:
+            continue
+        try:
+            destination_path = Path(destination).expanduser().resolve()
+            destination_path.relative_to(quarantine_root)
+        except (OSError, ValueError):
+            continue
+        quarantine_plan_records.append(record)
+    quarantine_after = _quarantine_inventory(temp_dir)
+    quarantine_plan_bytes = sum(
+        int(record.get("size") or (record.get("entry") or {}).get("size") or 0)
+        for record in quarantine_plan_records
+    )
     author_conflict_count = len(author_review_records)
     same_author_count = len(review_moved_records)
     review_queue_move_count = (
@@ -3932,6 +4030,22 @@ def _clean_duplicates_impl(
         "contained_upgrade_count": len(superseded_records),
         "ordered_body_quarantine_count": len(ordered_duplicate_records),
         "metadata_only_count": len(metadata_only_records),
+        "quarantine_before": quarantine_before,
+        "quarantine_after": quarantine_after,
+        "quarantine_delta_files": (
+            quarantine_after["files"] - quarantine_before["files"]
+        ),
+        "quarantine_delta_bytes": (
+            quarantine_after["bytes"] - quarantine_before["bytes"]
+        ),
+        "quarantine_plan_count": len(quarantine_plan_records),
+        "quarantine_plan_bytes": quarantine_plan_bytes,
+        "quarantine_created_count": (
+            len(quarantine_plan_records) if not dry_run else 0
+        ),
+        "quarantine_created_bytes": (
+            quarantine_plan_bytes if not dry_run else 0
+        ),
         "author_conflict_count": author_conflict_count,
         "same_author_count": same_author_count,
         "disambig_count": len(disambig_assigned),

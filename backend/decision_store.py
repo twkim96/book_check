@@ -1314,7 +1314,7 @@ def prepare_actual_run(
                     if _test_failpoint is None:
                         json.dump(
                             manifest_payload, manifest,
-                            ensure_ascii=False, indent=2,
+                            ensure_ascii=False, separators=(",", ":"),
                         )
                     else:
                         class _FailpointWriter:
@@ -1334,7 +1334,7 @@ def prepare_actual_run(
                             manifest_payload,
                             _FailpointWriter(manifest),
                             ensure_ascii=False,
-                            indent=2,
+                            separators=(",", ":"),
                         )
                     manifest.flush()
                     os.fsync(manifest.fileno())
@@ -1487,6 +1487,153 @@ def prepare_actual_run(
     return run_id, str(manifest_path)
 
 
+def _manifest_ctime_only_drift(current, expected):
+    return (
+        current != expected
+        and all(current[index] == expected[index] for index in (0, 1, 3, 4))
+    )
+
+
+def _assert_private_manifest_info(info):
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise RuntimeError("actual run manifest identity is stale: unsafe file metadata")
+
+
+def _refresh_verified_manifest_ctime(conn, run):
+    """Refresh only ctime after revalidating the exact owned manifest bytes.
+
+    Unchanged evidence keeps the existing stat-only fast path. Metadata drift
+    requires a stable no-follow descriptor, the original device/inode/size/mtime
+    and SHA-256, and an active run rechecked under the writer transaction.
+    """
+    from mutation_io import (
+        inspect_open_regular_file_fd,
+        opened_directory_nofollow,
+    )
+
+    expected = _stored_identity(run, "manifest")
+    identity = _regular_file_identity(run["manifest_path"])
+    if identity == expected:
+        return run
+    if not _manifest_ctime_only_drift(identity, expected):
+        raise RuntimeError("actual run manifest identity is stale")
+
+    with (nullcontext() if conn.in_transaction else transaction(conn)):
+        current = conn.execute(
+            "SELECT * FROM actual_runs WHERE run_id = ? AND state = 'active'",
+            (run["run_id"],),
+        ).fetchone()
+        if current is None or any(
+            current[key] != run[key]
+            for key in ("manifest_path", "manifest_sha256", "house_root", "temp_root")
+        ):
+            raise RuntimeError("actual run changed during manifest ctime verification")
+        current_expected = _stored_identity(current, "manifest")
+        if current_expected not in (expected, identity):
+            raise RuntimeError("actual run manifest identity changed during ctime verification")
+        path = Path(current["manifest_path"])
+        with opened_directory_nofollow(path.parent) as parent_fd:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                _assert_private_manifest_info(os.fstat(fd))
+                evidence = inspect_open_regular_file_fd(fd)
+                verified_identity = (
+                    evidence.dev, evidence.ino, evidence.ctime_ns,
+                    evidence.size, evidence.mtime_ns,
+                )
+                if verified_identity != identity or evidence.sha256 != current["manifest_sha256"]:
+                    raise RuntimeError("actual run manifest identity is stale: SHA-256 or identity mismatch")
+                final = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                _assert_private_manifest_info(final)
+                if (
+                    final.st_dev, final.st_ino, final.st_ctime_ns,
+                    final.st_size, final.st_mtime_ns,
+                ) != verified_identity or (
+                    _symlink_component(path) is not None
+                    or _regular_file_identity(path) != verified_identity
+                ):
+                    raise RuntimeError("actual run manifest pathname changed during ctime verification")
+                conn.execute(
+                    "UPDATE actual_runs SET manifest_ctime_ns = ? WHERE run_id = ?",
+                    (evidence.ctime_ns, run["run_id"]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO settings(key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        f"actual_run_manifest_ctime_refresh:{run['run_id']}",
+                        json.dumps({
+                            "previous_ctime_ns": current_expected[2],
+                            "verified_ctime_ns": evidence.ctime_ns,
+                            "manifest_sha256": evidence.sha256,
+                        }, sort_keys=True),
+                    ),
+                )
+            finally:
+                os.close(fd)
+        refreshed = conn.execute(
+            "SELECT * FROM actual_runs WHERE run_id = ?", (run["run_id"],)
+        ).fetchone()
+    return refreshed
+
+
+def _refresh_verified_backup_ctime(conn, run):
+    """Preserve exact backup bytes while correcting verified ctime-only drift."""
+    from mutation_io import FileEvidence, inspect_verified_destination
+
+    expected = _stored_identity(run, "backup")
+    identity = _regular_file_identity(run["backup_path"])
+    if identity == expected:
+        return run
+    if not _manifest_ctime_only_drift(identity, expected):
+        raise RuntimeError("actual run backup identity is stale")
+    try:
+        evidence = inspect_verified_destination(
+            run["backup_path"], FileEvidence(*expected, run["backup_sha256"])
+        )
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"actual run backup identity is stale: {exc}") from exc
+    verified = (evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size, evidence.mtime_ns)
+    if verified != identity:
+        raise RuntimeError("actual run backup changed during ctime verification")
+    with (nullcontext() if conn.in_transaction else transaction(conn)):
+        current = conn.execute(
+            "SELECT * FROM actual_runs WHERE run_id = ? AND state = 'active'", (run["run_id"],)
+        ).fetchone()
+        if current is None or any(current[key] != run[key] for key in (
+            "backup_path", "backup_sha256", "house_root", "temp_root",
+        )) or _stored_identity(current, "backup") not in (expected, verified):
+            raise RuntimeError("actual run changed during backup ctime verification")
+        if _regular_file_identity(run["backup_path"]) != verified:
+            raise RuntimeError("actual run backup pathname changed during ctime verification")
+        conn.execute(
+            "UPDATE actual_runs SET backup_ctime_ns = ? WHERE run_id = ?", (evidence.ctime_ns, run["run_id"])
+        )
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE "
+            "SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+            (f"actual_run_backup_ctime_refresh:{run['run_id']}", json.dumps({
+                "previous_ctime_ns": expected[2], "verified_ctime_ns": evidence.ctime_ns,
+                "backup_sha256": evidence.sha256,
+            }, sort_keys=True)),
+        )
+        return conn.execute("SELECT * FROM actual_runs WHERE run_id = ?", (run["run_id"],)).fetchone()
+
+
 def assert_active_actual_run(
     conn, run_id, *, house_dir=None, temp_dir=None, full_evidence=False
 ):
@@ -1504,10 +1651,8 @@ def assert_active_actual_run(
     if not row["manifest_path"] or not row["manifest_sha256"]:
         raise RuntimeError("actual run manifest evidence is missing")
     try:
-        if _regular_file_identity(row["backup_path"]) != _stored_identity(row, "backup"):
-            raise RuntimeError("actual run backup identity is stale")
-        if _regular_file_identity(row["manifest_path"]) != _stored_identity(row, "manifest"):
-            raise RuntimeError("actual run manifest identity is stale")
+        row = _refresh_verified_backup_ctime(conn, row)
+        row = _refresh_verified_manifest_ctime(conn, row)
         if full_evidence:
             _verify_backup_evidence(row["backup_path"], row["backup_sha256"])
             if sha256_file(row["manifest_path"]) != row["manifest_sha256"]:
@@ -1562,7 +1707,20 @@ def _actual_run_manifest_lookup(run):
         run["manifest_size"], run["manifest_mtime_ns"], run["manifest_sha256"],
     )
     if not evidence_matches(evidence, expected):
-        raise RuntimeError("actual run manifest identity or SHA-256 mismatch")
+        # Callers may retain the run snapshot returned before an OS metadata
+        # update. Reusing that snapshot still requires the exact original bytes;
+        # cache keys include current ctime, so this path cannot reuse stale data.
+        observed = (
+            evidence.dev, evidence.ino, evidence.ctime_ns,
+            evidence.size, evidence.mtime_ns,
+        )
+        if (
+            not _manifest_ctime_only_drift(observed, _stored_identity(run, "manifest"))
+            or evidence.sha256 != expected.sha256
+            or observed != _regular_file_identity(run["manifest_path"])
+        ):
+            raise RuntimeError("actual run manifest identity or SHA-256 mismatch")
+        _assert_private_manifest_info(os.stat(run["manifest_path"], follow_symlinks=False))
     if payload.get("run_id") != run["run_id"]:
         raise RuntimeError("actual run manifest run_id mismatch")
     lookup = _manifest_lookup_from_records(payload.get("files", []))
@@ -1571,7 +1729,36 @@ def _actual_run_manifest_lookup(run):
     return lookup
 
 
-def assert_manifest_source(run, path, root_field, evidence) -> None:
+def _verified_file_ctime_receipt_matches(conn, run, path, expected, evidence):
+    """Accept only the identity chain proved by this active run's SHA checks."""
+    from mutation_io import inspect_verified_destination
+
+    current = (evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size, evidence.mtime_ns)
+    if conn is None or not _manifest_ctime_only_drift(current, expected):
+        return False
+    row = conn.execute(
+        "SELECT f.file_id, f.current_fingerprint_id, s.value "
+        "FROM files AS f JOIN settings AS s "
+        "ON s.key = 'actual_run_file_ctime_refresh:' || ? || ':' || f.file_id "
+        "JOIN actual_runs AS r ON r.run_id = ? AND r.state = 'active' "
+        "WHERE f.active = 1 AND f.canonical_path = ? "
+        "AND f.dev = ? AND f.ino = ? AND f.ctime_ns = ? AND f.size = ? AND f.mtime_ns = ?",
+        (run["run_id"], run["run_id"], str(path), *current),
+    ).fetchone()
+    if row is None:
+        return False
+    receipt = json.loads(row["value"])
+    if any(receipt.get(key) != value for key, value in {
+        "path": str(path), "dev": evidence.dev, "ino": evidence.ino,
+        "size": evidence.size, "mtime_ns": evidence.mtime_ns,
+        "verified_ctime_ns": evidence.ctime_ns, "raw_sha256": evidence.sha256,
+        "fingerprint_id": row["current_fingerprint_id"],
+    }.items()) or expected[2] not in receipt.get("verified_from_ctimes", []):
+        return False
+    return inspect_verified_destination(path, evidence) == evidence
+
+
+def assert_manifest_source(run, path, root_field, evidence, *, conn=None) -> None:
     source = "house" if root_field == "house_root" else "temp"
     root = Path(run[root_field])
     candidate = Path(canonicalize_real_path(path))
@@ -1591,7 +1778,9 @@ def assert_manifest_source(run, path, root_field, evidence) -> None:
     current = (
         evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size, evidence.mtime_ns,
     )
-    if expected != current:
+    if expected != current and not _verified_file_ctime_receipt_matches(
+        conn, run, candidate, expected, evidence
+    ):
         raise RuntimeError(f"actual run manifest source identity is stale: {candidate}")
 
 
@@ -1610,7 +1799,7 @@ def assert_manifest_or_same_run_house_source(
     """
 
     try:
-        assert_manifest_source(run, path, "house_root", evidence)
+        assert_manifest_source(run, path, "house_root", evidence, conn=conn)
         return
     except RuntimeError as manifest_error:
         if not str(manifest_error).startswith(
@@ -1633,6 +1822,12 @@ def assert_manifest_or_same_run_house_source(
             expected = _operation_evidence(row, "destination")
             if expected is not None and evidence_matches(evidence, expected):
                 return
+            if expected is not None and evidence.sha256 == expected.sha256 and _verified_file_ctime_receipt_matches(
+                conn, run, candidate,
+                (expected.dev, expected.ino, expected.ctime_ns, expected.size, expected.mtime_ns),
+                evidence,
+            ):
+                return
         raise manifest_error
 
 
@@ -1650,7 +1845,7 @@ def assert_manifest_or_same_run_queue_source(
     """
 
     try:
-        assert_manifest_source(run, path, "temp_root", evidence)
+        assert_manifest_source(run, path, "temp_root", evidence, conn=conn)
         return
     except RuntimeError as manifest_error:
         if not str(manifest_error).startswith(
@@ -1673,6 +1868,12 @@ def assert_manifest_or_same_run_queue_source(
         for row in rows:
             expected = _operation_evidence(row, "destination")
             if expected is not None and evidence_matches(evidence, expected):
+                return
+            if expected is not None and evidence.sha256 == expected.sha256 and _verified_file_ctime_receipt_matches(
+                conn, run, candidate,
+                (expected.dev, expected.ino, expected.ctime_ns, expected.size, expected.mtime_ns),
+                evidence,
+            ):
                 return
         raise manifest_error
 
@@ -1781,8 +1982,7 @@ def close_interrupted_pre_mutation_run(
         raise RuntimeError("interrupted actual run manifest evidence is missing")
     if _regular_file_identity(run["backup_path"]) != _stored_identity(run, "backup"):
         raise RuntimeError("interrupted actual run backup identity is stale")
-    if _regular_file_identity(run["manifest_path"]) != _stored_identity(run, "manifest"):
-        raise RuntimeError("interrupted actual run manifest identity is stale")
+    run = _refresh_verified_manifest_ctime(conn, run)
     _verify_backup_evidence(run["backup_path"], run["backup_sha256"])
     if sha256_file(run["manifest_path"]) != run["manifest_sha256"]:
         raise RuntimeError("interrupted actual run manifest SHA-256 mismatch")
@@ -2407,9 +2607,13 @@ def copy_record_consume_operation(
         copied = copy_no_clobber(source, destination, expected=source_evidence)
         with transaction(conn):
             record_operation_destination(conn, operation_id, copied.destination_evidence)
-        consume_copied_source(copied, guard=guard)
+        destination_evidence = consume_copied_source(copied, guard=guard)
+        if destination_evidence is None:
+            destination_evidence = copied.destination_evidence
         try:
             with transaction(conn):
+                if destination_evidence != copied.destination_evidence:
+                    record_operation_destination(conn, operation_id, destination_evidence)
                 transition_operation(conn, operation_id, "fs_done")
         except Exception as exc:
             with transaction(conn):
@@ -2419,7 +2623,7 @@ def copy_record_consume_operation(
                     (f"post-consume fs_done failed: {exc}", operation_id),
                 )
             raise
-        return copied.destination_evidence
+        return destination_evidence
     except Exception as exc:
         if copied is not None:
             try:
@@ -2587,10 +2791,14 @@ def _rollback_owned_destination(conn, row, destination, source, source_bucket):
                 copied.destination_evidence.mtime_ns, row["operation_id"],
             ),
         )
-    consume_copied_source(copied)
+    destination_evidence = consume_copied_source(copied) or copied.destination_evidence
     with transaction(conn):
+        conn.execute(
+            "UPDATE operations SET source_ctime_ns = ? WHERE operation_id = ?",
+            (destination_evidence.ctime_ns, row["operation_id"]),
+        )
         fingerprint_id = _clone_fingerprint_for_recovered_file(
-            conn, row["file_id"], source, copied.destination_evidence
+            conn, row["file_id"], source, destination_evidence
         )
         conn.execute(
             """
@@ -2599,14 +2807,14 @@ def _rollback_owned_destination(conn, row, destination, source, source_bucket):
                 current_fingerprint_id = ? WHERE file_id = ?
             """,
             (
-                str(source), source_bucket, copied.destination_evidence.dev,
-                copied.destination_evidence.ino, copied.destination_evidence.ctime_ns,
-                copied.destination_evidence.size, copied.destination_evidence.mtime_ns,
+                str(source), source_bucket, destination_evidence.dev,
+                destination_evidence.ino, destination_evidence.ctime_ns,
+                destination_evidence.size, destination_evidence.mtime_ns,
                 fingerprint_id, row["file_id"],
             ),
         )
         transition_operation(conn, row["operation_id"], "rolled_back")
-    return copied.destination_evidence
+    return destination_evidence
 
 
 def _finalize_existing_source_rollback(conn, row, source, source_bucket):
@@ -3211,7 +3419,45 @@ def recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) -
         return _recover_interrupted_operation(conn, operation_id)
 
 
+def _refresh_operation_destination_ctime(conn, operation_id):
+    from mutation_io import inspect_verified_destination
+
+    row = conn.execute(
+        "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
+    ).fetchone()
+    if row is None or row["state"] not in {"planned", "fs_done", "db_done"}:
+        return
+    expected = _operation_evidence(row, "destination")
+    value = row["quarantine_path"] or row["dest_path"]
+    if expected is None or not value:
+        return
+    run = _actual_run_for_operation(conn, row["run_id"])
+    assert_actual_run_path_any(run, value, ("temp_root", "house_root"))
+    try:
+        evidence = inspect_verified_destination(value, expected)
+    except (OSError, RuntimeError):
+        # Leave changed or absent evidence to the existing conservative recovery.
+        return
+    if evidence.ctime_ns == expected.ctime_ns:
+        return
+    with transaction(conn):
+        record_operation_destination(conn, operation_id, evidence)
+        conn.execute(
+            "INSERT OR REPLACE INTO settings(key, value, updated_at) "
+            "VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (
+                f"operation_destination_ctime_refresh:{operation_id}",
+                json.dumps({
+                    "previous_ctime_ns": expected.ctime_ns,
+                    "verified_ctime_ns": evidence.ctime_ns,
+                    "destination_sha256": evidence.sha256,
+                }, sort_keys=True),
+            ),
+        )
+
+
 def _recover_interrupted_operation(conn: sqlite3.Connection, operation_id: int) -> str:
+    _refresh_operation_destination_ctime(conn, operation_id)
     row = conn.execute(
         "SELECT action FROM operations WHERE operation_id = ?", (operation_id,)
     ).fetchone()

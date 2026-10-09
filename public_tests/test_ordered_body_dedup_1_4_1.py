@@ -221,6 +221,24 @@ def test_side_story_total_is_equal_without_relabeling_main_episodes():
     assert relation.right.side_count == 20
 
 
+def test_explicit_side_aggregate_and_epilogue_ranges_keep_main_coordinates():
+    aggregate = classify_dedup_coordinate_relation(
+        "판타지소설 1-450화 + 외전5.txt",
+        "판타지소설 1-450화 외전 1-5화.txt",
+    )
+    epilogue = classify_dedup_coordinate_relation(
+        "판타지소설 1-450화 에필로그 1-5화.txt",
+        "판타지소설 1-450화.txt",
+    )
+
+    assert aggregate.mode == "same_coordinates"
+    assert aggregate.left.primary_end == aggregate.right.primary_end == 450
+    assert aggregate.left.side_ranges == aggregate.right.side_ranges == ((1, 5),)
+    assert epilogue.preferred_side == "left"
+    assert epilogue.left.primary_end == epilogue.right.primary_end == 450
+    assert epilogue.left.side_ranges == ((1, 5),)
+
+
 def test_episode_and_volume_are_candidates_without_numeric_conversion():
     relation = classify_dedup_coordinate_relation(
         "판타지소설 1-150화.txt",
@@ -316,6 +334,46 @@ def test_same_coordinate_96_percent_body_uses_choose_keep_and_final_quarantine(t
     assert record["coordinate_mode"] == "same_coordinates"
 
 
+def test_same_coordinate_keeps_larger_body_even_below_five_percent_length_gap(tmp_path):
+    shorter = _lines()
+    longer = shorter + "".join(
+        f"추가된 본문 {number:03d}의 고유한 사건 전개입니다.\n"
+        for number in range(100)
+    )
+    house, temp, state_db, index, old = _prepare_managed_reference(
+        tmp_path, "합성길이 1-150화.txt", shorter
+    )
+    incoming = temp / "합성길이 1-150화 완결.txt"
+    incoming.write_text(longer, encoding="utf-8")
+
+    summary = _run(house, temp, state_db, index)
+
+    record = _assert_ordered_quarantine(summary, temp)
+    assert not old.exists() and not incoming.exists()
+    assert (house / incoming.name).read_text(encoding="utf-8") == longer
+    assert record["coordinate_mode"] == "same_coordinates"
+
+
+def test_same_coordinate_quarantines_shorter_incoming_against_larger_house(tmp_path):
+    shorter = _lines()
+    longer = shorter + "".join(
+        f"하우스에만 있는 추가 본문 {number:03d}입니다.\n"
+        for number in range(100)
+    )
+    house, temp, state_db, index, existing = _prepare_managed_reference(
+        tmp_path, "합성역길이 1-150화.txt", longer
+    )
+    incoming = temp / "합성역길이 1-150화 완결.txt"
+    incoming.write_text(shorter, encoding="utf-8")
+
+    summary = _run(house, temp, state_db, index)
+
+    record = _assert_ordered_quarantine(summary, temp)
+    assert existing.read_text(encoding="utf-8") == longer
+    assert not incoming.exists()
+    assert record["coordinate_mode"] == "same_coordinates"
+
+
 def test_exact_95_percent_boundary_is_inclusive(tmp_path):
     base = _lines()
     changed = _lines(changed=range(0, 5_000, 20))
@@ -332,7 +390,7 @@ def test_exact_95_percent_boundary_is_inclusive(tmp_path):
     assert record["ordered_body_evidence"]["coverage_ppm"] == 950_000
 
 
-def test_side_story_aggregate_96_percent_is_auto_deduplicated(tmp_path):
+def test_side_story_aggregate_96_percent_stays_at_original_paths(tmp_path):
     base = _lines()
     changed = _lines(changed=range(0, 5_000, 25))
     house, temp, state_db, index, existing = _prepare_managed_reference(
@@ -343,9 +401,9 @@ def test_side_story_aggregate_96_percent_is_auto_deduplicated(tmp_path):
 
     summary = _run(house, temp, state_db, index)
 
-    record = _assert_ordered_quarantine(summary, temp)
-    assert existing.exists() and not incoming.exists()
-    assert record["coordinate_mode"] == "side_aggregate_equivalent"
+    assert existing.exists() and incoming.exists()
+    assert summary["ordered_body_quarantine_count"] == 0
+    assert summary["warning_count"] == 0
 
 
 def test_same_format_same_start_compilations_use_95_percent_body_proof(tmp_path):
@@ -472,7 +530,7 @@ def test_same_run_ingested_keep_is_not_reprocessed_by_second_relation(tmp_path):
         conn.close()
 
 
-def test_episode_to_volume_96_percent_uses_choose_keep(tmp_path):
+def test_episode_to_volume_96_percent_stays_at_original_paths(tmp_path):
     base = _lines()
     changed = _lines(changed=range(0, 5_000, 25))
     house, temp, state_db, index, old = _prepare_managed_reference(
@@ -483,10 +541,9 @@ def test_episode_to_volume_96_percent_uses_choose_keep(tmp_path):
 
     summary = _run(house, temp, state_db, index)
 
-    record = _assert_ordered_quarantine(summary, temp)
-    assert not old.exists() and not incoming.exists()
-    assert (house / incoming.name).exists()
-    assert record["coordinate_mode"] == "cross_unit_edition"
+    assert old.exists() and incoming.exists()
+    assert summary["ordered_body_quarantine_count"] == 0
+    assert summary["warning_count"] == 0
 
 
 def test_distributed_match_below_95_percent_is_not_auto_quarantined(tmp_path):

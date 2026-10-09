@@ -98,10 +98,10 @@ FINGERPRINT_NORMALIZER_COMPAT_VERSION = "1.3.0"
 # 1.4.16 suffix admits reversible legacy-byte fingerprints only to exact digest
 # equality; it never enables fuzzy/containment comparison for damaged text.
 # This invalidates pair decisions only; the base fingerprint policy stays 1.4.2.
-PAIR_POLICY_VERSION = "1.5.4-epub-context-v2"
+PAIR_POLICY_VERSION = "1.5.5-declared-coverage-v1"
 LEGACY_ESCAPE_FINGERPRINT_SUFFIX = ":lossless-legacy-v1"
 PAIR_NORMALIZER_COMPAT_VERSION = "1.3.0"
-AUDITOR_VERSION = "1.5.4"
+AUDITOR_VERSION = "1.5.5"
 MANAGED_REPRESENTATIVE_MODE = "normalized_sha_join"
 SUPPORTS_READ_ONLY_CACHE = True
 DEFAULT_FULL_SWEEP_MAX_READ_BYTES = 256 * 1024 * 1024 * 1024
@@ -2891,6 +2891,17 @@ def _ordered_keep_side(candidate, relation, left_analysis, right_analysis):
         )
     left_chars = left_analysis.normalized_length
     right_chars = right_analysis.normalized_length
+    if (
+        relation.mode == "same_coordinates"
+        and left_chars > 0
+        and right_chars > 0
+        and left_chars != right_chars
+    ):
+        return (
+            ("left", "larger_normalized_body_same_coordinates")
+            if left_chars > right_chars
+            else ("right", "larger_normalized_body_same_coordinates")
+        )
     larger = max(left_chars, right_chars)
     smaller = min(left_chars, right_chars)
     if larger > 0 and (larger - smaller) / larger > 0.05:
@@ -3078,7 +3089,7 @@ def _apply_ordered_body_classification(
 
         result.evidence.update({
             "ordered_body_checked": True,
-            "ordered_body_version": "1.5.4",
+            "ordered_body_version": "1.5.5",
             "ordered_body_direction": direction,
             "ordered_body_keep_side": keep_side,
             "ordered_body_selection_policy": selection_policy,
@@ -3088,7 +3099,21 @@ def _apply_ordered_body_classification(
             "ordered_body_coordinate": relation.as_evidence(),
         })
         if ordered_body_coverage_sufficient(proof):
-            result.classification = "ordered_body_match"
+            # A same-coordinate pair has an explicit, equal episode range;
+            # under the library policy the shorter body is the discard side.
+            # A directed coordinate relation is equally safe because the
+            # filename proves which side covers more episodes.  Side-story
+            # redistribution and episode/volume pairs remain report-only.
+            if (
+                relation.mode == "same_coordinates"
+                or relation.preferred_side in {"left", "right"}
+            ):
+                result.classification = "ordered_body_match"
+            else:
+                result.classification = "ordered_body_review"
+                result.evidence[
+                    "ordered_body_auto_disposition"
+                ] = "blocked_without_comparable_declared_coverage"
         elif (
             proof.coverage_ppm >= ORDERED_BODY_REVIEW_FLOOR_PPM
             and result.classification

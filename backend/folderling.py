@@ -2344,7 +2344,7 @@ def _process_items_authorized(
             f"{dedup_summary.get('contained_upgrade_count', 0)}개 자동 격리"
         )
         print(
-            "  본문 95% 중복: 동일/중첩/외전 총량/화↔권 관계 "
+            "  본문 95% 중복: 동일 회차/명확한 넓은 범위 관계 "
             f"{dedup_summary.get('ordered_body_quarantine_count', 0)}개 자동 격리"
         )
     print(f"  폴더링  : 입고 {move_count}개, pass {pass_count}개")

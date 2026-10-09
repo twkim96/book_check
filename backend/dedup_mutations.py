@@ -17,6 +17,8 @@ from mutation_io import (
     assert_mutation_lock_held,
     contained_anchor_proof_sufficient,
     evidence_matches,
+    FileEvidence,
+    SourceIdentityChanged,
     ensure_directory_nofollow,
     inspect_contained_text,
     inspect_epub_content,
@@ -24,6 +26,7 @@ from mutation_io import (
     inspect_epub_spine_text,
     inspect_ordered_text,
     inspect_regular_file,
+    inspect_verified_destination,
     inspect_normalized_text,
     mutation_lock,
 )
@@ -256,7 +259,7 @@ def user_queue_restore(conn, *, file_id, run_id):
     """Restore a currently approved queue snapshot to its original house path."""
     with mutation_lock(conn, f"user_queue_restore:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
-        source = _file_state(conn, file_id)
+        source = _file_state(conn, file_id, run_id=run_id)
         if source["source"] != "queue":
             raise RuntimeError("user restore source must be an active queue file")
         original = conn.execute(
@@ -302,7 +305,7 @@ def user_queue_restore(conn, *, file_id, run_id):
 
         def guard():
             decision_store.assert_active_actual_run(conn, run_id)
-            current = _file_state(conn, file_id)
+            current = _file_state(conn, file_id, run_id=run_id)
             if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("user restore fingerprint changed")
 
@@ -362,7 +365,7 @@ def user_queue_accept_to_house(
     """
     with mutation_lock(conn, f"user_queue_accept:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
-        source = _ensure_intake_fingerprint(conn, _file_state(conn, file_id))
+        source = _ensure_intake_fingerprint(conn, _file_state(conn, file_id, run_id=run_id))
         if source["source"] != "queue":
             raise RuntimeError("user accept source must be an active queue file")
         if source["protected"] or source["representative"]:
@@ -404,7 +407,7 @@ def user_queue_accept_to_house(
 
         def guard():
             decision_store.assert_active_actual_run(conn, run_id)
-            current = _file_state(conn, file_id)
+            current = _file_state(conn, file_id, run_id=run_id)
             if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("user accept fingerprint changed")
 
@@ -474,8 +477,8 @@ def house_review_move(
     """
     with mutation_lock(conn, f"house_review_move:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
-        move = _file_state(conn, move_file_id)
-        keep = _file_state(conn, keep_file_id)
+        move = _file_state(conn, move_file_id, run_id=run_id)
+        keep = _file_state(conn, keep_file_id, run_id=run_id)
         if move["source"] != "house" or keep["source"] not in {"house", "temp"}:
             raise RuntimeError(
                 "house review move requires a house source and a house/temp keep"
@@ -526,13 +529,13 @@ def house_review_move(
             move_evidence = inspect_regular_file(move_path)
             keep_evidence = inspect_regular_file(keep_path)
         decision_store.assert_manifest_source(
-            actual_run, move_path, "house_root", move_evidence
+            actual_run, move_path, "house_root", move_evidence, conn=conn
         )
         decision_store.assert_manifest_source(
             actual_run,
             keep_path,
             "house_root" if keep["source"] == "house" else "temp_root",
-            keep_evidence,
+            keep_evidence, conn=conn,
         )
         destination = _unique_destination(conn, queue_dir, move_path.name)
         with decision_store.transaction(conn):
@@ -550,8 +553,8 @@ def house_review_move(
 
         def guard():
             decision_store.assert_active_actual_run(conn, run_id)
-            current_move = _file_state(conn, move_file_id)
-            current_keep = _file_state(conn, keep_file_id)
+            current_move = _file_state(conn, move_file_id, run_id=run_id)
+            current_keep = _file_state(conn, keep_file_id, run_id=run_id)
             if current_move["current_fingerprint_id"] != move["current_fingerprint_id"]:
                 raise RuntimeError("house cleanup source changed before consume")
             if current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
@@ -595,8 +598,8 @@ def apply_strong_equivalent_quarantine(
     """Finalize a revalidated TXT/EPUB equivalent as recoverable quarantine."""
     if classification not in STRONG_QUEUE_CLASSES:
         raise ValueError("strong-equivalent quarantine requires a strong class")
-    discard = _file_state(conn, discard_file_id)
-    keep = _file_state(conn, keep_file_id)
+    discard = _file_state(conn, discard_file_id, run_id=run_id)
+    keep = _file_state(conn, keep_file_id, run_id=run_id)
     if discard_file_id == keep_file_id:
         raise ValueError("strong-equivalent endpoints must differ")
     if discard["source"] not in {"house", "temp", "queue"}:
@@ -680,7 +683,7 @@ def _ingest_to_house(
 ):
     """Journal a temp-to-house intake while preserving the stable file_id."""
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
-    source = _file_state(conn, source_file_id)
+    source = _file_state(conn, source_file_id, run_id=run_id)
     decision_store.assert_actual_run_path(
         actual_run, source["canonical_path"], "temp_root"
     )
@@ -717,7 +720,7 @@ def _ingest_to_house(
             destination_analysis["analyzed_name"] = destination.name
     source_evidence = inspect_regular_file(source_path)
     decision_store.assert_manifest_source(
-        actual_run, source_path, "temp_root", source_evidence
+        actual_run, source_path, "temp_root", source_evidence, conn=conn
     )
     routing_result = None
     with decision_store.transaction(conn):
@@ -752,7 +755,7 @@ def _ingest_to_house(
         )
     def intake_guard():
         decision_store.assert_active_actual_run(conn, run_id)
-        current = _file_state(conn, source_file_id)
+        current = _file_state(conn, source_file_id, run_id=run_id)
         if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
             raise RuntimeError("intake source fingerprint changed before consume")
 
@@ -846,7 +849,7 @@ def _unique_destination(conn, directory, filename):
         counter += 1
 
 
-def _file_state(conn, file_id):
+def _file_state(conn, file_id, *, run_id=None):
     row = conn.execute(
         """
         SELECT f.*, fp.raw_sha256, fp.normalized_sha256,
@@ -860,6 +863,8 @@ def _file_state(conn, file_id):
     ).fetchone()
     if row is None:
         raise ValueError(f"active file not found: {file_id}")
+    if run_id is not None:
+        row = _refresh_actual_file_ctime(conn, run_id, row)
     return row
 
 
@@ -898,6 +903,100 @@ def _assert_row_identity(row, evidence, path):
             raise RuntimeError(f"stale source identity: {path}")
     elif actual[3:] != expected[3:]:
         raise RuntimeError(f"stale source snapshot: {path}")
+
+
+def _refresh_actual_file_ctime(conn, run_id, row):
+    """Refresh ctime at an active-run boundary after proving unchanged bytes.
+
+    A reference may have been ingested earlier in this run, so its immutable
+    fingerprint can describe the original inode. Keep that fingerprint and the
+    review relationship intact; refresh only the current file projection.
+    Sources still require manifest authorization and strict unlink checks.
+    """
+    path = Path(row["canonical_path"])
+    current = path.lstat()
+    actual = (
+        current.st_dev, current.st_ino, current.st_ctime_ns,
+        current.st_size, current.st_mtime_ns,
+    )
+    expected = (row["dev"], row["ino"], row["ctime_ns"], row["size"], row["mtime_ns"])
+    if actual == expected:
+        return row
+    if actual[:2] + actual[3:] != expected[:2] + expected[3:]:
+        _assert_row_identity(row, actual, path)
+    if any(value is None for value in expected) or not row["raw_sha256"]:
+        _assert_row_identity(row, actual, path)
+        raise RuntimeError(f"file lacks verified identity for ctime refresh: {path}")
+    assert_mutation_lock_held(conn, run_id=run_id)
+    run = decision_store.assert_active_actual_run(conn, run_id)
+    decision_store.assert_actual_run_path(
+        run, path, "house_root" if row["source"] == "house" else "temp_root"
+    )
+    fingerprint = conn.execute(
+        "SELECT file_id, size, raw_sha256 FROM fingerprints WHERE fingerprint_id = ?",
+        (row["current_fingerprint_id"],),
+    ).fetchone()
+    if fingerprint is None or tuple(fingerprint) != (
+        row["file_id"], row["size"], row["raw_sha256"],
+    ):
+        raise RuntimeError(f"file fingerprint is stale for ctime refresh: {path}")
+    try:
+        evidence = inspect_verified_destination(path, FileEvidence(*expected, row["raw_sha256"]))
+    except SourceIdentityChanged as exc:
+        raise SourceIdentityChanged(f"stale source identity: {path}; ctime verification failed: {exc}") from exc
+    with decision_store.transaction(conn):
+        decision_store.assert_active_actual_run(conn, run_id)
+        if dict(_file_state(conn, row["file_id"])) != dict(row):
+            raise RuntimeError(f"file row changed during ctime verification: {path}")
+        latest = path.lstat()
+        _assert_row_identity(
+            {**dict(row), "ctime_ns": evidence.ctime_ns},
+            (latest.st_dev, latest.st_ino, latest.st_ctime_ns, latest.st_size, latest.st_mtime_ns),
+            path,
+        )
+        receipt_key = f"actual_run_file_ctime_refresh:{run_id}:{row['file_id']}"
+        previous = conn.execute("SELECT value FROM settings WHERE key = ?", (receipt_key,)).fetchone()
+        previous = json.loads(previous[0]) if previous is not None else {}
+        identity = {"path": str(path), "dev": evidence.dev, "ino": evidence.ino,
+                    "size": evidence.size, "mtime_ns": evidence.mtime_ns,
+                    "raw_sha256": evidence.sha256, "fingerprint_id": row["current_fingerprint_id"]}
+        prior_ctimes = previous.get("verified_from_ctimes", []) if all(
+            previous.get(key) == value for key, value in identity.items()
+        ) and previous.get("verified_ctime_ns") == row["ctime_ns"] else []
+        # A prior-run copy can already have metadata drift at activation, while
+        # its DB projection still holds the old ctime. Bind the frozen snapshot
+        # too, but only for this exact inode/size/mtime whose bytes we just proved.
+        root_field = "house_root" if row["source"] == "house" else "temp_root"
+        source_kind = "house" if row["source"] == "house" else "temp"
+        relative = decision_store._manifest_relative_path_key(
+            path.relative_to(Path(run[root_field])).as_posix()
+        )
+        record = decision_store._actual_run_manifest_lookup(run).get((source_kind, relative))
+        if record is not None and tuple(record.get(key) for key in ("dev", "ino", "size", "mtime_ns")) == (
+            evidence.dev, evidence.ino, evidence.size, evidence.mtime_ns,
+        ) and record.get("ctime_ns") is not None:
+            prior_ctimes = prior_ctimes + [record["ctime_ns"]]
+        receipt = {**identity, "previous_ctime_ns": row["ctime_ns"],
+                   "verified_ctime_ns": evidence.ctime_ns,
+                   "verified_from_ctimes": sorted(set(prior_ctimes + [row["ctime_ns"]]))}
+        conn.execute(
+            "UPDATE files SET ctime_ns = ?, last_seen_at = CURRENT_TIMESTAMP WHERE file_id = ?",
+            (evidence.ctime_ns, row["file_id"]),
+        )
+        conn.execute(
+            "UPDATE file_analysis SET analyzed_ctime_ns = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE file_id = ? AND analyzed_size = ? AND analyzed_mtime_ns = ? "
+            "AND (analyzed_ctime_ns IS NULL OR analyzed_ctime_ns = ?)",
+            (evidence.ctime_ns, row["file_id"], row["size"], row["mtime_ns"], row["ctime_ns"]),
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE "
+            "SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            (
+                receipt_key, json.dumps(receipt),
+            ),
+        )
+    return _file_state(conn, row["file_id"])
 
 
 def _ensure_mutable_source(row, *, allow_unassigned_house_exact=False):
@@ -1083,8 +1182,8 @@ def _exact_quarantine(
     run_id,
 ):
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
-    source = _file_state(conn, source_file_id)
-    keep = _file_state(conn, keep_file_id)
+    source = _file_state(conn, source_file_id, run_id=run_id)
+    keep = _file_state(conn, keep_file_id, run_id=run_id)
     # Some legacy files and analyses that could not decode the body have no
     # current fingerprint.  Exact cleanup still has stronger evidence
     # available: both regular files are hashed in full immediately below.
@@ -1164,7 +1263,7 @@ def _exact_quarantine(
         )
     else:
         decision_store.assert_manifest_source(
-            actual_run, source_path, source_root, source_evidence
+            actual_run, source_path, source_root, source_evidence, conn=conn
         )
     if queue_keep:
         # The queue peer may have existed at activation or may be an exact,
@@ -1230,8 +1329,8 @@ def _exact_quarantine(
 
     def exact_guard():
         decision_store.assert_active_actual_run(conn, run_id)
-        current_source = _file_state(conn, source_file_id)
-        current_keep = _file_state(conn, keep_file_id)
+        current_source = _file_state(conn, source_file_id, run_id=run_id)
+        current_keep = _file_state(conn, keep_file_id, run_id=run_id)
         if current_source["current_fingerprint_id"] != source["current_fingerprint_id"]:
             raise RuntimeError("exact source fingerprint changed before consume")
         if current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
@@ -1310,13 +1409,13 @@ def user_quarantine(
     """
     with mutation_lock(conn, f"user_quarantine:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
-        source = _file_state(conn, source_file_id)
-        keep = _file_state(conn, keep_file_id) if keep_file_id else None
+        source = _file_state(conn, source_file_id, run_id=run_id)
+        keep = _file_state(conn, keep_file_id, run_id=run_id) if keep_file_id else None
         if keep_file_id and source_file_id == keep_file_id:
             raise ValueError("discard source and keep must differ")
         if keep is not None and keep["source"] != "house":
             raise RuntimeError("user-discard keep file must already be in house")
-        replacement = _file_state(conn, replacement_file_id) if replacement_file_id else None
+        replacement = _file_state(conn, replacement_file_id, run_id=run_id) if replacement_file_id else None
         if source["representative"]:
             if replacement is not None:
                 if (
@@ -1368,7 +1467,7 @@ def user_quarantine(
             )
         else:
             decision_store.assert_manifest_source(
-                actual_run, source_path, source_root, source_evidence
+                actual_run, source_path, source_root, source_evidence, conn=conn
             )
         if keep_path is not None:
             if keep_origin_operation_id is None:
@@ -1439,8 +1538,8 @@ def user_quarantine(
 
         def guard():
             decision_store.assert_active_actual_run(conn, run_id)
-            current_source = _file_state(conn, source_file_id)
-            current_keep = _file_state(conn, keep_file_id) if keep_file_id else None
+            current_source = _file_state(conn, source_file_id, run_id=run_id)
+            current_keep = _file_state(conn, keep_file_id, run_id=run_id) if keep_file_id else None
             if current_source["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("user-discard source fingerprint changed")
             if keep is not None and current_keep["current_fingerprint_id"] != keep["current_fingerprint_id"]:
@@ -1448,7 +1547,7 @@ def user_quarantine(
             if keep_path is not None and not evidence_matches(inspect_regular_file(keep_path), keep_evidence):
                 raise RuntimeError("user-discard keep identity changed")
             if replacement is not None:
-                current_replacement = _file_state(conn, replacement_file_id)
+                current_replacement = _file_state(conn, replacement_file_id, run_id=run_id)
                 if current_replacement["current_fingerprint_id"] != replacement["current_fingerprint_id"]:
                     raise RuntimeError("replacement representative fingerprint changed")
                 if not evidence_matches(inspect_regular_file(replacement_path), replacement_evidence):
@@ -1524,7 +1623,7 @@ def hold_epub_analysis_error(
 
     with mutation_lock(conn, f"epub-analysis-hold:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
-        source = _file_state(conn, source_file_id)
+        source = _file_state(conn, source_file_id, run_id=run_id)
         if source["source"] != "temp":
             raise RuntimeError("EPUB analysis hold source must be temp")
         if (
@@ -1557,7 +1656,7 @@ def hold_epub_analysis_error(
         )
         source_evidence = inspect_regular_file(source_path)
         decision_store.assert_manifest_source(
-            actual_run, source_path, "temp_root", source_evidence
+            actual_run, source_path, "temp_root", source_evidence, conn=conn
         )
         destination_dir = (
             Path(temp_root) / "trash_bin" / "warning" / "epub_analysis_errors"
@@ -1585,7 +1684,7 @@ def hold_epub_analysis_error(
 
         def guard():
             decision_store.assert_active_actual_run(conn, run_id)
-            current = _file_state(conn, source_file_id)
+            current = _file_state(conn, source_file_id, run_id=run_id)
             if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("EPUB analysis hold source changed before consume")
 
@@ -1677,7 +1776,7 @@ def record_user_approved_purge_revalidation(
             or group["state"] != "planned"
         ):
             raise RuntimeError("purge revalidation requires its approved plan group")
-        keep = _file_state(conn, keep_file_id)
+        keep = _file_state(conn, keep_file_id, run_id=run_id)
         if keep["source"] != "house" or keep_file_id == origin["file_id"]:
             raise RuntimeError("purge revalidation keep must be another house file")
 
@@ -1699,11 +1798,11 @@ def record_user_approved_purge_revalidation(
             actual_run, quarantine_path, "temp_root"
         )
         decision_store.assert_manifest_source(
-            actual_run, quarantine_path, "temp_root", quarantine_evidence
+            actual_run, quarantine_path, "temp_root", quarantine_evidence, conn=conn
         )
         decision_store.assert_actual_run_path(actual_run, keep_path, "house_root")
         decision_store.assert_manifest_source(
-            actual_run, keep_path, "house_root", keep_evidence
+            actual_run, keep_path, "house_root", keep_evidence, conn=conn
         )
 
         with decision_store.transaction(conn):
@@ -1798,8 +1897,8 @@ def apply_contained_upgrade(
     """
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     assert_mutation_lock_held(conn, run_id=run_id)
-    shorter = _file_state(conn, shorter_file_id)
-    longer = _file_state(conn, longer_file_id)
+    shorter = _file_state(conn, shorter_file_id, run_id=run_id)
+    longer = _file_state(conn, longer_file_id, run_id=run_id)
     if shorter_file_id == longer_file_id:
         raise ValueError("contained upgrade endpoints must differ")
     if shorter["source"] not in {"house", "temp", "queue"} or longer["source"] not in {
@@ -1926,7 +2025,7 @@ def apply_contained_upgrade(
         )
     else:
         decision_store.assert_manifest_source(
-            actual_run, short_path, short_root, proof.short_file_evidence
+            actual_run, short_path, short_root, proof.short_file_evidence, conn=conn
         )
     if longer["source"] == "queue":
         decision_store.assert_manifest_or_same_run_queue_source(
@@ -1942,7 +2041,7 @@ def apply_contained_upgrade(
         )
     else:
         decision_store.assert_manifest_source(
-            actual_run, long_path, long_root, proof.long_file_evidence
+            actual_run, long_path, long_root, proof.long_file_evidence, conn=conn
         )
 
     ingest_result = None
@@ -1965,14 +2064,14 @@ def apply_contained_upgrade(
                 destination=destination,
                 run_id=run_id,
             )
-        longer = _file_state(conn, longer_file_id)
+        longer = _file_state(conn, longer_file_id, run_id=run_id)
     elif house_destination is not None and decision_store.canonicalize_path(
         house_destination
     ) != longer["canonical_path"]:
         raise RuntimeError("contained upgrade destination disagrees with current house path")
 
-    shorter = _file_state(conn, shorter_file_id)
-    longer = _file_state(conn, longer_file_id)
+    shorter = _file_state(conn, shorter_file_id, run_id=run_id)
+    longer = _file_state(conn, longer_file_id, run_id=run_id)
     if longer["source"] != "house":
         raise RuntimeError("contained upgrade keep endpoint is not in house")
 
@@ -2080,8 +2179,8 @@ def apply_ordered_body_quarantine(
     """
     actual_run = decision_store.assert_active_actual_run(conn, run_id)
     assert_mutation_lock_held(conn, run_id=run_id)
-    discard = _file_state(conn, discard_file_id)
-    keep = _file_state(conn, keep_file_id)
+    discard = _file_state(conn, discard_file_id, run_id=run_id)
+    keep = _file_state(conn, keep_file_id, run_id=run_id)
     if discard_file_id == keep_file_id:
         raise ValueError("ordered body endpoints must differ")
     if discard["source"] not in {"house", "temp", "queue"} or keep["source"] not in {
@@ -2199,6 +2298,13 @@ def apply_ordered_body_quarantine(
     if classification == "ordered_body_match":
         if coordinate_relation is None:
             raise RuntimeError("ordered body quarantine coordinate relation changed")
+        if (
+            coordinate_relation.mode != "same_coordinates"
+            and coordinate_relation.preferred_side not in {"left", "right"}
+        ):
+            raise OrderedBodyMatchNotProven(
+                "ordered body quarantine requires comparable declared coverage"
+            )
         if coordinate_relation.preferred_side not in {None, "right"}:
             raise RuntimeError("ordered body quarantine would discard wider coverage")
         coordinate_mode = coordinate_relation.mode
@@ -2258,6 +2364,16 @@ def apply_ordered_body_quarantine(
         or proof.target_normalized_sha256 != keep["normalized_sha256"]
     ):
         raise RuntimeError("ordered body normalized SHA revalidation failed")
+    if (
+        classification == "ordered_body_match"
+        and coordinate_relation is not None
+        and coordinate_relation.mode == "same_coordinates"
+        and not legacy_marker_discard
+        and proof.source_normalized_length > proof.target_normalized_length
+    ):
+        raise OrderedBodyMatchNotProven(
+            "same-coordinate ordered body must quarantine the shorter body"
+        )
     if not ordered_body_coverage_sufficient(proof.coverage):
         raise OrderedBodyMatchNotProven(
             "ordered body coverage fell below the current 1.4.1 contract"
@@ -2311,7 +2427,7 @@ def apply_ordered_body_quarantine(
         )
     else:
         decision_store.assert_manifest_source(
-            actual_run, discard_path, discard_root, proof.source_file_evidence
+            actual_run, discard_path, discard_root, proof.source_file_evidence, conn=conn
         )
     if keep["source"] == "queue":
         decision_store.assert_manifest_or_same_run_queue_source(
@@ -2327,7 +2443,7 @@ def apply_ordered_body_quarantine(
         )
     else:
         decision_store.assert_manifest_source(
-            actual_run, keep_path, keep_root, proof.target_file_evidence
+            actual_run, keep_path, keep_root, proof.target_file_evidence, conn=conn
         )
 
     ingest_result = None
@@ -2350,14 +2466,14 @@ def apply_ordered_body_quarantine(
                 destination=destination,
                 run_id=run_id,
             )
-        keep = _file_state(conn, keep_file_id)
+        keep = _file_state(conn, keep_file_id, run_id=run_id)
     elif house_destination is not None and decision_store.canonicalize_path(
         house_destination
     ) != keep["canonical_path"]:
         raise RuntimeError("ordered body destination disagrees with keep path")
 
-    discard = _file_state(conn, discard_file_id)
-    keep = _file_state(conn, keep_file_id)
+    discard = _file_state(conn, discard_file_id, run_id=run_id)
+    keep = _file_state(conn, keep_file_id, run_id=run_id)
     if keep["source"] != "house":
         raise RuntimeError("ordered body keep endpoint is not in house")
 
@@ -2470,7 +2586,7 @@ def user_action_quarantine(
     """Quarantine an explicitly submitted action-inbox file without a keep pair."""
     with mutation_lock(conn, f"user_action_quarantine:{run_id}", run_id=run_id):
         actual_run = decision_store.assert_active_actual_run(conn, run_id)
-        source = _ensure_intake_fingerprint(conn, _file_state(conn, source_file_id))
+        source = _ensure_intake_fingerprint(conn, _file_state(conn, source_file_id, run_id=run_id))
         if source["source"] not in {"temp", "queue"}:
             raise RuntimeError("action discard source must be under temp")
         if source["protected"] or source["representative"]:
@@ -2480,7 +2596,7 @@ def user_action_quarantine(
         decision_store.assert_actual_run_path(actual_run, quarantine_dir, "temp_root")
         source_evidence = inspect_regular_file(source_path)
         decision_store.assert_manifest_source(
-            actual_run, source_path, "temp_root", source_evidence
+            actual_run, source_path, "temp_root", source_evidence, conn=conn
         )
         destination = _unique_destination(conn, quarantine_dir, source_path.name)
         with decision_store.transaction(conn):
@@ -2496,7 +2612,7 @@ def user_action_quarantine(
             )
 
         def guard():
-            current = _file_state(conn, source_file_id)
+            current = _file_state(conn, source_file_id, run_id=run_id)
             if current["current_fingerprint_id"] != source["current_fingerprint_id"]:
                 raise RuntimeError("action discard fingerprint changed")
 
@@ -2572,8 +2688,8 @@ def _queue_candidate(
         raise ValueError(f"classification is not queueable: {classification}")
     if review_id is None:
         raise RuntimeError("persisted review evidence is required for queue mutation")
-    candidate = _file_state(conn, candidate_file_id)
-    reference = _file_state(conn, reference_file_id)
+    candidate = _file_state(conn, candidate_file_id, run_id=run_id)
+    reference = _file_state(conn, reference_file_id, run_id=run_id)
     decision_store.assert_actual_run_path(
         actual_run, candidate["canonical_path"], "temp_root"
     )
@@ -2659,7 +2775,7 @@ def _queue_candidate(
     destination = _unique_destination(conn, queue_dir, candidate_path.name)
     source_evidence = source_evidence or inspect_regular_file(candidate_path)
     decision_store.assert_manifest_source(
-        actual_run, candidate_path, "temp_root", source_evidence
+        actual_run, candidate_path, "temp_root", source_evidence, conn=conn
     )
     with decision_store.transaction(conn):
         operation_id = decision_store.create_operation(
@@ -2685,8 +2801,8 @@ def _queue_candidate(
 
     def queue_guard():
         decision_store.assert_active_actual_run(conn, run_id)
-        current_candidate = _file_state(conn, candidate_file_id)
-        current_reference = _file_state(conn, reference_file_id)
+        current_candidate = _file_state(conn, candidate_file_id, run_id=run_id)
+        current_reference = _file_state(conn, reference_file_id, run_id=run_id)
         if current_candidate["current_fingerprint_id"] != candidate["current_fingerprint_id"]:
             raise RuntimeError("queue candidate fingerprint changed before consume")
         if current_reference["current_fingerprint_id"] != reference["current_fingerprint_id"]:
@@ -2696,10 +2812,7 @@ def _queue_candidate(
             or current_reference["assignment_state"] != "managed"
         ):
             raise RuntimeError("queue representative guard changed before consume")
-        if not evidence_matches(
-            inspect_regular_file(reference["canonical_path"]), reference_guard_evidence
-        ):
-            raise RuntimeError("queue representative identity changed before consume")
+        inspect_verified_destination(reference["canonical_path"], reference_guard_evidence)
 
     destination_evidence = _copy_record_consume(
         conn, operation_id, candidate_path, destination, source_evidence, guard=queue_guard

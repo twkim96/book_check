@@ -1129,6 +1129,36 @@ def reconcile_file_metadata(
         assignment_state = row["assignment_state"]
         assignment_origin = row["assignment_origin"]
         current_fingerprint_id = row["current_fingerprint_id"]
+        ctime_only = (
+            changed and assignment_state == "managed"
+            and row["dev"] == stat.st_dev and row["ino"] == stat.st_ino
+            and row["size"] == stat.st_size and row["mtime_ns"] == stat.st_mtime_ns
+            and row["ctime_ns"] is not None and row["ctime_ns"] != stat.st_ctime_ns
+        )
+        if ctime_only and current_fingerprint_id is not None:
+            fingerprint = conn.execute(
+                "SELECT raw_sha256 FROM fingerprints WHERE fingerprint_id = ? AND file_id = ?",
+                (current_fingerprint_id, file_id),
+            ).fetchone()
+            if fingerprint is not None and fingerprint["raw_sha256"]:
+                from mutation_io import FileEvidence, inspect_verified_destination
+
+                try:
+                    evidence = inspect_verified_destination(
+                        physical_path,
+                        FileEvidence(row["dev"], row["ino"], row["ctime_ns"],
+                                     row["size"], row["mtime_ns"], fingerprint["raw_sha256"]),
+                    )
+                    stat = os.stat(physical_path, follow_symlinks=False)
+                    changed = (
+                        stat.st_dev, stat.st_ino, stat.st_ctime_ns,
+                        stat.st_size, stat.st_mtime_ns,
+                    ) != (evidence.dev, evidence.ino, evidence.ctime_ns,
+                          evidence.size, evidence.mtime_ns)
+                except (OSError, RuntimeError):
+                    # A content rewrite or replacement must still invalidate
+                    # the assignment; ctime alone never proves unchanged bytes.
+                    pass
         if changed:
             current_fingerprint_id = None
             if assignment_state == "managed":

@@ -12,9 +12,11 @@ from typing import Mapping, Sequence
 import decision_store
 from dedup_mutations import _ensure_intake_fingerprint, _file_state, user_quarantine
 from mutation_io import (
+    FileEvidence,
     ensure_directory_nofollow,
     evidence_matches,
     inspect_regular_file,
+    inspect_verified_destination,
     mutation_lock,
     mutation_lock_for_roots,
     unlink_owned,
@@ -93,11 +95,27 @@ def _require_current_file(
         raise RuntimeError(f"file must be an active {source} file: {row['file_id']}")
     if require_fingerprint and row["current_fingerprint_id"] is None:
         raise RuntimeError(f"current fingerprint is missing: {row['file_id']}")
-    evidence = inspect_regular_file(row["canonical_path"])
+    try:
+        evidence = inspect_regular_file(row["canonical_path"])
+    except OSError as exc:
+        raise RuntimeError(f"file snapshot is unavailable: {row['file_id']}: {exc}") from exc
     expected = (row["dev"], row["ino"], row["ctime_ns"], row["size"], row["mtime_ns"])
     actual = (evidence.dev, evidence.ino, evidence.ctime_ns, evidence.size, evidence.mtime_ns)
     if expected != actual:
-        raise RuntimeError(f"file snapshot is stale: {row['file_id']}")
+        if (
+            any(value is None for value in expected)
+            or actual[:2] + actual[3:] != expected[:2] + expected[3:]
+            or not row["raw_sha256"]
+        ):
+            raise RuntimeError(f"file snapshot is stale: {row['file_id']}")
+        # Preview remains read-only. The active-run loader refreshes the DB
+        # projection after backup and revalidates before the actual mutation.
+        try:
+            inspect_verified_destination(
+                row["canonical_path"], FileEvidence(*expected, row["raw_sha256"])
+            )
+        except OSError as exc:
+            raise RuntimeError(f"file snapshot is unavailable: {row['file_id']}: {exc}") from exc
 
 
 def _prepare_current_fingerprint(conn, file_id: str):
@@ -382,9 +400,17 @@ def apply_quarantine(
         conn = decision_store.connect_state_db(state_db)
         try:
             issues = decision_store.doctor_issues(conn)
+            backup = None
+            if issues and all(issue["kind"] == "stale_identity" for issue in issues):
+                backup = decision_store.backup_state_db(conn, _backup_path(state_db, "user_quarantine"))
+                decision_store.refresh_verified_managed_ctime_identities(
+                    conn, backup_path=backup, house_dir=house_dir, temp_dir=temp_dir,
+                )
+                issues = decision_store.doctor_issues(conn)
             if issues:
                 raise RuntimeError(f"doctor failed before quarantine: {issues[0]['kind']}")
-            backup = decision_store.backup_state_db(conn, _backup_path(state_db, "user_quarantine"))
+            if backup is None:
+                backup = decision_store.backup_state_db(conn, _backup_path(state_db, "user_quarantine"))
             preparation_ids = [source_file_id]
             for key in ("keep", "replacement_representative"):
                 item = plan[key]
@@ -472,6 +498,8 @@ def restore_preview(
         if origin["file_active"] or origin["file_source"] != "quarantine":
             blockers.append("file_not_quarantined")
         quarantine_path = Path(origin["quarantine_path"] or origin["dest_path"] or "")
+        verified_source = None
+        source_identity_refreshed = False
         house_root = Path(house_dir).resolve()
         if destination_rel is None:
             destination = Path(origin["source_path"]).resolve()
@@ -509,7 +537,32 @@ def restore_preview(
                 evidence.mtime_ns, evidence.sha256,
             )
             if expected != actual:
-                blockers.append("quarantine_identity_stale")
+                # An explicitly requested restore may encounter an APFS device
+                # rebind or metadata ctime drift in an inactive quarantine.
+                # Keep inode/size/mtime and the original owned bytes strict;
+                # the new plan and run pin the freshly verified identity.
+                if (
+                    origin["file_path"] == str(quarantine_path)
+                    and actual[1] == expected[1]
+                    and actual[3:] == expected[3:]
+                    and evidence.dev == quarantine_path.parent.stat().st_dev
+                    and all(value is not None for value in expected)
+                ):
+                    try:
+                        checked = inspect_verified_destination(
+                            quarantine_path, FileEvidence(
+                                evidence.dev, *expected[1:]
+                            ),
+                        )
+                        source_identity_refreshed = checked == evidence
+                    except (OSError, RuntimeError):
+                        source_identity_refreshed = False
+                if not source_identity_refreshed:
+                    blockers.append("quarantine_identity_stale")
+            verified_source = {
+                "dev": evidence.dev, "ino": evidence.ino, "ctime_ns": evidence.ctime_ns,
+                "size": evidence.size, "mtime_ns": evidence.mtime_ns, "sha256": evidence.sha256,
+            }
         if destination.exists() or destination.is_symlink():
             blockers.append("original_destination_occupied")
         reference_file_id = reference_file_id or origin["keep_file_id"]
@@ -531,6 +584,7 @@ def restore_preview(
             "verdict": verdict, "destination": str(destination),
             "destination_rel": str(destination_rel).strip() if destination_rel is not None else None,
             "note": note.strip(),
+            "verified_source": verified_source,
         }
         return {
             "version": "1.3.2", "kind": "quarantine_restore", "item_count": 1,
@@ -538,6 +592,8 @@ def restore_preview(
             "reference": _public_file(reference) if reference else None,
             "quarantine_path": str(quarantine_path), "destination_path": str(destination),
             "verdict": verdict, "note": note.strip(), "blocked_reasons": blockers,
+            "verified_source": verified_source,
+            "source_identity_refreshed": source_identity_refreshed,
             "apply_available": not blockers, "plan_sha256": _hash(payload), "readonly": True,
         }
     finally:
@@ -557,6 +613,8 @@ def _restore_quarantine_file(conn, *, plan: Mapping[str, object], run_id: str) -
         raise FileExistsError(destination)
     ensure_directory_nofollow(destination.parent)
     source_evidence = inspect_regular_file(source)
+    if plan.get("verified_source") is not None and source_evidence != FileEvidence(**plan["verified_source"]):
+        raise RuntimeError("restore verified quarantine identity changed")
     reference_evidence = inspect_regular_file(reference["canonical_path"])
     decision_store.assert_manifest_source(actual_run, source, "temp_root", source_evidence)
     decision_store.assert_manifest_source(actual_run, reference["canonical_path"], "house_root", reference_evidence)
@@ -612,6 +670,15 @@ def _restore_quarantine_file(conn, *, plan: Mapping[str, object], run_id: str) -
              destination_evidence.ctime_ns, destination_evidence.size,
              destination_evidence.mtime_ns, origin["file_id"]),
         )
+        fingerprint_id = decision_store._clone_fingerprint_for_recovered_file(
+            conn, origin["file_id"], destination, destination_evidence
+        )
+        conn.execute(
+            "UPDATE files SET current_fingerprint_id = ? WHERE file_id = ?",
+            (fingerprint_id, origin["file_id"]),
+        )
+        decision_store.upsert_file_analysis(conn, origin["file_id"], destination)
+        _file_state(conn, origin["file_id"], run_id=run_id)
         decision_store.supersede_open_reviews_for_file(
             conn, origin["file_id"], reason="user_selected_restore"
         )
@@ -622,7 +689,7 @@ def _restore_quarantine_file(conn, *, plan: Mapping[str, object], run_id: str) -
                 right_fingerprint_id, classification, state, evidence_json
             ) VALUES (?, ?, ?, ?, 'user_restore_review', 'pending', ?)
             """,
-            (origin["file_id"], reference["file_id"], origin["file_fingerprint_id"],
+            (origin["file_id"], reference["file_id"], fingerprint_id,
              reference["current_fingerprint_id"], json.dumps({
                  "actor": "local_user", "human_disposition": "user_selected_restore",
                  "origin_operation_id": origin["operation_id"],

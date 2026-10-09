@@ -30,7 +30,8 @@ _COMPOUND_PART_RE = re.compile(
 )
 _AGGREGATE_SUFFIX_RE = re.compile(
     r"^(?P<title>.+?)\s+(?P<base>\d{2,5})\s*[+＋]"
-    r"\s*(?P<extra>\d{1,4})(?=\s|完|완|본|외|후|@|\.|$)",
+    r"\s*(?:(?:외전|번외|특외|후일담|에필로그|에필)\s*)?"
+    r"(?P<extra>\d{1,4})(?=\s|完|완|본|외|후|@|\.|$)",
     re.IGNORECASE,
 )
 _SEASON_TOTAL_RE = re.compile(
@@ -177,7 +178,23 @@ def _aggregate_suffix_profile(name: str):
     title_core = analyze_name(match.group("title"))["core_title"]
     if not title_core:
         return None
-    return title_core, base, _aggregate_profile(base + extra)
+    suffix = match.group(0)
+    has_side_marker = bool(
+        re.search(r"(?:외전|번외|특외|후일담|에필로그|에필)", suffix)
+    )
+    if has_side_marker:
+        profile = EpisodeProfile(
+            unit="화",
+            primary_start=1,
+            primary_end=base,
+            primary_role="main",
+            side_ranges=((1, extra),),
+            side_count=extra,
+            total_count=base + extra,
+        )
+    else:
+        profile = _aggregate_profile(base + extra)
+    return title_core, base, profile
 
 
 def _season_total_profile(name: str):

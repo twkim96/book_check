@@ -1739,6 +1739,47 @@ def copy_no_clobber(source, destination, *, expected: FileEvidence | None = None
         os.close(source_parent_fd)
 
 
+def inspect_verified_destination(path, expected: FileEvidence) -> FileEvidence:
+    """Verify owned destination bytes, allowing only metadata-only ctime drift."""
+    path = Path(path)
+    with opened_directory_nofollow(path.parent) as parent_fd:
+        parent_info = os.fstat(parent_fd)
+        fd = os.open(
+            path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd
+        )
+        try:
+            evidence = inspect_open_regular_file_fd(fd)
+            if (
+                evidence.dev, evidence.ino, evidence.size,
+                evidence.mtime_ns, evidence.sha256,
+            ) != (
+                expected.dev, expected.ino, expected.size,
+                expected.mtime_ns, expected.sha256,
+            ):
+                raise SourceIdentityChanged(f"destination pathname identity or content changed: {path}")
+            final = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                final.st_dev, final.st_ino, final.st_ctime_ns,
+                final.st_size, final.st_mtime_ns, final.st_nlink,
+            ) != (
+                evidence.dev, evidence.ino, evidence.ctime_ns,
+                evidence.size, evidence.mtime_ns, 1,
+            ):
+                raise SourceIdentityChanged(f"destination changed during verification: {path}")
+            with opened_directory_nofollow(path.parent) as current_parent_fd:
+                current_parent = os.fstat(current_parent_fd)
+                current_leaf = os.stat(path.name, dir_fd=current_parent_fd, follow_symlinks=False)
+            if (current_parent.st_dev, current_parent.st_ino) != (
+                parent_info.st_dev, parent_info.st_ino,
+            ) or (current_leaf.st_dev, current_leaf.st_ino, current_leaf.st_ctime_ns) != (
+                evidence.dev, evidence.ino, evidence.ctime_ns,
+            ):
+                raise SourceIdentityChanged(f"destination pathname changed during verification: {path}")
+            return evidence
+        finally:
+            os.close(fd)
+
+
 def consume_copied_source(copied: CopiedFile, *, guard=None):
     """Consume source only after the durable journal owns the copied destination.
 
@@ -1746,22 +1787,14 @@ def consume_copied_source(copied: CopiedFile, *, guard=None):
     actual command holds the global lock.  These checks additionally fail closed
     if a pathname replacement is observed at either endpoint.
     """
-    destination_now = inspect_regular_file(copied.destination)
-    if not evidence_matches(destination_now, copied.destination_evidence):
-        raise SourceIdentityChanged(
-            f"destination pathname identity changed: {copied.destination}"
-        )
+    inspect_verified_destination(copied.destination, copied.destination_evidence)
     source_now = inspect_regular_file(copied.source)
     if not evidence_matches(source_now, copied.source_evidence):
         raise SourceIdentityChanged(f"source identity changed: {copied.source}")
     if guard is not None:
         guard()
     unlink_owned(copied.source, expected=copied.source_evidence)
-    destination_after = inspect_regular_file(copied.destination)
-    if not evidence_matches(destination_after, copied.destination_evidence):
-        raise SourceIdentityChanged(
-            f"destination changed while source was consumed: {copied.destination}"
-        )
+    return inspect_verified_destination(copied.destination, copied.destination_evidence)
 
 
 def move_no_clobber(source, destination, *, expected: FileEvidence | None = None):
@@ -1771,8 +1804,8 @@ def move_no_clobber(source, destination, *, expected: FileEvidence | None = None
     evidence, then call consume_copied_source().
     """
     copied = copy_no_clobber(source, destination, expected=expected)
-    consume_copied_source(copied)
-    return copied.source_evidence, copied.destination_evidence
+    destination_evidence = consume_copied_source(copied)
+    return copied.source_evidence, destination_evidence
 
 
 def unlink_owned(path, *, expected: FileEvidence):
